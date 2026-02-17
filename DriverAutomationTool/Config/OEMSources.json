@@ -1,0 +1,21 @@
+{
+    "schemaVersion": 1,
+    "dell": {
+        "driverPackCatalog": "https://downloads.dell.com/catalog/DriverPackCatalog.cab",
+        "biosCatalog": "https://downloads.dell.com/catalog/CatalogPC.cab",
+        "biosUtility": "https://downloads.dell.com/FOLDER07515461M/1/Flash64W.exe",
+        "baseUrl": "https://downloads.dell.com"
+    },
+    "lenovo": {
+        "driverCatalog": "https://download.lenovo.com/cdrt/td/catalogv2.xml",
+        "biosBase": "https://download.lenovo.com/catalog/"
+    },
+    "windowsBuilds": {
+        "Windows 11 24H2": "10.0.26100",
+        "Windows 11 23H2": "10.0.22631",
+        "Windows 11 22H2": "10.0.22621",
+        "Windows 11 21H2": "10.0.22000",
+        "Windows 10 22H2": "10.0.19045",
+        "Windows 10 21H2": "10.0.19044"
+    }
+}
