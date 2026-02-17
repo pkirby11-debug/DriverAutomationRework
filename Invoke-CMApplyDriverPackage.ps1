@@ -279,7 +279,11 @@ param(
 	[parameter(Mandatory = $true, ParameterSetName = "Debug")]
 	[parameter(Mandatory = $false, ParameterSetName = "XMLPackage")]
 	[ValidateNotNullOrEmpty()]
-	[ValidateSet("25H2","24H2","23H2","22H2", "21H2", "21H1", "20H2", "2004", "1909", "1903", "1809", "1803", "1709", "1703", "1607")]
+	[ValidateScript({
+		$KnownVersions = @("25H2","24H2","23H2","22H2","21H2","21H1","20H2","2004","1909","1903","1809","1803","1709","1703","1607")
+		if ($_ -in $KnownVersions -or $_ -match '^\d{2}H\d$') { return $true }
+		throw "Invalid OS version '$_'. Valid values: $($KnownVersions -join ', ') or any pattern matching ##H# (e.g. '26H2')"
+	})]
 	[string]$TargetOSVersion,
 	
 	[parameter(Mandatory = $false, ParameterSetName = "BareMetal", HelpMessage = "Define the value that will be used as the target operating system architecture e.g. 'x64'.")]
@@ -366,6 +370,16 @@ Process {
 		}
 	}
 	
+	# Dot-source helper functions if available (extracted for testability and modernization)
+	$HelperPath = Join-Path -Path $PSScriptRoot -ChildPath "Invoke-CMApplyDriverPackage.helpers.ps1"
+	if (Test-Path -Path $HelperPath) {
+		. $HelperPath
+		$HelpersLoaded = $true
+	}
+	else {
+		$HelpersLoaded = $false
+	}
+
 	# Functions
 	function Write-CMLogEntry {
 		param(
@@ -493,8 +507,11 @@ Process {
 			$TSEnvironment.Value("OSDDownloadDestinationPath") = "$($CustomLocationPath)"
 		}
 		
-		# Set SMSTSDownloadRetryCount to 1000 to overcome potential BranchCache issue that will cause 'SendWinHttpRequest failed. 80072efe'
-		$TSEnvironment.Value("SMSTSDownloadRetryCount") = 1000
+		# Set SMSTSDownloadRetryCount to overcome potential BranchCache issue ('SendWinHttpRequest failed. 80072efe')
+		# Configurable via MDMDownloadRetryCount TS variable; defaults to 100 (previous hardcoded value of 1000 was excessive)
+		$RetryCount = $TSEnvironment.Value("MDMDownloadRetryCount")
+		if ([string]::IsNullOrEmpty($RetryCount)) { $RetryCount = 100 }
+		$TSEnvironment.Value("SMSTSDownloadRetryCount") = $RetryCount
 		
 		# Invoke download of package content
 		try {
@@ -549,30 +566,29 @@ Process {
 		$TSEnvironment.Value("OSDDownloadDestinationPath") = [System.String]::Empty
 	}
 	
-	function New-TerminatingErrorRecord {
-		param(
-			[parameter(Mandatory = $false, HelpMessage = "Specify the exception message details.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$Message = "InnerTerminatingFailure",
-			
-			[parameter(Mandatory = $false, HelpMessage = "Specify the violation exception causing the error.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$Exception = "System.Management.Automation.RuntimeException",
-			
-			[parameter(Mandatory = $false, HelpMessage = "Specify the error category of the exception causing the error.")]
-			[ValidateNotNullOrEmpty()]
-			[System.Management.Automation.ErrorCategory]$ErrorCategory = [System.Management.Automation.ErrorCategory]::NotImplemented,
-			
-			[parameter(Mandatory = $false, HelpMessage = "Specify the target object causing the error.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$TargetObject = ([string]::Empty)
-		)
-		# Construct new error record to be returned from function based on parameter inputs
-		$SystemException = New-Object -TypeName $Exception -ArgumentList $Message
-		$ErrorRecord = New-Object -TypeName System.Management.Automation.ErrorRecord -ArgumentList @($SystemException, $ErrorID, $ErrorCategory, $TargetObject)
-		
-		# Handle return value
-		return $ErrorRecord
+	if (-not $HelpersLoaded) {
+		function New-TerminatingErrorRecord {
+			param(
+				[parameter(Mandatory = $false, HelpMessage = "Specify the exception message details.")]
+				[ValidateNotNullOrEmpty()]
+				[string]$Message = "InnerTerminatingFailure",
+
+				[parameter(Mandatory = $false, HelpMessage = "Specify the violation exception causing the error.")]
+				[ValidateNotNullOrEmpty()]
+				[string]$Exception = "System.Management.Automation.RuntimeException",
+
+				[parameter(Mandatory = $false, HelpMessage = "Specify the error category of the exception causing the error.")]
+				[ValidateNotNullOrEmpty()]
+				[System.Management.Automation.ErrorCategory]$ErrorCategory = [System.Management.Automation.ErrorCategory]::NotImplemented,
+
+				[parameter(Mandatory = $false, HelpMessage = "Specify the target object causing the error.")]
+				[ValidateNotNullOrEmpty()]
+				[string]$TargetObject = ([string]::Empty)
+			)
+			$SystemException = New-Object -TypeName $Exception -ArgumentList $Message
+			$ErrorRecord = New-Object -TypeName System.Management.Automation.ErrorRecord -ArgumentList @($SystemException, $ErrorID, $ErrorCategory, $TargetObject)
+			return $ErrorRecord
+		}
 	}
 	
 	function Get-DeploymentType {
@@ -597,26 +613,23 @@ Process {
 		}
 	}
 	
-	function ConvertTo-ObfuscatedUserName {
-		param(
-			[parameter(Mandatory = $true, HelpMessage = "Specify the user name string to be obfuscated for log output.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$InputObject
-		)
-		# Convert input object to a character array
-		$UserNameArray = $InputObject.ToCharArray()
-		
-		# Loop through each character obfuscate every second item, with exceptions of the @ character if present
-		for ($i = 0; $i -lt $UserNameArray.Count; $i++) {
-			if ($UserNameArray[$i] -notmatch "@") {
-				if ($i % 2) {
-					$UserNameArray[$i] = "*"
+	if (-not $HelpersLoaded) {
+		function ConvertTo-ObfuscatedUserName {
+			param(
+				[parameter(Mandatory = $true, HelpMessage = "Specify the user name string to be obfuscated for log output.")]
+				[ValidateNotNullOrEmpty()]
+				[string]$InputObject
+			)
+			$UserNameArray = $InputObject.ToCharArray()
+			for ($i = 0; $i -lt $UserNameArray.Count; $i++) {
+				if ($UserNameArray[$i] -notmatch "@") {
+					if ($i % 2) {
+						$UserNameArray[$i] = "*"
+					}
 				}
 			}
+			return -join @($UserNameArray)
 		}
-		
-		# Join character array and return value
-		return -join @($UserNameArray)
 	}
 	
 	function Test-AdminServiceData {
@@ -752,8 +765,8 @@ Process {
 			default {
 				Write-CMLogEntry -Value " - Attempting to determine AdminService endpoint type based on current active Management Point candidates and from ClientInfo class" -Severity 1
 				
-				# Determine active MP candidates and if 
-				$ActiveMPCandidates = Get-WmiObject -Namespace "root\ccm\LocationServices" -Class "SMS_ActiveMPCandidate"
+				# Determine active MP candidates and if currently on internet or intranet
+				$ActiveMPCandidates = Get-CimInstance -Namespace "root/ccm/LocationServices" -ClassName "SMS_ActiveMPCandidate"
 				$ActiveMPInternalCandidatesCount = ($ActiveMPCandidates | Where-Object {
 						$PSItem.Type -like "Assigned"
 					} | Measure-Object).Count
@@ -762,7 +775,7 @@ Process {
 					} | Measure-Object).Count
 				
 				# Determine if ConfigMgr client has detected if the computer is currently on internet or intranet
-				$CMClientInfo = Get-WmiObject -Namespace "root\ccm" -Class "ClientInfo"
+				$CMClientInfo = Get-CimInstance -Namespace "root/ccm" -ClassName "ClientInfo"
 				switch ($CMClientInfo.InInternet) {
 					$true {
 						if ($ActiveMPExternalCandidatesCount -ge 1) {
@@ -804,53 +817,36 @@ Process {
 		Write-CMLogEntry -Value " - Setting 'AdminServiceURL' variable to: $($Script:AdminServiceURL)" -Severity 1
 	}
 	
-	function Install-AuthModule {
-		# Determine if the PSIntuneAuth module needs to be installed
-		try {
-			Write-CMLogEntry -Value " - Attempting to locate PSIntuneAuth module" -Severity 1
-			$PSIntuneAuthModule = Get-InstalledModule -Name "PSIntuneAuth" -ErrorAction Stop -Verbose:$false
-			if ($PSIntuneAuthModule -ne $null) {
-				Write-CMLogEntry -Value " - Authentication module detected, checking for latest version" -Severity 1
-				$LatestModuleVersion = (Find-Module -Name "PSIntuneAuth" -ErrorAction SilentlyContinue -Verbose:$false).Version
-				if ($LatestModuleVersion -gt $PSIntuneAuthModule.Version) {
-					Write-CMLogEntry -Value " - Latest version of PSIntuneAuth module is not installed, attempting to install: $($LatestModuleVersion.ToString())" -Severity 1
-					$UpdateModuleInvocation = Update-Module -Name "PSIntuneAuth" -Scope CurrentUser -Force -ErrorAction Stop -Confirm:$false -Verbose:$false
-				}
-			}
-		}
-		catch [System.Exception] {
-			Write-CMLogEntry -Value " - Unable to detect PSIntuneAuth module, attempting to install from PSGallery" -Severity 2
-			try {
-				# Install NuGet package provider
-				$PackageProvider = Install-PackageProvider -Name "NuGet" -Force -Verbose:$false
-				
-				# Install PSIntuneAuth module
-				Install-Module -Name "PSIntuneAuth" -Scope AllUsers -Force -ErrorAction Stop -Confirm:$false -Verbose:$false
-				Write-CMLogEntry -Value " - Successfully installed PSIntuneAuth module" -Severity 1
-			}
-			catch [System.Exception] {
-				Write-CMLogEntry -Value " - An error occurred while attempting to install PSIntuneAuth module. Error message: $($_.Exception.Message)" -Severity 3
-				
-				# Throw terminating error				
-				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
-			}
-		}
-	}
-	
 	function Get-AuthToken {
 		try {
-			# Attempt to install PSIntuneAuth module, if already installed ensure the latest version is being used
-			Install-AuthModule
-			
-			# Retrieve authentication token
-			Write-CMLogEntry -Value " - Attempting to retrieve authentication token using native client with ID: $($ClientID)" -Severity 1
-			$Script:AuthToken = Get-MSIntuneAuthToken -TenantName $TenantName -ClientID $ClientID -Credential $Credential -Resource $ApplicationIDURI -RedirectUri "https://login.microsoftonline.com/common/oauth2/nativeclient" -ErrorAction Stop
+			Write-CMLogEntry -Value " - Attempting to retrieve OAuth authentication token using native client with ID: $($ClientID)" -Severity 1
+
+			if ($HelpersLoaded) {
+				# Use modern native OAuth from helpers (no external module dependency)
+				$Script:AuthToken = Get-OAuthToken -TenantName $TenantName -ClientID $ClientID -Credential $Credential -Resource $ApplicationIDURI -Logger { param($msg, $sev) Write-CMLogEntry -Value $msg -Severity $sev }
+			}
+			else {
+				# Fallback: Direct OAuth token request using built-in Invoke-RestMethod
+				$TokenEndpoint = "https://login.microsoftonline.com/$TenantName/oauth2/token"
+				$Body = @{
+					grant_type = 'password'
+					client_id  = $ClientID
+					resource   = $ApplicationIDURI
+					username   = $Credential.UserName
+					password   = $Credential.GetNetworkCredential().Password
+				}
+				$Response = Invoke-RestMethod -Method Post -Uri $TokenEndpoint -Body $Body -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop
+				$Script:AuthToken = @{
+					'Authorization' = "Bearer $($Response.access_token)"
+				}
+			}
+
 			Write-CMLogEntry -Value " - Successfully retrieved authentication token" -Severity 1
 		}
 		catch [System.Exception] {
 			Write-CMLogEntry -Value " - Failed to retrieve authentication token. Error message: $($PSItem.Exception.Message)" -Severity 3
-			
-			# Throw terminating error			
+
+			# Throw terminating error
 			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
 		}
 	}
@@ -893,26 +889,34 @@ Process {
 					$AdminServiceResponse = Invoke-RestMethod -Method Get -Uri $AdminServiceUri -Credential $Credential -ErrorAction Stop
 				}
 				catch [System.Security.Authentication.AuthenticationException] {
-					Write-CMLogEntry -Value " - The remote AdminService endpoint certificate is invalid according to the validation procedure. Error message: $($PSItem.Exception.Message)" -Severity 2
-					Write-CMLogEntry -Value " - Will attempt to set the current session to ignore self-signed certificates and retry AdminService endpoint connection" -Severity 2
-					
-					# Attempt to ignore self-signed certificate binding for AdminService
-					# Convert encoded base64 string for ignore self-signed certificate validation functionality
-					$CertificationValidationCallbackEncoded = "DQAKACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAdQBzAGkAbgBnACAAUwB5AHMAdABlAG0AOwANAAoAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAB1AHMAaQBuAGcAIABTAHkAcwB0AGUAbQAuAE4AZQB0ADsADQAKACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAdQBzAGkAbgBnACAAUwB5AHMAdABlAG0ALgBOAGUAdAAuAFMAZQBjAHUAcgBpAHQAeQA7AA0ACgAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgAHUAcwBpAG4AZwAgAFMAeQBzAHQAZQBtAC4AUwBlAGMAdQByAGkAdAB5AC4AQwByAHkAcAB0AG8AZwByAGEAcABoAHkALgBYADUAMAA5AEMAZQByAHQAaQBmAGkAYwBhAHQAZQBzADsADQAKACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAcAB1AGIAbABpAGMAIABjAGwAYQBzAHMAIABTAGUAcgB2AGUAcgBDAGUAcgB0AGkAZgBpAGMAYQB0AGUAVgBhAGwAaQBkAGEAdABpAG8AbgBDAGEAbABsAGIAYQBjAGsADQAKACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAewANAAoAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgAHAAdQBiAGwAaQBjACAAcwB0AGEAdABpAGMAIAB2AG8AaQBkACAASQBnAG4AbwByAGUAKAApAA0ACgAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAewANAAoAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAaQBmACgAUwBlAHIAdgBpAGMAZQBQAG8AaQBuAHQATQBhAG4AYQBnAGUAcgAuAFMAZQByAHYAZQByAEMAZQByAHQAaQBmAGkAYwBhAHQAZQBWAGEAbABpAGQAYQB0AGkAbwBuAEMAYQBsAGwAYgBhAGMAawAgAD0APQBuAHUAbABsACkADQAKACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgAHsADQAKACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAUwBlAHIAdgBpAGMAZQBQAG8AaQBuAHQATQBhAG4AYQBnAGUAcgAuAFMAZQByAHYAZQByAEMAZQByAHQAaQBmAGkAYwBhAHQAZQBWAGEAbABpAGQAYQB0AGkAbwBuAEMAYQBsAGwAYgBhAGMAawAgACsAPQAgAA0ACgAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAZABlAGwAZQBnAGEAdABlAA0ACgAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAKAANAAoAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAATwBiAGoAZQBjAHQAIABvAGIAagAsACAADQAKACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgAFgANQAwADkAQwBlAHIAdABpAGYAaQBjAGEAdABlACAAYwBlAHIAdABpAGYAaQBjAGEAdABlACwAIAANAAoAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAWAA1ADAAOQBDAGgAYQBpAG4AIABjAGgAYQBpAG4ALAAgAA0ACgAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIABTAHMAbABQAG8AbABpAGMAeQBFAHIAcgBvAHIAcwAgAGUAcgByAG8AcgBzAA0ACgAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAKQANAAoAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgAHsADQAKACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgAHIAZQB0AHUAcgBuACAAdAByAHUAZQA7AA0ACgAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAfQA7AA0ACgAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAB9AA0ACgAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAfQANAAoAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAAgACAAIAB9AA0ACgAgACAAIAAgACAAIAAgACAA"
-					$CertificationValidationCallback = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($CertificationValidationCallbackEncoded))
-					
-					# Load required type definition to be able to ignore self-signed certificate to circumvent issues with AdminService running with ConfigMgr self-signed certificate binding
-					Add-Type -TypeDefinition $CertificationValidationCallback
-					[ServerCertificateValidationCallback]::Ignore()
-					
+					Write-CMLogEntry -Value " - The remote AdminService endpoint certificate is untrusted. Error message: $($PSItem.Exception.Message)" -Severity 2
+					Write-CMLogEntry -Value " - Attempting to bypass certificate validation and retry AdminService endpoint connection" -Severity 2
+
+					# Bypass self-signed certificate validation for AdminService using readable inline C#
+					if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+						Add-Type -Language CSharp @"
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) {
+        return true;
+    }
+}
+"@
+					}
+					[System.Net.ServicePointManager]::CertificatePolicy = [TrustAllCertsPolicy]::new()
+
 					try {
-						# Call AdminService endpoint to retrieve package data
+						# Retry AdminService endpoint call with certificate validation bypassed
 						$AdminServiceResponse = Invoke-RestMethod -Method Get -Uri $AdminServiceUri -Credential $Credential -ErrorAction Stop
 					}
 					catch [System.Exception] {
-						Write-CMLogEntry -Value " - Failed to retrieve available package items from AdminService endpoint. Error message: $($PSItem.Exception.Message)" -Severity 3
-						
-						# Throw terminating error						
+						Write-CMLogEntry -Value " - Failed to retrieve available package items from AdminService endpoint after certificate bypass. Error message: $($PSItem.Exception.Message)" -Severity 3
+
+						# Throw terminating error
 						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
 					}
 				}
@@ -940,9 +944,9 @@ Process {
 		switch ($Script:DeploymentMode) {
 			"DriverUpdate" {
 				$OSImageDetails = [PSCustomObject]@{
-					Architecture = Get-OSArchitecture -InputObject (Get-WmiObject -Class Win32_OperatingSystem | Select-Object -ExpandProperty OSArchitecture)
+					Architecture = Get-OSArchitecture -InputObject (Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -ExpandProperty OSArchitecture)
 					Name = $Script:TargetOSName
-					Version = Get-OSBuild -InputObject (Get-WmiObject -Class Win32_OperatingSystem | Select-Object -ExpandProperty Version) -OSName $Script:TargetOSName
+					Version = Get-OSBuild -InputObject (Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -ExpandProperty Version) -OSName $Script:TargetOSName
 				}
 			}
 			default {
@@ -963,125 +967,49 @@ Process {
 		return $OSImageDetails
 	}
 	
-	function Get-OSBuild {
-		param(
-			[parameter(Mandatory = $true, HelpMessage = "OS version data to be translated.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$InputObject,
+	if (-not $HelpersLoaded) {
+		# Fallback inline Get-OSBuild when helpers file is not available
+		function Get-OSBuild {
+			param(
+				[parameter(Mandatory = $true)]
+				[ValidateNotNullOrEmpty()]
+				[string]$InputObject,
 
-			[parameter(Mandatory = $true, HelpMessage = "OS name data to differentiate builds.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$OSName	
-		)
-		switch ($OSName) {
-			"Windows 11" {
-				switch (([System.Version]$InputObject).Build) {
-					"26200" {
-						$OSVersion = '25H2'
-					}
-        			"26100" {
-						$OSVersion = '24H2'
-					}
-    				"22631" {
-						$OSVersion = '23H2'
-					}
-					"22621" {
-						$OSVersion = '22H2'
-					}
-					"22000" {
-						$OSVersion = '21H2'
-					}
-					default {
-						Write-CMLogEntry -Value " - Unable to translate OS version using input object: $($InputObject)" -Severity 3
-						Write-CMLogEntry -Value " - Unsupported OS version detected, please reach out to the developers of this script" -Severity 3
-						
-						# Throw terminating error						
-						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
-					}
-				}
+				[parameter(Mandatory = $true)]
+				[ValidateNotNullOrEmpty()]
+				[string]$OSName
+			)
+			$BuildNumber = ([System.Version]$InputObject).Build.ToString()
+			$Mapping = @{
+				'Windows 11' = @{ '26200'='25H2'; '26100'='24H2'; '22631'='23H2'; '22621'='22H2'; '22000'='21H2' }
+				'Windows 10' = @{ '19045'='22H2'; '19044'='21H2'; '19043'='21H1'; '19042'='20H2'; '19041'='2004'; '18363'='1909'; '18362'='1903'; '17763'='1809'; '17134'='1803'; '16299'='1709'; '15063'='1703'; '14393'='1607' }
 			}
-			"Windows 10" {
-				switch (([System.Version]$InputObject).Build) {
-					"19045" {
-						$OSVersion = '22H2'
-					}
-					"19044" {
-						$OSVersion = '21H2'
-					}
-					"19043" {
-						$OSVersion = '21H1'
-					}
-					"19042" {
-						$OSVersion = '20H2'
-					}
-					"19041" {
-						$OSVersion = 2004
-					}
-					"18363" {
-						$OSVersion = 1909
-					}
-					"18362" {
-						$OSVersion = 1903
-					}
-					"17763" {
-						$OSVersion = 1809
-					}
-					"17134" {
-						$OSVersion = 1803
-					}
-					"16299" {
-						$OSVersion = 1709
-					}
-					"15063" {
-						$OSVersion = 1703
-					}
-					"14393" {
-						$OSVersion = 1607
-					}
-					default {
-						Write-CMLogEntry -Value " - Unable to translate OS version using input object: $($InputObject)" -Severity 3
-						Write-CMLogEntry -Value " - Unsupported OS version detected, please reach out to the developers of this script" -Severity 3
-						
-						# Throw terminating error						
-						$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
-					}
+			if ($Mapping.ContainsKey($OSName) -and $Mapping[$OSName].ContainsKey($BuildNumber)) {
+				return [string]$Mapping[$OSName][$BuildNumber]
+			}
+			Write-CMLogEntry -Value " - Unable to translate OS version using input object: $($InputObject)" -Severity 3
+			Write-CMLogEntry -Value " - Unsupported OS version detected. Update Config\WindowsBuilds.json with the new build mapping." -Severity 3
+			$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
+		}
+
+		# Fallback inline Get-OSArchitecture when helpers file is not available
+		function Get-OSArchitecture {
+			param(
+				[parameter(Mandatory = $true)]
+				[ValidateNotNullOrEmpty()]
+				[string]$InputObject
+			)
+			switch -Wildcard ($InputObject) {
+				"9" { return "x64" }
+				"64*" { return "x64" }
+				"0" { return "x86" }
+				"32*" { return "x86" }
+				default {
+					Write-CMLogEntry -Value " - Unable to translate OS architecture using input object: $($InputObject)" -Severity 3
+					$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
 				}
 			}
 		}
-		
-		# Handle return value from function
-		return [string]$OSVersion
-	}
-	
-	function Get-OSArchitecture {
-		param(
-			[parameter(Mandatory = $true, HelpMessage = "OS architecture data to be translated.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$InputObject
-		)
-		switch -Wildcard ($InputObject) {
-			"9" {
-				$OSArchitecture = "x64"
-			}
-			"0" {
-				$OSArchitecture = "x86"
-			}
-			"64*" {
-				$OSArchitecture = "x64"
-			}
-			"32*" {
-				$OSArchitecture = "x86"
-			}
-			default {
-				Write-CMLogEntry -Value " - Unable to translate OS architecture using input object: $($InputObject)" -Severity 3
-				
-				# Throw terminating error				
-				$PSCmdlet.ThrowTerminatingError((New-TerminatingErrorRecord))
-			}
-		}
-		
-		# Handle return value from function
-		return $OSArchitecture
 	}
 	
 	function Get-DriverPackages {
@@ -1140,124 +1068,123 @@ Process {
 	}
 	
 	function Get-ComputerData {
-		# Create a custom object for computer details gathered from local WMI
+		# Use data-driven manufacturer registry from helpers if available, otherwise use CIM-based inline detection
+		if ($HelpersLoaded) {
+			$DebugOverrides = @{
+				Logger = { param($msg, $sev) Write-CMLogEntry -Value $msg -Severity $sev }
+			}
+			if ($Script:PSCmdlet.ParameterSetName -like "Debug") {
+				if (-not([string]::IsNullOrEmpty($Manufacturer))) { $DebugOverrides['OverrideManufacturer'] = $Manufacturer }
+				if (-not([string]::IsNullOrEmpty($ComputerModel))) { $DebugOverrides['OverrideModel'] = $ComputerModel }
+				if (-not([string]::IsNullOrEmpty($SystemSKU))) { $DebugOverrides['OverrideSKU'] = $SystemSKU }
+			}
+			return Get-ComputerDataFromRegistry @DebugOverrides
+		}
+
+		# Fallback inline detection using Get-CimInstance (no helpers file)
 		$ComputerDetails = [PSCustomObject]@{
 			Manufacturer = $null
 			Model = $null
 			SystemSKU = $null
 			FallbackSKU = $null
 		}
-		
-		# Gather computer details based upon specific computer manufacturer
-		$ComputerManufacturer = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Manufacturer).Trim()
+
+		$ComputerManufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem).Manufacturer.Trim()
 		switch -Wildcard ($ComputerManufacturer) {
 			"*Microsoft*" {
 				$ComputerDetails.Manufacturer = "Microsoft"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
-				$ComputerDetails.SystemSKU = Get-WmiObject -Namespace "root\wmi" -Class "MS_SystemInformation" | Select-Object -ExpandProperty SystemSKU
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
+				$ComputerDetails.SystemSKU = (Get-CimInstance -Namespace "root/wmi" -ClassName MS_SystemInformation).SystemSKU
 			}
 			"*HP*" {
 				$ComputerDetails.Manufacturer = "HP"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
-				$ComputerDetails.SystemSKU = (Get-CIMInstance -ClassName "MS_SystemInformation" -NameSpace "root\WMI").BaseBoardProduct.Trim()
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
+				$ComputerDetails.SystemSKU = (Get-CimInstance -Namespace "root/wmi" -ClassName MS_SystemInformation).BaseBoardProduct.Trim()
 			}
 			"*Hewlett-Packard*" {
 				$ComputerDetails.Manufacturer = "HP"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
-				$ComputerDetails.SystemSKU = (Get-CIMInstance -ClassName "MS_SystemInformation" -NameSpace "root\WMI").BaseBoardProduct.Trim()
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
+				$ComputerDetails.SystemSKU = (Get-CimInstance -Namespace "root/wmi" -ClassName MS_SystemInformation).BaseBoardProduct.Trim()
 			}
 			"*Dell*" {
 				$ComputerDetails.Manufacturer = "Dell"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
-				$ComputerDetails.SystemSKU = (Get-CIMInstance -ClassName "MS_SystemInformation" -NameSpace "root\WMI").SystemSku.Trim()
-				[string]$OEMString = Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty OEMStringArray
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
+				$ComputerDetails.SystemSKU = (Get-CimInstance -Namespace "root/wmi" -ClassName MS_SystemInformation).SystemSku.Trim()
+				[string]$OEMString = Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object -ExpandProperty OEMStringArray
 				$ComputerDetails.FallbackSKU = [regex]::Matches($OEMString, '\[\S*]')[0].Value.TrimStart("[").TrimEnd("]")
 			}
 			"*Lenovo*" {
 				$ComputerDetails.Manufacturer = "Lenovo"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystemProduct" | Select-Object -ExpandProperty Version).Trim()
-				$ComputerDetails.SystemSKU = ((Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).SubString(0, 4)).Trim()
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystemProduct).Version.Trim()
+				$ComputerDetails.SystemSKU = ((Get-CimInstance -ClassName Win32_ComputerSystem).Model.SubString(0, 4)).Trim()
 			}
 			"*Panasonic*" {
 				$ComputerDetails.Manufacturer = "Panasonic Corporation"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
-				$ComputerDetails.SystemSKU = (Get-CIMInstance -ClassName "MS_SystemInformation" -NameSpace "root\WMI").BaseBoardProduct.Trim()
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
+				$ComputerDetails.SystemSKU = (Get-CimInstance -Namespace "root/wmi" -ClassName MS_SystemInformation).BaseBoardProduct.Trim()
 			}
 			"*Viglen*" {
 				$ComputerDetails.Manufacturer = "Viglen"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
-				$ComputerDetails.SystemSKU = (Get-WmiObject -Class "Win32_BaseBoard" | Select-Object -ExpandProperty SKU).Trim()
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
+				$ComputerDetails.SystemSKU = (Get-CimInstance -ClassName Win32_BaseBoard).SKU.Trim()
 			}
 			"*AZW*" {
 				$ComputerDetails.Manufacturer = "AZW"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
-				$ComputerDetails.SystemSKU = (Get-CIMInstance -ClassName "MS_SystemInformation" -NameSpace root\WMI).BaseBoardProduct.Trim()
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
+				$ComputerDetails.SystemSKU = (Get-CimInstance -Namespace "root/wmi" -ClassName MS_SystemInformation).BaseBoardProduct.Trim()
 			}
 			"*Fujitsu*" {
 				$ComputerDetails.Manufacturer = "Fujitsu"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
-				$ComputerDetails.SystemSKU = (Get-WmiObject -Class "Win32_BaseBoard" | Select-Object -ExpandProperty SKU).Trim()
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
+				$ComputerDetails.SystemSKU = (Get-CimInstance -ClassName Win32_BaseBoard).SKU.Trim()
 			}
 			"*Getac*" {
 				$ComputerDetails.Manufacturer = "Getac"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
-				$ComputerDetails.SystemSKU = (Get-CIMInstance -ClassName "MS_SystemInformation" -NameSpace root\WMI).BaseBoardProduct.Trim()
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
+				$ComputerDetails.SystemSKU = (Get-CimInstance -Namespace "root/wmi" -ClassName MS_SystemInformation).BaseBoardProduct.Trim()
 			}
 			"*Intel*" {
 				$ComputerDetails.Manufacturer = "Intel"
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
 			}
 			"*ByteSpeed*" {
-				if ($(Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim() -like "*NUC*") {
+				if ((Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim() -like "*NUC*") {
 					$ComputerDetails.Manufacturer = "Intel"
-					$ComputerDetails.Model = (Get-CIMInstance -ClassName "MS_SystemInformation" -NameSpace root\WMI).BaseBoardProduct.Trim()
+					$ComputerDetails.Model = (Get-CimInstance -Namespace "root/wmi" -ClassName MS_SystemInformation).BaseBoardProduct.Trim()
 				} else {
 					$ComputerDetails.Manufacturer = "ByteSpeed"
-					$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
+					$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
 				}
 			}
 			Default {
-				$ComputerDetails.Manufacturer = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Manufacturer).Trim()
-				$ComputerDetails.Model = (Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty Model).Trim()
+				$ComputerDetails.Manufacturer = $ComputerManufacturer
+				$ComputerDetails.Model = (Get-CimInstance -ClassName Win32_ComputerSystem).Model.Trim()
 			}
 		}
-		
+
 		# Handle overriding computer details if debug mode and additional parameters was specified
 		if ($Script:PSCmdlet.ParameterSetName -like "Debug") {
-			if (-not([string]::IsNullOrEmpty($Manufacturer))) {
-				$ComputerDetails.Manufacturer = $Manufacturer
-			}
-			if (-not([string]::IsNullOrEmpty($ComputerModel))) {
-				$ComputerDetails.Model = $ComputerModel
-			}
-			if (-not([string]::IsNullOrEmpty($SystemSKU))) {
-				$ComputerDetails.SystemSKU = $SystemSKU
-			}
+			if (-not([string]::IsNullOrEmpty($Manufacturer))) { $ComputerDetails.Manufacturer = $Manufacturer }
+			if (-not([string]::IsNullOrEmpty($ComputerModel))) { $ComputerDetails.Model = $ComputerModel }
+			if (-not([string]::IsNullOrEmpty($SystemSKU))) { $ComputerDetails.SystemSKU = $SystemSKU }
 		}
-		
-		# Handle output to log file for computer details
+
 		Write-CMLogEntry -Value " - Computer manufacturer determined as: $($ComputerDetails.Manufacturer)" -Severity 1
 		Write-CMLogEntry -Value " - Computer model determined as: $($ComputerDetails.Model)" -Severity 1
-		
-		# Handle output to log file for computer SystemSKU
 		if (-not([string]::IsNullOrEmpty($ComputerDetails.SystemSKU))) {
 			Write-CMLogEntry -Value " - Computer SystemSKU determined as: $($ComputerDetails.SystemSKU)" -Severity 1
-		}
-		else {
+		} else {
 			Write-CMLogEntry -Value " - Computer SystemSKU determined as: <null>" -Severity 2
 		}
-		
-		# Handle output to log file for Fallback SKU
 		if (-not([string]::IsNullOrEmpty($ComputerDetails.FallBackSKU))) {
 			Write-CMLogEntry -Value " - Computer Fallback SystemSKU determined as: $($ComputerDetails.FallBackSKU)" -Severity 1
 		}
-		
-		# Handle return value from function
+
 		return $ComputerDetails
 	}
 	
 	function Get-ComputerSystemType {
-		$ComputerSystemType = Get-WmiObject -Class "Win32_ComputerSystem" | Select-Object -ExpandProperty "Model"
+		$ComputerSystemType = (Get-CimInstance -ClassName Win32_ComputerSystem).Model
 		if ($ComputerSystemType -notin @("Virtual Machine", "VMware Virtual Platform", "VirtualBox", "HVM domU", "KVM", "VMWare7,1")) {
 			Write-CMLogEntry -Value " - Supported computer platform detected, script execution allowed to continue" -Severity 1
 		}
@@ -1276,7 +1203,7 @@ Process {
 	
 	function Get-OperatingSystemVersion {
 		if (($Script:PSCmdlet.ParameterSetName -like "DriverUpdate") -or ($Script:PSCmdlet.ParameterSetName -like "OSUpgrade")) {
-			$OperatingSystemVersion = Get-WmiObject -Class "Win32_OperatingSystem" | Select-Object -ExpandProperty "Version"
+			$OperatingSystemVersion = (Get-CimInstance -ClassName Win32_OperatingSystem).Version
 			if ($OperatingSystemVersion -like "10.0.*") {
 				Write-CMLogEntry -Value " - Supported operating system version currently running detected, script execution allowed to continue" -Severity 1
 			}
@@ -1614,220 +1541,123 @@ Process {
 		}
 	}
 	
-	function Confirm-OSVersion {
-		param(
-			[parameter(Mandatory = $true, HelpMessage = "Specify the OS version value from the driver package object.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$DriverPackageInput,
-			
-			[parameter(Mandatory = $true, HelpMessage = "Specify the computer data object.")]
-			[ValidateNotNullOrEmpty()]
-			[PSCustomObject]$OSImageData,
-			
-			[parameter(Mandatory = $false, HelpMessage = "Set to True to check for drivers packages that matches earlier versions of Windows than what's detected from web service call.")]
-			[ValidateNotNullOrEmpty()]
-			[bool]$OSVersionFallback = $false
-		)
-		if ($OSVersionFallback -eq $true) {
-			# Attempt to convert 2XHX build version into digit, 2XH1 into 2X05 and 2XH2 into 2X10 for simplified version comparison
-			$DriverPackageInputConversion = $DriverPackageInput.Replace("H1", "05").Replace("H2", 10)
-			$OSImageDataVersionConversion = $OSImageData.Version.Replace("H1", "05").Replace("H2", 10)
+	# Matching functions - use helpers file versions when available, otherwise define inline fallbacks
+	if (-not $HelpersLoaded) {
+		function Confirm-OSVersion {
+			param(
+				[parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$DriverPackageInput,
+				[parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][PSCustomObject]$OSImageData,
+				[parameter(Mandatory = $false)][bool]$OSVersionFallback = $false
+			)
+			if ($OSVersionFallback -eq $true) {
+				$DriverPackageInputConversion = $DriverPackageInput.Replace("H1", "05").Replace("H2", 10)
+				$OSImageDataVersionConversion = $OSImageData.Version.Replace("H1", "05").Replace("H2", 10)
+				if ([int]$DriverPackageInputConversion -lt [int]$OSImageDataVersionConversion) {
+					Write-CMLogEntry -Value " - Matched operating system version: $($DriverPackageInput)" -Severity 1
+					return $true
+				} else {
+					return $false
+				}
+			} else {
+				if ($DriverPackageInput -like $OSImageData.Version) {
+					Write-CMLogEntry -Value " - Matched operating system version: $($OSImageData.Version)" -Severity 1
+					return $true
+				} else {
+					return $false
+				}
+			}
+		}
 
-			if ([int]$DriverPackageInputConversion -lt [int]$OSImageDataVersionConversion) {
-				# OS version match found where driver package input was less than input from OSImageData version
-				Write-CMLogEntry -Value " - Matched operating system version: $($DriverPackageInput)" -Severity 1
+		function Confirm-Architecture {
+			param(
+				[parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$DriverPackageInput,
+				[parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][PSCustomObject]$OSImageData
+			)
+			if ($DriverPackageInput -like $OSImageData.Architecture) {
+				Write-CMLogEntry -Value " - Matched operating system architecture: $($OSImageData.Architecture)" -Severity 1
 				return $true
-			}
-			else {
-				# OS version match was not found
+			} else {
+				Write-CMLogEntry -Value " - Could not match operating system architecture: $($OSImageData.Architecture)" -Severity 2
 				return $false
 			}
 		}
-		else {
-			if ($DriverPackageInput -like $OSImageData.Version) {
-				# OS version match found
-				Write-CMLogEntry -Value " - Matched operating system version: $($OSImageData.Version)" -Severity 1
+
+		function Confirm-OSName {
+			param(
+				[parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$DriverPackageInput,
+				[parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][PSCustomObject]$OSImageData
+			)
+			if ($DriverPackageInput -like $OSImageData.Name) {
+				Write-CMLogEntry -Value " - Matched operating system name: $($OSImageData.Name)" -Severity 1
 				return $true
-			}
-			else {
-				# OS version match was not found
+			} else {
+				Write-CMLogEntry -Value " - Could not match operating system name: $($OSImageData.Name)" -Severity 2
 				return $false
 			}
 		}
-	}
-	
-	function Confirm-Architecture {
-		param(
-			[parameter(Mandatory = $true, HelpMessage = "Specify the Architecture value from the driver package object.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$DriverPackageInput,
-			
-			[parameter(Mandatory = $true, HelpMessage = "Specify the computer data object.")]
-			[ValidateNotNullOrEmpty()]
-			[PSCustomObject]$OSImageData
-		)
-		if ($DriverPackageInput -like $OSImageData.Architecture) {
-			# OS architecture match found
-			Write-CMLogEntry -Value " - Matched operating system architecture: $($OSImageData.Architecture)" -Severity 1
-			return $true
-		}
-		else {
-			# OS architecture match was not found
-			Write-CMLogEntry -Value " - Could not match operating system architecture: $($OSImageData.Architecture)" -Severity 2
-			return $false
-		}
-	}
-	
-	function Confirm-OSName {
-		param(
-			[parameter(Mandatory = $true, HelpMessage = "Specify the OS name value from the driver package object.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$DriverPackageInput,
-			
-			[parameter(Mandatory = $true, HelpMessage = "Specify the computer data object.")]
-			[ValidateNotNullOrEmpty()]
-			[PSCustomObject]$OSImageData
-		)
-		if ($DriverPackageInput -like $OSImageData.Name) {
-			# OS name match found
-			Write-CMLogEntry -Value " - Matched operating system name: $($OSImageData.Name)" -Severity 1
-			return $true
-		}
-		else {
-			# OS name match was not found
-			Write-CMLogEntry -Value " - Could not matched operating system name: $($OSImageData.Name)" -Severity 2
-			return $false
-		}
-	}
-	
-	function Confirm-ComputerModel {
-		param(
-			[parameter(Mandatory = $true, HelpMessage = "Specify the computer model value from the driver package object.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$DriverPackageInput,
-			
-			[parameter(Mandatory = $true, HelpMessage = "Specify the computer data object.")]
-			[ValidateNotNullOrEmpty()]
-			[PSCustomObject]$ComputerData
-		)
-		# Construct custom object for return value
-		$ModelDetectionResult = [PSCustomObject]@{
-			Detected = $null
-		}
-		
-		if ($DriverPackageInput -like $ComputerData.Model) {
-			# Computer model match found
-			Write-CMLogEntry -Value " - Matched computer model: $($ComputerData.Model)" -Severity 1
-			
-			# Set properties for custom object for return value
-			$ModelDetectionResult.Detected = $true
-			
+
+		function Confirm-ComputerModel {
+			param(
+				[parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$DriverPackageInput,
+				[parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][PSCustomObject]$ComputerData
+			)
+			$ModelDetectionResult = [PSCustomObject]@{ Detected = $null }
+			if ($DriverPackageInput -like $ComputerData.Model) {
+				Write-CMLogEntry -Value " - Matched computer model: $($ComputerData.Model)" -Severity 1
+				$ModelDetectionResult.Detected = $true
+			} else {
+				$ModelDetectionResult.Detected = $false
+			}
 			return $ModelDetectionResult
 		}
-		else {
-			# Computer model match was not found
-			# Set properties for custom object for return value
-			$ModelDetectionResult.Detected = $false
-			
-			return $ModelDetectionResult
-		}
-	}
-	
-	function Confirm-SystemSKU {
-		param(
-			[parameter(Mandatory = $true, HelpMessage = "Specify the SystemSKU value from the driver package object.")]
-			[ValidateNotNullOrEmpty()]
-			[string]$DriverPackageInput,
-			
-			[parameter(Mandatory = $true, HelpMessage = "Specify the computer data object.")]
-			[ValidateNotNullOrEmpty()]
-			[PSCustomObject]$ComputerData
-		)
-		
-		# Handle multiple SystemSKU's from driver package input and determine the proper delimiter
-		if ($DriverPackageInput -match ",") {
-			$SystemSKUDelimiter = ","
-		}
-		if ($DriverPackageInput -match ";") {
-			$SystemSKUDelimiter = ";"
-		}
-		
-		# Remove any space characters from driver package input data, replace them with a comma instead and ensure there's no duplicate entries
-		$DriverPackageInputArray = $DriverPackageInput.Replace(" ", ",").Split($SystemSKUDelimiter) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
-		
-		# Construct custom object for return value
-		$SystemSKUDetectionResult = [PSCustomObject]@{
-			Detected = $null
-			SystemSKUValue = $null
-		}
-		
-		# Attempt to determine if the driver package input matches with the computer data input and account for multiple SystemSKU's by separating them with the detected delimiter
-		if (-not ([string]::IsNullOrEmpty($SystemSKUDelimiter))) {
-			# Construct table for keeping track of matched SystemSKU items
-			$SystemSKUTable = @{
-			}
-			
-			# Attempt to match for each SystemSKU item based on computer data input
-			foreach ($SystemSKUItem in $DriverPackageInputArray) {
-				if ((-not([string]::IsNullOrEmpty($ComputerData.SystemSKU))) -and ($ComputerData.SystemSKU -eq $SystemSKUItem)) {
-					# Add key value pair with match success
-					$SystemSKUTable.Add($SystemSKUItem, $true)
-					
-					# Set custom object property with SystemSKU value that was matched on the detection result object
-					$SystemSKUDetectionResult.SystemSKUValue = $SystemSKUItem
+
+		function Confirm-SystemSKU {
+			param(
+				[parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$DriverPackageInput,
+				[parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][PSCustomObject]$ComputerData
+			)
+			$SystemSKUDelimiter = $null
+			if ($DriverPackageInput -match ",") { $SystemSKUDelimiter = "," }
+			if ($DriverPackageInput -match ";") { $SystemSKUDelimiter = ";" }
+			$DriverPackageInputArray = $DriverPackageInput.Replace(" ", ",").Split($SystemSKUDelimiter) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+			$SystemSKUDetectionResult = [PSCustomObject]@{ Detected = $null; SystemSKUValue = $null }
+			if (-not ([string]::IsNullOrEmpty($SystemSKUDelimiter))) {
+				$SystemSKUTable = @{}
+				foreach ($SystemSKUItem in $DriverPackageInputArray) {
+					if ((-not([string]::IsNullOrEmpty($ComputerData.SystemSKU))) -and ($ComputerData.SystemSKU -eq $SystemSKUItem)) {
+						$SystemSKUTable.Add($SystemSKUItem, $true)
+						$SystemSKUDetectionResult.SystemSKUValue = $SystemSKUItem
+					} else {
+						$SystemSKUTable.Add($SystemSKUItem, $false)
+					}
 				}
-				else {
-					# Add key value pair with match failure
-					$SystemSKUTable.Add($SystemSKUItem, $false)
+				if ($SystemSKUTable.Values -contains $true) {
+					Write-CMLogEntry -Value " - Matched SystemSKU: $($ComputerData.SystemSKU)" -Severity 1
+					$SystemSKUDetectionResult.Detected = $true
+					return $SystemSKUDetectionResult
+				} else {
+					$SystemSKUDetectionResult.SystemSKUValue = ""
+					$SystemSKUDetectionResult.Detected = $false
+					return $SystemSKUDetectionResult
 				}
 			}
-			
-			# Check if table contains a matched SystemSKU
-			if ($SystemSKUTable.Values -contains $true) {
-				# SystemSKU match found based upon multiple items detected in computer data input
+			elseif ((-not([string]::IsNullOrEmpty($ComputerData.SystemSKU))) -and ($DriverPackageInput -match $ComputerData.SystemSKU)) {
 				Write-CMLogEntry -Value " - Matched SystemSKU: $($ComputerData.SystemSKU)" -Severity 1
-				
-				# Set custom object property that SystemSKU value that was matched on the detection result object
+				$SystemSKUDetectionResult.SystemSKUValue = $ComputerData.SystemSKU
 				$SystemSKUDetectionResult.Detected = $true
-				
+				return $SystemSKUDetectionResult
+			}
+			elseif ((-not ([string]::IsNullOrEmpty($ComputerData.FallbackSKU))) -and ($DriverPackageInput -match $ComputerData.FallbackSKU)) {
+				Write-CMLogEntry -Value " - Matched SystemSKU: $($ComputerData.FallbackSKU)" -Severity 1
+				$SystemSKUDetectionResult.SystemSKUValue = $ComputerData.FallbackSKU
+				$SystemSKUDetectionResult.Detected = $true
 				return $SystemSKUDetectionResult
 			}
 			else {
-				# SystemSKU match was not found based upon multiple items detected in computer data input
-				# Set properties for custom object for return value
 				$SystemSKUDetectionResult.SystemSKUValue = ""
 				$SystemSKUDetectionResult.Detected = $false
-				
 				return $SystemSKUDetectionResult
 			}
-		}
-		elseif ($DriverPackageInput -match $ComputerData.SystemSKU) {
-			# SystemSKU match found based upon single item detected in computer data input
-			Write-CMLogEntry -Value " - Matched SystemSKU: $($ComputerData.SystemSKU)" -Severity 1
-			
-			# Set properties for custom object for return value
-			$SystemSKUDetectionResult.SystemSKUValue = $ComputerData.SystemSKU
-			$SystemSKUDetectionResult.Detected = $true
-			
-			return $SystemSKUDetectionResult
-		}
-		elseif ((-not ([string]::IsNullOrEmpty($ComputerData.FallbackSKU))) -and ($DriverPackageInput -match $ComputerData.FallbackSKU)) {
-			# SystemSKU match found using FallbackSKU value using detection method OEMString, this should only be valid for Dell
-			Write-CMLogEntry -Value " - Matched SystemSKU: $($ComputerData.FallbackSKU)" -Severity 1
-			
-			# Set properties for custom object for return value
-			$SystemSKUDetectionResult.SystemSKUValue = $ComputerData.FallbackSKU
-			$SystemSKUDetectionResult.Detected = $true
-			
-			return $SystemSKUDetectionResult
-		}
-		else {
-			# None of the above methods worked to match SystemSKU from driver package input with computer data input
-			# Set properties for custom object for return value
-			$SystemSKUDetectionResult.SystemSKUValue = ""
-			$SystemSKUDetectionResult.Detected = $false
-			
-			return $SystemSKUDetectionResult
 		}
 	}
 	
