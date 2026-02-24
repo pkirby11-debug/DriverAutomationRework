@@ -228,7 +228,9 @@ function New-DATDriverPackage {
                     ErrorAction  = 'Stop'
                 }
 
-                # Retry package creation in case of transient SEDO lock on auto-assigned PackageID
+                # Retry package creation in case of transient SEDO lock on auto-assigned PackageID.
+                # If the lock references a specific PackageID, the package may already exist from
+                # a previous failed run (ghost package). In that case, adopt it instead of creating new.
                 $MaxRetries = 3
                 $Package = $null
                 for ($Attempt = 1; $Attempt -le $MaxRetries; $Attempt++) {
@@ -236,14 +238,34 @@ function New-DATDriverPackage {
                         $Package = New-CMPackage @PkgParams
                         break
                     } catch {
-                        if ($Attempt -lt $MaxRetries -and $_.Exception.Message -match 'lock|Lock') {
-                            Write-DATLog -Message "  Package creation attempt $Attempt/$MaxRetries hit a lock - releasing and retrying..." -Severity 2
-                            # Extract PackageID from error message if possible
+                        $IsLockError = $_.Exception.Message -match 'lock|Lock|SEDO'
+
+                        if ($IsLockError) {
+                            Write-DATLog -Message "  Package creation attempt $Attempt/$MaxRetries hit a lock" -Severity 2
+
                             if ($_.Exception.Message -match 'PackageID="([^"]+)"') {
                                 $LockedID = $Matches[1]
                                 Invoke-DATReleaseStaleLock -PackageID $LockedID `
                                     -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
+
+                                # Check if the locked PackageID is a ghost package we can adopt
+                                $GhostPkg = Get-CMPackage -Id $LockedID -Fast -ErrorAction SilentlyContinue
+                                if ($GhostPkg) {
+                                    Write-DATLog -Message "  Found existing package $LockedID ('$($GhostPkg.Name)') - adopting instead of creating new" -Severity 2
+                                    try {
+                                        Set-CMPackage -Id $LockedID -NewName $Name -Version $Version `
+                                            -Description $Description -Path $SourcePath `
+                                            -Manufacturer $Manufacturer -ErrorAction Stop
+                                        $Package = Get-CMPackage -Id $LockedID -Fast
+                                        Write-DATLog -Message "  Successfully adopted package $LockedID" -Severity 1
+                                        break
+                                    } catch {
+                                        Write-DATLog -Message "  Could not adopt package: $($_.Exception.Message)" -Severity 2
+                                    }
+                                }
                             }
+
+                            if ($Attempt -ge $MaxRetries) { throw }
                             Start-Sleep -Seconds ($Attempt * 5)
                         } else {
                             throw
@@ -425,7 +447,8 @@ function New-DATCMDriverPackage {
             } else {
                 Write-DATLog -Message "Creating new CM driver package: $Name" -Severity 1
 
-                # Retry package creation in case of transient SEDO lock
+                # Retry package creation in case of transient SEDO lock.
+                # If the lock references a specific PackageID, try to adopt the ghost package.
                 $MaxRetries = 3
                 $Package = $null
                 for ($Attempt = 1; $Attempt -le $MaxRetries; $Attempt++) {
@@ -435,14 +458,36 @@ function New-DATCMDriverPackage {
                             -Description $Description -ErrorAction Stop
                         break
                     } catch {
-                        if ($Attempt -lt $MaxRetries -and $_.Exception.Message -match 'lock|Lock') {
-                            Write-DATLog -Message "  Driver package creation attempt $Attempt/$MaxRetries hit a lock - releasing and retrying..." -Severity 2
-                            # Extract PackageID from error message if possible
+                        $IsLockError = $_.Exception.Message -match 'lock|Lock|SEDO'
+
+                        if ($IsLockError) {
+                            Write-DATLog -Message "  Driver package creation attempt $Attempt/$MaxRetries hit a lock" -Severity 2
+
                             if ($_.Exception.Message -match 'PackageID="([^"]+)"') {
                                 $LockedID = $Matches[1]
                                 Invoke-DATReleaseStaleLock -PackageID $LockedID `
                                     -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
+
+                                # Check if the locked PackageID is a ghost package we can adopt
+                                $GhostPkg = Get-CMDriverPackage -Id $LockedID -ErrorAction SilentlyContinue
+                                if (-not $GhostPkg) {
+                                    $GhostPkg = Get-CMPackage -Id $LockedID -Fast -ErrorAction SilentlyContinue
+                                }
+                                if ($GhostPkg) {
+                                    Write-DATLog -Message "  Found existing package $LockedID ('$($GhostPkg.Name)') - adopting instead of creating new" -Severity 2
+                                    try {
+                                        Set-CMDriverPackage -Id $LockedID -Version $Version `
+                                            -Description $Description -ErrorAction Stop
+                                        $Package = Get-CMDriverPackage -Id $LockedID
+                                        Write-DATLog -Message "  Successfully adopted driver package $LockedID" -Severity 1
+                                        break
+                                    } catch {
+                                        Write-DATLog -Message "  Could not adopt package: $($_.Exception.Message)" -Severity 2
+                                    }
+                                }
                             }
+
+                            if ($Attempt -ge $MaxRetries) { throw }
                             Start-Sleep -Seconds ($Attempt * 5)
                         } else {
                             throw
@@ -785,6 +830,7 @@ function Invoke-DATClearAllStaleLocks {
 
     # --- Phase 1: WMI-based lock release (proper SMS Provider channel) ---
     $WmiCleared = $false
+    $WmiFailed = $false
     $LocksFound = 0
     try {
         $AllLocks = @(Get-WmiObject -ComputerName $SiteServer -Namespace $WmiNamespace `
@@ -834,7 +880,21 @@ function Invoke-DATClearAllStaleLocks {
             $WmiCleared = $true
         }
     } catch {
-        Write-DATLog -Message "WMI lock query failed: $($_.Exception.Message) - falling back to SQL cleanup" -Severity 2
+        Write-DATLog -Message "WMI lock query failed: $($_.Exception.Message) - falling back to alternate methods" -Severity 2
+        $WmiFailed = $true
+    }
+
+    # --- Phase 1b: Blind ReleaseAllLocks even when enumeration failed ---
+    # SMS_ObjectLockRequest.ReleaseAllLocks may work even if SMS_ObjectLock enumeration fails.
+    # This can clear session-held locks without needing to enumerate them first.
+    if ($WmiFailed) {
+        try {
+            Invoke-WmiMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
+                -Class SMS_ObjectLockRequest -Name ReleaseAllLocks -ErrorAction Stop | Out-Null
+            Write-DATLog -Message "Called ReleaseAllLocks (blind) on SMS_ObjectLockRequest" -Severity 1
+        } catch {
+            Write-DATLog -Message "Blind ReleaseAllLocks also failed: $($_.Exception.Message)" -Severity 2
+        }
     }
 
     # Check SQL even if WMI found nothing — locks may exist in DB but not in WMI view
@@ -935,9 +995,93 @@ function Invoke-DATClearAllStaleLocks {
             Write-DATLog -Message "No SEDO locks found in SQL" -Severity 1
         }
 
+        # --- Phase 3: Flush ghost locks from SMS Provider memory ---
+        # When WMI can't enumerate locks (Generic failure) AND SQL has no lock rows,
+        # ghost locks may exist ONLY in the SMS Provider's in-memory cache. These locks
+        # (epoch timestamp 12/31/1969, Unassigned state, no owner) survive indefinitely
+        # and block all package operations. The only way to clear them is to restart
+        # SMS_EXECUTIVE so the provider re-reads the (empty) SEDO_LockState table.
+        $NeedProviderFlush = ($Result.SqlDeleted -gt 0 -and -not $Result.SvcRestarted) -or
+                             ($WmiFailed -and [int]$Result.SqlDeleted -eq 0)
+
+        if ($NeedProviderFlush) {
+            if ($WmiFailed -and [int]$Result.SqlDeleted -eq 0) {
+                Write-DATLog -Message "WMI cannot enumerate locks and SQL has none - ghost locks likely exist in SMS Provider memory only" -Severity 2
+            }
+            Write-DATLog -Message "Restarting SMS_EXECUTIVE to flush provider lock cache..." -Severity 1
+
+            try {
+                $SvcResult = Invoke-Command -ComputerName $SiteServer -ScriptBlock {
+                    try {
+                        Restart-Service -Name 'SMS_EXECUTIVE' -Force -ErrorAction Stop
+                        $Elapsed = 0
+                        while ($Elapsed -lt 120) {
+                            Start-Sleep -Seconds 5
+                            $Elapsed += 5
+                            $Svc = Get-Service -Name 'SMS_EXECUTIVE' -ErrorAction SilentlyContinue
+                            if ($Svc -and $Svc.Status -eq 'Running') {
+                                return @{ Restarted = $true; WaitSec = $Elapsed }
+                            }
+                        }
+                        return @{ Restarted = $false; WaitSec = $Elapsed; Error = 'Timed out waiting for service' }
+                    } catch {
+                        return @{ Restarted = $false; WaitSec = 0; Error = $_.Exception.Message }
+                    }
+                } -ErrorAction Stop
+
+                if ($SvcResult.Restarted) {
+                    Write-DATLog -Message "SMS_EXECUTIVE restarted ($($SvcResult.WaitSec)s) - waiting for SMS Provider to initialize..." -Severity 1
+                    Start-Sleep -Seconds 30
+                    Write-DATLog -Message "SMS Provider initialized - ghost locks flushed" -Severity 1
+                } else {
+                    Write-DATLog -Message "WARNING: SMS_EXECUTIVE restart failed: $($SvcResult.Error)" -Severity 2
+                    Write-DATLog -Message "Ghost locks may still block package operations. Consider restarting SMS_EXECUTIVE manually." -Severity 2
+                }
+            } catch {
+                Write-DATLog -Message "Could not restart SMS_EXECUTIVE: $($_.Exception.Message)" -Severity 2
+                Write-DATLog -Message "If package creation fails with lock errors, restart SMS_EXECUTIVE manually on $SiteServer" -Severity 2
+            }
+        }
+
         return [Math]::Max($LocksFound, [int]$Result.SqlDeleted)
     } catch {
         Write-DATLog -Message "Could not run SQL lock cleanup on site server: $($_.Exception.Message)" -Severity 2
+
+        # Even if SQL cleanup fails, try restarting SMS_EXECUTIVE when WMI failed —
+        # this is the last resort to flush ghost locks from provider memory
+        if ($WmiFailed) {
+            Write-DATLog -Message "Attempting SMS_EXECUTIVE restart as last resort to clear ghost locks..." -Severity 2
+            try {
+                $SvcResult = Invoke-Command -ComputerName $SiteServer -ScriptBlock {
+                    try {
+                        Restart-Service -Name 'SMS_EXECUTIVE' -Force -ErrorAction Stop
+                        $Elapsed = 0
+                        while ($Elapsed -lt 120) {
+                            Start-Sleep -Seconds 5
+                            $Elapsed += 5
+                            $Svc = Get-Service -Name 'SMS_EXECUTIVE' -ErrorAction SilentlyContinue
+                            if ($Svc -and $Svc.Status -eq 'Running') {
+                                return @{ Restarted = $true; WaitSec = $Elapsed }
+                            }
+                        }
+                        return @{ Restarted = $false; Error = 'Timed out' }
+                    } catch {
+                        return @{ Restarted = $false; Error = $_.Exception.Message }
+                    }
+                } -ErrorAction Stop
+
+                if ($SvcResult.Restarted) {
+                    Write-DATLog -Message "SMS_EXECUTIVE restarted ($($SvcResult.WaitSec)s) - waiting for SMS Provider..." -Severity 1
+                    Start-Sleep -Seconds 30
+                    Write-DATLog -Message "SMS Provider initialized" -Severity 1
+                } else {
+                    Write-DATLog -Message "SMS_EXECUTIVE restart failed: $($SvcResult.Error)" -Severity 2
+                }
+            } catch {
+                Write-DATLog -Message "Last-resort SMS_EXECUTIVE restart failed: $($_.Exception.Message)" -Severity 2
+            }
+        }
+
         return -1
     }
 }
@@ -991,11 +1135,10 @@ function Invoke-DATReleaseStaleLock {
     }
 
     # --- Strategy 2: WMI-based release via SMS_ObjectLockRequest ---
-    # Query SMS_ObjectLock for locks on BOTH SMS_Package and SMS_DriverPackage
-    # (the tool supports both Standard Pkg and Driver Pkg deployment platforms).
-    # Then release via SMS_ObjectLockRequest.ReleaseLock — the proper WMI method
-    # that communicates with the SMS Provider (unlike the old approach of calling
-    # methods on SMS_ObjectLock instances, which is a read-only status class).
+    # Call ReleaseLock DIRECTLY for both SMS_Package and SMS_DriverPackage paths
+    # without first enumerating via SMS_ObjectLock (which may fail with "Generic failure").
+    # The ReleaseLock method communicates with the SMS Provider and can release locks
+    # even when the read-only SMS_ObjectLock enumeration class is inaccessible.
     $ObjectPaths = @(
         "SMS_Package.PackageID=`"$PackageID`"",
         "SMS_DriverPackage.PackageID=`"$PackageID`""
@@ -1004,23 +1147,26 @@ function Invoke-DATReleaseStaleLock {
     $WmiReleased = $false
     foreach ($ObjPath in $ObjectPaths) {
         try {
-            $Locks = @(Get-WmiObject -ComputerName $SiteServer -Namespace $WmiNamespace `
-                -Class SMS_ObjectLock -Filter "ObjectRelPath='$ObjPath'" -ErrorAction SilentlyContinue)
-
-            if ($Locks.Count -gt 0) {
-                Write-DATLog -Message "  Found $($Locks.Count) lock(s) for $ObjPath" -Severity 1
-                try {
-                    Invoke-WmiMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
-                        -Class SMS_ObjectLockRequest -Name ReleaseLock `
-                        -ArgumentList @($ObjPath) -ErrorAction Stop | Out-Null
-                    Write-DATLog -Message "  Released via SMS_ObjectLockRequest: $ObjPath" -Severity 1
-                    $WmiReleased = $true
-                } catch {
-                    Write-DATLog -Message "  WMI ReleaseLock failed for $ObjPath`: $($_.Exception.Message)" -Severity 2
-                }
-            }
+            Write-DATLog -Message "  Attempting WMI ReleaseLock for $ObjPath..." -Severity 1
+            Invoke-WmiMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
+                -Class SMS_ObjectLockRequest -Name ReleaseLock `
+                -ArgumentList @($ObjPath) -ErrorAction Stop | Out-Null
+            Write-DATLog -Message "  Released via SMS_ObjectLockRequest: $ObjPath" -Severity 1
+            $WmiReleased = $true
         } catch {
-            Write-DATLog -Message "  WMI lock query failed for $ObjPath`: $($_.Exception.Message)" -Severity 2
+            Write-DATLog -Message "  WMI ReleaseLock failed for $ObjPath`: $($_.Exception.Message)" -Severity 2
+        }
+    }
+
+    # Also try ReleaseAllLocks as a broader sweep
+    if (-not $WmiReleased) {
+        try {
+            Invoke-WmiMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
+                -Class SMS_ObjectLockRequest -Name ReleaseAllLocks -ErrorAction Stop | Out-Null
+            Write-DATLog -Message "  Called ReleaseAllLocks on SMS_ObjectLockRequest" -Severity 1
+            $WmiReleased = $true
+        } catch {
+            Write-DATLog -Message "  ReleaseAllLocks failed: $($_.Exception.Message)" -Severity 2
         }
     }
 
