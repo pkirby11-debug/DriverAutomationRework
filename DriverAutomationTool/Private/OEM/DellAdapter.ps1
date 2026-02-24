@@ -339,20 +339,31 @@ function Get-DellBIOSUpdate {
 function Get-DellIndividualDrivers {
     <#
     .SYNOPSIS
-        Finds individual Dell drivers newer than a baseline date for a specific model.
+        Finds individual Dell drivers newer than a baseline date for a specific model,
+        and optionally includes the latest driver for any categories missing from the base pack.
     .DESCRIPTION
         Queries CatalogPC.cab (already cached for BIOS lookups) for SoftwareComponent
         entries matching the given SystemID. Filters to driver categories (excluding BIOS
         and firmware/application categories), returns only components released after the
         baseline date, and selects the latest per category.
+
+        When -MissingCategories is provided, also returns the latest driver for each
+        missing category regardless of the baseline date. This covers the scenario where
+        a base driver pack is missing an entire driver category (e.g., sound driver not
+        included for a newer model) — the catalog may have a driver that was released
+        before the pack but simply wasn't bundled into it.
     .PARAMETER SystemID
         The Dell SystemID(s), semicolon-delimited (e.g., '0991;09A1').
     .PARAMETER BaselineDate
         Only return drivers with dateTime newer than this value.
         Typically the driver pack's ReleaseDate.
+    .PARAMETER MissingCategories
+        Array of category names (Video, Network, Audio, Chipset, Storage, Input)
+        that are absent from the extracted base driver pack. For these categories,
+        the latest available driver is returned regardless of the baseline date.
     .OUTPUTS
         Array of PSCustomObjects with: Category, Name, Version, ReleaseDate,
-        Url, FileName, HashMD5, Size. Returns $null if none found.
+        Url, FileName, HashMD5, Size, IsMissing. Returns $null if none found.
     #>
     [CmdletBinding()]
     param(
@@ -360,7 +371,9 @@ function Get-DellIndividualDrivers {
         [string]$SystemID,
 
         [Parameter(Mandatory)]
-        [string]$BaselineDate
+        [string]$BaselineDate,
+
+        [string[]]$MissingCategories
     )
 
     $CatalogPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
@@ -387,6 +400,13 @@ function Get-DellIndividualDrivers {
 
     # Parse semicolon-delimited SystemIDs
     $SystemIDs = $SystemID.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+
+    # Normalize MissingCategories for fast lookup
+    $MissingSet = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    if ($MissingCategories) {
+        foreach ($MC in $MissingCategories) { $MissingSet.Add($MC) | Out-Null }
+    }
 
     # Category keyword map for classifying SoftwareComponents
     $CategoryPatterns = [ordered]@{
@@ -426,13 +446,12 @@ function Get-DellIndividualDrivers {
         }
         if (-not $SysMatch) { continue }
 
-        # Date filter — only newer than baseline
+        # Parse component date
         try {
             $ComponentDate = [datetime]::Parse($Component.dateTime)
         } catch {
             continue
         }
-        if ($ComponentDate -le $BaselineParsed) { continue }
 
         # Classify into category
         $ResolvedCategory = $null
@@ -449,6 +468,11 @@ function Get-DellIndividualDrivers {
             continue
         }
 
+        # Date filter — for categories present in the base pack, only include newer drivers.
+        # For missing categories, include ALL drivers (we need them regardless of date).
+        $IsMissing = $MissingSet.Contains($ResolvedCategory)
+        if (-not $IsMissing -and $ComponentDate -le $BaselineParsed) { continue }
+
         # Build download URL
         $DownloadPath = $Component.path -replace '^/', ''
         $DownloadUrl = '{0}/{1}' -f $Sources.dell.baseUrl.TrimEnd('/'), $DownloadPath
@@ -463,11 +487,16 @@ function Get-DellIndividualDrivers {
             FileName    = Split-Path $DownloadUrl -Leaf
             HashMD5     = $Component.hashMD5
             Size        = $Component.size
+            IsMissing   = $IsMissing
         })
     }
 
     if ($MatchedDrivers.Count -eq 0) {
-        Write-DATLog -Message "No individual drivers newer than $BaselineDate found for SystemID $SystemID" -Severity 1
+        $Msg = "No individual drivers newer than $BaselineDate found for SystemID $SystemID"
+        if ($MissingSet.Count -gt 0) {
+            $Msg += " (also checked missing categories: $($MissingCategories -join ', '))"
+        }
+        Write-DATLog -Message $Msg -Severity 1
         return $null
     }
 
@@ -481,10 +510,126 @@ function Get-DellIndividualDrivers {
             $_.Group | Sort-Object ParsedDate -Descending | Select-Object -First 1
         }
 
+    # Log summary split by updated vs missing
+    $UpdatedCount = @($LatestPerDriver | Where-Object { -not $_.IsMissing }).Count
+    $MissingCount = @($LatestPerDriver | Where-Object { $_.IsMissing }).Count
     $Categories = ($LatestPerDriver.Category | Sort-Object -Unique) -join ', '
-    Write-DATLog -Message "Found $($LatestPerDriver.Count) newer individual driver(s) across categories: $Categories" -Severity 1
+
+    if ($MissingCount -gt 0 -and $UpdatedCount -gt 0) {
+        Write-DATLog -Message "Found $UpdatedCount newer + $MissingCount missing individual driver(s) across categories: $Categories" -Severity 1
+    } elseif ($MissingCount -gt 0) {
+        Write-DATLog -Message "Found $MissingCount missing individual driver(s) across categories: $Categories" -Severity 1
+    } else {
+        Write-DATLog -Message "Found $UpdatedCount newer individual driver(s) across categories: $Categories" -Severity 1
+    }
+
+    foreach ($Drv in $LatestPerDriver) {
+        if ($Drv.IsMissing) {
+            Write-DATLog -Message "  [MISSING] $($Drv.Category): $($Drv.Name) v$($Drv.Version)" -Severity 1
+        }
+    }
 
     return @($LatestPerDriver)
+}
+
+function Get-DATBasePackCategories {
+    <#
+    .SYNOPSIS
+        Scans an extracted driver pack directory for .inf files and classifies which
+        driver categories are present based on the Windows driver Class= directive.
+    .DESCRIPTION
+        Parses each .inf file's [Version] section for the Class= line, which contains
+        the standardized Windows driver class name (e.g., MEDIA, NET, DISPLAY).
+        Maps these to the same category names used by Get-DellIndividualDrivers
+        (Video, Network, Audio, Chipset, Storage, Input) so the caller can determine
+        which categories are missing from the base pack.
+    .PARAMETER Path
+        Path to the extracted driver pack directory to scan.
+    .OUTPUTS
+        Array of unique category name strings that are present in the pack.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path $Path)) {
+        Write-DATLog -Message "Base pack path not found for INF scan: $Path" -Severity 2
+        return @()
+    }
+
+    # Windows INF Class= values mapped to our category names.
+    # Multiple INF class names can map to one category.
+    $ClassToCategory = @{
+        # Audio
+        'MEDIA'          = 'Audio'
+        'AUDIOENDPOINT'  = 'Audio'
+        'AUDIOPROCESSING'= 'Audio'
+        # Video
+        'DISPLAY'        = 'Video'
+        'MONITOR'        = 'Video'
+        # Network
+        'NET'            = 'Network'
+        'NETTRANS'       = 'Network'
+        'BLUETOOTH'      = 'Network'
+        'INFRARED'       = 'Network'
+        # Storage
+        'SCSIADAPTER'    = 'Storage'
+        'DISKDRIVE'      = 'Storage'
+        'HDC'            = 'Storage'
+        'VOLUME'         = 'Storage'
+        'FLOPPYDISK'     = 'Storage'
+        # Chipset
+        'SYSTEM'         = 'Chipset'
+        'PROCESSOR'      = 'Chipset'
+        'FIRMWARE'       = 'Chipset'
+        'SOFTWAREDEVICE' = 'Chipset'
+        'SECURITYDEVICES'= 'Chipset'
+        'WPDDEVICE'      = 'Chipset'
+        # Input
+        'HIDCLASS'       = 'Input'
+        'MOUSE'          = 'Input'
+        'KEYBOARD'       = 'Input'
+        'BIOMETRIC'      = 'Input'
+        'SENSOR'         = 'Input'
+        'SMARTCARDREADER' = 'Input'
+    }
+
+    $FoundCategories = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+
+    $InfFiles = @(Get-ChildItem -Path $Path -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+
+    if ($InfFiles.Count -eq 0) {
+        Write-DATLog -Message "No .inf files found in $Path" -Severity 2
+        return @()
+    }
+
+    foreach ($InfFile in $InfFiles) {
+        try {
+            # Read first 100 lines — the [Version] section with Class= is always near the top
+            $Lines = Get-Content -Path $InfFile.FullName -TotalCount 100 -ErrorAction SilentlyContinue
+
+            foreach ($Line in $Lines) {
+                # Match Class = ClassName (with optional whitespace, quotes, and trailing comments)
+                if ($Line -match '^\s*Class\s*=\s*"?([A-Za-z]+)"?') {
+                    $ClassName = $Matches[1].Trim().ToUpper()
+                    if ($ClassToCategory.ContainsKey($ClassName)) {
+                        $FoundCategories.Add($ClassToCategory[$ClassName]) | Out-Null
+                    }
+                    break  # Only need the first Class= line per INF
+                }
+            }
+        } catch {
+            # Skip unreadable INF files
+        }
+    }
+
+    $CatList = @($FoundCategories | Sort-Object)
+    Write-DATLog -Message "Base pack INF scan: $($InfFiles.Count) .inf file(s), categories present: $($CatList -join ', ')" -Severity 1
+
+    return $CatList
 }
 
 function ConvertTo-DellOSCode {
