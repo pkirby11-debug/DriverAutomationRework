@@ -405,16 +405,51 @@ function New-DATCMDriverPackage {
                 $Existing = $ExistingAll[0]
             }
 
+            $WmiNamespace = "root\SMS\site_$($script:CMSiteCode)"
+            $SiteServer = $script:CMSiteServer
+
             if ($Existing) {
-                Write-DATLog -Message "Updating existing driver package: $Name (ID: $([string]$Existing.PackageID))" -Severity 1
-                Set-CMDriverPackage -Id ([string]$Existing.PackageID) -Version $Version -Description $Description
                 $PackageID = [string]$Existing.PackageID
+                Write-DATLog -Message "Updating existing driver package: $Name (ID: $PackageID)" -Severity 1
+
+                # Release any stale SEDO locks before updating
+                Invoke-DATReleaseStaleLock -PackageID $PackageID `
+                    -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
+
+                try {
+                    Set-CMDriverPackage -Id $PackageID -Version $Version -Description $Description -ErrorAction Stop
+                } catch {
+                    Write-DATLog -Message "Warning: Could not update driver package $PackageID (may be locked): $($_.Exception.Message)" -Severity 2
+                    Write-DATLog -Message "Continuing with existing driver package - will still ensure correct folder placement" -Severity 2
+                }
             } else {
                 Write-DATLog -Message "Creating new CM driver package: $Name" -Severity 1
 
-                # New-CMDriverPackage does not accept -Manufacturer or -Version directly
-                $Package = New-CMDriverPackage -Name $Name -Path $SourcePath `
-                    -Description $Description -ErrorAction Stop
+                # Retry package creation in case of transient SEDO lock
+                $MaxRetries = 3
+                $Package = $null
+                for ($Attempt = 1; $Attempt -le $MaxRetries; $Attempt++) {
+                    try {
+                        # New-CMDriverPackage does not accept -Manufacturer or -Version directly
+                        $Package = New-CMDriverPackage -Name $Name -Path $SourcePath `
+                            -Description $Description -ErrorAction Stop
+                        break
+                    } catch {
+                        if ($Attempt -lt $MaxRetries -and $_.Exception.Message -match 'lock|Lock') {
+                            Write-DATLog -Message "  Driver package creation attempt $Attempt/$MaxRetries hit a lock - releasing and retrying..." -Severity 2
+                            # Extract PackageID from error message if possible
+                            if ($_.Exception.Message -match 'PackageID="([^"]+)"') {
+                                $LockedID = $Matches[1]
+                                Invoke-DATReleaseStaleLock -PackageID $LockedID `
+                                    -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
+                            }
+                            Start-Sleep -Seconds ($Attempt * 5)
+                        } else {
+                            throw
+                        }
+                    }
+                }
+
                 $PackageID = [string]$Package.PackageID
 
                 # Set version and BDR after creation
@@ -718,11 +753,12 @@ function Get-DATKnownModels {
 function Invoke-DATClearAllStaleLocks {
     <#
     .SYNOPSIS
-        Clears ALL orphaned SEDO locks from the ConfigMgr database at once.
+        Clears ALL SEDO locks from the ConfigMgr database at sync startup.
     .DESCRIPTION
-        Runs a SQL DELETE on the SEDO_LockState table to remove all orphaned lock entries
-        (empty AssignedUser, empty AssignedMachine, or LockState=0). This should be called
-        once at sync startup to clear any stale locks before package creation/updates.
+        Runs a SQL DELETE on the SEDO_LockState table to remove ALL lock entries.
+        This clears both orphaned locks (LockStateID=0, no user) AND locks with actual
+        state/user data from crashed console sessions or previous tool runs that would
+        otherwise block package creation. Called once at sync startup before any processing.
 
         The SQL is executed on the site server via Invoke-Command (PS remoting) to avoid
         firewall/connectivity issues when the SQL Server is co-located with the site server
@@ -743,7 +779,7 @@ function Invoke-DATClearAllStaleLocks {
     )
 
     $DbName = "CM_$SiteCode"
-    Write-DATLog -Message "Clearing all orphaned SEDO locks from $DbName on $SiteServer..." -Severity 1
+    Write-DATLog -Message "Clearing all SEDO locks from $DbName on $SiteServer..." -Severity 1
 
     try {
         $Result = Invoke-Command -ComputerName $SiteServer -ScriptBlock {
@@ -753,24 +789,19 @@ function Invoke-DATClearAllStaleLocks {
                 $Conn = New-Object System.Data.SqlClient.SqlConnection($ConnStr)
                 $Conn.Open()
 
-                # Count stale locks first
+                # Count all locks first
                 # SEDO_LockState columns: ID, LockID, LockStateID, AssignedSite,
                 #   AssignedUser, AssignedObjectLockContext, AssignedMachine, AssignmentTime
-                # Orphaned locks have LockStateID=0 and NULL user/machine/time
+                # Clear ALL locks at startup — not just orphaned ones (LockStateID=0/NULL user).
+                # Locks with actual state/user data from crashed consoles or previous tool runs
+                # also block package creation and must be removed.
                 $CountCmd = $Conn.CreateCommand()
-                $CountCmd.CommandText = @"
-SELECT COUNT(*) FROM SEDO_LockState
-WHERE LockStateID = 0 AND AssignedUser IS NULL
-"@
+                $CountCmd.CommandText = "SELECT COUNT(*) FROM SEDO_LockState"
                 $StaleCount = [int]$CountCmd.ExecuteScalar()
 
                 if ($StaleCount -gt 0) {
-                    # Delete all orphaned locks (LockStateID=0 with no owner)
                     $DeleteCmd = $Conn.CreateCommand()
-                    $DeleteCmd.CommandText = @"
-DELETE FROM SEDO_LockState
-WHERE LockStateID = 0 AND AssignedUser IS NULL
-"@
+                    $DeleteCmd.CommandText = "DELETE FROM SEDO_LockState"
                     $Deleted = $DeleteCmd.ExecuteNonQuery()
                     $Conn.Close()
                     return @{ Success = $true; Count = $Deleted; Error = '' }
@@ -785,9 +816,9 @@ WHERE LockStateID = 0 AND AssignedUser IS NULL
 
         if ($Result.Success) {
             if ($Result.Count -gt 0) {
-                Write-DATLog -Message "Cleared $($Result.Count) orphaned SEDO lock(s) from database" -Severity 1
+                Write-DATLog -Message "Cleared $($Result.Count) SEDO lock(s) from database" -Severity 1
             } else {
-                Write-DATLog -Message "No orphaned SEDO locks found in database" -Severity 1
+                Write-DATLog -Message "No SEDO locks found in database" -Severity 1
             }
             return [int]$Result.Count
         } else {
@@ -807,8 +838,8 @@ function Invoke-DATReleaseStaleLock {
     .DESCRIPTION
         Attempts to clear SEDO locks for a specific package by:
         1. Unlock-CMObject cmdlet (works for current-session locks)
-        2. SQL DELETE via Invoke-Command on the site server (works for orphaned locks)
-        3. WMI fallback methods (rarely succeeds for orphaned locks)
+        2. Force-release via SMS_ObjectLock WMI class (targets the specific package)
+        3. SQL DELETE via Invoke-Command on the site server (clears all locks as fallback)
     .PARAMETER PackageID
         The SCCM package ID to check and release locks for.
     .PARAMETER SiteServer
@@ -843,12 +874,38 @@ function Invoke-DATReleaseStaleLock {
         Write-DATLog -Message "  Unlock-CMObject failed (expected for orphaned locks): $($_.Exception.Message)" -Severity 2
     }
 
-    # --- Strategy 2: SQL DELETE via Invoke-Command on the site server ---
-    # The SEDO_LockState table does NOT have an ObjectRelPath column — locks are
-    # tracked by LockID (GUID) with no direct mapping to PackageID. So we clear
-    # ALL orphaned locks (LockStateID=0 with NULL user) rather than targeting one.
+    # --- Strategy 2: Force-release via SMS_ObjectLock WMI class ---
+    # SMS_ObjectLock tracks locks by ObjectRelPath (e.g. SMS_Package.PackageID="XXX")
+    # so we can target the specific package lock directly.
+    try {
+        $ObjectPath = "SMS_Package.PackageID=`"$PackageID`""
+        Write-DATLog -Message "  Attempting SMS_ObjectLock release for $PackageID..." -Severity 1
+        $Locks = @(Get-WmiObject -ComputerName $SiteServer -Namespace $WmiNamespace `
+            -Class SMS_ObjectLock -Filter "ObjectRelPath='$ObjectPath'" -ErrorAction SilentlyContinue)
+        if ($Locks.Count -gt 0) {
+            foreach ($Lock in $Locks) {
+                try {
+                    $Lock.ReleaseLock($Lock.LockID) | Out-Null
+                } catch {
+                    Write-DATLog -Message "  Could not release LockID $($Lock.LockID): $($_.Exception.Message)" -Severity 2
+                }
+            }
+            Write-DATLog -Message "  Released $($Locks.Count) lock(s) via SMS_ObjectLock for $PackageID" -Severity 1
+            Start-Sleep -Seconds 2
+            return $true
+        } else {
+            Write-DATLog -Message "  No SMS_ObjectLock entries found for $PackageID" -Severity 1
+        }
+    } catch {
+        Write-DATLog -Message "  SMS_ObjectLock release failed: $($_.Exception.Message)" -Severity 2
+    }
+
+    # --- Strategy 3: SQL DELETE via Invoke-Command on the site server ---
+    # Clear ALL SEDO locks as a fallback — the SEDO_LockState table has no ObjectRelPath
+    # column so we cannot target a specific package. Since this function is only called
+    # when we've already hit a lock error, aggressive cleanup is appropriate.
     $DbName = "CM_$($script:CMSiteCode)"
-    Write-DATLog -Message "  Attempting SQL cleanup of all orphaned SEDO locks via site server remoting..." -Severity 1
+    Write-DATLog -Message "  Attempting SQL cleanup of all SEDO locks via site server remoting..." -Severity 1
 
     try {
         $Result = Invoke-Command -ComputerName $SiteServer -ScriptBlock {
@@ -859,7 +916,7 @@ function Invoke-DATReleaseStaleLock {
                 $Conn.Open()
 
                 $DeleteCmd = $Conn.CreateCommand()
-                $DeleteCmd.CommandText = "DELETE FROM SEDO_LockState WHERE LockStateID = 0 AND AssignedUser IS NULL"
+                $DeleteCmd.CommandText = "DELETE FROM SEDO_LockState"
                 $Deleted = $DeleteCmd.ExecuteNonQuery()
                 $Conn.Close()
                 return @{ Success = $true; Count = $Deleted; Error = '' }
@@ -869,11 +926,11 @@ function Invoke-DATReleaseStaleLock {
         } -ArgumentList $DbName -ErrorAction Stop
 
         if ($Result.Success -and $Result.Count -gt 0) {
-            Write-DATLog -Message "  Deleted $($Result.Count) orphaned SEDO lock(s) via SQL" -Severity 1
+            Write-DATLog -Message "  Deleted $($Result.Count) SEDO lock(s) via SQL" -Severity 1
             Start-Sleep -Seconds 3
             return $true
         } elseif ($Result.Success) {
-            Write-DATLog -Message "  No orphaned SEDO locks found in SQL" -Severity 1
+            Write-DATLog -Message "  No SEDO locks found in SQL" -Severity 1
         } else {
             Write-DATLog -Message "  SQL cleanup failed: $($Result.Error)" -Severity 2
         }
