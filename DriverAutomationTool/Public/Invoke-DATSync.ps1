@@ -108,6 +108,7 @@ function Invoke-DATSync {
         [switch]$CleanUnusedDrivers,
         [switch]$CleanDownloads,
         [switch]$UpdateIndividualDrivers,
+        [switch]$IncludeMissingDrivers,
 
         [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg')]
         [string]$DeploymentPlatform = 'ConfigMgr - Standard Pkg',
@@ -148,6 +149,7 @@ function Invoke-DATSync {
         $CleanUnusedDrivers = [switch]$Config.options.cleanUnusedDrivers
         $CleanDownloads = [switch]$Config.options.cleanDownloads
         $UpdateIndividualDrivers = [switch]$Config.options.updateIndividualDrivers
+        $IncludeMissingDrivers = [switch]$Config.options.includeMissingDrivers
         $WebhookUrl = $Config.logging.webhookUrl
 
         Write-DATLog -Message "Loaded configuration from $ConfigFile" -Severity 1
@@ -219,6 +221,7 @@ function Invoke-DATSync {
                             -CompressPackage:$CompressPackage -CompressionType $CompressionType `
                             -DeploymentPlatform $DeploymentPlatform `
                             -UpdateIndividualDrivers:$UpdateIndividualDrivers `
+                            -IncludeMissingDrivers:$IncludeMissingDrivers `
                             -DistributionPoints $DistributionPoints `
                             -DistributionPointGroups $DistributionPointGroups
 
@@ -338,6 +341,7 @@ function Invoke-DATSyncSinglePackage {
         [switch]$CleanSource,
         [switch]$CompressPackage,
         [switch]$UpdateIndividualDrivers,
+        [switch]$IncludeMissingDrivers,
 
         [ValidateSet('ZIP', 'WIM')]
         [string]$CompressionType = 'ZIP',
@@ -400,14 +404,45 @@ function Invoke-DATSyncSinglePackage {
     # When UpdateIndividualDrivers is enabled and a package already exists (base or overlay version),
     # query the Dell catalog for available individual drivers and compute a fingerprint. If the
     # fingerprint matches what's embedded in the existing package version, nothing has changed → skip.
+    #
+    # Note: When IncludeMissingDrivers is enabled, the smart check still works but the fingerprint
+    # includes a marker ('INCMISSING') so that toggling the flag forces a rebuild. The actual INF
+    # scan for missing categories happens later after base pack extraction.
     $OverlayFingerprint = $null
     $CachedIndividualDrivers = $null
+    $CachedMissingCategories = $null
     if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers' -and ($Existing -or $OverlayExisting)) {
         try {
             Write-DATLog -Message "Checking if individual Dell drivers have changed for $ModelName..." -Severity 1
-            $CachedIndividualDrivers = Get-DellIndividualDrivers `
-                -SystemID $PackageInfo.SystemID `
-                -BaselineDate $PackageInfo.ReleaseDate
+
+            # If IncludeMissingDrivers is enabled and the existing package has a source path,
+            # scan the source to detect missing categories for a more accurate smart check.
+            $SmartCheckMissing = @()
+            if ($IncludeMissingDrivers) {
+                $ExPkg = if ($OverlayExisting) {
+                    if ($OverlayExisting -is [array]) { $OverlayExisting[0] } else { $OverlayExisting }
+                } elseif ($Existing) {
+                    if ($Existing -is [array]) { $Existing[0] } else { $Existing }
+                } else { $null }
+
+                if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
+                    $PresentCats = Get-DATBasePackCategories -Path $ExPkg.SourcePath
+                    $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input')
+                    $SmartCheckMissing = @($AllCategories | Where-Object { $_ -notin $PresentCats })
+                    if ($SmartCheckMissing.Count -gt 0) {
+                        Write-DATLog -Message "Smart check: existing package missing categories: $($SmartCheckMissing -join ', ')" -Severity 1
+                    }
+                }
+            }
+
+            $GetDriverParams = @{
+                SystemID     = $PackageInfo.SystemID
+                BaselineDate = $PackageInfo.ReleaseDate
+            }
+            if ($SmartCheckMissing.Count -gt 0) {
+                $GetDriverParams['MissingCategories'] = $SmartCheckMissing
+            }
+            $CachedIndividualDrivers = Get-DellIndividualDrivers @GetDriverParams
 
             if ($CachedIndividualDrivers -and $CachedIndividualDrivers.Count -gt 0) {
                 # Build fingerprint: sorted "Name=Version" strings hashed together
@@ -635,24 +670,60 @@ function Invoke-DATSyncSinglePackage {
         # --- Individual driver overlay (Dell only) ---
         # After extracting the base driver pack, check Dell's component catalog
         # for newer individual drivers and overlay them into the package source.
+        # When IncludeMissingDrivers is enabled, also scan the extracted pack's
+        # INF files to detect which driver categories are absent and fetch the
+        # latest available driver for those categories from the catalog.
         # Reuse $CachedIndividualDrivers if the smart check already queried them.
         if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers') {
-            Write-DATLog -Message "Checking for newer individual Dell drivers for $ModelName..." -Severity 1
+            Write-DATLog -Message "Checking for individual Dell drivers for $ModelName..." -Severity 1
             try {
-                $IndividualDrivers = if ($CachedIndividualDrivers) {
-                    $CachedIndividualDrivers
+                # Detect missing categories by scanning INF files in the extracted base pack
+                $MissingCats = @()
+                if ($IncludeMissingDrivers) {
+                    $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input')
+                    $PresentCategories = Get-DATBasePackCategories -Path $PackageSourceDir
+                    $MissingCats = @($AllCategories | Where-Object { $_ -notin $PresentCategories })
+                    if ($MissingCats.Count -gt 0) {
+                        Write-DATLog -Message "Base pack is missing driver categories: $($MissingCats -join ', ')" -Severity 2
+                    } else {
+                        Write-DATLog -Message "Base pack covers all driver categories - no missing drivers to add" -Severity 1
+                    }
+                }
+
+                # Use cached results from smart check if available and category detection matches
+                $IndividualDrivers = $null
+                if ($CachedIndividualDrivers -and $CachedMissingCategories -and
+                    (Compare-Object $MissingCats $CachedMissingCategories -SyncWindow 0 | Measure-Object).Count -eq 0) {
+                    $IndividualDrivers = $CachedIndividualDrivers
+                } elseif ($CachedIndividualDrivers -and $MissingCats.Count -eq 0) {
+                    $IndividualDrivers = $CachedIndividualDrivers
                 } else {
-                    Get-DellIndividualDrivers `
-                        -SystemID $PackageInfo.SystemID `
-                        -BaselineDate $PackageInfo.ReleaseDate
+                    $GetDriverParams = @{
+                        SystemID     = $PackageInfo.SystemID
+                        BaselineDate = $PackageInfo.ReleaseDate
+                    }
+                    if ($MissingCats.Count -gt 0) {
+                        $GetDriverParams['MissingCategories'] = $MissingCats
+                    }
+                    $IndividualDrivers = Get-DellIndividualDrivers @GetDriverParams
                 }
 
                 if ($IndividualDrivers -and $IndividualDrivers.Count -gt 0) {
-                    Write-DATLog -Message "Found $($IndividualDrivers.Count) newer individual driver(s) to overlay" -Severity 1
+                    $UpdatedCount = @($IndividualDrivers | Where-Object { -not $_.IsMissing }).Count
+                    $MissingCount = @($IndividualDrivers | Where-Object { $_.IsMissing }).Count
+                    $OverlayMsg = if ($MissingCount -gt 0 -and $UpdatedCount -gt 0) {
+                        "Found $UpdatedCount newer + $MissingCount missing individual driver(s) to overlay"
+                    } elseif ($MissingCount -gt 0) {
+                        "Found $MissingCount missing individual driver(s) to overlay"
+                    } else {
+                        "Found $UpdatedCount newer individual driver(s) to overlay"
+                    }
+                    Write-DATLog -Message $OverlayMsg -Severity 1
                     $OverlayTempDir = Get-DATTempPath -Prefix 'DellOverlay'
                     try {
                         foreach ($IndvDriver in $IndividualDrivers) {
-                            Write-DATLog -Message "  Overlaying: $($IndvDriver.Category) - $($IndvDriver.Name) v$($IndvDriver.Version) ($($IndvDriver.ReleaseDate))" -Severity 1
+                            $OverlayTag = if ($IndvDriver.IsMissing) { '[MISSING]' } else { '[UPDATE]' }
+                            Write-DATLog -Message "  $OverlayTag Overlaying: $($IndvDriver.Category) - $($IndvDriver.Name) v$($IndvDriver.Version) ($($IndvDriver.ReleaseDate))" -Severity 1
 
                             # Download individual driver .exe to temp
                             $DriverExePath = Join-Path $OverlayTempDir $IndvDriver.FileName
@@ -732,7 +803,11 @@ function Invoke-DATSyncSinglePackage {
                         Remove-DATTempPath -Path $OverlayTempDir
                     }
                 } else {
-                    Write-DATLog -Message "No newer individual drivers found for $ModelName - driver pack is up to date" -Severity 1
+                    if ($MissingCats.Count -gt 0) {
+                        Write-DATLog -Message "No individual drivers found in catalog for $ModelName (checked missing: $($MissingCats -join ', '))" -Severity 2
+                    } else {
+                        Write-DATLog -Message "No newer individual drivers found for $ModelName - driver pack is up to date" -Severity 1
+                    }
                 }
             } catch {
                 Write-DATLog -Message "Individual driver overlay failed: $($_.Exception.Message) - continuing with base driver pack" -Severity 2

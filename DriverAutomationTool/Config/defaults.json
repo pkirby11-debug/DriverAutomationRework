@@ -23,7 +23,8 @@
         "deploymentPlatform": "ConfigMgr - Standard Pkg",
         "compressPackage": false,
         "compressionType": "ZIP",
-        "updateIndividualDrivers": false
+        "updateIndividualDrivers": false,
+        "includeMissingDrivers": false
     },
     "proxy": {
         "enabled": false,
