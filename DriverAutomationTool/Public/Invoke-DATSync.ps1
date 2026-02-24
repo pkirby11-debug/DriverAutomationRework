@@ -108,7 +108,6 @@ function Invoke-DATSync {
         [switch]$CleanUnusedDrivers,
         [switch]$CleanDownloads,
         [switch]$UpdateIndividualDrivers,
-        [switch]$IncludeMissingDrivers,
 
         [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg')]
         [string]$DeploymentPlatform = 'ConfigMgr - Standard Pkg',
@@ -149,7 +148,6 @@ function Invoke-DATSync {
         $CleanUnusedDrivers = [switch]$Config.options.cleanUnusedDrivers
         $CleanDownloads = [switch]$Config.options.cleanDownloads
         $UpdateIndividualDrivers = [switch]$Config.options.updateIndividualDrivers
-        $IncludeMissingDrivers = [switch]$Config.options.includeMissingDrivers
         $WebhookUrl = $Config.logging.webhookUrl
 
         Write-DATLog -Message "Loaded configuration from $ConfigFile" -Severity 1
@@ -221,7 +219,6 @@ function Invoke-DATSync {
                             -CompressPackage:$CompressPackage -CompressionType $CompressionType `
                             -DeploymentPlatform $DeploymentPlatform `
                             -UpdateIndividualDrivers:$UpdateIndividualDrivers `
-                            -IncludeMissingDrivers:$IncludeMissingDrivers `
                             -DistributionPoints $DistributionPoints `
                             -DistributionPointGroups $DistributionPointGroups
 
@@ -341,7 +338,6 @@ function Invoke-DATSyncSinglePackage {
         [switch]$CleanSource,
         [switch]$CompressPackage,
         [switch]$UpdateIndividualDrivers,
-        [switch]$IncludeMissingDrivers,
 
         [ValidateSet('ZIP', 'WIM')]
         [string]$CompressionType = 'ZIP',
@@ -405,9 +401,8 @@ function Invoke-DATSyncSinglePackage {
     # query the Dell catalog for available individual drivers and compute a fingerprint. If the
     # fingerprint matches what's embedded in the existing package version, nothing has changed → skip.
     #
-    # Note: When IncludeMissingDrivers is enabled, the smart check still works but the fingerprint
-    # includes a marker ('INCMISSING') so that toggling the flag forces a rebuild. The actual INF
-    # scan for missing categories happens later after base pack extraction.
+    # The smart check also scans the existing package source for missing driver categories
+    # (via INF Class= parsing) so that missing-category drivers are included in the fingerprint.
     $OverlayFingerprint = $null
     $CachedIndividualDrivers = $null
     $CachedMissingCategories = $null
@@ -415,23 +410,20 @@ function Invoke-DATSyncSinglePackage {
         try {
             Write-DATLog -Message "Checking if individual Dell drivers have changed for $ModelName..." -Severity 1
 
-            # If IncludeMissingDrivers is enabled and the existing package has a source path,
-            # scan the source to detect missing categories for a more accurate smart check.
+            # Scan the existing package source to detect missing categories for a more accurate smart check.
             $SmartCheckMissing = @()
-            if ($IncludeMissingDrivers) {
-                $ExPkg = if ($OverlayExisting) {
-                    if ($OverlayExisting -is [array]) { $OverlayExisting[0] } else { $OverlayExisting }
-                } elseif ($Existing) {
-                    if ($Existing -is [array]) { $Existing[0] } else { $Existing }
-                } else { $null }
+            $ExPkg = if ($OverlayExisting) {
+                if ($OverlayExisting -is [array]) { $OverlayExisting[0] } else { $OverlayExisting }
+            } elseif ($Existing) {
+                if ($Existing -is [array]) { $Existing[0] } else { $Existing }
+            } else { $null }
 
-                if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
-                    $PresentCats = Get-DATBasePackCategories -Path $ExPkg.SourcePath
-                    $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input')
-                    $SmartCheckMissing = @($AllCategories | Where-Object { $_ -notin $PresentCats })
-                    if ($SmartCheckMissing.Count -gt 0) {
-                        Write-DATLog -Message "Smart check: existing package missing categories: $($SmartCheckMissing -join ', ')" -Severity 1
-                    }
+            if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
+                $PresentCats = Get-DATBasePackCategories -Path $ExPkg.SourcePath
+                $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input')
+                $SmartCheckMissing = @($AllCategories | Where-Object { $_ -notin $PresentCats })
+                if ($SmartCheckMissing.Count -gt 0) {
+                    Write-DATLog -Message "Smart check: existing package missing categories: $($SmartCheckMissing -join ', ')" -Severity 1
                 }
             }
 
@@ -670,24 +662,20 @@ function Invoke-DATSyncSinglePackage {
         # --- Individual driver overlay (Dell only) ---
         # After extracting the base driver pack, check Dell's component catalog
         # for newer individual drivers and overlay them into the package source.
-        # When IncludeMissingDrivers is enabled, also scan the extracted pack's
-        # INF files to detect which driver categories are absent and fetch the
-        # latest available driver for those categories from the catalog.
+        # Also scans the extracted pack's INF files to detect which driver categories
+        # are absent and fetches the latest available driver for those categories.
         # Reuse $CachedIndividualDrivers if the smart check already queried them.
         if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers') {
             Write-DATLog -Message "Checking for individual Dell drivers for $ModelName..." -Severity 1
             try {
                 # Detect missing categories by scanning INF files in the extracted base pack
-                $MissingCats = @()
-                if ($IncludeMissingDrivers) {
-                    $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input')
-                    $PresentCategories = Get-DATBasePackCategories -Path $PackageSourceDir
-                    $MissingCats = @($AllCategories | Where-Object { $_ -notin $PresentCategories })
-                    if ($MissingCats.Count -gt 0) {
-                        Write-DATLog -Message "Base pack is missing driver categories: $($MissingCats -join ', ')" -Severity 2
-                    } else {
-                        Write-DATLog -Message "Base pack covers all driver categories - no missing drivers to add" -Severity 1
-                    }
+                $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input')
+                $PresentCategories = Get-DATBasePackCategories -Path $PackageSourceDir
+                $MissingCats = @($AllCategories | Where-Object { $_ -notin $PresentCategories })
+                if ($MissingCats.Count -gt 0) {
+                    Write-DATLog -Message "Base pack is missing driver categories: $($MissingCats -join ', ')" -Severity 2
+                } else {
+                    Write-DATLog -Message "Base pack covers all driver categories" -Severity 1
                 }
 
                 # Use cached results from smart check if available and category detection matches
