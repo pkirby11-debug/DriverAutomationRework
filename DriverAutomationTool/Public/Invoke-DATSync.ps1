@@ -180,9 +180,6 @@ function Invoke-DATSync {
         Connect-DATConfigMgr @ConnectParams
     }
 
-    # Clear any orphaned SEDO locks before processing — prevents lock errors during package creation/updates
-    Invoke-DATClearAllStaleLocks -SiteServer $SiteServer -SiteCode $script:CMSiteCode
-
     # Process each manufacturer
     foreach ($Make in $Manufacturer) {
         Write-DATLog -Message "======== Processing $Make ========" -Severity 1
@@ -412,6 +409,7 @@ function Invoke-DATSyncSinglePackage {
 
             # Scan the existing package source to detect missing categories for a more accurate smart check.
             $SmartCheckMissing = @()
+            $SourceScanComplete = $false
             $ExPkg = if ($OverlayExisting) {
                 if ($OverlayExisting -is [array]) { $OverlayExisting[0] } else { $OverlayExisting }
             } elseif ($Existing) {
@@ -420,12 +418,20 @@ function Invoke-DATSyncSinglePackage {
 
             if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
                 $PresentCats = Get-DATBasePackCategories -Path $ExPkg.SourcePath
-                $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input')
-                $SmartCheckMissing = @($AllCategories | Where-Object { $_ -notin $PresentCats })
-                if ($SmartCheckMissing.Count -gt 0) {
-                    Write-DATLog -Message "Smart check: existing package missing categories: $($SmartCheckMissing -join ', ')" -Severity 1
+                if ($PresentCats.Count -gt 0) {
+                    $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input')
+                    $SmartCheckMissing = @($AllCategories | Where-Object { $_ -notin $PresentCats })
+                    $SourceScanComplete = $true
+                    if ($SmartCheckMissing.Count -gt 0) {
+                        Write-DATLog -Message "Smart check: existing package missing categories: $($SmartCheckMissing -join ', ')" -Severity 1
+                    }
+                } else {
+                    Write-DATLog -Message "Smart check: could not detect categories from source (no INF files found) - will do full scan after download" -Severity 2
                 }
+            } else {
+                Write-DATLog -Message "Smart check: package source path not accessible - will do full scan after download" -Severity 2
             }
+            $CachedMissingCategories = $SmartCheckMissing
 
             $GetDriverParams = @{
                 SystemID     = $PackageInfo.SystemID
@@ -474,43 +480,49 @@ function Invoke-DATSyncSinglePackage {
                     Write-DATLog -Message "Individual drivers have changed - overlay update needed" -Severity 1
                 }
             } else {
-                # No individual drivers newer than baseline — check if base version already exists
-                if ($Existing) {
-                    Write-DATLog -Message "No newer individual drivers found and base package exists at v$Version - Skipping" -Severity 1
-                    $ExistingPkg = if ($Existing -is [array]) { $Existing[0] } else { $Existing }
+                # No individual drivers newer than baseline found in catalog.
+                # Only safe to skip if the source scan completed successfully — meaning we
+                # could reliably detect which categories were present/missing. If the source
+                # wasn't accessible (network share down, WIM-compressed, etc.), we can't be
+                # sure there aren't missing categories, so fall through to the full
+                # download → extract → scan path.
+                if ($SourceScanComplete) {
+                    if ($Existing) {
+                        Write-DATLog -Message "No newer individual drivers found and base package exists at v$Version - Skipping" -Severity 1
+                        $ExistingPkg = if ($Existing -is [array]) { $Existing[0] } else { $Existing }
 
+                        Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
+                            -Version $Version -PackageID $ExistingPkg.PackageID -Status 'Skipped'
 
-                    Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
-                        -Version $Version -PackageID $ExistingPkg.PackageID -Status 'Skipped'
-
-                    return [PSCustomObject]@{
-                        Manufacturer = $Make
-                        Model        = $ModelName
-                        Type         = $Type
-                        Version      = $Version
-                        PackageID    = $ExistingPkg.PackageID
-                        Status       = 'Skipped'
-                        Message      = 'Already at latest version'
+                        return [PSCustomObject]@{
+                            Manufacturer = $Make
+                            Model        = $ModelName
+                            Type         = $Type
+                            Version      = $Version
+                            PackageID    = $ExistingPkg.PackageID
+                            Status       = 'Skipped'
+                            Message      = 'Already at latest version'
+                        }
                     }
-                }
-                # If only overlay version exists but no new individual drivers, still skip
-                if ($OverlayExisting) {
-                    $OvlPkg = if ($OverlayExisting -is [array]) { $OverlayExisting[0] } else { $OverlayExisting }
-                    Write-DATLog -Message "No newer individual drivers found - package at v$($OvlPkg.Version) is current - Skipping" -Severity 1
+                    if ($OverlayExisting) {
+                        $OvlPkg = if ($OverlayExisting -is [array]) { $OverlayExisting[0] } else { $OverlayExisting }
+                        Write-DATLog -Message "No newer individual drivers found - package at v$($OvlPkg.Version) is current - Skipping" -Severity 1
 
+                        Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
+                            -Version $OvlPkg.Version -PackageID $OvlPkg.PackageID -Status 'Skipped'
 
-                    Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
-                        -Version $OvlPkg.Version -PackageID $OvlPkg.PackageID -Status 'Skipped'
-
-                    return [PSCustomObject]@{
-                        Manufacturer = $Make
-                        Model        = $ModelName
-                        Type         = $Type
-                        Version      = $OvlPkg.Version
-                        PackageID    = $OvlPkg.PackageID
-                        Status       = 'Skipped'
-                        Message      = 'Individual drivers already up to date'
+                        return [PSCustomObject]@{
+                            Manufacturer = $Make
+                            Model        = $ModelName
+                            Type         = $Type
+                            Version      = $OvlPkg.Version
+                            PackageID    = $OvlPkg.PackageID
+                            Status       = 'Skipped'
+                            Message      = 'Individual drivers already up to date'
+                        }
                     }
+                } else {
+                    Write-DATLog -Message "No newer individual drivers in catalog but source scan was incomplete - proceeding with full download to check for missing categories" -Severity 1
                 }
             }
         } catch {
