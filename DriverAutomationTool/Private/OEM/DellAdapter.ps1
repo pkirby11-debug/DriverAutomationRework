@@ -411,11 +411,11 @@ function Get-DellIndividualDrivers {
     # Category keyword map for classifying SoftwareComponents
     $CategoryPatterns = [ordered]@{
         'Video'    = 'Video|Graphics|VGA|Display|GPU'
-        'Network'  = 'Network|Ethernet|WiFi|Wi-Fi|Wireless|Bluetooth|WLAN|\bLAN\b'
-        'Audio'    = 'Audio|Sound|Realtek HD'
-        'Chipset'  = 'Chipset|Intel Management Engine|Serial IO|\bIME\b|\bMEI\b'
+        'Network'  = 'Network|Ethernet|WiFi|Wi-Fi|Wireless|Bluetooth|WLAN|\bLAN\b|Thunderbolt'
+        'Audio'    = 'Audio|Sound|Realtek HD|Studio Effects'
+        'Chipset'  = 'Chipset|Intel Management Engine|Serial IO|\bIME\b|\bMEI\b|Dynamic Tuning|Platform Framework|Platform Monitoring|Innovation Platform|AI Boost'
         'Storage'  = 'Storage|Intel Rapid|NVMe|SATA|AHCI|Optane'
-        'Input'    = 'Touchpad|HID|Mouse|Keyboard|Pointing'
+        'Input'    = 'Touchpad|HID|Mouse|Keyboard|Pointing|Sensor Solution|Camera|Imaging'
     }
 
     # Exclusion pattern — skip BIOS, firmware, applications, utilities, docks, and Dell-specific tools
@@ -463,9 +463,9 @@ function Get-DellIndividualDrivers {
         }
 
         if (-not $ResolvedCategory) {
-            # Unrecognized category — skip with debug log
-            Write-DATLog -Message "Skipping unrecognized Dell component: $DisplayName" -Severity 1
-            continue
+            # Driver passed the exclusion filter but doesn't match a known category —
+            # classify as "Other" so it still gets included in the overlay.
+            $ResolvedCategory = 'Other'
         }
 
         # Date filter — for categories present in the base pack, only include newer drivers.

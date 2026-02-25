@@ -419,7 +419,7 @@ function Invoke-DATSyncSinglePackage {
             if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
                 $PresentCats = Get-DATBasePackCategories -Path $ExPkg.SourcePath
                 if ($PresentCats.Count -gt 0) {
-                    $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input')
+                    $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input', 'Other')
                     $SmartCheckMissing = @($AllCategories | Where-Object { $_ -notin $PresentCats })
                     $SourceScanComplete = $true
                     if ($SmartCheckMissing.Count -gt 0) {
@@ -681,7 +681,7 @@ function Invoke-DATSyncSinglePackage {
             Write-DATLog -Message "Checking for individual Dell drivers for $ModelName..." -Severity 1
             try {
                 # Detect missing categories by scanning INF files in the extracted base pack
-                $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input')
+                $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input', 'Other')
                 $PresentCategories = Get-DATBasePackCategories -Path $PackageSourceDir
                 $MissingCats = @($AllCategories | Where-Object { $_ -notin $PresentCategories })
                 if ($MissingCats.Count -gt 0) {
