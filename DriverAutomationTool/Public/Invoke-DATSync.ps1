@@ -418,6 +418,22 @@ function Invoke-DATSyncSinglePackage {
 
             if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
                 $PresentCats = Get-DATBasePackCategories -Path $ExPkg.SourcePath
+
+                # If no INFs found (e.g., WIM-compressed package source), check the sibling
+                # extracted directory. WIM packages store everything in a single .wim file so
+                # INF files aren't directly accessible. The extracted directory (kept after
+                # compression) preserves the original INF files for category detection.
+                if ($PresentCats.Count -eq 0) {
+                    $SourceLeaf = Split-Path $ExPkg.SourcePath -Leaf
+                    if ($SourceLeaf -like 'Compressed-*') {
+                        $ExtractedLeaf = $SourceLeaf -replace '^Compressed-', ''
+                        $ExtractedPath = Join-Path (Split-Path $ExPkg.SourcePath -Parent) $ExtractedLeaf
+                        if (Test-Path $ExtractedPath) {
+                            Write-DATLog -Message "Smart check: package source is WIM-compressed, scanning extracted directory for INF files" -Severity 1
+                            $PresentCats = Get-DATBasePackCategories -Path $ExtractedPath
+                        }
+                    }
+                }
                 if ($PresentCats.Count -gt 0) {
                     $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input', 'Other')
                     $SmartCheckMissing = @($AllCategories | Where-Object { $_ -notin $PresentCats })
@@ -833,9 +849,9 @@ function Invoke-DATSyncSinglePackage {
             # Use the compressed output directory as the package source
             $PackageSourceDir = Split-Path $CompressedPath -Parent
 
-            # NOTE: Do NOT delete $OrigExtractDir here. Defer cleanup until after
-            # the ConfigMgr package is successfully created, to avoid ghost locks
-            # caused by partial package creation failures.
+            # NOTE: $OrigExtractDir is intentionally kept. It contains INF files needed
+            # by the smart check on future runs to detect which driver categories are
+            # present. The compressed directory only has the WIM file.
         }
     }
 
@@ -872,11 +888,10 @@ function Invoke-DATSyncSinglePackage {
         }
     }
 
-    # Clean up extracted source files now that the package was created successfully
-    if ($OrigExtractDir -and $OrigExtractDir -ne $PackageSourceDir -and (Test-Path $OrigExtractDir)) {
-        Write-DATLog -Message "Cleaning up extracted source files from $OrigExtractDir" -Severity 1
-        Remove-Item -Path $OrigExtractDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    # Keep extracted source files (do not delete $OrigExtractDir). When the package is
+    # WIM-compressed, the compressed directory only contains DriverPackage.wim with no INF
+    # files. Future smart-check runs need the extracted directory's INF files to detect
+    # which driver categories are present vs missing, avoiding unnecessary re-downloads.
 
     # Distribute content
     if ($PkgResult -and ($DistributionPoints -or $DistributionPointGroups)) {
