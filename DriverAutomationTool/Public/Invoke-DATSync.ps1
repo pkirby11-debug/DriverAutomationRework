@@ -713,56 +713,60 @@ function Invoke-DATSyncSinglePackage {
                             $OverlayTag = if ($IndvDriver.IsMissing) { '[MISSING]' } else { '[UPDATE]' }
                             Write-DATLog -Message "  $OverlayTag Overlaying: $($IndvDriver.Category) - $($IndvDriver.Name) v$($IndvDriver.Version) ($($IndvDriver.ReleaseDate))" -Severity 1
 
-                            # Download individual driver .exe to temp
-                            $DriverExePath = Join-Path $OverlayTempDir $IndvDriver.FileName
-                            Invoke-DATDownload -Url $IndvDriver.Url -DestinationPath $DriverExePath -MaxRetries 2
-
-                            # Create category subdirectory in package source
-                            $OverlayTargetDir = Join-Path $PackageSourceDir $IndvDriver.Category
-                            if (-not (Test-Path $OverlayTargetDir)) {
-                                New-Item -Path $OverlayTargetDir -ItemType Directory -Force | Out-Null
-                            }
-
-                            # Extract using the same dual-method approach as driver pack EXEs
-                            $ExtractDir = Join-Path $OverlayTempDir ($IndvDriver.Category + '_extract')
-                            if (Test-Path $ExtractDir) {
-                                Remove-Item -Path $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
-                            }
-                            New-Item -Path $ExtractDir -ItemType Directory -Force | Out-Null
-
-                            $OverlayExtracted = $false
-
-                            # Method 1: /s /e="path"
                             try {
-                                $ExtractArgs = "/s /e=`"$ExtractDir`""
-                                $Proc = Start-Process -FilePath $DriverExePath -ArgumentList $ExtractArgs `
-                                    -Wait -NoNewWindow -PassThru -ErrorAction Stop
-                                if ($Proc.ExitCode -eq 0 -and
-                                    @(Get-ChildItem $ExtractDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
-                                    $OverlayExtracted = $true
-                                }
-                            } catch { }
+                                # Download individual driver .exe to temp
+                                $DriverExePath = Join-Path $OverlayTempDir $IndvDriver.FileName
+                                Invoke-DATDownload -Url $IndvDriver.Url -DestinationPath $DriverExePath -MaxRetries 2
 
-                            # Method 2: /extract:"path" /quiet
-                            if (-not $OverlayExtracted) {
+                                # Create category subdirectory in package source
+                                $OverlayTargetDir = Join-Path $PackageSourceDir $IndvDriver.Category
+                                if (-not (Test-Path $OverlayTargetDir)) {
+                                    New-Item -Path $OverlayTargetDir -ItemType Directory -Force | Out-Null
+                                }
+
+                                # Extract using the same dual-method approach as driver pack EXEs
+                                $ExtractDir = Join-Path $OverlayTempDir ($IndvDriver.Category + '_extract')
+                                if (Test-Path $ExtractDir) {
+                                    Remove-Item -Path $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
+                                }
+                                New-Item -Path $ExtractDir -ItemType Directory -Force | Out-Null
+
+                                $OverlayExtracted = $false
+
+                                # Method 1: /s /e="path"
                                 try {
-                                    $ExtractArgs = "/extract:`"$ExtractDir`" /quiet"
-                                    $Proc2 = Start-Process -FilePath $DriverExePath -ArgumentList $ExtractArgs `
+                                    $ExtractArgs = "/s /e=`"$ExtractDir`""
+                                    $Proc = Start-Process -FilePath $DriverExePath -ArgumentList $ExtractArgs `
                                         -Wait -NoNewWindow -PassThru -ErrorAction Stop
-                                    if ($Proc2.ExitCode -eq 0 -and
+                                    if ($Proc.ExitCode -eq 0 -and
                                         @(Get-ChildItem $ExtractDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
                                         $OverlayExtracted = $true
                                     }
                                 } catch { }
-                            }
 
-                            if ($OverlayExtracted) {
-                                # Copy extracted content into the package source category subdirectory
-                                Copy-Item -Path "$ExtractDir\*" -Destination $OverlayTargetDir -Recurse -Force
-                                $OverlayFileCount = @(Get-ChildItem $OverlayTargetDir -Recurse -File -ErrorAction SilentlyContinue).Count
-                                Write-DATLog -Message "  Overlaid $OverlayFileCount file(s) for $($IndvDriver.Category)" -Severity 1
-                            } else {
-                                Write-DATLog -Message "  WARNING: Failed to extract $($IndvDriver.FileName) - skipping this driver" -Severity 2
+                                # Method 2: /extract:"path" /quiet
+                                if (-not $OverlayExtracted) {
+                                    try {
+                                        $ExtractArgs = "/extract:`"$ExtractDir`" /quiet"
+                                        $Proc2 = Start-Process -FilePath $DriverExePath -ArgumentList $ExtractArgs `
+                                            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                                        if ($Proc2.ExitCode -eq 0 -and
+                                            @(Get-ChildItem $ExtractDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
+                                            $OverlayExtracted = $true
+                                        }
+                                    } catch { }
+                                }
+
+                                if ($OverlayExtracted) {
+                                    # Copy extracted content into the package source category subdirectory
+                                    Copy-Item -Path "$ExtractDir\*" -Destination $OverlayTargetDir -Recurse -Force
+                                    $OverlayFileCount = @(Get-ChildItem $OverlayTargetDir -Recurse -File -ErrorAction SilentlyContinue).Count
+                                    Write-DATLog -Message "  Overlaid $OverlayFileCount file(s) for $($IndvDriver.Category)" -Severity 1
+                                } else {
+                                    Write-DATLog -Message "  WARNING: Failed to extract $($IndvDriver.FileName) - skipping this driver" -Severity 2
+                                }
+                            } catch {
+                                Write-DATLog -Message "  WARNING: Failed to download $($IndvDriver.Name) - $($_.Exception.Message) - skipping" -Severity 2
                             }
                         }
 

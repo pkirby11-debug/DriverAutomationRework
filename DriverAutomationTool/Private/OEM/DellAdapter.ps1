@@ -418,8 +418,8 @@ function Get-DellIndividualDrivers {
         'Input'    = 'Touchpad|HID|Mouse|Keyboard|Pointing'
     }
 
-    # Exclusion pattern — skip BIOS, firmware, applications, utilities, docks, and Dell-specific tools
-    $ExcludePattern = 'BIOS|Firmware|Application|Utility|Dock|SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Dell Digital Delivery'
+    # Exclusion pattern — skip BIOS, firmware, applications, utilities, installers, docks, and Dell-specific tools
+    $ExcludePattern = 'BIOS|Firmware|Application|Utility|Installer|Dock|SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Dell Digital Delivery'
 
     # Find matching SoftwareComponents
     $MatchedDrivers = [System.Collections.Generic.List[PSCustomObject]]::new()
