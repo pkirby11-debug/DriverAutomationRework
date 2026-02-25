@@ -277,17 +277,29 @@ function New-DATDriverPackage {
 
                 $PackageID = [string]$Package.PackageID
 
-                # Set BDR and priority
-                if ($EnableBDR) {
-                    Set-CMPackage -Id $PackageID -EnableBinaryDeltaReplication $true
-                }
+                # Release any SEDO lock left by New-CMPackage before modifying properties.
+                # ConfigMgr cmdlets can leave locks that block subsequent Set-CMPackage calls.
+                Invoke-DATReleaseStaleLock -PackageID $PackageID `
+                    -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
 
-                Set-CMPackage -Id $PackageID -Priority $ReplicationPriority
+                # Set BDR and priority — non-fatal so package still gets returned for distribution
+                try {
+                    if ($EnableBDR) {
+                        Set-CMPackage -Id $PackageID -EnableBinaryDeltaReplication $true
+                    }
+                    Set-CMPackage -Id $PackageID -Priority $ReplicationPriority
+                } catch {
+                    Write-DATLog -Message "Warning: Could not set BDR/Priority on $PackageID (may be locked): $($_.Exception.Message)" -Severity 2
+                }
             }
 
-            # Move to console folder if specified
+            # Move to console folder if specified — non-fatal
             if ($FolderPath) {
-                Set-DATPackageFolder -PackageID $PackageID -FolderPath $FolderPath
+                try {
+                    Set-DATPackageFolder -PackageID $PackageID -FolderPath $FolderPath
+                } catch {
+                    Write-DATLog -Message "Warning: Could not move $PackageID to folder '$FolderPath': $($_.Exception.Message)" -Severity 2
+                }
             }
 
             Write-DATLog -Message "Driver package ready: $Name (ID: $PackageID)" -Severity 1
@@ -501,19 +513,31 @@ function New-DATCMDriverPackage {
 
                 $PackageID = [string]$Package.PackageID
 
-                # Set version and BDR after creation
-                Set-CMDriverPackage -Id $PackageID -Version $Version
+                # Release any SEDO lock left by New-CMDriverPackage before modifying properties.
+                Invoke-DATReleaseStaleLock -PackageID $PackageID `
+                    -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
 
-                if ($EnableBDR) {
-                    Set-CMDriverPackage -Id $PackageID -EnableBinaryDeltaReplication $true
+                # Set version, BDR, and priority — non-fatal so package still gets returned for distribution
+                try {
+                    Set-CMDriverPackage -Id $PackageID -Version $Version
+
+                    if ($EnableBDR) {
+                        Set-CMDriverPackage -Id $PackageID -EnableBinaryDeltaReplication $true
+                    }
+
+                    Set-CMDriverPackage -Id $PackageID -Priority $ReplicationPriority
+                } catch {
+                    Write-DATLog -Message "Warning: Could not set Version/BDR/Priority on $PackageID (may be locked): $($_.Exception.Message)" -Severity 2
                 }
-
-                Set-CMDriverPackage -Id $PackageID -Priority $ReplicationPriority
             }
 
-            # Move to console folder if specified
+            # Move to console folder if specified — non-fatal
             if ($FolderPath) {
-                Set-DATPackageFolder -PackageID $PackageID -FolderPath $FolderPath -ObjectType 'DriverPackage'
+                try {
+                    Set-DATPackageFolder -PackageID $PackageID -FolderPath $FolderPath -ObjectType 'DriverPackage'
+                } catch {
+                    Write-DATLog -Message "Warning: Could not move $PackageID to folder: $($_.Exception.Message)" -Severity 2
+                }
             }
 
             Write-DATLog -Message "CM driver package ready: $Name (ID: $PackageID)" -Severity 1
@@ -617,6 +641,12 @@ function Distribute-DATContent {
     $OriginalLocation = Get-Location
     try {
         Set-Location -Path "$($script:CMSiteCode):"
+
+        # Release any SEDO lock before distributing — creation or Set-CM* calls
+        # may have left a lock that blocks Start-CMContentDistribution.
+        $WmiNamespace = "root\SMS\site_$($script:CMSiteCode)"
+        Invoke-DATReleaseStaleLock -PackageID $PackageID `
+            -SiteServer $script:CMSiteServer -WmiNamespace $WmiNamespace | Out-Null
 
         # For existing packages: refresh content on all current distribution points
         if ($IsUpdate) {
