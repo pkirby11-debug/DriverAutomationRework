@@ -362,7 +362,7 @@ function Compress-DATPackage {
                 Write-DATLog -Message "Warning: DISM /Capture-Image typically requires administrator privileges. If compression fails, run the DAT Tool as Administrator." -Severity 2
             }
 
-            # DISM does NOT support UNC paths — must use local temp directory
+            # DISM does NOT support UNC paths - must use local temp directory
             # (Same approach as original script lines 20288-20308)
             # IMPORTANT: The WIM output file must be in a SEPARATE directory from the
             # capture source, otherwise DISM gets exit code 5 (Access Denied) because it

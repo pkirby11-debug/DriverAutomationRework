@@ -214,7 +214,7 @@ function Get-DellDriverPack {
     $DownloadPath = $Best.path -replace '^/', ''
     $DownloadUrl = '{0}/{1}' -f $Sources.dell.baseUrl.TrimEnd('/'), $DownloadPath
 
-    # Get SystemID(s) for this driver pack — needed for SCCM package Description
+    # Get SystemID(s) for this driver pack - needed for SCCM package Description
     $SystemIDs = @($Best.SupportedSystems.Brand.Model.SystemID) -join ';'
 
     $Result = [PSCustomObject]@{
@@ -424,8 +424,8 @@ function Get-DellIndividualDrivers {
         'Input'    = 'Touchpad|HID|Mouse|Keyboard|Pointing|Sensor Solution|Camera|Imaging'
     }
 
-    # Exclusion pattern — catch Dell-specific tools and non-driver software by name.
-    # NOTE: "Firmware" is intentionally omitted — some driver packages include firmware
+    # Exclusion pattern - catch Dell-specific tools and non-driver software by name.
+    # NOTE: "Firmware" is intentionally omitted - some driver packages include firmware
     # components (e.g., "Intel Thunderbolt Controller Driver"). The packageType attribute
     # handles BIOS/firmware filtering more reliably.
     $ExcludePattern = 'SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Dell Digital Delivery'
@@ -444,7 +444,7 @@ function Get-DellIndividualDrivers {
     foreach ($Component in $Xml.Manifest.SoftwareComponent) {
         $TotalScanned++
 
-        # Use packageType attribute for primary filtering — more reliable than name matching.
+        # Use packageType attribute for primary filtering - more reliable than name matching.
         # CatalogPC.xml packageType values: LWXP (drivers), BIOS, FRMW (firmware), APP (applications).
         # Only include LWXP (drivers) or components with no packageType (treat as potential drivers).
         $PkgType = $Component.packageType
@@ -460,7 +460,7 @@ function Get-DellIndividualDrivers {
             continue
         }
 
-        # Secondary exclusion by name — catch Dell-specific tools that got past packageType
+        # Secondary exclusion by name - catch Dell-specific tools that got past packageType
         if ($DisplayName -match $ExcludePattern) {
             $SkippedExcluded++
             continue
@@ -500,12 +500,12 @@ function Get-DellIndividualDrivers {
         }
 
         if (-not $ResolvedCategory) {
-            # Driver passed all filters but doesn't match a known category —
+            # Driver passed all filters but doesn't match a known category -
             # classify as "Other" so it still gets included in the overlay.
             $ResolvedCategory = 'Other'
         }
 
-        # Date filter — for categories present in the base pack, only include newer drivers.
+        # Date filter - for categories present in the base pack, only include newer drivers.
         # For missing categories, include ALL drivers (we need them regardless of date).
         $IsMissing = $MissingSet.Contains($ResolvedCategory)
         if (-not $IsMissing -and $ComponentDate -le $BaselineParsed) {
@@ -542,7 +542,7 @@ function Get-DellIndividualDrivers {
         if ($MissingSet.Count -gt 0) {
             $Msg += " (checked missing categories: $($MissingCategories -join ', '))"
         }
-        $Msg += " — baseline date: $BaselineDate"
+        $Msg += " - baseline date: $BaselineDate"
         Write-DATLog -Message $Msg -Severity 2
         return $null
     }
@@ -550,7 +550,7 @@ function Get-DellIndividualDrivers {
     # Deduplicate: keep only the latest version of each distinct driver component.
     # Group by display name (e.g., "Intel PCIe Ethernet Controller Driver" vs
     # "Intel Wi-Fi Driver" are different drivers even though both are Network category).
-    # Multiple versions of the same driver → keep only the newest.
+    # Multiple versions of the same driver - keep only the newest.
     $LatestPerDriver = $MatchedDrivers |
         Group-Object Name |
         ForEach-Object {
@@ -654,7 +654,7 @@ function Get-DATBasePackCategories {
 
     foreach ($InfFile in $InfFiles) {
         try {
-            # Read first 100 lines — the [Version] section with Class= is always near the top
+            # Read first 100 lines - the [Version] section with Class= is always near the top
             $Lines = Get-Content -Path $InfFile.FullName -TotalCount 100 -ErrorAction SilentlyContinue
 
             foreach ($Line in $Lines) {

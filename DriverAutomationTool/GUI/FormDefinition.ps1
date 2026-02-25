@@ -691,10 +691,10 @@ function New-DATMainForm {
     # WinForms docks last-added controls first (reverse z-order).
     # Fill must be added FIRST so it docks LAST, filling only the space
     # remaining after all Top/Bottom edge-docked controls are placed.
-    # 1. TabControl (Dock=Fill) — added first, docks last, gets remaining space
-    # 2. StatusStrip (auto-bottom) — docks third
-    # 3. BottomPanel (Dock=Bottom, 50px) — docks second
-    # 4. HeaderPanel (Dock=Top, 50px) — added last, docks first
+    # 1. TabControl (Dock=Fill) - added first, docks last, gets remaining space
+    # 2. StatusStrip (auto-bottom) - docks third
+    # 3. BottomPanel (Dock=Bottom, 50px) - docks second
+    # 4. HeaderPanel (Dock=Top, 50px) - added last, docks first
     $Form.Controls.Add($TabControl)
     $Form.Controls.Add($StatusStrip)
     $Form.Controls.Add($BottomPanel)
