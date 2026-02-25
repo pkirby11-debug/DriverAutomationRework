@@ -424,11 +424,12 @@ function Get-DellIndividualDrivers {
         'Input'    = 'Touchpad|HID|Mouse|Keyboard|Pointing|Sensor Solution|Camera|Imaging'
     }
 
-    # Exclusion pattern - catch Dell-specific tools and non-driver software by name.
-    # NOTE: "Firmware" is intentionally omitted - some driver packages include firmware
-    # components (e.g., "Intel Thunderbolt Controller Driver"). The packageType attribute
-    # handles BIOS/firmware filtering more reliably.
-    $ExcludePattern = 'SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Dell Digital Delivery'
+    # Exclusion pattern - catch non-driver software by name as a secondary filter.
+    # The packageType attribute handles most filtering, but some BIOS/application
+    # components carry packageType=LWXP and slip through.
+    # NOTE: "Firmware" is intentionally omitted - legitimate drivers can include
+    # firmware components (e.g., "Intel Thunderbolt Controller Firmware").
+    $ExcludePattern = '\bBIOS\b|SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Digital Delivery|\bApplication\b|\bUtility\b'
 
     # Diagnostic counters
     $TotalScanned = 0
