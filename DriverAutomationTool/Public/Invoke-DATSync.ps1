@@ -422,8 +422,9 @@ function Invoke-DATSyncSinglePackage {
                     $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input', 'Other')
                     $SmartCheckMissing = @($AllCategories | Where-Object { $_ -notin $PresentCats })
                     $SourceScanComplete = $true
-                    if ($SmartCheckMissing.Count -gt 0) {
-                        Write-DATLog -Message "Smart check: existing package missing categories: $($SmartCheckMissing -join ', ')" -Severity 1
+                    $StandardMissing = @($SmartCheckMissing | Where-Object { $_ -ne 'Other' })
+                    if ($StandardMissing.Count -gt 0) {
+                        Write-DATLog -Message "Smart check: existing package missing standard categories: $($StandardMissing -join ', ')" -Severity 1
                     }
                 } else {
                     Write-DATLog -Message "Smart check: could not detect categories from source (no INF files found) - will do full scan after download" -Severity 2
@@ -680,14 +681,17 @@ function Invoke-DATSyncSinglePackage {
         if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers') {
             Write-DATLog -Message "Checking for individual Dell drivers for $ModelName..." -Severity 1
             try {
-                # Detect missing categories by scanning INF files in the extracted base pack
+                # Detect missing categories by scanning INF files in the extracted base pack.
+                # "Other" is always treated as missing since INF scans can't detect it —
+                # this ensures unclassified drivers from the Dell catalog are always checked.
                 $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input', 'Other')
                 $PresentCategories = Get-DATBasePackCategories -Path $PackageSourceDir
                 $MissingCats = @($AllCategories | Where-Object { $_ -notin $PresentCategories })
-                if ($MissingCats.Count -gt 0) {
-                    Write-DATLog -Message "Base pack is missing driver categories: $($MissingCats -join ', ')" -Severity 2
+                $StandardMissing = @($MissingCats | Where-Object { $_ -ne 'Other' })
+                if ($StandardMissing.Count -gt 0) {
+                    Write-DATLog -Message "Base pack is missing standard driver categories: $($StandardMissing -join ', ')" -Severity 2
                 } else {
-                    Write-DATLog -Message "Base pack covers all driver categories" -Severity 1
+                    Write-DATLog -Message "Base pack covers all standard driver categories (also checking 'Other' for unclassified drivers)" -Severity 1
                 }
 
                 # Use cached results from smart check if available and category detection matches

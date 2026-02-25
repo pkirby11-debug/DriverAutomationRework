@@ -340,25 +340,30 @@ function Get-DellIndividualDrivers {
     <#
     .SYNOPSIS
         Finds individual Dell drivers newer than a baseline date for a specific model,
-        and optionally includes the latest driver for any categories missing from the base pack.
+        and includes the latest driver for any categories missing from the base pack.
     .DESCRIPTION
-        Queries CatalogPC.cab (already cached for BIOS lookups) for SoftwareComponent
-        entries matching the given SystemID. Filters to driver categories (excluding BIOS
-        and firmware/application categories), returns only components released after the
-        baseline date, and selects the latest per category.
+        Queries the Dell Command Update catalog (CatalogPC.cab) for SoftwareComponent
+        entries matching the given SystemID. Uses the packageType XML attribute to
+        filter to driver components, classifies them into categories, then returns
+        drivers released after the baseline date plus the latest driver for any
+        categories missing from the base pack.
 
-        When -MissingCategories is provided, also returns the latest driver for each
-        missing category regardless of the baseline date. This covers the scenario where
-        a base driver pack is missing an entire driver category (e.g., sound driver not
-        included for a newer model) — the catalog may have a driver that was released
-        before the pack but simply wasn't bundled into it.
+        When -MissingCategories is provided, returns the latest driver for each
+        missing category regardless of the baseline date. This covers the scenario
+        where a base driver pack is missing an entire driver category (e.g., sound
+        driver not included for a newer model).
+
+        The "Other" category is a catch-all for drivers that pass the exclusion
+        filter but don't match any known category pattern. Since INF-based category
+        detection can never identify "Other" drivers, this category is always treated
+        as missing when MissingCategories includes it.
     .PARAMETER SystemID
         The Dell SystemID(s), semicolon-delimited (e.g., '0991;09A1').
     .PARAMETER BaselineDate
         Only return drivers with dateTime newer than this value.
         Typically the driver pack's ReleaseDate.
     .PARAMETER MissingCategories
-        Array of category names (Video, Network, Audio, Chipset, Storage, Input)
+        Array of category names (Video, Network, Audio, Chipset, Storage, Input, Other)
         that are absent from the extracted base driver pack. For these categories,
         the latest available driver is returned regardless of the baseline date.
     .OUTPUTS
@@ -408,7 +413,8 @@ function Get-DellIndividualDrivers {
         foreach ($MC in $MissingCategories) { $MissingSet.Add($MC) | Out-Null }
     }
 
-    # Category keyword map for classifying SoftwareComponents
+    # Category keyword map for classifying SoftwareComponents.
+    # Patterns are matched against the component's display name.
     $CategoryPatterns = [ordered]@{
         'Video'    = 'Video|Graphics|VGA|Display|GPU'
         'Network'  = 'Network|Ethernet|WiFi|Wi-Fi|Wireless|Bluetooth|WLAN|\bLAN\b|Thunderbolt'
@@ -418,19 +424,47 @@ function Get-DellIndividualDrivers {
         'Input'    = 'Touchpad|HID|Mouse|Keyboard|Pointing|Sensor Solution|Camera|Imaging'
     }
 
-    # Exclusion pattern — skip BIOS, firmware, applications, utilities, docks, and Dell-specific tools
-    $ExcludePattern = 'BIOS|Firmware|Application|Utility|Dock|SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Dell Digital Delivery'
+    # Exclusion pattern — catch Dell-specific tools and non-driver software by name.
+    # NOTE: "Firmware" is intentionally omitted — some driver packages include firmware
+    # components (e.g., "Intel Thunderbolt Controller Driver"). The packageType attribute
+    # handles BIOS/firmware filtering more reliably.
+    $ExcludePattern = 'SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Dell Digital Delivery'
+
+    # Diagnostic counters
+    $TotalScanned = 0
+    $SkippedPkgType = 0
+    $SkippedNoName = 0
+    $SkippedExcluded = 0
+    $SkippedNoSysMatch = 0
+    $SkippedDate = 0
 
     # Find matching SoftwareComponents
     $MatchedDrivers = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     foreach ($Component in $Xml.Manifest.SoftwareComponent) {
+        $TotalScanned++
+
+        # Use packageType attribute for primary filtering — more reliable than name matching.
+        # CatalogPC.xml packageType values: LWXP (drivers), BIOS, FRMW (firmware), APP (applications).
+        # Only include LWXP (drivers) or components with no packageType (treat as potential drivers).
+        $PkgType = $Component.packageType
+        if ($PkgType -and $PkgType -notmatch '^LWXP$') {
+            $SkippedPkgType++
+            continue
+        }
+
         # Get display name
         $DisplayName = $Component.Name.Display.'#cdata-section'
-        if (-not $DisplayName) { continue }
+        if (-not $DisplayName) {
+            $SkippedNoName++
+            continue
+        }
 
-        # Exclude non-driver categories
-        if ($DisplayName -match $ExcludePattern) { continue }
+        # Secondary exclusion by name — catch Dell-specific tools that got past packageType
+        if ($DisplayName -match $ExcludePattern) {
+            $SkippedExcluded++
+            continue
+        }
 
         # Check SystemID match (case-insensitive)
         $ComponentSystems = @($Component.SupportedSystems.Brand.Model.SystemID) |
@@ -444,7 +478,10 @@ function Get-DellIndividualDrivers {
                 break
             }
         }
-        if (-not $SysMatch) { continue }
+        if (-not $SysMatch) {
+            $SkippedNoSysMatch++
+            continue
+        }
 
         # Parse component date
         try {
@@ -463,7 +500,7 @@ function Get-DellIndividualDrivers {
         }
 
         if (-not $ResolvedCategory) {
-            # Driver passed the exclusion filter but doesn't match a known category —
+            # Driver passed all filters but doesn't match a known category —
             # classify as "Other" so it still gets included in the overlay.
             $ResolvedCategory = 'Other'
         }
@@ -471,7 +508,10 @@ function Get-DellIndividualDrivers {
         # Date filter — for categories present in the base pack, only include newer drivers.
         # For missing categories, include ALL drivers (we need them regardless of date).
         $IsMissing = $MissingSet.Contains($ResolvedCategory)
-        if (-not $IsMissing -and $ComponentDate -le $BaselineParsed) { continue }
+        if (-not $IsMissing -and $ComponentDate -le $BaselineParsed) {
+            $SkippedDate++
+            continue
+        }
 
         # Build download URL
         $DownloadPath = $Component.path -replace '^/', ''
@@ -491,12 +531,19 @@ function Get-DellIndividualDrivers {
         })
     }
 
+    # Log diagnostic summary
+    Write-DATLog -Message ("Dell catalog scan: $TotalScanned components scanned, " +
+        "$SkippedPkgType non-driver (packageType), $SkippedExcluded excluded (name), " +
+        "$SkippedNoSysMatch wrong SystemID, $SkippedDate older than baseline, " +
+        "$($MatchedDrivers.Count) matched") -Severity 1
+
     if ($MatchedDrivers.Count -eq 0) {
-        $Msg = "No individual drivers newer than $BaselineDate found for SystemID $SystemID"
+        $Msg = "No individual drivers found for SystemID $SystemID"
         if ($MissingSet.Count -gt 0) {
-            $Msg += " (also checked missing categories: $($MissingCategories -join ', '))"
+            $Msg += " (checked missing categories: $($MissingCategories -join ', '))"
         }
-        Write-DATLog -Message $Msg -Severity 1
+        $Msg += " — baseline date: $BaselineDate"
+        Write-DATLog -Message $Msg -Severity 2
         return $null
     }
 
@@ -524,9 +571,8 @@ function Get-DellIndividualDrivers {
     }
 
     foreach ($Drv in $LatestPerDriver) {
-        if ($Drv.IsMissing) {
-            Write-DATLog -Message "  [MISSING] $($Drv.Category): $($Drv.Name) v$($Drv.Version)" -Severity 1
-        }
+        $Tag = if ($Drv.IsMissing) { '[MISSING]' } else { '[UPDATE]' }
+        Write-DATLog -Message "  $Tag $($Drv.Category): $($Drv.Name) v$($Drv.Version) ($($Drv.ReleaseDate))" -Severity 1
     }
 
     return @($LatestPerDriver)
