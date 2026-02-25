@@ -245,8 +245,10 @@ function New-DATDriverPackage {
 
                             if ($_.Exception.Message -match 'PackageID="([^"]+)"') {
                                 $LockedID = $Matches[1]
+                                $IsLastAttempt = $Attempt -ge $MaxRetries
                                 Invoke-DATReleaseStaleLock -PackageID $LockedID `
-                                    -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
+                                    -SiteServer $SiteServer -WmiNamespace $WmiNamespace `
+                                    -LastResort:$IsLastAttempt | Out-Null
 
                                 # Check if the locked PackageID is a ghost package we can adopt
                                 $GhostPkg = Get-CMPackage -Id $LockedID -Fast -ErrorAction SilentlyContinue
@@ -465,8 +467,10 @@ function New-DATCMDriverPackage {
 
                             if ($_.Exception.Message -match 'PackageID="([^"]+)"') {
                                 $LockedID = $Matches[1]
+                                $IsLastAttempt = $Attempt -ge $MaxRetries
                                 Invoke-DATReleaseStaleLock -PackageID $LockedID `
-                                    -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
+                                    -SiteServer $SiteServer -WmiNamespace $WmiNamespace `
+                                    -LastResort:$IsLastAttempt | Out-Null
 
                                 # Check if the locked PackageID is a ghost package we can adopt
                                 $GhostPkg = Get-CMDriverPackage -Id $LockedID -ErrorAction SilentlyContinue
@@ -798,15 +802,17 @@ function Get-DATKnownModels {
 function Invoke-DATClearAllStaleLocks {
     <#
     .SYNOPSIS
-        Clears ALL SEDO locks at sync startup using a two-phase approach.
+        Clears known SEDO locks at sync startup (lightweight — no service restarts).
     .DESCRIPTION
         Phase 1: Releases locks via WMI (SMS_ObjectLockRequest.ReleaseLock) which
         properly communicates with the SMS Provider's in-memory lock cache.
 
         Phase 2 (fallback): If WMI release fails or locks remain, deletes directly
-        from the SEDO_LockState SQL table and restarts SMS_EXECUTIVE so the provider
-        re-reads the (now empty) table. Without the restart, the provider's in-memory
-        cache retains stale lock state and continues to block package operations.
+        from the SEDO_LockState SQL table.
+
+        Does NOT restart SMS_EXECUTIVE. If ghost locks remain in SMS Provider memory,
+        they will be detected and handled lazily when actual lock errors occur during
+        package operations (Invoke-DATReleaseStaleLock handles escalation).
 
         Called once at sync startup before any processing.
     .PARAMETER SiteServer
@@ -814,7 +820,7 @@ function Invoke-DATClearAllStaleLocks {
     .PARAMETER SiteCode
         The ConfigMgr site code (used to derive database name CM_{SiteCode}).
     .OUTPUTS
-        Returns the number of locks cleared, or -1 on failure.
+        Returns the number of locks cleared, or 0 if environment is clean.
     #>
     param(
         [Parameter(Mandatory)]
@@ -826,7 +832,7 @@ function Invoke-DATClearAllStaleLocks {
 
     $WmiNamespace = "root\SMS\site_$SiteCode"
     $DbName = "CM_$SiteCode"
-    Write-DATLog -Message "Clearing all SEDO locks from $SiteServer..." -Severity 1
+    Write-DATLog -Message "Checking for SEDO locks on $SiteServer..." -Severity 1
 
     # --- Phase 1: WMI-based lock release (proper SMS Provider channel) ---
     $WmiCleared = $false
@@ -844,7 +850,6 @@ function Invoke-DATClearAllStaleLocks {
                 $ObjPath = $Lock.ObjectRelPath
                 Write-DATLog -Message "  Lock: $ObjPath (User: $($Lock.AssignedUser), Machine: $($Lock.AssignedMachine))" -Severity 1
                 try {
-                    # ReleaseLock via SMS_ObjectLockRequest (not SMS_ObjectLock which is read-only)
                     Invoke-WmiMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
                         -Class SMS_ObjectLockRequest -Name ReleaseLock `
                         -ArgumentList @($ObjPath) -ErrorAction Stop | Out-Null
@@ -854,7 +859,6 @@ function Invoke-DATClearAllStaleLocks {
                 }
             }
 
-            # Also call ReleaseAllLocks to catch any locks not enumerated above
             try {
                 Invoke-WmiMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
                     -Class SMS_ObjectLockRequest -Name ReleaseAllLocks -ErrorAction Stop | Out-Null
@@ -880,13 +884,11 @@ function Invoke-DATClearAllStaleLocks {
             $WmiCleared = $true
         }
     } catch {
-        Write-DATLog -Message "WMI lock query failed: $($_.Exception.Message) - falling back to alternate methods" -Severity 2
+        Write-DATLog -Message "WMI lock query unavailable: $($_.Exception.Message)" -Severity 2
         $WmiFailed = $true
     }
 
     # --- Phase 1b: Blind ReleaseAllLocks even when enumeration failed ---
-    # SMS_ObjectLockRequest.ReleaseAllLocks may work even if SMS_ObjectLock enumeration fails.
-    # This can clear session-held locks without needing to enumerate them first.
     if ($WmiFailed) {
         try {
             Invoke-WmiMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
@@ -924,17 +926,42 @@ function Invoke-DATClearAllStaleLocks {
         }
     }
 
-    # --- Phase 2: SQL cleanup + SMS_EXECUTIVE restart ---
-    # Direct SQL manipulation bypasses the SMS Provider's in-memory lock cache.
-    # We MUST restart SMS_EXECUTIVE after the DELETE so the provider re-reads
-    # the (now empty) SEDO_LockState table. Without this restart, the provider
-    # still thinks locks exist and ALL package operations fail — even from other tools.
+    # If WMI failed and SQL has nothing, don't restart — handle lazily if lock errors occur
+    if ($WmiFailed) {
+        try {
+            $SqlCount = Invoke-Command -ComputerName $SiteServer -ScriptBlock {
+                param($Database)
+                try {
+                    $ConnStr = "Server=localhost;Database=$Database;Integrated Security=True;Connection Timeout=15"
+                    $Conn = New-Object System.Data.SqlClient.SqlConnection($ConnStr)
+                    $Conn.Open()
+                    $Cmd = $Conn.CreateCommand()
+                    $Cmd.CommandText = "SELECT COUNT(*) FROM SEDO_LockState"
+                    $Count = [int]$Cmd.ExecuteScalar()
+                    $Conn.Close()
+                    return $Count
+                } catch { return -1 }
+            } -ArgumentList $DbName -ErrorAction Stop
+
+            if ($SqlCount -le 0) {
+                Write-DATLog -Message "WMI unavailable but no locks in SQL - proceeding (will handle lock errors lazily if they occur)" -Severity 1
+                return 0
+            }
+            Write-DATLog -Message "WMI unavailable and SQL has $SqlCount lock(s) - cleaning up" -Severity 2
+        } catch {
+            Write-DATLog -Message "Cannot check SQL for locks - proceeding (will handle lock errors lazily if they occur)" -Severity 2
+            return 0
+        }
+    }
+
+    # --- Phase 2: SQL cleanup (no service restart) ---
+    # Delete locks from SQL. If ghost locks exist in SMS Provider memory, they'll be
+    # detected when actual package operations fail and handled by Invoke-DATReleaseStaleLock.
     try {
         $Result = Invoke-Command -ComputerName $SiteServer -ScriptBlock {
             param($Database)
-            $Out = @{ SqlDeleted = 0; SqlError = ''; SvcRestarted = $false; SvcError = '' }
+            $Out = @{ SqlDeleted = 0; SqlError = '' }
 
-            # Step 1: SQL DELETE
             try {
                 $ConnStr = "Server=localhost;Database=$Database;Integrated Security=True;Connection Timeout=15"
                 $Conn = New-Object System.Data.SqlClient.SqlConnection($ConnStr)
@@ -954,155 +981,49 @@ function Invoke-DATClearAllStaleLocks {
                 $Out.SqlError = $_.Exception.Message
             }
 
-            # Step 2: Restart SMS_EXECUTIVE to flush the in-memory lock cache
-            if ($Out.SqlDeleted -gt 0) {
-                try {
-                    Restart-Service -Name 'SMS_EXECUTIVE' -Force -ErrorAction Stop
-                    $Elapsed = 0
-                    while ($Elapsed -lt 120) {
-                        Start-Sleep -Seconds 5
-                        $Elapsed += 5
-                        $Svc = Get-Service -Name 'SMS_EXECUTIVE' -ErrorAction SilentlyContinue
-                        if ($Svc -and $Svc.Status -eq 'Running') {
-                            $Out.SvcRestarted = $true
-                            break
-                        }
-                    }
-                } catch {
-                    $Out.SvcError = $_.Exception.Message
-                }
-            }
-
             return $Out
         } -ArgumentList $DbName -ErrorAction Stop
 
         if ($Result.SqlDeleted -gt 0) {
             Write-DATLog -Message "Deleted $($Result.SqlDeleted) SEDO lock(s) from SQL" -Severity 1
-            if ($Result.SvcRestarted) {
-                Write-DATLog -Message "SMS_EXECUTIVE restarted to flush provider lock cache" -Severity 1
-                # Allow SMS Provider to fully initialize after service restart
-                Write-DATLog -Message "Waiting for SMS Provider to initialize..." -Severity 1
-                Start-Sleep -Seconds 30
-                Write-DATLog -Message "SMS Provider should be ready" -Severity 1
-            } elseif ($Result.SvcError) {
-                Write-DATLog -Message "WARNING: SMS_EXECUTIVE restart failed: $($Result.SvcError)" -Severity 2
-                Write-DATLog -Message "The SMS Provider may still cache stale locks. Consider restarting SMS_EXECUTIVE manually." -Severity 2
-            }
+            Start-Sleep -Seconds 5
         } elseif ($Result.SqlError) {
             Write-DATLog -Message "SQL lock cleanup failed: $($Result.SqlError)" -Severity 2
-            return -1
         } else {
             Write-DATLog -Message "No SEDO locks found in SQL" -Severity 1
-        }
-
-        # --- Phase 3: Flush ghost locks from SMS Provider memory ---
-        # When WMI can't enumerate locks (Generic failure) AND SQL has no lock rows,
-        # ghost locks may exist ONLY in the SMS Provider's in-memory cache. These locks
-        # (epoch timestamp 12/31/1969, Unassigned state, no owner) survive indefinitely
-        # and block all package operations. The only way to clear them is to restart
-        # SMS_EXECUTIVE so the provider re-reads the (empty) SEDO_LockState table.
-        $NeedProviderFlush = ($Result.SqlDeleted -gt 0 -and -not $Result.SvcRestarted) -or
-                             ($WmiFailed -and [int]$Result.SqlDeleted -eq 0)
-
-        if ($NeedProviderFlush) {
-            if ($WmiFailed -and [int]$Result.SqlDeleted -eq 0) {
-                Write-DATLog -Message "WMI cannot enumerate locks and SQL has none - ghost locks likely exist in SMS Provider memory only" -Severity 2
-            }
-            Write-DATLog -Message "Restarting SMS_EXECUTIVE to flush provider lock cache..." -Severity 1
-
-            try {
-                $SvcResult = Invoke-Command -ComputerName $SiteServer -ScriptBlock {
-                    try {
-                        Restart-Service -Name 'SMS_EXECUTIVE' -Force -ErrorAction Stop
-                        $Elapsed = 0
-                        while ($Elapsed -lt 120) {
-                            Start-Sleep -Seconds 5
-                            $Elapsed += 5
-                            $Svc = Get-Service -Name 'SMS_EXECUTIVE' -ErrorAction SilentlyContinue
-                            if ($Svc -and $Svc.Status -eq 'Running') {
-                                return @{ Restarted = $true; WaitSec = $Elapsed }
-                            }
-                        }
-                        return @{ Restarted = $false; WaitSec = $Elapsed; Error = 'Timed out waiting for service' }
-                    } catch {
-                        return @{ Restarted = $false; WaitSec = 0; Error = $_.Exception.Message }
-                    }
-                } -ErrorAction Stop
-
-                if ($SvcResult.Restarted) {
-                    Write-DATLog -Message "SMS_EXECUTIVE restarted ($($SvcResult.WaitSec)s) - waiting for SMS Provider to initialize..." -Severity 1
-                    Start-Sleep -Seconds 30
-                    Write-DATLog -Message "SMS Provider initialized - ghost locks flushed" -Severity 1
-                } else {
-                    Write-DATLog -Message "WARNING: SMS_EXECUTIVE restart failed: $($SvcResult.Error)" -Severity 2
-                    Write-DATLog -Message "Ghost locks may still block package operations. Consider restarting SMS_EXECUTIVE manually." -Severity 2
-                }
-            } catch {
-                Write-DATLog -Message "Could not restart SMS_EXECUTIVE: $($_.Exception.Message)" -Severity 2
-                Write-DATLog -Message "If package creation fails with lock errors, restart SMS_EXECUTIVE manually on $SiteServer" -Severity 2
-            }
         }
 
         return [Math]::Max($LocksFound, [int]$Result.SqlDeleted)
     } catch {
         Write-DATLog -Message "Could not run SQL lock cleanup on site server: $($_.Exception.Message)" -Severity 2
-
-        # Even if SQL cleanup fails, try restarting SMS_EXECUTIVE when WMI failed —
-        # this is the last resort to flush ghost locks from provider memory
-        if ($WmiFailed) {
-            Write-DATLog -Message "Attempting SMS_EXECUTIVE restart as last resort to clear ghost locks..." -Severity 2
-            try {
-                $SvcResult = Invoke-Command -ComputerName $SiteServer -ScriptBlock {
-                    try {
-                        Restart-Service -Name 'SMS_EXECUTIVE' -Force -ErrorAction Stop
-                        $Elapsed = 0
-                        while ($Elapsed -lt 120) {
-                            Start-Sleep -Seconds 5
-                            $Elapsed += 5
-                            $Svc = Get-Service -Name 'SMS_EXECUTIVE' -ErrorAction SilentlyContinue
-                            if ($Svc -and $Svc.Status -eq 'Running') {
-                                return @{ Restarted = $true; WaitSec = $Elapsed }
-                            }
-                        }
-                        return @{ Restarted = $false; Error = 'Timed out' }
-                    } catch {
-                        return @{ Restarted = $false; Error = $_.Exception.Message }
-                    }
-                } -ErrorAction Stop
-
-                if ($SvcResult.Restarted) {
-                    Write-DATLog -Message "SMS_EXECUTIVE restarted ($($SvcResult.WaitSec)s) - waiting for SMS Provider..." -Severity 1
-                    Start-Sleep -Seconds 30
-                    Write-DATLog -Message "SMS Provider initialized" -Severity 1
-                } else {
-                    Write-DATLog -Message "SMS_EXECUTIVE restart failed: $($SvcResult.Error)" -Severity 2
-                }
-            } catch {
-                Write-DATLog -Message "Last-resort SMS_EXECUTIVE restart failed: $($_.Exception.Message)" -Severity 2
-            }
-        }
-
-        return -1
+        return 0
     }
 }
 
 function Invoke-DATReleaseStaleLock {
     <#
     .SYNOPSIS
-        Releases SEDO locks on a specific package using three escalating strategies.
+        Releases SEDO locks on a specific package using four escalating strategies.
     .DESCRIPTION
         Attempts to clear SEDO locks for a specific package by:
         1. Unlock-CMObject cmdlet (works for current-session locks)
-        2. SMS_ObjectLockRequest.ReleaseLock WMI method — queries SMS_ObjectLock for
-           both SMS_Package and SMS_DriverPackage object paths, then releases each
-           lock through the proper WMI channel (not the read-only SMS_ObjectLock class)
-        3. SQL DELETE via Invoke-Command on the site server (clears all locks as fallback)
+        2. SMS_ObjectLockRequest.ReleaseLock WMI method — releases locks for
+           both SMS_Package and SMS_DriverPackage object paths
+        3. SQL DELETE via Invoke-Command on the site server (clears all locks)
+        4. SMS_EXECUTIVE restart (last resort for ghost locks in provider memory)
+
+        Strategy 4 is only triggered when the caller sets -LastResort, indicating
+        that all retry attempts have been exhausted and the lock persists.
     .PARAMETER PackageID
         The SCCM package ID to check and release locks for.
     .PARAMETER SiteServer
         The ConfigMgr site server hostname.
     .PARAMETER WmiNamespace
         The WMI namespace for this site (e.g. root\SMS\site_P01).
+    .PARAMETER LastResort
+        When set, escalates to SMS_EXECUTIVE restart if softer strategies fail.
+        Only use this on the final retry attempt — the restart is slow but
+        guaranteed to flush ghost locks from SMS Provider memory.
     .OUTPUTS
         Returns $true if lock cleanup was attempted, $false on failure.
     #>
@@ -1114,7 +1035,9 @@ function Invoke-DATReleaseStaleLock {
         [string]$SiteServer,
 
         [Parameter(Mandatory)]
-        [string]$WmiNamespace
+        [string]$WmiNamespace,
+
+        [switch]$LastResort
     )
 
     # --- Strategy 1: Try Unlock-CMObject first (works for current-session locks) ---
@@ -1135,10 +1058,6 @@ function Invoke-DATReleaseStaleLock {
     }
 
     # --- Strategy 2: WMI-based release via SMS_ObjectLockRequest ---
-    # Call ReleaseLock DIRECTLY for both SMS_Package and SMS_DriverPackage paths
-    # without first enumerating via SMS_ObjectLock (which may fail with "Generic failure").
-    # The ReleaseLock method communicates with the SMS Provider and can release locks
-    # even when the read-only SMS_ObjectLock enumeration class is inaccessible.
     $ObjectPaths = @(
         "SMS_Package.PackageID=`"$PackageID`"",
         "SMS_DriverPackage.PackageID=`"$PackageID`""
@@ -1158,7 +1077,6 @@ function Invoke-DATReleaseStaleLock {
         }
     }
 
-    # Also try ReleaseAllLocks as a broader sweep
     if (-not $WmiReleased) {
         try {
             Invoke-WmiMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
@@ -1176,14 +1094,10 @@ function Invoke-DATReleaseStaleLock {
     }
 
     # --- Strategy 3: SQL DELETE via Invoke-Command on the site server ---
-    # Clear ALL SEDO locks as a fallback — the SEDO_LockState table has no ObjectRelPath
-    # column so we cannot target a specific package. Since this function is only called
-    # when we've already hit a lock error, aggressive cleanup is appropriate.
-    # Note: We do NOT restart SMS_EXECUTIVE here — the startup function handles that.
-    # The retry loop in the caller will attempt the operation again after a delay.
     $DbName = "CM_$($script:CMSiteCode)"
     Write-DATLog -Message "  Attempting SQL cleanup of SEDO locks..." -Severity 1
 
+    $SqlCleaned = $false
     try {
         $Result = Invoke-Command -ComputerName $SiteServer -ScriptBlock {
             param($Database)
@@ -1204,8 +1118,11 @@ function Invoke-DATReleaseStaleLock {
 
         if ($Result.Success -and $Result.Count -gt 0) {
             Write-DATLog -Message "  Deleted $($Result.Count) SEDO lock(s) via SQL" -Severity 1
-            Start-Sleep -Seconds 5
-            return $true
+            $SqlCleaned = $true
+            if (-not $LastResort) {
+                Start-Sleep -Seconds 5
+                return $true
+            }
         } elseif ($Result.Success) {
             Write-DATLog -Message "  No SEDO locks found in SQL table" -Severity 1
         } else {
@@ -1213,6 +1130,44 @@ function Invoke-DATReleaseStaleLock {
         }
     } catch {
         Write-DATLog -Message "  SQL cleanup via Invoke-Command failed: $($_.Exception.Message)" -Severity 2
+    }
+
+    # --- Strategy 4: SMS_EXECUTIVE restart (last resort for ghost locks) ---
+    # Ghost locks only exist in SMS Provider memory — not in WMI or SQL. The only
+    # way to flush them is to restart SMS_EXECUTIVE so the provider re-reads the
+    # (now empty) SEDO_LockState table. Only triggered on the final retry attempt.
+    if ($LastResort) {
+        Write-DATLog -Message "  All lock release strategies exhausted - restarting SMS_EXECUTIVE to flush ghost locks..." -Severity 2
+        try {
+            $SvcResult = Invoke-Command -ComputerName $SiteServer -ScriptBlock {
+                try {
+                    Restart-Service -Name 'SMS_EXECUTIVE' -Force -ErrorAction Stop
+                    $Elapsed = 0
+                    while ($Elapsed -lt 120) {
+                        Start-Sleep -Seconds 5
+                        $Elapsed += 5
+                        $Svc = Get-Service -Name 'SMS_EXECUTIVE' -ErrorAction SilentlyContinue
+                        if ($Svc -and $Svc.Status -eq 'Running') {
+                            return @{ Restarted = $true; WaitSec = $Elapsed }
+                        }
+                    }
+                    return @{ Restarted = $false; Error = 'Timed out waiting for service' }
+                } catch {
+                    return @{ Restarted = $false; Error = $_.Exception.Message }
+                }
+            } -ErrorAction Stop
+
+            if ($SvcResult.Restarted) {
+                Write-DATLog -Message "  SMS_EXECUTIVE restarted ($($SvcResult.WaitSec)s) - waiting for SMS Provider to initialize..." -Severity 1
+                Start-Sleep -Seconds 30
+                Write-DATLog -Message "  SMS Provider initialized - ghost locks flushed" -Severity 1
+                return $true
+            } else {
+                Write-DATLog -Message "  SMS_EXECUTIVE restart failed: $($SvcResult.Error)" -Severity 2
+            }
+        } catch {
+            Write-DATLog -Message "  Could not restart SMS_EXECUTIVE: $($_.Exception.Message)" -Severity 2
+        }
     }
 
     Start-Sleep -Seconds 2
@@ -1289,9 +1244,10 @@ function Remove-DATLegacyPackage {
                     $ErrMsg = $_.Exception.Message
                     if ($Attempt -lt $MaxRetries -and $ErrMsg -match 'lock') {
                         Write-DATLog -Message "  Attempt $Attempt/$MaxRetries failed (lock): $ErrMsg" -Severity 2
-                        # Try releasing again — each attempt uses all available strategies
+                        $IsLastAttempt = $Attempt -ge ($MaxRetries - 1)
                         Invoke-DATReleaseStaleLock -PackageID $PackageID `
-                            -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
+                            -SiteServer $SiteServer -WmiNamespace $WmiNamespace `
+                            -LastResort:$IsLastAttempt | Out-Null
                         $WaitSec = $Attempt * 5
                         Write-DATLog -Message "  Waiting $WaitSec seconds before retry..." -Severity 1
                         Start-Sleep -Seconds $WaitSec
