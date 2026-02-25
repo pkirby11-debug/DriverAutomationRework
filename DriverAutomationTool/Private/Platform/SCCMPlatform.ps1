@@ -282,7 +282,7 @@ function New-DATDriverPackage {
                 Invoke-DATReleaseStaleLock -PackageID $PackageID `
                     -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
 
-                # Set BDR and priority — non-fatal so package still gets returned for distribution
+                # Set BDR and priority - non-fatal so package still gets returned for distribution
                 try {
                     if ($EnableBDR) {
                         Set-CMPackage -Id $PackageID -EnableBinaryDeltaReplication $true
@@ -293,7 +293,7 @@ function New-DATDriverPackage {
                 }
             }
 
-            # Move to console folder if specified — non-fatal
+            # Move to console folder if specified - non-fatal
             if ($FolderPath) {
                 try {
                     Set-DATPackageFolder -PackageID $PackageID -FolderPath $FolderPath
@@ -517,7 +517,7 @@ function New-DATCMDriverPackage {
                 Invoke-DATReleaseStaleLock -PackageID $PackageID `
                     -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
 
-                # Set version, BDR, and priority — non-fatal so package still gets returned for distribution
+                # Set version, BDR, and priority - non-fatal so package still gets returned for distribution
                 try {
                     Set-CMDriverPackage -Id $PackageID -Version $Version
 
@@ -531,7 +531,7 @@ function New-DATCMDriverPackage {
                 }
             }
 
-            # Move to console folder if specified — non-fatal
+            # Move to console folder if specified - non-fatal
             if ($FolderPath) {
                 try {
                     Set-DATPackageFolder -PackageID $PackageID -FolderPath $FolderPath -ObjectType 'DriverPackage'
@@ -642,7 +642,7 @@ function Distribute-DATContent {
     try {
         Set-Location -Path "$($script:CMSiteCode):"
 
-        # Release any SEDO lock before distributing — creation or Set-CM* calls
+        # Release any SEDO lock before distributing - creation or Set-CM* calls
         # may have left a lock that blocks Start-CMContentDistribution.
         $WmiNamespace = "root\SMS\site_$($script:CMSiteCode)"
         Invoke-DATReleaseStaleLock -PackageID $PackageID `
@@ -836,7 +836,7 @@ function Invoke-DATReleaseStaleLock {
     .DESCRIPTION
         Attempts to clear SEDO locks for a specific package by:
         1. Unlock-CMObject cmdlet (works for current-session locks)
-        2. SMS_ObjectLockRequest.ReleaseLock WMI method — releases locks for
+        2. SMS_ObjectLockRequest.ReleaseLock WMI method - releases locks for
            both SMS_Package and SMS_DriverPackage object paths
         3. SQL DELETE via Invoke-Command on the site server (clears all locks)
         4. SMS_EXECUTIVE restart (last resort for ghost locks in provider memory)
@@ -851,7 +851,7 @@ function Invoke-DATReleaseStaleLock {
         The WMI namespace for this site (e.g. root\SMS\site_P01).
     .PARAMETER LastResort
         When set, escalates to SMS_EXECUTIVE restart if softer strategies fail.
-        Only use this on the final retry attempt — the restart is slow but
+        Only use this on the final retry attempt - the restart is slow but
         guaranteed to flush ghost locks from SMS Provider memory.
     .OUTPUTS
         Returns $true if lock cleanup was attempted, $false on failure.
@@ -962,7 +962,7 @@ function Invoke-DATReleaseStaleLock {
     }
 
     # --- Strategy 4: SMS_EXECUTIVE restart (last resort for ghost locks) ---
-    # Ghost locks only exist in SMS Provider memory — not in WMI or SQL. The only
+    # Ghost locks only exist in SMS Provider memory - not in WMI or SQL. The only
     # way to flush them is to restart SMS_EXECUTIVE so the provider re-reads the
     # (now empty) SEDO_LockState table. Only triggered on the final retry attempt.
     if ($LastResort) {
@@ -1084,7 +1084,7 @@ function Remove-DATLegacyPackage {
                         Write-DATLog -Message "  Attempt $Attempt/$MaxRetries failed: $ErrMsg - retrying..." -Severity 2
                         Start-Sleep -Seconds ($Attempt * 3)
                     } else {
-                        # Final attempt failed — try WMI direct deletion as last resort
+                        # Final attempt failed - try WMI direct deletion as last resort
                         Write-DATLog -Message "  All CM cmdlet attempts failed. Trying direct WMI package deletion..." -Severity 2
                         try {
                             $WmiPkg = Get-WmiObject -ComputerName $SiteServer `

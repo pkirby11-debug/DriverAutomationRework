@@ -374,7 +374,7 @@ function Invoke-DATSyncSinglePackage {
     # Check if this version already exists (use correct lookup based on deployment platform)
     $IsDriverPkg = ($DeploymentPlatform -eq 'ConfigMgr - Driver Pkg')
 
-    # Find ALL existing packages for this model/type (any version) — used for duplicate prevention
+    # Find ALL existing packages for this model/type (any version) - used for duplicate prevention
     $AllExisting = if ($IsDriverPkg) {
         Find-DATExistingDriverPackages -Manufacturer $Make -Model $ModelName -Type $Type |
             Where-Object { $_.Name -eq $PackageName }
@@ -387,7 +387,7 @@ function Invoke-DATSyncSinglePackage {
     $Existing = $AllExisting | Where-Object { $_.Version -eq $Version }
 
     # For individual driver overlay, also match packages whose version starts with the
-    # base version (e.g. "A01.OVL.abc123" starts with "A01") — these are previous overlay runs
+    # base version (e.g. "A01.OVL.abc123" starts with "A01") - these are previous overlay runs
     $OverlayExisting = $null
     if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers' -and -not $Existing) {
         $OverlayExisting = $AllExisting | Where-Object { $_.Version -like "$Version.OVL.*" -or $_.Version -like "$Version.*" }
@@ -396,7 +396,7 @@ function Invoke-DATSyncSinglePackage {
     # --- Smart overlay skip: check if individual drivers have changed before re-building ---
     # When UpdateIndividualDrivers is enabled and a package already exists (base or overlay version),
     # query the Dell catalog for available individual drivers and compute a fingerprint. If the
-    # fingerprint matches what's embedded in the existing package version, nothing has changed → skip.
+    # fingerprint matches what's embedded in the existing package version, nothing has changed - skip.
     #
     # The smart check also scans the existing package source for missing driver categories
     # (via INF Class= parsing) so that missing-category drivers are included in the fingerprint.
@@ -482,11 +482,11 @@ function Invoke-DATSyncSinglePackage {
                 }
             } else {
                 # No individual drivers newer than baseline found in catalog.
-                # Only safe to skip if the source scan completed successfully — meaning we
+                # Only safe to skip if the source scan completed successfully - meaning we
                 # could reliably detect which categories were present/missing. If the source
                 # wasn't accessible (network share down, WIM-compressed, etc.), we can't be
                 # sure there aren't missing categories, so fall through to the full
-                # download → extract → scan path.
+                # download - extract - scan path.
                 if ($SourceScanComplete) {
                     if ($Existing) {
                         Write-DATLog -Message "No newer individual drivers found and base package exists at v$Version - Skipping" -Severity 1
@@ -682,7 +682,7 @@ function Invoke-DATSyncSinglePackage {
             Write-DATLog -Message "Checking for individual Dell drivers for $ModelName..." -Severity 1
             try {
                 # Detect missing categories by scanning INF files in the extracted base pack.
-                # "Other" is always treated as missing since INF scans can't detect it —
+                # "Other" is always treated as missing since INF scans can't detect it -
                 # this ensures unclassified drivers from the Dell catalog are always checked.
                 $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input', 'Other')
                 $PresentCategories = Get-DATBasePackCategories -Path $PackageSourceDir
@@ -888,7 +888,7 @@ function Invoke-DATSyncSinglePackage {
         }
     }
 
-    # Remove duplicate packages (same name, different PackageID) — prevents accumulation
+    # Remove duplicate packages (same name, different PackageID) - prevents accumulation
     if ($PkgResult -and $AllExisting) {
         $Duplicates = @($AllExisting | Where-Object { $_.PackageID -ne $PkgResult.PackageID })
         foreach ($Dup in $Duplicates) {
