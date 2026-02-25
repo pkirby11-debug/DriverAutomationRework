@@ -807,6 +807,7 @@ function Invoke-DATSyncSinglePackage {
         }
 
         # Compress driver package if requested (BIOS packages are never compressed)
+        $OrigExtractDir = $null
         if ($CompressPackage) {
             $OrigExtractDir = $PackageSourceDir
             Write-DATLog -Message "Compressing package as $CompressionType..." -Severity 1
@@ -816,11 +817,9 @@ function Invoke-DATSyncSinglePackage {
             # Use the compressed output directory as the package source
             $PackageSourceDir = Split-Path $CompressedPath -Parent
 
-            # Clean up extracted source files, leaving only the compressed output (WIM/ZIP)
-            if ($OrigExtractDir -ne $PackageSourceDir -and (Test-Path $OrigExtractDir)) {
-                Write-DATLog -Message "Cleaning up extracted source files from $OrigExtractDir" -Severity 1
-                Remove-Item -Path $OrigExtractDir -Recurse -Force -ErrorAction SilentlyContinue
-            }
+            # NOTE: Do NOT delete $OrigExtractDir here. Defer cleanup until after
+            # the ConfigMgr package is successfully created, to avoid ghost locks
+            # caused by partial package creation failures.
         }
     }
 
@@ -855,6 +854,12 @@ function Invoke-DATSyncSinglePackage {
                 -Description $PackageDescription `
                 -FolderPath $FolderPath -EnableBDR:$EnableBDR
         }
+    }
+
+    # Clean up extracted source files now that the package was created successfully
+    if ($OrigExtractDir -and $OrigExtractDir -ne $PackageSourceDir -and (Test-Path $OrigExtractDir)) {
+        Write-DATLog -Message "Cleaning up extracted source files from $OrigExtractDir" -Severity 1
+        Remove-Item -Path $OrigExtractDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     # Distribute content
