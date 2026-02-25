@@ -417,6 +417,7 @@ function Invoke-DATSyncSinglePackage {
             } else { $null }
 
             if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
+                Write-DATLog -Message "Smart check: scanning package source: $($ExPkg.SourcePath)" -Severity 1
                 $PresentCats = Get-DATBasePackCategories -Path $ExPkg.SourcePath
 
                 # If no INFs found (e.g., WIM-compressed package source), check the sibling
@@ -425,13 +426,17 @@ function Invoke-DATSyncSinglePackage {
                 # compression) preserves the original INF files for category detection.
                 if ($PresentCats.Count -eq 0) {
                     $SourceLeaf = Split-Path $ExPkg.SourcePath -Leaf
+                    Write-DATLog -Message "Smart check: no INFs in package source (leaf: '$SourceLeaf'), checking for extracted sibling directory" -Severity 1
                     if ($SourceLeaf -like 'Compressed-*') {
                         $ExtractedLeaf = $SourceLeaf -replace '^Compressed-', ''
                         $ExtractedPath = Join-Path (Split-Path $ExPkg.SourcePath -Parent) $ExtractedLeaf
+                        Write-DATLog -Message "Smart check: looking for extracted directory: $ExtractedPath (exists: $(Test-Path $ExtractedPath))" -Severity 1
                         if (Test-Path $ExtractedPath) {
-                            Write-DATLog -Message "Smart check: package source is WIM-compressed, scanning extracted directory for INF files" -Severity 1
+                            Write-DATLog -Message "Smart check: found extracted directory, scanning for INF files" -Severity 1
                             $PresentCats = Get-DATBasePackCategories -Path $ExtractedPath
                         }
+                    } else {
+                        Write-DATLog -Message "Smart check: source directory name does not start with 'Compressed-' - cannot derive extracted path" -Severity 2
                     }
                 }
                 if ($PresentCats.Count -gt 0) {
@@ -653,29 +658,62 @@ function Invoke-DATSyncSinglePackage {
             } elseif ($FileName -like '*.zip') {
                 Expand-Archive -Path $DownloadDest -DestinationPath $PackageSourceDir -Force
             } elseif ($FileName -like '*.exe') {
-                # Dell and Lenovo driver packs may be self-extracting EXEs
-                Write-DATLog -Message "Extracting self-extracting EXE: $FileName" -Severity 1
-                $ExtractArgs = "/s /e=`"$PackageSourceDir`""
-                try {
-                    $Proc = Start-Process -FilePath $DownloadDest -ArgumentList $ExtractArgs -Wait -NoNewWindow -PassThru -ErrorAction Stop
-                    if ($Proc.ExitCode -ne 0) {
-                        Write-DATLog -Message "EXE extraction attempt 1 returned exit code $($Proc.ExitCode), trying alternate method" -Severity 2
-                    }
-                } catch {
-                    Write-DATLog -Message "EXE extraction attempt 1 failed: $($_.Exception.Message)" -Severity 2
-                }
+                Write-DATLog -Message "Extracting self-extracting EXE: $FileName ($Make)" -Severity 1
+                $ExeTimeout = 300000  # 5 minutes
 
-                # If that didn't work, try alternate extraction
-                if ((Get-ChildItem $PackageSourceDir -Recurse -File -ErrorAction SilentlyContinue).Count -eq 0) {
-                    Write-DATLog -Message "First extraction produced no files, trying /extract method" -Severity 2
-                    $ExtractArgs = "/extract:`"$PackageSourceDir`" /quiet"
+                if ($Make -eq 'Lenovo') {
+                    # Lenovo SCCM packs use InnoSetup: /VERYSILENT suppresses all UI
+                    # including EULA, /DIR sets extract location, /EXTRACT=YES extracts
+                    # without installing.
+                    $ExtractArgs = "/VERYSILENT /DIR=`"$PackageSourceDir`" /EXTRACT=`"YES`""
+                    Write-DATLog -Message "Using Lenovo extraction: $ExtractArgs" -Severity 1
                     try {
-                        $Proc2 = Start-Process -FilePath $DownloadDest -ArgumentList $ExtractArgs -Wait -NoNewWindow -PassThru -ErrorAction Stop
-                        if ($Proc2.ExitCode -ne 0) {
-                            Write-DATLog -Message "EXE extraction attempt 2 returned exit code $($Proc2.ExitCode)" -Severity 3
+                        $Proc = Start-Process -FilePath $DownloadDest -ArgumentList $ExtractArgs `
+                            -NoNewWindow -PassThru -ErrorAction Stop
+                        $Completed = $Proc.WaitForExit($ExeTimeout)
+                        if (-not $Completed) {
+                            Write-DATLog -Message "Lenovo extraction timed out after 5 minutes - killing process" -Severity 3
+                            $Proc.Kill()
+                        } elseif ($Proc.ExitCode -ne 0) {
+                            Write-DATLog -Message "Lenovo extraction returned exit code $($Proc.ExitCode)" -Severity 2
                         }
                     } catch {
-                        Write-DATLog -Message "EXE extraction attempt 2 failed: $($_.Exception.Message)" -Severity 3
+                        Write-DATLog -Message "Lenovo extraction failed: $($_.Exception.Message)" -Severity 2
+                    }
+                } else {
+                    # Dell and other OEMs: try /s /e="path" first, then /extract:"path" /quiet
+                    $ExtractArgs = "/s /e=`"$PackageSourceDir`""
+                    try {
+                        $Proc = Start-Process -FilePath $DownloadDest -ArgumentList $ExtractArgs `
+                            -NoNewWindow -PassThru -ErrorAction Stop
+                        $Completed = $Proc.WaitForExit($ExeTimeout)
+                        if (-not $Completed) {
+                            Write-DATLog -Message "EXE extraction timed out after 5 minutes - killing process" -Severity 3
+                            $Proc.Kill()
+                        } elseif ($Proc.ExitCode -ne 0) {
+                            Write-DATLog -Message "EXE extraction attempt 1 returned exit code $($Proc.ExitCode), trying alternate method" -Severity 2
+                        }
+                    } catch {
+                        Write-DATLog -Message "EXE extraction attempt 1 failed: $($_.Exception.Message)" -Severity 2
+                    }
+
+                    # If that didn't work, try alternate extraction
+                    if ((Get-ChildItem $PackageSourceDir -Recurse -File -ErrorAction SilentlyContinue).Count -eq 0) {
+                        Write-DATLog -Message "First extraction produced no files, trying /extract method" -Severity 2
+                        $ExtractArgs = "/extract:`"$PackageSourceDir`" /quiet"
+                        try {
+                            $Proc2 = Start-Process -FilePath $DownloadDest -ArgumentList $ExtractArgs `
+                                -NoNewWindow -PassThru -ErrorAction Stop
+                            $Completed = $Proc2.WaitForExit($ExeTimeout)
+                            if (-not $Completed) {
+                                Write-DATLog -Message "EXE extraction (attempt 2) timed out after 5 minutes - killing process" -Severity 3
+                                $Proc2.Kill()
+                            } elseif ($Proc2.ExitCode -ne 0) {
+                                Write-DATLog -Message "EXE extraction attempt 2 returned exit code $($Proc2.ExitCode)" -Severity 3
+                            }
+                        } catch {
+                            Write-DATLog -Message "EXE extraction attempt 2 failed: $($_.Exception.Message)" -Severity 3
+                        }
                     }
                 }
             }
@@ -764,13 +802,18 @@ function Invoke-DATSyncSinglePackage {
                                 New-Item -Path $ExtractDir -ItemType Directory -Force | Out-Null
 
                                 $OverlayExtracted = $false
+                                $OvlTimeout = 300000  # 5 minutes
 
                                 # Method 1: /s /e="path"
                                 try {
                                     $ExtractArgs = "/s /e=`"$ExtractDir`""
                                     $Proc = Start-Process -FilePath $DriverExePath -ArgumentList $ExtractArgs `
-                                        -Wait -NoNewWindow -PassThru -ErrorAction Stop
-                                    if ($Proc.ExitCode -eq 0 -and
+                                        -NoNewWindow -PassThru -ErrorAction Stop
+                                    $OvlCompleted = $Proc.WaitForExit($OvlTimeout)
+                                    if (-not $OvlCompleted) {
+                                        Write-DATLog -Message "Overlay extraction timed out for $($IndvDriver.Name) - killing process" -Severity 3
+                                        $Proc.Kill()
+                                    } elseif ($Proc.ExitCode -eq 0 -and
                                         @(Get-ChildItem $ExtractDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
                                         $OverlayExtracted = $true
                                     }
@@ -781,8 +824,12 @@ function Invoke-DATSyncSinglePackage {
                                     try {
                                         $ExtractArgs = "/extract:`"$ExtractDir`" /quiet"
                                         $Proc2 = Start-Process -FilePath $DriverExePath -ArgumentList $ExtractArgs `
-                                            -Wait -NoNewWindow -PassThru -ErrorAction Stop
-                                        if ($Proc2.ExitCode -eq 0 -and
+                                            -NoNewWindow -PassThru -ErrorAction Stop
+                                        $OvlCompleted = $Proc2.WaitForExit($OvlTimeout)
+                                        if (-not $OvlCompleted) {
+                                            Write-DATLog -Message "Overlay extraction (attempt 2) timed out for $($IndvDriver.Name) - killing process" -Severity 3
+                                            $Proc2.Kill()
+                                        } elseif ($Proc2.ExitCode -eq 0 -and
                                             @(Get-ChildItem $ExtractDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
                                             $OverlayExtracted = $true
                                         }
