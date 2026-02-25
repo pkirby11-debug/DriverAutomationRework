@@ -648,14 +648,42 @@ function Distribute-DATContent {
         Invoke-DATReleaseStaleLock -PackageID $PackageID `
             -SiteServer $script:CMSiteServer -WmiNamespace $WmiNamespace | Out-Null
 
-        # For existing packages: refresh content on all current distribution points
+        # For existing packages: refresh content on all current distribution points.
+        # This ensures DPs that already have the package receive the updated source content.
+        # Uses Update-CMDistributionPoint first, with a WMI RefreshPkgSource fallback
+        # if the cmdlet fails (e.g. due to SEDO locks or timing issues).
         if ($IsUpdate) {
+            $RefreshSucceeded = $false
             try {
                 Write-DATLog -Message "Refreshing content on existing distribution points for $PackageID" -Severity 1
                 Update-CMDistributionPoint -PackageId $PackageID -ErrorAction Stop
                 Write-DATLog -Message "Content refresh queued for $PackageID" -Severity 1
+                $RefreshSucceeded = $true
             } catch {
-                Write-DATLog -Message "Content refresh for $PackageID`: $($_.Exception.Message)" -Severity 2
+                Write-DATLog -Message "Update-CMDistributionPoint failed for $PackageID`: $($_.Exception.Message)" -Severity 2
+            }
+
+            # Fallback: use WMI to set RefreshNow on each DP that carries this package.
+            # This is a more direct call that bypasses the CM cmdlet layer.
+            if (-not $RefreshSucceeded) {
+                try {
+                    Write-DATLog -Message "Attempting WMI RefreshPkgSource fallback for $PackageID" -Severity 2
+                    $DPInstances = Get-WmiObject -ComputerName $script:CMSiteServer `
+                        -Namespace $WmiNamespace `
+                        -Query "SELECT * FROM SMS_DistributionPoint WHERE PackageID='$PackageID'" `
+                        -ErrorAction Stop
+                    if ($DPInstances) {
+                        foreach ($DPInst in $DPInstances) {
+                            $DPInst.RefreshNow = $true
+                            $DPInst.Put() | Out-Null
+                        }
+                        Write-DATLog -Message "WMI RefreshPkgSource set on $(@($DPInstances).Count) distribution point(s) for $PackageID" -Severity 1
+                    } else {
+                        Write-DATLog -Message "No existing distribution points found for $PackageID via WMI - content will be distributed fresh" -Severity 1
+                    }
+                } catch {
+                    Write-DATLog -Message "WMI RefreshPkgSource fallback failed for $PackageID`: $($_.Exception.Message)" -Severity 2
+                }
             }
         }
 
@@ -669,7 +697,11 @@ function Distribute-DATContent {
                         Write-DATLog -Message "Content distribution started: $PackageID -> $DP" -Severity 1
                     } catch {
                         if ($_.Exception.Message -match 'already been distributed|No content destination') {
-                            Write-DATLog -Message "Content already distributed: $PackageID -> $DP" -Severity 1
+                            if ($IsUpdate) {
+                                Write-DATLog -Message "DP $DP already has $PackageID - content refresh was triggered above" -Severity 1
+                            } else {
+                                Write-DATLog -Message "Content already distributed: $PackageID -> $DP" -Severity 1
+                            }
                         } else {
                             Write-DATLog -Message "Failed to distribute $PackageID to DP $DP`: $($_.Exception.Message)" -Severity 3
                         }
@@ -688,7 +720,11 @@ function Distribute-DATContent {
                         Write-DATLog -Message "Content distribution started: $PackageID -> DPG '$DPG'" -Severity 1
                     } catch {
                         if ($_.Exception.Message -match 'already been distributed|No content destination') {
-                            Write-DATLog -Message "Content already distributed: $PackageID -> DPG '$DPG'" -Severity 1
+                            if ($IsUpdate) {
+                                Write-DATLog -Message "DPG '$DPG' already has $PackageID - content refresh was triggered above" -Severity 1
+                            } else {
+                                Write-DATLog -Message "Content already distributed: $PackageID -> DPG '$DPG'" -Severity 1
+                            }
                         } else {
                             Write-DATLog -Message "Failed to distribute $PackageID to DPG '$DPG'`: $($_.Exception.Message)" -Severity 3
                         }

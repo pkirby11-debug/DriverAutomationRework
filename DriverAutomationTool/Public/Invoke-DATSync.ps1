@@ -941,12 +941,17 @@ function Invoke-DATSyncSinglePackage {
     # which driver categories are present vs missing, avoiding unnecessary re-downloads.
 
     # Distribute content
-    if ($PkgResult -and ($DistributionPoints -or $DistributionPointGroups)) {
+    # For NEW packages: only distribute if DPs/DPGs are configured.
+    # For UPDATED packages: always call Distribute-DATContent so that
+    # Update-CMDistributionPoint refreshes content on DPs that already have it,
+    # even when no explicit DP/DPG parameters were provided.
+    $IsPackageUpdate = $PkgResult -and (-not $PkgResult.IsNew)
+    if ($PkgResult -and ($DistributionPoints -or $DistributionPointGroups -or $IsPackageUpdate)) {
         if ($PSCmdlet.ShouldProcess($PkgResult.PackageID, 'Distribute content')) {
             Distribute-DATContent -PackageID $PkgResult.PackageID `
                 -DistributionPoints $DistributionPoints `
                 -DistributionPointGroups $DistributionPointGroups `
-                -IsUpdate:(-not $PkgResult.IsNew)
+                -IsUpdate:$IsPackageUpdate
         }
     }
 
