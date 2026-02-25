@@ -417,6 +417,7 @@ function Invoke-DATSyncSinglePackage {
             } else { $null }
 
             if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
+                Write-DATLog -Message "Smart check: scanning package source: $($ExPkg.SourcePath)" -Severity 1
                 $PresentCats = Get-DATBasePackCategories -Path $ExPkg.SourcePath
 
                 # If no INFs found (e.g., WIM-compressed package source), check the sibling
@@ -425,13 +426,17 @@ function Invoke-DATSyncSinglePackage {
                 # compression) preserves the original INF files for category detection.
                 if ($PresentCats.Count -eq 0) {
                     $SourceLeaf = Split-Path $ExPkg.SourcePath -Leaf
+                    Write-DATLog -Message "Smart check: no INFs in package source (leaf: '$SourceLeaf'), checking for extracted sibling directory" -Severity 1
                     if ($SourceLeaf -like 'Compressed-*') {
                         $ExtractedLeaf = $SourceLeaf -replace '^Compressed-', ''
                         $ExtractedPath = Join-Path (Split-Path $ExPkg.SourcePath -Parent) $ExtractedLeaf
+                        Write-DATLog -Message "Smart check: looking for extracted directory: $ExtractedPath (exists: $(Test-Path $ExtractedPath))" -Severity 1
                         if (Test-Path $ExtractedPath) {
-                            Write-DATLog -Message "Smart check: package source is WIM-compressed, scanning extracted directory for INF files" -Severity 1
+                            Write-DATLog -Message "Smart check: found extracted directory, scanning for INF files" -Severity 1
                             $PresentCats = Get-DATBasePackCategories -Path $ExtractedPath
                         }
+                    } else {
+                        Write-DATLog -Message "Smart check: source directory name does not start with 'Compressed-' - cannot derive extracted path" -Severity 2
                     }
                 }
                 if ($PresentCats.Count -gt 0) {
