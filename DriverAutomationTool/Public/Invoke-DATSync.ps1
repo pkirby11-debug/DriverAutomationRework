@@ -180,9 +180,6 @@ function Invoke-DATSync {
         Connect-DATConfigMgr @ConnectParams
     }
 
-    # Clear any orphaned SEDO locks before processing — prevents lock errors during package creation/updates
-    Invoke-DATClearAllStaleLocks -SiteServer $SiteServer -SiteCode $script:CMSiteCode
-
     # Process each manufacturer
     foreach ($Make in $Manufacturer) {
         Write-DATLog -Message "======== Processing $Make ========" -Severity 1
