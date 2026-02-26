@@ -348,6 +348,12 @@ function Get-DellIndividualDrivers {
         drivers released after the baseline date plus the latest driver for any
         categories missing from the base pack.
 
+        When -CategoryBaselines is provided (hashtable of category -> datetime), uses
+        the per-category DriverVer date from the extracted base pack as the cutoff
+        instead of the global BaselineDate. This is more accurate because the pack's
+        publish date can be AFTER an individual driver's release date even though
+        the pack doesn't actually contain that newer driver version.
+
         When -MissingCategories is provided, returns the latest driver for each
         missing category regardless of the baseline date. This covers the scenario
         where a base driver pack is missing an entire driver category (e.g., sound
@@ -360,8 +366,14 @@ function Get-DellIndividualDrivers {
     .PARAMETER SystemID
         The Dell SystemID(s), semicolon-delimited (e.g., '0991;09A1').
     .PARAMETER BaselineDate
-        Only return drivers with dateTime newer than this value.
-        Typically the driver pack's ReleaseDate.
+        Fallback date: only return drivers with dateTime newer than this value.
+        Typically the driver pack's ReleaseDate. Used when CategoryBaselines does
+        not contain an entry for a given category.
+    .PARAMETER CategoryBaselines
+        Hashtable mapping category name (Video, Network, Audio, etc.) to the newest
+        DriverVer datetime found in the base pack's INF files for that category.
+        When present, the per-category date is used instead of BaselineDate for
+        more accurate filtering.
     .PARAMETER MissingCategories
         Array of category names (Video, Network, Audio, Chipset, Storage, Input, Other)
         that are absent from the extracted base driver pack. For these categories,
@@ -377,6 +389,8 @@ function Get-DellIndividualDrivers {
 
         [Parameter(Mandatory)]
         [string]$BaselineDate,
+
+        [hashtable]$CategoryBaselines,
 
         [string[]]$MissingCategories
     )
@@ -508,10 +522,18 @@ function Get-DellIndividualDrivers {
 
         # Date filter - for categories present in the base pack, only include newer drivers.
         # For missing categories, include ALL drivers (we need them regardless of date).
+        # Use per-category DriverVer baseline when available (more accurate than pack date),
+        # falling back to the global pack release date.
         $IsMissing = $MissingSet.Contains($ResolvedCategory)
-        if (-not $IsMissing -and $ComponentDate -le $BaselineParsed) {
-            $SkippedDate++
-            continue
+        if (-not $IsMissing) {
+            $EffectiveBaseline = $BaselineParsed
+            if ($CategoryBaselines -and $CategoryBaselines.ContainsKey($ResolvedCategory)) {
+                $EffectiveBaseline = $CategoryBaselines[$ResolvedCategory]
+            }
+            if ($ComponentDate -le $EffectiveBaseline) {
+                $SkippedDate++
+                continue
+            }
         }
 
         # Build download URL
@@ -592,10 +614,17 @@ function Get-DATBasePackCategories {
         Maps these to the same category names used by Get-DellIndividualDrivers
         (Video, Network, Audio, Chipset, Storage, Input) so the caller can determine
         which categories are missing from the base pack.
+
+        Also extracts DriverVer= dates from INF files to determine the newest driver
+        date per category. This is used as a per-category baseline for individual
+        driver filtering, which is more accurate than using the pack's publish date
+        (Dell can publish a pack after a driver was released without including it).
     .PARAMETER Path
         Path to the extracted driver pack directory to scan.
     .OUTPUTS
-        Array of unique category name strings that are present in the pack.
+        Hashtable with:
+          Categories     - Array of unique category name strings present in the pack.
+          CategoryDates  - Hashtable mapping category name to newest DriverVer date (datetime).
     #>
     [CmdletBinding()]
     param(
@@ -605,7 +634,7 @@ function Get-DATBasePackCategories {
 
     if (-not (Test-Path $Path)) {
         Write-DATLog -Message "Base pack path not found for INF scan: $Path" -Severity 2
-        return @()
+        return @{ Categories = @(); CategoryDates = @{} }
     }
 
     # Windows INF Class= values mapped to our category names.
@@ -647,27 +676,49 @@ function Get-DATBasePackCategories {
 
     $FoundCategories = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase)
+    # Track the newest DriverVer date per category
+    $CategoryDates = @{}
 
     $InfFiles = @(Get-ChildItem -Path $Path -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
 
     if ($InfFiles.Count -eq 0) {
         Write-DATLog -Message "No .inf files found in $Path" -Severity 2
-        return @()
+        return @{ Categories = @(); CategoryDates = @{} }
     }
 
     foreach ($InfFile in $InfFiles) {
         try {
-            # Read first 100 lines - the [Version] section with Class= is always near the top
+            # Read first 100 lines - the [Version] section with Class= and DriverVer= is always near the top
             $Lines = Get-Content -Path $InfFile.FullName -TotalCount 100 -ErrorAction SilentlyContinue
+
+            $InfCategory = $null
+            $InfDriverDate = $null
 
             foreach ($Line in $Lines) {
                 # Match Class = ClassName (with optional whitespace, quotes, and trailing comments)
-                if ($Line -match '^\s*Class\s*=\s*"?([A-Za-z]+)"?') {
+                if (-not $InfCategory -and $Line -match '^\s*Class\s*=\s*"?([A-Za-z]+)"?') {
                     $ClassName = $Matches[1].Trim().ToUpper()
                     if ($ClassToCategory.ContainsKey($ClassName)) {
-                        $FoundCategories.Add($ClassToCategory[$ClassName]) | Out-Null
+                        $InfCategory = $ClassToCategory[$ClassName]
+                        $FoundCategories.Add($InfCategory) | Out-Null
                     }
-                    break  # Only need the first Class= line per INF
+                }
+
+                # Match DriverVer = MM/DD/YYYY, x.x.x.x
+                if (-not $InfDriverDate -and $Line -match '^\s*DriverVer\s*=\s*(\d{1,2}/\d{1,2}/\d{4})') {
+                    try {
+                        $InfDriverDate = [datetime]::Parse($Matches[1])
+                    } catch { }
+                }
+
+                # Stop once we have both
+                if ($InfCategory -and $InfDriverDate) { break }
+            }
+
+            # Update the newest date for this category
+            if ($InfCategory -and $InfDriverDate) {
+                if (-not $CategoryDates.ContainsKey($InfCategory) -or $InfDriverDate -gt $CategoryDates[$InfCategory]) {
+                    $CategoryDates[$InfCategory] = $InfDriverDate
                 }
             }
         } catch {
@@ -678,7 +729,19 @@ function Get-DATBasePackCategories {
     $CatList = @($FoundCategories | Sort-Object)
     Write-DATLog -Message "Base pack INF scan: $($InfFiles.Count) .inf file(s), categories present: $($CatList -join ', ')" -Severity 1
 
-    return $CatList
+    # Log per-category dates for diagnostics
+    foreach ($Cat in $CatList) {
+        if ($CategoryDates.ContainsKey($Cat)) {
+            Write-DATLog -Message "  $Cat newest DriverVer: $($CategoryDates[$Cat].ToString('yyyy-MM-dd'))" -Severity 1
+        } else {
+            Write-DATLog -Message "  $Cat no DriverVer date found" -Severity 1
+        }
+    }
+
+    return @{
+        Categories    = $CatList
+        CategoryDates = $CategoryDates
+    }
 }
 
 function ConvertTo-DellOSCode {

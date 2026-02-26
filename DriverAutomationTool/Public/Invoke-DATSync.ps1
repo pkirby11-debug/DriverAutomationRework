@@ -421,7 +421,9 @@ function Invoke-DATSyncSinglePackage {
 
             if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
                 Write-DATLog -Message "Smart check: scanning package source: $($ExPkg.SourcePath)" -Severity 1
-                $PresentCats = Get-DATBasePackCategories -Path $ExPkg.SourcePath
+                $InfScanResult = Get-DATBasePackCategories -Path $ExPkg.SourcePath
+                $PresentCats = $InfScanResult.Categories
+                $CachedCategoryDates = $InfScanResult.CategoryDates
 
                 # If no INFs found (e.g., WIM-compressed package source), check the sibling
                 # extracted directory. WIM packages store everything in a single .wim file so
@@ -436,7 +438,9 @@ function Invoke-DATSyncSinglePackage {
                         Write-DATLog -Message "Smart check: looking for extracted directory: $ExtractedPath (exists: $(Test-Path $ExtractedPath))" -Severity 1
                         if (Test-Path $ExtractedPath) {
                             Write-DATLog -Message "Smart check: found extracted directory, scanning for INF files" -Severity 1
-                            $PresentCats = Get-DATBasePackCategories -Path $ExtractedPath
+                            $InfScanResult = Get-DATBasePackCategories -Path $ExtractedPath
+                            $PresentCats = $InfScanResult.Categories
+                            $CachedCategoryDates = $InfScanResult.CategoryDates
                         }
                     } else {
                         Write-DATLog -Message "Smart check: source directory name does not start with 'Compressed-' - cannot derive extracted path" -Severity 2
@@ -461,6 +465,9 @@ function Invoke-DATSyncSinglePackage {
             $GetDriverParams = @{
                 SystemID     = $PackageInfo.SystemID
                 BaselineDate = $PackageInfo.ReleaseDate
+            }
+            if ($CachedCategoryDates -and $CachedCategoryDates.Count -gt 0) {
+                $GetDriverParams['CategoryBaselines'] = $CachedCategoryDates
             }
             if ($SmartCheckMissing.Count -gt 0) {
                 $GetDriverParams['MissingCategories'] = $SmartCheckMissing
@@ -757,11 +764,15 @@ function Invoke-DATSyncSinglePackage {
         if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers') {
             Write-DATLog -Message "Checking for individual Dell drivers for $ModelName..." -Severity 1
             try {
-                # Detect missing categories by scanning INF files in the extracted base pack.
+                # Detect missing categories and per-category DriverVer dates by scanning
+                # INF files in the extracted base pack. Per-category dates are used as
+                # baselines for individual driver filtering (more accurate than pack date).
                 # "Other" is always treated as missing since INF scans can't detect it -
                 # this ensures unclassified drivers from the Dell catalog are always checked.
                 $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input', 'Other')
-                $PresentCategories = Get-DATBasePackCategories -Path $PackageSourceDir
+                $InfScanResult = Get-DATBasePackCategories -Path $PackageSourceDir
+                $PresentCategories = $InfScanResult.Categories
+                $PackCategoryDates = $InfScanResult.CategoryDates
                 $MissingCats = @($AllCategories | Where-Object { $_ -notin $PresentCategories })
                 $StandardMissing = @($MissingCats | Where-Object { $_ -ne 'Other' })
                 if ($StandardMissing.Count -gt 0) {
@@ -781,6 +792,9 @@ function Invoke-DATSyncSinglePackage {
                     $GetDriverParams = @{
                         SystemID     = $PackageInfo.SystemID
                         BaselineDate = $PackageInfo.ReleaseDate
+                    }
+                    if ($PackCategoryDates -and $PackCategoryDates.Count -gt 0) {
+                        $GetDriverParams['CategoryBaselines'] = $PackCategoryDates
                     }
                     if ($MissingCats.Count -gt 0) {
                         $GetDriverParams['MissingCategories'] = $MissingCats
