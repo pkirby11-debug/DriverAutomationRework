@@ -686,10 +686,11 @@ function Get-DellIndividualDrivers {
         $TotalScanned++
 
         # Use packageType attribute for primary filtering - more reliable than name matching.
-        # CatalogPC.xml packageType values: LWXP (drivers), BIOS, FRMW (firmware), APP (applications).
-        # Only include LWXP (drivers) or components with no packageType (treat as potential drivers).
+        # CatalogPC.xml uses: LWXP (drivers), BIOS, FRMW (firmware), APP (applications).
+        # Per-model catalogs also use: LW64 (64-bit Windows drivers).
+        # Accept any LW* prefix as a driver type; exclude BIOS, FRMW, APP, etc.
         $PkgType = $Component.packageType
-        if ($PkgType -and $PkgType -notmatch '^LWXP$') {
+        if ($PkgType -and $PkgType -notmatch '^LW') {
             $SkippedPkgType++
             continue
         }
