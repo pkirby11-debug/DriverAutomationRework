@@ -831,13 +831,18 @@ function Invoke-DATSyncSinglePackage {
                                     continue
                                 }
 
+                                # Remove Mark of the Web so Windows doesn't block execution
+                                # (WebRequest downloads get Zone.Identifier ADS from internet zone)
+                                Unblock-File -Path $DriverExePath -ErrorAction SilentlyContinue
+
                                 # Create category subdirectory in package source
                                 $OverlayTargetDir = Join-Path $PackageSourceDir $IndvDriver.Category
                                 if (-not (Test-Path $OverlayTargetDir)) {
                                     New-Item -Path $OverlayTargetDir -ItemType Directory -Force | Out-Null
                                 }
 
-                                # Extract using the same dual-method approach as driver pack EXEs
+                                # Extract Dell Update Package (DUP) - try multiple methods since
+                                # different DUP versions use different self-extraction formats.
                                 $ExtractDir = Join-Path $OverlayTempDir ($IndvDriver.Category + '_extract')
                                 if (Test-Path $ExtractDir) {
                                     Remove-Item -Path $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -847,36 +852,85 @@ function Invoke-DATSyncSinglePackage {
                                 $OverlayExtracted = $false
                                 $OvlTimeout = 300000  # 5 minutes
 
-                                # Method 1: /s /e="path"
-                                try {
-                                    $ExtractArgs = "/s /e=`"$ExtractDir`""
-                                    $Proc = Start-Process -FilePath $DriverExePath -ArgumentList $ExtractArgs `
-                                        -NoNewWindow -PassThru -ErrorAction Stop
-                                    $OvlCompleted = $Proc.WaitForExit($OvlTimeout)
-                                    if (-not $OvlCompleted) {
-                                        Write-DATLog -Message "Overlay extraction timed out for $($IndvDriver.Name) - killing process" -Severity 3
-                                        $Proc.Kill()
-                                    } elseif ($Proc.ExitCode -eq 0 -and
-                                        @(Get-ChildItem $ExtractDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
-                                        $OverlayExtracted = $true
-                                    }
-                                } catch { }
+                                # Helper: check if extraction produced files
+                                $CheckExtracted = {
+                                    @(Get-ChildItem $ExtractDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0
+                                }
 
-                                # Method 2: /extract:"path" /quiet
+                                # Method 1: /s /e="path" (standard Dell DUP extraction)
                                 if (-not $OverlayExtracted) {
                                     try {
-                                        $ExtractArgs = "/extract:`"$ExtractDir`" /quiet"
-                                        $Proc2 = Start-Process -FilePath $DriverExePath -ArgumentList $ExtractArgs `
-                                            -NoNewWindow -PassThru -ErrorAction Stop
+                                        $Proc = Start-Process -FilePath $DriverExePath -ArgumentList '/s', "/e=`"$ExtractDir`"" `
+                                            -WindowStyle Hidden -PassThru -ErrorAction Stop
+                                        $OvlCompleted = $Proc.WaitForExit($OvlTimeout)
+                                        if (-not $OvlCompleted) {
+                                            Write-DATLog -Message "  Extraction method 1 (/s /e=) timed out - killing process" -Severity 2
+                                            $Proc.Kill()
+                                        } elseif (& $CheckExtracted) {
+                                            $OverlayExtracted = $true
+                                            Write-DATLog -Message "  Extracted via /s /e= (exit code: $($Proc.ExitCode))" -Severity 1
+                                        } else {
+                                            Write-DATLog -Message "  Method 1 (/s /e=) exit code $($Proc.ExitCode) - no files extracted" -Severity 2
+                                        }
+                                    } catch {
+                                        Write-DATLog -Message "  Method 1 (/s /e=) error: $($_.Exception.Message)" -Severity 2
+                                    }
+                                }
+
+                                # Method 2: /s /drivers="path" (Dell Command Update style driver extraction)
+                                if (-not $OverlayExtracted) {
+                                    try {
+                                        $Proc2 = Start-Process -FilePath $DriverExePath -ArgumentList '/s', "/drivers=`"$ExtractDir`"" `
+                                            -WindowStyle Hidden -PassThru -ErrorAction Stop
                                         $OvlCompleted = $Proc2.WaitForExit($OvlTimeout)
                                         if (-not $OvlCompleted) {
-                                            Write-DATLog -Message "Overlay extraction (attempt 2) timed out for $($IndvDriver.Name) - killing process" -Severity 3
                                             $Proc2.Kill()
-                                        } elseif ($Proc2.ExitCode -eq 0 -and
-                                            @(Get-ChildItem $ExtractDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
+                                        } elseif (& $CheckExtracted) {
                                             $OverlayExtracted = $true
+                                            Write-DATLog -Message "  Extracted via /s /drivers= (exit code: $($Proc2.ExitCode))" -Severity 1
+                                        } else {
+                                            Write-DATLog -Message "  Method 2 (/s /drivers=) exit code $($Proc2.ExitCode) - no files extracted" -Severity 2
                                         }
-                                    } catch { }
+                                    } catch {
+                                        Write-DATLog -Message "  Method 2 (/s /drivers=) error: $($_.Exception.Message)" -Severity 2
+                                    }
+                                }
+
+                                # Method 3: /extract:"path" /quiet (alternative Dell format)
+                                if (-not $OverlayExtracted) {
+                                    try {
+                                        $Proc3 = Start-Process -FilePath $DriverExePath -ArgumentList "/extract:`"$ExtractDir`"", '/quiet' `
+                                            -WindowStyle Hidden -PassThru -ErrorAction Stop
+                                        $OvlCompleted = $Proc3.WaitForExit($OvlTimeout)
+                                        if (-not $OvlCompleted) {
+                                            $Proc3.Kill()
+                                        } elseif (& $CheckExtracted) {
+                                            $OverlayExtracted = $true
+                                            Write-DATLog -Message "  Extracted via /extract: (exit code: $($Proc3.ExitCode))" -Severity 1
+                                        } else {
+                                            Write-DATLog -Message "  Method 3 (/extract:) exit code $($Proc3.ExitCode) - no files extracted" -Severity 2
+                                        }
+                                    } catch {
+                                        Write-DATLog -Message "  Method 3 (/extract:) error: $($_.Exception.Message)" -Severity 2
+                                    }
+                                }
+
+                                # Method 4: expand.exe (Dell DUPs are often repackaged CAB files)
+                                if (-not $OverlayExtracted) {
+                                    try {
+                                        $ExpandExe = Join-Path $env:SystemRoot 'System32\expand.exe'
+                                        if (Test-Path $ExpandExe) {
+                                            $Output = & $ExpandExe "$DriverExePath" '-F:*' "$ExtractDir" -R 2>&1
+                                            if (& $CheckExtracted) {
+                                                $OverlayExtracted = $true
+                                                Write-DATLog -Message "  Extracted via expand.exe (CAB)" -Severity 1
+                                            } else {
+                                                Write-DATLog -Message "  Method 4 (expand.exe) produced no files" -Severity 2
+                                            }
+                                        }
+                                    } catch {
+                                        Write-DATLog -Message "  Method 4 (expand.exe) error: $($_.Exception.Message)" -Severity 2
+                                    }
                                 }
 
                                 if ($OverlayExtracted) {
