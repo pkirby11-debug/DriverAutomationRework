@@ -1,5 +1,6 @@
 # Dell OEM Adapter
-# Handles Dell DriverPackCatalog.cab and CatalogPC.cab for driver packs and BIOS updates.
+# Handles Dell DriverPackCatalog.cab for driver packs, CatalogIndexPC.cab chain for
+# per-model individual driver lookup, and CatalogPC.cab as legacy fallback/BIOS updates.
 
 function Update-DellCatalogCache {
     <#
@@ -76,6 +77,147 @@ function Update-DellCatalogCache {
             Remove-DATTempPath -Path $TempDir
         }
     }
+}
+
+function Update-DellModelCatalog {
+    <#
+    .SYNOPSIS
+        Downloads and caches a per-model Dell catalog using the CatalogIndexPC chain.
+    .DESCRIPTION
+        Dell Command Update uses a two-tier catalog system:
+          1. CatalogIndexPC.cab - master index listing all Dell models with paths
+             to per-model catalogs (ManifestIndex → GroupManifest)
+          2. Per-model .cab files (e.g., Dell_Pro_Laptops_OCE8.cab) containing a
+             Manifest XML with SoftwareComponent entries for that model group.
+
+        This function:
+          1. Downloads and caches CatalogIndexPC.cab → CatalogIndexPC.xml
+          2. Finds the GroupManifest entry matching the given SystemID
+          3. Downloads and caches the per-model .cab → per-model .xml
+          4. Returns the path to the cached per-model XML
+
+        The per-model catalogs are significantly more up-to-date than the legacy
+        CatalogPC.cab (which Dell no longer updates frequently).
+    .PARAMETER SystemID
+        Dell SystemID(s), semicolon-delimited (e.g., '0CE8;0CE9').
+    .PARAMETER ForceRefresh
+        Forces re-download even if cache is valid.
+    .PARAMETER CacheTTLHours
+        Cache time-to-live in hours. Default: 24.
+    .OUTPUTS
+        Path to the cached per-model XML file, or $null if not available.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SystemID,
+
+        [switch]$ForceRefresh,
+        [int]$CacheTTLHours = 24
+    )
+
+    $Sources = Get-DATOEMSources
+    $DellSources = $Sources.dell
+
+    if (-not $DellSources.catalogIndex) {
+        Write-DATLog -Message "Dell catalogIndex URL not configured in OEMSources.json - cannot use per-model catalog" -Severity 2
+        return $null
+    }
+
+    # Step 1: Download and cache CatalogIndexPC (master index)
+    $IndexCacheKey = 'Dell_CatalogIndexPC.xml'
+    $CachedIndex = if (-not $ForceRefresh) { Get-DATCachedItem -Key $IndexCacheKey -MaxAgeHours $CacheTTLHours } else { $null }
+
+    if (-not $CachedIndex) {
+        Write-DATLog -Message "Downloading Dell CatalogIndexPC.cab (model catalog index)" -Severity 1
+        $TempDir = Get-DATTempPath -Prefix 'DellCatIndex'
+        try {
+            $CabPath = Join-Path $TempDir 'CatalogIndexPC.cab'
+            Invoke-DATDownload -Url $DellSources.catalogIndex -DestinationPath $CabPath
+
+            $ExtractedFiles = Expand-DATCabinet -CabPath $CabPath -DestinationPath $TempDir -Filter '*.xml'
+            $XmlFile = $ExtractedFiles | Where-Object { $_ -like '*.xml' } | Select-Object -First 1
+
+            if ($XmlFile) {
+                $CachedIndex = Set-DATCachedItem -Key $IndexCacheKey -SourcePath $XmlFile -SourceUrl $DellSources.catalogIndex
+                Write-DATLog -Message "Dell CatalogIndexPC cached successfully" -Severity 1
+            } else {
+                Write-DATLog -Message "No XML file found in CatalogIndexPC.cab" -Severity 3
+                return $null
+            }
+        } catch {
+            Write-DATLog -Message "Failed to download/extract CatalogIndexPC: $($_.Exception.Message)" -Severity 3
+            return $null
+        } finally {
+            Remove-DATTempPath -Path $TempDir
+        }
+    }
+
+    # Step 2: Parse index XML to find per-model catalog path by SystemID
+    $IndexXml = Read-DATXml -Path $CachedIndex
+    $SystemIDs = $SystemID.Split(';') | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
+
+    $MatchingManifest = $null
+    foreach ($GroupManifest in $IndexXml.ManifestIndex.GroupManifest) {
+        $ManifestSysIDs = @($GroupManifest.SupportedSystems.Brand.Model.systemID) |
+            ForEach-Object { if ($_) { $_.Trim().ToUpper() } }
+
+        foreach ($SysID in $SystemIDs) {
+            if ($ManifestSysIDs -contains $SysID) {
+                $MatchingManifest = $GroupManifest
+                break
+            }
+        }
+        if ($MatchingManifest) { break }
+    }
+
+    if (-not $MatchingManifest) {
+        Write-DATLog -Message "No per-model catalog found in CatalogIndexPC for SystemID: $SystemID" -Severity 2
+        return $null
+    }
+
+    $ModelCatalogPath = $MatchingManifest.ManifestInformation.path
+    if (-not $ModelCatalogPath) {
+        Write-DATLog -Message "ManifestInformation.path is empty for SystemID: $SystemID" -Severity 2
+        return $null
+    }
+
+    $ModelCatalogName = Split-Path $ModelCatalogPath -Leaf
+    Write-DATLog -Message "Found per-model catalog for SystemID $($SystemIDs[0]): $ModelCatalogName" -Severity 1
+
+    # Step 3: Download and cache the per-model catalog
+    $PrimaryID = $SystemIDs[0]
+    $ModelCacheKey = "Dell_ModelCatalog_${PrimaryID}.xml"
+    $CachedModel = if (-not $ForceRefresh) { Get-DATCachedItem -Key $ModelCacheKey -MaxAgeHours $CacheTTLHours } else { $null }
+
+    if (-not $CachedModel) {
+        $ModelCatalogUrl = '{0}/{1}' -f $DellSources.baseUrl.TrimEnd('/'), ($ModelCatalogPath -replace '^/', '')
+        Write-DATLog -Message "Downloading per-model catalog: $ModelCatalogUrl" -Severity 1
+
+        $TempDir = Get-DATTempPath -Prefix 'DellModelCat'
+        try {
+            $CabPath = Join-Path $TempDir $ModelCatalogName
+            Invoke-DATDownload -Url $ModelCatalogUrl -DestinationPath $CabPath
+
+            $ExtractedFiles = Expand-DATCabinet -CabPath $CabPath -DestinationPath $TempDir -Filter '*.xml'
+            $XmlFile = $ExtractedFiles | Where-Object { $_ -like '*.xml' } | Select-Object -First 1
+
+            if ($XmlFile) {
+                $CachedModel = Set-DATCachedItem -Key $ModelCacheKey -SourcePath $XmlFile -SourceUrl $ModelCatalogUrl
+                Write-DATLog -Message "Per-model catalog cached: $ModelCacheKey" -Severity 1
+            } else {
+                Write-DATLog -Message "No XML found in per-model catalog: $ModelCatalogName" -Severity 3
+                return $null
+            }
+        } catch {
+            Write-DATLog -Message "Failed to download/extract per-model catalog: $($_.Exception.Message)" -Severity 3
+            return $null
+        } finally {
+            Remove-DATTempPath -Path $TempDir
+        }
+    }
+
+    return $CachedModel
 }
 
 function Get-DellModelList {
@@ -342,11 +484,12 @@ function Get-DellIndividualDrivers {
         Finds individual Dell drivers newer than a baseline date for a specific model,
         and includes the latest driver for any categories missing from the base pack.
     .DESCRIPTION
-        Queries the Dell Command Update catalog (CatalogPC.cab) for SoftwareComponent
-        entries matching the given SystemID. Uses the packageType XML attribute to
-        filter to driver components, classifies them into categories, then returns
-        drivers released after the baseline date plus the latest driver for any
-        categories missing from the base pack.
+        Queries the Dell per-model catalog (via CatalogIndexPC chain) for SoftwareComponent
+        entries matching the given SystemID. Falls back to the legacy CatalogPC.cab if the
+        per-model catalog is not available. Uses the packageType XML attribute to filter
+        to driver components, classifies them into categories, then returns drivers
+        released after the baseline date plus the latest driver for any categories
+        missing from the base pack.
 
         When -CategoryBaselines is provided (hashtable of category -> datetime), uses
         the per-category DriverVer date from the extracted base pack as the cutoff
@@ -402,19 +545,48 @@ function Get-DellIndividualDrivers {
         [string[]]$MissingCategories
     )
 
-    $CatalogPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
+    # Try per-model catalog first (CatalogIndexPC chain - more current than legacy CatalogPC).
+    # The per-model catalogs are what Dell Command Update actually uses and contain the
+    # latest driver entries. CatalogPC.cab is retained as a fallback for older models
+    # that might not appear in CatalogIndexPC.
+    $UsingModelCatalog = $false
+    $CatalogPath = $null
+    try {
+        $ModelCatalogPath = Update-DellModelCatalog -SystemID $SystemID
+        if ($ModelCatalogPath) {
+            $CatalogPath = $ModelCatalogPath
+            $UsingModelCatalog = $true
+            Write-DATLog -Message "Using per-model catalog for individual driver lookup (CatalogIndexPC chain)" -Severity 1
+        }
+    } catch {
+        Write-DATLog -Message "Per-model catalog lookup failed: $($_.Exception.Message) - falling back to CatalogPC" -Severity 2
+    }
+
+    # Fallback to legacy CatalogPC
     if (-not $CatalogPath) {
-        Update-DellCatalogCache
+        Write-DATLog -Message "Falling back to CatalogPC for individual driver lookup" -Severity 1
         $CatalogPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
+        if (-not $CatalogPath) {
+            Update-DellCatalogCache
+            $CatalogPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
+        }
     }
 
     if (-not $CatalogPath) {
-        Write-DATLog -Message "Dell CatalogPC not available for individual driver lookup" -Severity 2
+        Write-DATLog -Message "No Dell catalog available for individual driver lookup" -Severity 2
         return $null
     }
 
     $Xml = Read-DATXml -Path $CatalogPath
     $Sources = Get-DATOEMSources
+
+    # Select the correct download base URL based on which catalog we're using.
+    # Per-model catalog entries use dl.dell.com; CatalogPC entries use downloads.dell.com.
+    $DriverBaseUrl = if ($UsingModelCatalog -and $Sources.dell.dlBaseUrl) {
+        $Sources.dell.dlBaseUrl
+    } else {
+        $Sources.dell.baseUrl
+    }
 
     # Build compatible OS code patterns for filtering.
     # Dell uses TWO different OS code formats across their catalogs:
@@ -621,9 +793,9 @@ function Get-DellIndividualDrivers {
             }
         }
 
-        # Build download URL
+        # Build download URL using the appropriate base URL for the catalog source
         $DownloadPath = $Component.path -replace '^/', ''
-        $DownloadUrl = '{0}/{1}' -f $Sources.dell.baseUrl.TrimEnd('/'), $DownloadPath
+        $DownloadUrl = '{0}/{1}' -f $DriverBaseUrl.TrimEnd('/'), $DownloadPath
 
         $MatchedDrivers.Add([PSCustomObject]@{
             Category    = $ResolvedCategory
@@ -640,7 +812,8 @@ function Get-DellIndividualDrivers {
     }
 
     # Log diagnostic summary
-    Write-DATLog -Message ("Dell catalog scan: $TotalScanned components scanned, " +
+    $CatalogSource = if ($UsingModelCatalog) { 'per-model (CatalogIndexPC)' } else { 'CatalogPC (legacy)' }
+    Write-DATLog -Message ("Dell catalog scan [$CatalogSource]: $TotalScanned components scanned, " +
         "$SkippedPkgType non-driver (packageType), $SkippedExcluded excluded (name), " +
         "$SkippedNoSysMatch wrong SystemID, $SkippedWrongOS wrong OS, " +
         "$SkippedDate older than baseline, $($MatchedDrivers.Count) matched") -Severity 1
@@ -867,8 +1040,10 @@ function Test-DellCatalogConnectivity {
 
     foreach ($Endpoint in @(
         @{ Name = 'DriverPackCatalog'; Url = $Sources.dell.driverPackCatalog }
+        @{ Name = 'CatalogIndexPC'; Url = $Sources.dell.catalogIndex }
         @{ Name = 'BIOSCatalog'; Url = $Sources.dell.biosCatalog }
         @{ Name = 'BaseUrl'; Url = $Sources.dell.baseUrl }
+        @{ Name = 'DlBaseUrl'; Url = $Sources.dell.dlBaseUrl }
     )) {
         $Reachable = Test-DATUrlReachable -Url $Endpoint.Url
         $Results.Add([PSCustomObject]@{
