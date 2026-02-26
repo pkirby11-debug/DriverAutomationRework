@@ -25,7 +25,7 @@ function Get-DATDriverPack {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Dell', 'Lenovo')]
+        [ValidateSet('Dell', 'Lenovo', 'Microsoft')]
         [string[]]$Manufacturer,
 
         [string[]]$Model,
@@ -84,6 +84,30 @@ function Get-DATDriverPack {
                             Manufacturer = 'Lenovo'
                             Model        = $M.Model
                             MachineType  = $M.MachineType
+                            OS           = $OperatingSystem
+                            Architecture = $Architecture
+                            Url          = $null
+                            Version      = $null
+                            Status       = 'Available'
+                        })
+                    }
+                }
+            }
+            'Microsoft' {
+                Update-SurfaceCatalogCache
+
+                if ($Model) {
+                    foreach ($M in $Model) {
+                        $Pack = Get-SurfaceDriverPack -Model $M -OperatingSystem $OperatingSystem -Architecture $Architecture
+                        if ($Pack) { $Results.Add($Pack) }
+                    }
+                } else {
+                    $AllModels = Get-SurfaceModelList
+                    foreach ($M in $AllModels) {
+                        $Results.Add([PSCustomObject]@{
+                            Manufacturer = 'Microsoft'
+                            Model        = $M.Model
+                            DownloadID   = $M.DownloadID
                             OS           = $OperatingSystem
                             Architecture = $Architecture
                             Url          = $null
