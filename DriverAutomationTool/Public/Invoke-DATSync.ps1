@@ -806,9 +806,13 @@ function Invoke-DATSyncSinglePackage {
                             Write-DATLog -Message "  $OverlayTag Overlaying: $($IndvDriver.Category) - $($IndvDriver.Name) v$($IndvDriver.Version) ($($IndvDriver.ReleaseDate))" -Severity 1
 
                             try {
-                                # Download individual driver .exe to temp
+                                # Download individual driver .exe to temp (10 min timeout per driver)
                                 $DriverExePath = Join-Path $OverlayTempDir $IndvDriver.FileName
-                                Invoke-DATDownload -Url $IndvDriver.Url -DestinationPath $DriverExePath -MaxRetries 2
+                                $DlResult = Invoke-DATDownload -Url $IndvDriver.Url -DestinationPath $DriverExePath -MaxRetries 2 -TimeoutSeconds 600
+                                if (-not $DlResult) {
+                                    Write-DATLog -Message "  WARNING: Download timed out for $($IndvDriver.Name) - skipping this driver" -Severity 2
+                                    continue
+                                }
 
                                 # Create category subdirectory in package source
                                 $OverlayTargetDir = Join-Path $PackageSourceDir $IndvDriver.Category
