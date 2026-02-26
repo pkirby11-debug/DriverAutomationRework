@@ -417,11 +417,24 @@ function Get-DellIndividualDrivers {
     $Sources = Get-DATOEMSources
 
     # Convert OS name to Dell's catalog OS code for filtering (e.g., "Windows11")
-    $TargetOsCode = $null
+    # Build a set of compatible OS codes because Dell's CatalogPC.xml frequently lists
+    # Windows 11 drivers with only osCode="Windows10" (same driver model/stack).
+    # We accept forward-compatible codes and exclude legacy OS codes like Windows 7/8/XP.
+    $CompatibleOsCodes = $null
     if ($OperatingSystem) {
         $TargetOsCode = ConvertTo-DellOSCode -OperatingSystem $OperatingSystem
         if ($TargetOsCode) {
-            Write-DATLog -Message "Filtering individual drivers to OS code: $TargetOsCode (from '$OperatingSystem')" -Severity 1
+            # Windows 10 and 11 share the same WDDM/WDF driver model, so drivers
+            # listing either OS code are compatible with both.
+            $CompatibleOsCodes = [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase)
+            $CompatibleOsCodes.Add($TargetOsCode) | Out-Null
+            if ($TargetOsCode -eq 'Windows11') {
+                $CompatibleOsCodes.Add('Windows10') | Out-Null
+            } elseif ($TargetOsCode -eq 'Windows10') {
+                $CompatibleOsCodes.Add('Windows11') | Out-Null
+            }
+            Write-DATLog -Message "Filtering individual drivers to compatible OS codes: $($CompatibleOsCodes -join ', ') (from '$OperatingSystem')" -Severity 1
         } else {
             Write-DATLog -Message "Could not map OS '$OperatingSystem' to Dell OS code - OS filtering disabled" -Severity 2
         }
@@ -518,11 +531,19 @@ function Get-DellIndividualDrivers {
         }
 
         # Check OS compatibility - skip drivers for wrong OS (e.g., Windows 7 in a Win11 package)
-        if ($TargetOsCode) {
+        # Uses the compatible OS code set which includes both Windows10 and Windows11
+        # since they share the same driver model (many Win11 drivers list only Windows10).
+        if ($CompatibleOsCodes) {
             $ComponentOsCodes = @($Component.SupportedOperatingSystems.OperatingSystem.osCode) |
                 Where-Object { $_ }
             if ($ComponentOsCodes.Count -gt 0) {
-                $OsMatch = $ComponentOsCodes | Where-Object { $_ -like "*$TargetOsCode*" }
+                $OsMatch = $false
+                foreach ($Code in $ComponentOsCodes) {
+                    if ($CompatibleOsCodes.Contains($Code)) {
+                        $OsMatch = $true
+                        break
+                    }
+                }
                 if (-not $OsMatch) {
                     $SkippedWrongOS++
                     continue
