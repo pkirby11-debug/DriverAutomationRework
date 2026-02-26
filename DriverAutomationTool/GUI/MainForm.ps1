@@ -56,6 +56,8 @@ function Initialize-DATMainForm {
             $Controls['UpdateIndividualCheckBox'].Enabled = $false
             $Controls['UpdateIndividualCheckBox'].Checked = $false
         }
+        # Microsoft Surface works with any OS version
+        $Controls['MicrosoftCheckBox'].Enabled = $true
     })
 
     # Set initial manufacturer checkbox state based on default OS selection
@@ -104,15 +106,20 @@ function Initialize-DATMainForm {
             $Manufacturers = @()
             if ($Controls['DellCheckBox'].Checked) { $Manufacturers += 'Dell' }
             if ($Controls['LenovoCheckBox'].Checked) { $Manufacturers += 'Lenovo' }
+            if ($Controls['MicrosoftCheckBox'].Checked) { $Manufacturers += 'Microsoft' }
 
             foreach ($Make in $Manufacturers) {
                 $Models = switch ($Make) {
-                    'Dell'   { Get-DellModelList }
-                    'Lenovo' { Get-LenovoModelList }
+                    'Dell'      { Get-DellModelList }
+                    'Lenovo'    { Get-LenovoModelList }
+                    'Microsoft' { Get-SurfaceModelList }
                 }
 
                 foreach ($M in $Models) {
-                    $ID = if ($M.SystemID) { $M.SystemID } elseif ($M.MachineType) { $M.MachineType } else { '' }
+                    $ID = if ($M.SystemID) { $M.SystemID }
+                          elseif ($M.MachineType) { $M.MachineType }
+                          elseif ($M.DownloadID) { $M.DownloadID }
+                          else { '' }
                     $Plat = if ($M.Platform) { $M.Platform } else { '' }
                     $Controls['ModelGrid'].Rows.Add($false, $M.Manufacturer, $M.Model, $ID, $Plat)
                 }
@@ -128,6 +135,7 @@ function Initialize-DATMainForm {
                     $Manufacturers = @()
                     if ($Controls['DellCheckBox'].Checked) { $Manufacturers += 'Dell' }
                     if ($Controls['LenovoCheckBox'].Checked) { $Manufacturers += 'Lenovo' }
+                    if ($Controls['MicrosoftCheckBox'].Checked) { $Manufacturers += 'Microsoft' }
 
                     $KnownModels = Get-DATKnownModels -Manufacturers $Manufacturers
                     $MatchCount = Select-DATKnownModelsInGrid -Grid $Controls['ModelGrid'] -KnownModels $KnownModels
@@ -183,6 +191,7 @@ function Initialize-DATMainForm {
                 $Manufacturers = @()
                 if ($Controls['DellCheckBox'].Checked) { $Manufacturers += 'Dell' }
                 if ($Controls['LenovoCheckBox'].Checked) { $Manufacturers += 'Lenovo' }
+                if ($Controls['MicrosoftCheckBox'].Checked) { $Manufacturers += 'Microsoft' }
 
                 $KnownModels = Get-DATKnownModels -Manufacturers $Manufacturers
                 $MatchCount = Select-DATKnownModelsInGrid -Grid $Controls['ModelGrid'] -KnownModels $KnownModels
@@ -313,6 +322,7 @@ function Initialize-DATMainForm {
         $Manufacturers = @()
         if ($Controls['DellCheckBox'].Checked) { $Manufacturers += 'Dell' }
         if ($Controls['LenovoCheckBox'].Checked) { $Manufacturers += 'Lenovo' }
+        if ($Controls['MicrosoftCheckBox'].Checked) { $Manufacturers += 'Microsoft' }
 
         $ModelNames = $SelectedModels | ForEach-Object { $_.Model }
 
@@ -533,6 +543,7 @@ function Initialize-DATMainForm {
 
             if ($Controls['DellCheckBox'].Checked) { $Config.manufacturers += 'Dell' }
             if ($Controls['LenovoCheckBox'].Checked) { $Config.manufacturers += 'Lenovo' }
+            if ($Controls['MicrosoftCheckBox'].Checked) { $Config.manufacturers += 'Microsoft' }
 
             Save-DATConfig -Config $Config
             Show-DATFormMessage -Message 'Settings saved successfully.' -Type Information
@@ -757,6 +768,7 @@ function Initialize-DATMainForm {
 
                 $Controls['DellCheckBox'].Checked = $Config.manufacturers -contains 'Dell'
                 $Controls['LenovoCheckBox'].Checked = $Config.manufacturers -contains 'Lenovo'
+                $Controls['MicrosoftCheckBox'].Checked = $Config.manufacturers -contains 'Microsoft'
 
                 if ($Config.operatingSystem) {
                     $Idx = $Controls['OsCombo'].Items.IndexOf($Config.operatingSystem)
