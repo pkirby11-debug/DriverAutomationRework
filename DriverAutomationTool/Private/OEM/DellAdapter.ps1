@@ -794,8 +794,14 @@ function Get-DellIndividualDrivers {
             }
         }
 
-        # Build download URL using the appropriate base URL for the catalog source
+        # Build download URL using the appropriate base URL for the catalog source.
+        # Per-model catalog SoftwareComponent elements store the relative path in
+        # the 'path' attribute (e.g. "FOLDER.../driver.exe").  Prepend the base URL.
         $DownloadPath = $Component.path -replace '^/', ''
+        if (-not $DownloadPath) {
+            Write-DATLog -Message "WARNING: SoftwareComponent '$DisplayName' has no path attribute - skipping" -Severity 2
+            continue
+        }
         $DownloadUrl = '{0}/{1}' -f $DriverBaseUrl.TrimEnd('/'), $DownloadPath
 
         $MatchedDrivers.Add([PSCustomObject]@{
@@ -818,6 +824,10 @@ function Get-DellIndividualDrivers {
         "$SkippedPkgType non-driver (packageType), $SkippedExcluded excluded (name), " +
         "$SkippedNoSysMatch wrong SystemID, $SkippedWrongOS wrong OS, " +
         "$SkippedDate older than baseline, $($MatchedDrivers.Count) matched") -Severity 1
+    Write-DATLog -Message "  Base URL: $DriverBaseUrl" -Severity 1
+    if ($MatchedDrivers.Count -gt 0) {
+        Write-DATLog -Message "  Sample download URL: $($MatchedDrivers[0].Url)" -Severity 1
+    }
 
     if ($MatchedDrivers.Count -eq 0) {
         $Msg = "No individual drivers found for SystemID $SystemID"
