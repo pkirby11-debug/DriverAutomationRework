@@ -416,25 +416,24 @@ function Get-DellIndividualDrivers {
     $Xml = Read-DATXml -Path $CatalogPath
     $Sources = Get-DATOEMSources
 
-    # Convert OS name to Dell's catalog OS code for filtering (e.g., "Windows11")
-    # Build a set of compatible OS codes because Dell's CatalogPC.xml frequently lists
-    # Windows 11 drivers with only osCode="Windows10" (same driver model/stack).
-    # We accept forward-compatible codes and exclude legacy OS codes like Windows 7/8/XP.
-    $CompatibleOsCodes = $null
+    # Build compatible OS code patterns for filtering.
+    # Dell uses TWO different OS code formats across their catalogs:
+    #   DriverPackCatalog.xml: "Windows10", "Windows11" (long format)
+    #   CatalogPC.xml:         "W10H4" (Win10 Home x64), "W10P4" (Win10 Pro x64),
+    #                          "W11P4" (Win11 Pro x64), "W21P4", "IOT01", etc.
+    # We use wildcard patterns that match both formats.
+    # Windows 10/11 share the same driver model, so accept both.
+    $CompatibleOsPatterns = $null
     if ($OperatingSystem) {
         $TargetOsCode = ConvertTo-DellOSCode -OperatingSystem $OperatingSystem
         if ($TargetOsCode) {
-            # Windows 10 and 11 share the same WDDM/WDF driver model, so drivers
-            # listing either OS code are compatible with both.
-            $CompatibleOsCodes = [System.Collections.Generic.HashSet[string]]::new(
-                [System.StringComparer]::OrdinalIgnoreCase)
-            $CompatibleOsCodes.Add($TargetOsCode) | Out-Null
-            if ($TargetOsCode -eq 'Windows11') {
-                $CompatibleOsCodes.Add('Windows10') | Out-Null
-            } elseif ($TargetOsCode -eq 'Windows10') {
-                $CompatibleOsCodes.Add('Windows11') | Out-Null
-            }
-            Write-DATLog -Message "Filtering individual drivers to compatible OS codes: $($CompatibleOsCodes -join ', ') (from '$OperatingSystem')" -Severity 1
+            $CompatibleOsPatterns = @(
+                '*Windows10*'   # DriverPackCatalog long format
+                '*Windows11*'   # DriverPackCatalog long format
+                'W10*'          # CatalogPC short format (Win10 Home/Pro/Ent, any arch)
+                'W11*'          # CatalogPC short format (Win11 Home/Pro/Ent, any arch)
+            )
+            Write-DATLog -Message "Filtering individual drivers to OS patterns: $($CompatibleOsPatterns -join ', ') (from '$OperatingSystem')" -Severity 1
         } else {
             Write-DATLog -Message "Could not map OS '$OperatingSystem' to Dell OS code - OS filtering disabled" -Severity 2
         }
@@ -554,18 +553,18 @@ function Get-DellIndividualDrivers {
         }
 
         # Check OS compatibility - skip drivers for wrong OS (e.g., Windows 7 in a Win11 package)
-        # Uses wildcard matching (like the driver pack catalog does) because Dell's CatalogPC.xml
-        # often uses extended OS codes like "Windows10X64" or "Windows11ARM64" rather than
-        # plain "Windows10"/"Windows11". Match if any compatible code is a substring of any
-        # component OS code.
-        if ($CompatibleOsCodes) {
+        # Dell CatalogPC.xml uses short OS edition codes: W10H4 (Win10 Home x64),
+        # W10P4 (Win10 Pro x64), W11P4 (Win11 Pro x64), etc.
+        # DriverPackCatalog.xml uses long codes: Windows10, Windows11.
+        # Our patterns handle both formats.
+        if ($CompatibleOsPatterns) {
             $ComponentOsCodes = @($Component.SupportedOperatingSystems.OperatingSystem.osCode) |
                 Where-Object { $_ }
             if ($ComponentOsCodes.Count -gt 0) {
                 $OsMatch = $false
                 foreach ($Code in $ComponentOsCodes) {
-                    foreach ($CompatCode in $CompatibleOsCodes) {
-                        if ($Code -like "*$CompatCode*") {
+                    foreach ($Pattern in $CompatibleOsPatterns) {
+                        if ($Code -like $Pattern) {
                             $OsMatch = $true
                             break
                         }
