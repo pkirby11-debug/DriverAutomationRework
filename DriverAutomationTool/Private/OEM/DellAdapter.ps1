@@ -133,7 +133,7 @@ function Update-DellModelCatalog {
         $TempDir = Get-DATTempPath -Prefix 'DellCatIndex'
         try {
             $CabPath = Join-Path $TempDir 'CatalogIndexPC.cab'
-            Invoke-DATDownload -Url $DellSources.catalogIndex -DestinationPath $CabPath
+            $null = Invoke-DATDownload -Url $DellSources.catalogIndex -DestinationPath $CabPath
 
             $ExtractedFiles = Expand-DATCabinet -CabPath $CabPath -DestinationPath $TempDir -Filter '*.xml'
             $XmlFile = $ExtractedFiles | Where-Object { $_ -like '*.xml' } | Select-Object -First 1
@@ -197,7 +197,7 @@ function Update-DellModelCatalog {
         $TempDir = Get-DATTempPath -Prefix 'DellModelCat'
         try {
             $CabPath = Join-Path $TempDir $ModelCatalogName
-            Invoke-DATDownload -Url $ModelCatalogUrl -DestinationPath $CabPath
+            $null = Invoke-DATDownload -Url $ModelCatalogUrl -DestinationPath $CabPath
 
             $ExtractedFiles = Expand-DATCabinet -CabPath $CabPath -DestinationPath $TempDir -Filter '*.xml'
             $XmlFile = $ExtractedFiles | Where-Object { $_ -like '*.xml' } | Select-Object -First 1
@@ -217,7 +217,7 @@ function Update-DellModelCatalog {
         }
     }
 
-    return $CachedModel
+    return [string]$CachedModel
 }
 
 function Get-DellModelList {
