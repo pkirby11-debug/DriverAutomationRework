@@ -2,9 +2,11 @@
     "schemaVersion": 1,
     "dell": {
         "driverPackCatalog": "https://downloads.dell.com/catalog/DriverPackCatalog.cab",
+        "catalogIndex": "https://downloads.dell.com/catalog/CatalogIndexPC.cab",
         "biosCatalog": "https://downloads.dell.com/catalog/CatalogPC.cab",
         "biosUtility": "https://downloads.dell.com/FOLDER08405216M/1/Ver3.3.16.zip",
-        "baseUrl": "https://downloads.dell.com"
+        "baseUrl": "https://downloads.dell.com",
+        "dlBaseUrl": "https://dl.dell.com"
     },
     "lenovo": {
         "driverCatalog": "https://download.lenovo.com/cdrt/td/catalogv2.xml",
