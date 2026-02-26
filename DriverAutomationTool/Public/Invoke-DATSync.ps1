@@ -67,7 +67,7 @@ function Invoke-DATSync {
         [string]$ConfigFile,
 
         [Parameter(ParameterSetName = 'Parameters', Mandatory)]
-        [ValidateSet('Dell', 'Lenovo')]
+        [ValidateSet('Dell', 'Lenovo', 'Microsoft')]
         [string[]]$Manufacturer,
 
         [Parameter(ParameterSetName = 'Parameters')]
@@ -186,8 +186,9 @@ function Invoke-DATSync {
 
         # Refresh catalogs
         switch ($Make) {
-            'Dell'   { Update-DellCatalogCache -ForceRefresh:$ForceRefresh }
-            'Lenovo' { Update-LenovoCatalogCache -ForceRefresh:$ForceRefresh }
+            'Dell'      { Update-DellCatalogCache -ForceRefresh:$ForceRefresh }
+            'Lenovo'    { Update-LenovoCatalogCache -ForceRefresh:$ForceRefresh }
+            'Microsoft' { Update-SurfaceCatalogCache -ForceRefresh:$ForceRefresh }
         }
 
         # Get model list
@@ -204,8 +205,9 @@ function Invoke-DATSync {
             if ($IncludeDrivers) {
                 try {
                     $DriverPack = switch ($Make) {
-                        'Dell'   { Get-DellDriverPack -Model $ModelName -OperatingSystem $OperatingSystem -Architecture $Architecture }
-                        'Lenovo' { Get-LenovoDriverPack -Model $ModelName -OperatingSystem $OperatingSystem }
+                        'Dell'      { Get-DellDriverPack -Model $ModelName -OperatingSystem $OperatingSystem -Architecture $Architecture }
+                        'Lenovo'    { Get-LenovoDriverPack -Model $ModelName -OperatingSystem $OperatingSystem }
+                        'Microsoft' { Get-SurfaceDriverPack -Model $ModelName -OperatingSystem $OperatingSystem -Architecture $Architecture }
                     }
 
                     if ($DriverPack) {
@@ -233,8 +235,9 @@ function Invoke-DATSync {
             if ($IncludeBIOS) {
                 try {
                     $BiosUpdate = switch ($Make) {
-                        'Dell'   { Get-DellBIOSUpdate -Model $ModelName }
-                        'Lenovo' { Get-LenovoBIOSUpdate -Model $ModelName -OperatingSystem $OperatingSystem }
+                        'Dell'      { Get-DellBIOSUpdate -Model $ModelName }
+                        'Lenovo'    { Get-LenovoBIOSUpdate -Model $ModelName -OperatingSystem $OperatingSystem }
+                        'Microsoft' { Get-SurfaceBIOSUpdate -Model $ModelName -OperatingSystem $OperatingSystem }
                     }
 
                     if ($BiosUpdate) {
@@ -274,7 +277,7 @@ function Invoke-DATSync {
         try {
             # Remove manufacturer/model download subdirectories
             $DownloadDirs = Get-ChildItem -Path $DownloadPath -Recurse -Directory -Depth 2 -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match 'Driver Cab|Windows|Dell|Lenovo|BIOS' }
+                Where-Object { $_.FullName -match 'Driver Cab|Windows|Dell|Lenovo|Microsoft|Surface|BIOS' }
             foreach ($Dir in $DownloadDirs) {
                 if ((Test-Path $Dir.FullName)) {
                     Write-DATLog -Message "Removing download content: $($Dir.FullName)" -Severity 1
@@ -653,7 +656,26 @@ function Invoke-DATSyncSinglePackage {
         Write-DATLog -Message "Extracting $FileName to $PackageSourceDir" -Severity 1
 
         if ($PSCmdlet.ShouldProcess($DownloadDest, 'Extract')) {
-            if ($FileName -like '*.cab') {
+            if ($FileName -like '*.msi') {
+                # Microsoft Surface driver packs are MSI files.
+                # Use msiexec /a (administrative install) to extract content without installing.
+                Write-DATLog -Message "Extracting MSI package: $FileName" -Severity 1
+                $MsiTimeout = 600000  # 10 minutes (Surface MSIs can be ~1 GB)
+                try {
+                    $MsiArgs = "/a `"$DownloadDest`" /qn TARGETDIR=`"$PackageSourceDir`""
+                    $Proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $MsiArgs `
+                        -NoNewWindow -PassThru -ErrorAction Stop
+                    $Completed = $Proc.WaitForExit($MsiTimeout)
+                    if (-not $Completed) {
+                        Write-DATLog -Message "MSI extraction timed out after 10 minutes - killing process" -Severity 3
+                        $Proc.Kill()
+                    } elseif ($Proc.ExitCode -ne 0) {
+                        Write-DATLog -Message "MSI extraction returned exit code $($Proc.ExitCode)" -Severity 2
+                    }
+                } catch {
+                    Write-DATLog -Message "MSI extraction failed: $($_.Exception.Message)" -Severity 3
+                }
+            } elseif ($FileName -like '*.cab') {
                 Expand-DATCabinet -CabPath $DownloadDest -DestinationPath $PackageSourceDir
             } elseif ($FileName -like '*.zip') {
                 Expand-Archive -Path $DownloadDest -DestinationPath $PackageSourceDir -Force
@@ -784,9 +806,13 @@ function Invoke-DATSyncSinglePackage {
                             Write-DATLog -Message "  $OverlayTag Overlaying: $($IndvDriver.Category) - $($IndvDriver.Name) v$($IndvDriver.Version) ($($IndvDriver.ReleaseDate))" -Severity 1
 
                             try {
-                                # Download individual driver .exe to temp
+                                # Download individual driver .exe to temp (10 min timeout per driver)
                                 $DriverExePath = Join-Path $OverlayTempDir $IndvDriver.FileName
-                                Invoke-DATDownload -Url $IndvDriver.Url -DestinationPath $DriverExePath -MaxRetries 2
+                                $DlResult = Invoke-DATDownload -Url $IndvDriver.Url -DestinationPath $DriverExePath -MaxRetries 2 -TimeoutSeconds 600
+                                if (-not $DlResult) {
+                                    Write-DATLog -Message "  WARNING: Download timed out for $($IndvDriver.Name) - skipping this driver" -Severity 2
+                                    continue
+                                }
 
                                 # Create category subdirectory in package source
                                 $OverlayTargetDir = Join-Path $PackageSourceDir $IndvDriver.Category

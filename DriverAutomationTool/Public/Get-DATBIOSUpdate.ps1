@@ -19,7 +19,7 @@ function Get-DATBIOSUpdate {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Dell', 'Lenovo')]
+        [ValidateSet('Dell', 'Lenovo', 'Microsoft')]
         [string[]]$Manufacturer,
 
         [Parameter(Mandatory)]
@@ -45,6 +45,11 @@ function Get-DATBIOSUpdate {
                 'Lenovo' {
                     if ($ForceRefresh) { Update-LenovoCatalogCache -ForceRefresh }
                     $Update = Get-LenovoBIOSUpdate -Model $M -OperatingSystem $OperatingSystem
+                    if ($Update) { $Results.Add($Update) }
+                }
+                'Microsoft' {
+                    # Surface firmware is bundled with driver MSI - no separate BIOS update
+                    $Update = Get-SurfaceBIOSUpdate -Model $M -OperatingSystem $OperatingSystem
                     if ($Update) { $Results.Add($Update) }
                 }
             }

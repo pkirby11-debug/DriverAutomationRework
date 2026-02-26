@@ -89,6 +89,13 @@ function New-DATMainForm {
     $ModelsTopPanel.Controls.Add($LenovoCheckBox)
     $Controls['LenovoCheckBox'] = $LenovoCheckBox
 
+    $MicrosoftCheckBox = New-Object System.Windows.Forms.CheckBox
+    $MicrosoftCheckBox.Text = 'Microsoft'
+    $MicrosoftCheckBox.Location = New-Object System.Drawing.Point(290, 8)
+    $MicrosoftCheckBox.AutoSize = $true
+    $ModelsTopPanel.Controls.Add($MicrosoftCheckBox)
+    $Controls['MicrosoftCheckBox'] = $MicrosoftCheckBox
+
     # OS selection
     $OsLabel = New-Object System.Windows.Forms.Label
     $OsLabel.Text = 'Operating System:'

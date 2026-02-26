@@ -13,10 +13,15 @@ function Invoke-DATDownload {
         Maximum number of retry attempts. Default: 4.
     .PARAMETER ProxyServer
         Optional proxy server URL. If not specified, uses system proxy or no proxy.
+    .PARAMETER TimeoutSeconds
+        Overall timeout in seconds for the entire download (including all retries).
+        Default: 0 (no timeout). When set, the download is abandoned after this many
+        seconds and returns $null instead of throwing, so the caller can skip and continue.
     .PARAMETER UseSystemProxy
         If set, auto-detects system proxy settings.
     .OUTPUTS
         Returns the path to the downloaded file, or throws on failure.
+        Returns $null if TimeoutSeconds is set and the download times out.
     #>
     [CmdletBinding()]
     param(
@@ -29,6 +34,8 @@ function Invoke-DATDownload {
         [string]$ExpectedHash,
 
         [int]$MaxRetries = 4,
+
+        [int]$TimeoutSeconds = 0,
 
         [string]$ProxyServer,
 
@@ -52,12 +59,23 @@ function Invoke-DATDownload {
     $FileName = Split-Path $Url -Leaf
     $JobName = 'DAT_{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 12)
 
+    # Overall timeout stopwatch (0 = no limit)
+    $OverallTimer = [System.Diagnostics.Stopwatch]::StartNew()
+
     # Retry loop with exponential backoff
     $BackoffSeconds = @(30, 60, 120, 300)
     $Attempt = 0
     $Success = $false
+    $TimedOut = $false
 
     while ($Attempt -le $MaxRetries -and -not $Success) {
+        # Check overall timeout before each attempt
+        if ($TimeoutSeconds -gt 0 -and $OverallTimer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+            $TimedOut = $true
+            Write-DATLog -Message "Download timed out after $TimeoutSeconds seconds for $FileName - skipping" -Severity 2
+            break
+        }
+
         $Attempt++
 
         if ($Attempt -gt 1) {
@@ -66,9 +84,14 @@ function Invoke-DATDownload {
             Start-Sleep -Seconds $WaitTime
         }
 
+        # Calculate remaining time budget for this attempt
+        $RemainingSeconds = if ($TimeoutSeconds -gt 0) {
+            [math]::Max(30, $TimeoutSeconds - [int]$OverallTimer.Elapsed.TotalSeconds)
+        } else { 0 }
+
         # Try BITS Transfer first
         $BitsSuccess = Invoke-DATBitsDownload -Url $Url -DestinationPath $DestinationPath `
-            -JobName $JobName -ProxyParams $ProxyParams
+            -JobName $JobName -ProxyParams $ProxyParams -TimeoutSeconds $RemainingSeconds
 
         if ($BitsSuccess) {
             $Success = $true
@@ -76,12 +99,17 @@ function Invoke-DATDownload {
             # Fallback to Invoke-WebRequest
             Write-DATLog -Message "BITS transfer failed for $FileName, falling back to WebRequest" -Severity 2
             $WebSuccess = Invoke-DATWebDownload -Url $Url -DestinationPath $DestinationPath `
-                -ProxyServer $ProxyServer
+                -ProxyServer $ProxyServer -TimeoutSeconds $RemainingSeconds
 
             if ($WebSuccess) {
                 $Success = $true
             }
         }
+    }
+
+    if ($TimedOut) {
+        Remove-Item $DestinationPath -Force -ErrorAction SilentlyContinue
+        return $null
     }
 
     if (-not $Success) {
@@ -113,7 +141,8 @@ function Invoke-DATBitsDownload {
         [string]$Url,
         [string]$DestinationPath,
         [string]$JobName,
-        [hashtable]$ProxyParams = @{}
+        [hashtable]$ProxyParams = @{},
+        [int]$TimeoutSeconds = 0
     )
 
     try {
@@ -125,13 +154,18 @@ function Invoke-DATBitsDownload {
 
         Import-Module BitsTransfer -ErrorAction Stop
 
+        # Use the timeout as BITS RetryTimeout if set (minimum 60s), otherwise default 300s
+        $BitsRetryTimeout = if ($TimeoutSeconds -gt 0) {
+            [math]::Max(60, $TimeoutSeconds)
+        } else { 300 }
+
         $BitsParams = @{
             Source          = $Url
             Destination     = $DestinationPath
             DisplayName     = $JobName
             Description     = "DAT Download: $(Split-Path $Url -Leaf)"
             RetryInterval   = 60
-            RetryTimeout    = 300
+            RetryTimeout    = $BitsRetryTimeout
             Priority        = 'Foreground'
             TransferType    = 'Download'
             ErrorAction     = 'Stop'
@@ -150,6 +184,13 @@ function Invoke-DATBitsDownload {
         $LastPercent = -1
 
         while ($BitsJob.JobState -eq 'Transferring' -or $BitsJob.JobState -eq 'Connecting') {
+            # Enforce overall timeout - kill the BITS job if it's taking too long
+            if ($TimeoutSeconds -gt 0 -and $StopWatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                Write-DATLog -Message "BITS download timed out after $TimeoutSeconds seconds for $FileName - cancelling" -Severity 2
+                Remove-BitsTransfer -BitsJob $BitsJob -ErrorAction SilentlyContinue
+                return $false
+            }
+
             if ($BitsJob.BytesTotal -gt 0) {
                 $Percent = [math]::Round(($BitsJob.BytesTransferred / $BitsJob.BytesTotal) * 100)
                 if ($Percent -ne $LastPercent -and ($Percent % 10 -eq 0)) {
@@ -199,7 +240,8 @@ function Invoke-DATWebDownload {
     param(
         [string]$Url,
         [string]$DestinationPath,
-        [string]$ProxyServer
+        [string]$ProxyServer,
+        [int]$TimeoutSeconds = 0
     )
 
     try {
@@ -212,6 +254,11 @@ function Invoke-DATWebDownload {
 
         if ($ProxyServer) {
             $WebParams['Proxy'] = $ProxyServer
+        }
+
+        # Apply timeout if set (Invoke-WebRequest -TimeoutSec)
+        if ($TimeoutSeconds -gt 0) {
+            $WebParams['TimeoutSec'] = $TimeoutSeconds
         }
 
         $StopWatch = [System.Diagnostics.Stopwatch]::StartNew()

@@ -549,11 +549,13 @@ function Get-DellIndividualDrivers {
     }
 
     # Deduplicate: keep only the latest version of each distinct driver component.
-    # Group by display name (e.g., "Intel PCIe Ethernet Controller Driver" vs
-    # "Intel Wi-Fi Driver" are different drivers even though both are Network category).
-    # Multiple versions of the same driver - keep only the newest.
+    # Dell catalog display names often include the Dell revision suffix in the name
+    # itself (e.g., "ASMedia USB Extended Host Controller Driver, A04" and the same
+    # driver as "...Driver, A10"). Stripping the trailing ", Axx" or ",Axx" before
+    # grouping ensures these are recognized as the same driver so only the newest is kept.
+    $RevisionSuffix = ',?\s*A\d{2,3}$'
     $LatestPerDriver = $MatchedDrivers |
-        Group-Object Name |
+        Group-Object { ($_.Name -replace $RevisionSuffix, '').Trim() } |
         ForEach-Object {
             $_.Group | Sort-Object ParsedDate -Descending | Select-Object -First 1
         }

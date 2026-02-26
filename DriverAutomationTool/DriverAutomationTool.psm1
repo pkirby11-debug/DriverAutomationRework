@@ -9,6 +9,7 @@ $PrivatePaths = @(
     'Private\Core\DownloadManager.ps1'
     'Private\OEM\DellAdapter.ps1'
     'Private\OEM\LenovoAdapter.ps1'
+    'Private\OEM\SurfaceAdapter.ps1'
     'Private\Platform\SCCMPlatform.ps1'
 )
 
