@@ -232,7 +232,10 @@ function Invoke-DATBitsDownload {
 function Invoke-DATWebDownload {
     <#
     .SYNOPSIS
-        Internal: Downloads a file using Invoke-WebRequest as fallback.
+        Internal: Downloads a file using HttpWebRequest with streaming timeout.
+        Unlike Invoke-WebRequest -TimeoutSec (which only limits the connection timeout
+        in PowerShell 5.1), this enforces a wall-clock timeout on the entire transfer
+        by checking elapsed time while streaming bytes to disk.
     .OUTPUTS
         Returns $true on success, $false on failure.
     #>
@@ -244,25 +247,58 @@ function Invoke-DATWebDownload {
         [int]$TimeoutSeconds = 0
     )
 
+    $FileName = Split-Path $Url -Leaf
+    $Response = $null
+    $ResponseStream = $null
+    $FileStream = $null
+
     try {
-        $WebParams = @{
-            Uri             = $Url
-            OutFile         = $DestinationPath
-            UseBasicParsing = $true
-            ErrorAction     = 'Stop'
-        }
+        $Request = [System.Net.HttpWebRequest]::Create($Url)
+        $Request.Method = 'GET'
+        $Request.AllowAutoRedirect = $true
+        $Request.UserAgent = 'DriverAutomationTool'
+
+        # Connection + initial response timeout (60s default, or the full timeout if set)
+        $ConnTimeout = if ($TimeoutSeconds -gt 0) {
+            [math]::Min(60, $TimeoutSeconds) * 1000
+        } else { 60000 }
+        $Request.Timeout = $ConnTimeout
+
+        # ReadWriteTimeout: max wait between individual socket reads (30s)
+        # This catches fully-stalled connections; our loop handles slow-but-active ones
+        $Request.ReadWriteTimeout = 30000
 
         if ($ProxyServer) {
-            $WebParams['Proxy'] = $ProxyServer
-        }
-
-        # Apply timeout if set (Invoke-WebRequest -TimeoutSec)
-        if ($TimeoutSeconds -gt 0) {
-            $WebParams['TimeoutSec'] = $TimeoutSeconds
+            $Request.Proxy = New-Object System.Net.WebProxy($ProxyServer)
         }
 
         $StopWatch = [System.Diagnostics.Stopwatch]::StartNew()
-        Invoke-WebRequest @WebParams
+        $Response = $Request.GetResponse()
+        $TotalBytes = $Response.ContentLength
+        $ResponseStream = $Response.GetResponseStream()
+
+        $FileStream = [System.IO.FileStream]::new($DestinationPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+        $Buffer = [byte[]]::new(65536)
+        $BytesDownloaded = 0
+
+        while (($BytesRead = $ResponseStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+            # Check wall-clock timeout during transfer
+            if ($TimeoutSeconds -gt 0 -and $StopWatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                Write-DATLog -Message "WebRequest download timed out after $TimeoutSeconds seconds for $FileName (transferred $([math]::Round($BytesDownloaded / 1MB, 1)) MB) - aborting" -Severity 2
+                $FileStream.Close(); $FileStream = $null
+                $ResponseStream.Close(); $ResponseStream = $null
+                $Response.Close(); $Response = $null
+                Remove-Item $DestinationPath -Force -ErrorAction SilentlyContinue
+                return $false
+            }
+
+            $FileStream.Write($Buffer, 0, $BytesRead)
+            $BytesDownloaded += $BytesRead
+        }
+
+        $FileStream.Close(); $FileStream = $null
+        $ResponseStream.Close(); $ResponseStream = $null
+        $Response.Close(); $Response = $null
         $StopWatch.Stop()
 
         if (Test-Path $DestinationPath) {
@@ -276,14 +312,18 @@ function Invoke-DATWebDownload {
                 return $false
             }
 
-            Write-DATLog -Message "Downloaded $(Split-Path $Url -Leaf) ($SizeMB MB) in $([math]::Round($StopWatch.Elapsed.TotalSeconds, 1))s via WebRequest" -Severity 1
+            Write-DATLog -Message "Downloaded $FileName ($SizeMB MB) in $([math]::Round($StopWatch.Elapsed.TotalSeconds, 1))s via WebRequest" -Severity 1
             return $true
         }
 
         return $false
     } catch {
-        Write-DATLog -Message "WebRequest download failed for $(Split-Path $Url -Leaf): $($_.Exception.Message)" -Severity 2
+        Write-DATLog -Message "WebRequest download failed for ${FileName}: $($_.Exception.Message)" -Severity 2
         return $false
+    } finally {
+        if ($FileStream)     { $FileStream.Dispose() }
+        if ($ResponseStream) { $ResponseStream.Dispose() }
+        if ($Response)       { $Response.Close() }
     }
 }
 
