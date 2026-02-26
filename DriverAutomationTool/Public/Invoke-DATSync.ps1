@@ -463,8 +463,9 @@ function Invoke-DATSyncSinglePackage {
             $CachedMissingCategories = $SmartCheckMissing
 
             $GetDriverParams = @{
-                SystemID     = $PackageInfo.SystemID
-                BaselineDate = $PackageInfo.ReleaseDate
+                SystemID        = $PackageInfo.SystemID
+                BaselineDate    = $PackageInfo.ReleaseDate
+                OperatingSystem = $PackageInfo.OS
             }
             if ($CachedCategoryDates -and $CachedCategoryDates.Count -gt 0) {
                 $GetDriverParams['CategoryBaselines'] = $CachedCategoryDates
@@ -790,8 +791,9 @@ function Invoke-DATSyncSinglePackage {
                     $IndividualDrivers = $CachedIndividualDrivers
                 } else {
                     $GetDriverParams = @{
-                        SystemID     = $PackageInfo.SystemID
-                        BaselineDate = $PackageInfo.ReleaseDate
+                        SystemID        = $PackageInfo.SystemID
+                        BaselineDate    = $PackageInfo.ReleaseDate
+                        OperatingSystem = $PackageInfo.OS
                     }
                     if ($PackCategoryDates -and $PackCategoryDates.Count -gt 0) {
                         $GetDriverParams['CategoryBaselines'] = $PackCategoryDates

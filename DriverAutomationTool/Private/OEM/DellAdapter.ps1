@@ -374,6 +374,11 @@ function Get-DellIndividualDrivers {
         DriverVer datetime found in the base pack's INF files for that category.
         When present, the per-category date is used instead of BaselineDate for
         more accurate filtering.
+    .PARAMETER OperatingSystem
+        The target operating system (e.g., 'Windows 11 24H2', 'Windows 10 22H2').
+        When specified, only drivers that list this OS in their SupportedOperatingSystems
+        are returned. This prevents picking up drivers for the wrong OS (e.g., Windows 7
+        drivers in a Windows 11 package).
     .PARAMETER MissingCategories
         Array of category names (Video, Network, Audio, Chipset, Storage, Input, Other)
         that are absent from the extracted base driver pack. For these categories,
@@ -392,6 +397,8 @@ function Get-DellIndividualDrivers {
 
         [hashtable]$CategoryBaselines,
 
+        [string]$OperatingSystem,
+
         [string[]]$MissingCategories
     )
 
@@ -408,6 +415,17 @@ function Get-DellIndividualDrivers {
 
     $Xml = Read-DATXml -Path $CatalogPath
     $Sources = Get-DATOEMSources
+
+    # Convert OS name to Dell's catalog OS code for filtering (e.g., "Windows11")
+    $TargetOsCode = $null
+    if ($OperatingSystem) {
+        $TargetOsCode = ConvertTo-DellOSCode -OperatingSystem $OperatingSystem
+        if ($TargetOsCode) {
+            Write-DATLog -Message "Filtering individual drivers to OS code: $TargetOsCode (from '$OperatingSystem')" -Severity 1
+        } else {
+            Write-DATLog -Message "Could not map OS '$OperatingSystem' to Dell OS code - OS filtering disabled" -Severity 2
+        }
+    }
 
     # Parse baseline date for comparison
     try {
@@ -451,6 +469,7 @@ function Get-DellIndividualDrivers {
     $SkippedNoName = 0
     $SkippedExcluded = 0
     $SkippedNoSysMatch = 0
+    $SkippedWrongOS = 0
     $SkippedDate = 0
 
     # Find matching SoftwareComponents
@@ -496,6 +515,20 @@ function Get-DellIndividualDrivers {
         if (-not $SysMatch) {
             $SkippedNoSysMatch++
             continue
+        }
+
+        # Check OS compatibility - skip drivers for wrong OS (e.g., Windows 7 in a Win11 package)
+        if ($TargetOsCode) {
+            $ComponentOsCodes = @($Component.SupportedOperatingSystems.OperatingSystem.osCode) |
+                Where-Object { $_ }
+            if ($ComponentOsCodes.Count -gt 0) {
+                $OsMatch = $ComponentOsCodes | Where-Object { $_ -like "*$TargetOsCode*" }
+                if (-not $OsMatch) {
+                    $SkippedWrongOS++
+                    continue
+                }
+            }
+            # If no OS codes listed, include the driver (don't filter it out)
         }
 
         # Parse component date
@@ -557,8 +590,8 @@ function Get-DellIndividualDrivers {
     # Log diagnostic summary
     Write-DATLog -Message ("Dell catalog scan: $TotalScanned components scanned, " +
         "$SkippedPkgType non-driver (packageType), $SkippedExcluded excluded (name), " +
-        "$SkippedNoSysMatch wrong SystemID, $SkippedDate older than baseline, " +
-        "$($MatchedDrivers.Count) matched") -Severity 1
+        "$SkippedNoSysMatch wrong SystemID, $SkippedWrongOS wrong OS, " +
+        "$SkippedDate older than baseline, $($MatchedDrivers.Count) matched") -Severity 1
 
     if ($MatchedDrivers.Count -eq 0) {
         $Msg = "No individual drivers found for SystemID $SystemID"
