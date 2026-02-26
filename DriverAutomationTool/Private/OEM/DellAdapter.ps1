@@ -531,20 +531,29 @@ function Get-DellIndividualDrivers {
         }
 
         # Check OS compatibility - skip drivers for wrong OS (e.g., Windows 7 in a Win11 package)
-        # Uses the compatible OS code set which includes both Windows10 and Windows11
-        # since they share the same driver model (many Win11 drivers list only Windows10).
+        # Uses wildcard matching (like the driver pack catalog does) because Dell's CatalogPC.xml
+        # often uses extended OS codes like "Windows10X64" or "Windows11ARM64" rather than
+        # plain "Windows10"/"Windows11". Match if any compatible code is a substring of any
+        # component OS code.
         if ($CompatibleOsCodes) {
             $ComponentOsCodes = @($Component.SupportedOperatingSystems.OperatingSystem.osCode) |
                 Where-Object { $_ }
             if ($ComponentOsCodes.Count -gt 0) {
                 $OsMatch = $false
                 foreach ($Code in $ComponentOsCodes) {
-                    if ($CompatibleOsCodes.Contains($Code)) {
-                        $OsMatch = $true
-                        break
+                    foreach ($CompatCode in $CompatibleOsCodes) {
+                        if ($Code -like "*$CompatCode*") {
+                            $OsMatch = $true
+                            break
+                        }
                     }
+                    if ($OsMatch) { break }
                 }
                 if (-not $OsMatch) {
+                    # Log the first few rejected OS codes for diagnostics
+                    if ($SkippedWrongOS -lt 3) {
+                        Write-DATLog -Message "  OS filter skip: '$DisplayName' has OS codes: $($ComponentOsCodes -join ', ')" -Severity 1
+                    }
                     $SkippedWrongOS++
                     continue
                 }
