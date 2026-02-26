@@ -485,6 +485,29 @@ function Get-DellIndividualDrivers {
     $SkippedWrongOS = 0
     $SkippedDate = 0
 
+    # --- Diagnostic pre-scan: count SystemID matches regardless of other filters ---
+    # This reveals whether the catalog has entries for this model at all, and what
+    # packageTypes they use (in case Dell uses non-LWXP types for newer drivers).
+    $PreScanTotal = 0
+    $PreScanPkgTypes = @{}
+    foreach ($Component in $Xml.Manifest.SoftwareComponent) {
+        $CompSysIDs = @($Component.SupportedSystems.Brand.Model.SystemID) |
+            ForEach-Object { if ($_) { $_.Trim().ToUpper() } }
+        $Hit = $false
+        foreach ($SysID in $SystemIDs) {
+            if ($CompSysIDs -contains $SysID.Trim().ToUpper()) { $Hit = $true; break }
+        }
+        if ($Hit) {
+            $PreScanTotal++
+            $PT = if ($Component.packageType) { $Component.packageType } else { '(none)' }
+            if (-not $PreScanPkgTypes.ContainsKey($PT)) { $PreScanPkgTypes[$PT] = 0 }
+            $PreScanPkgTypes[$PT]++
+        }
+    }
+    $PkgTypeSummary = ($PreScanPkgTypes.GetEnumerator() | Sort-Object Name |
+        ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '
+    Write-DATLog -Message "Pre-scan: $PreScanTotal total components match SystemID $SystemID. PackageType breakdown: $PkgTypeSummary" -Severity 1
+
     # Find matching SoftwareComponents
     $MatchedDrivers = [System.Collections.Generic.List[PSCustomObject]]::new()
 
