@@ -820,6 +820,7 @@ function Invoke-DATSyncSinglePackage {
                         foreach ($IndvDriver in $IndividualDrivers) {
                             $OverlayTag = if ($IndvDriver.IsMissing) { '[MISSING]' } else { '[UPDATE]' }
                             Write-DATLog -Message "  $OverlayTag Overlaying: $($IndvDriver.Category) - $($IndvDriver.Name) v$($IndvDriver.Version) ($($IndvDriver.ReleaseDate))" -Severity 1
+                            Write-DATLog -Message "    Download URL: $($IndvDriver.Url)" -Severity 1
 
                             try {
                                 # Download individual driver .exe to temp (10 min timeout per driver)
@@ -884,7 +885,18 @@ function Invoke-DATSyncSinglePackage {
                                     $OverlayFileCount = @(Get-ChildItem $OverlayTargetDir -Recurse -File -ErrorAction SilentlyContinue).Count
                                     Write-DATLog -Message "  Overlaid $OverlayFileCount file(s) for $($IndvDriver.Category)" -Severity 1
                                 } else {
-                                    Write-DATLog -Message "  WARNING: Failed to extract $($IndvDriver.FileName) - skipping this driver" -Severity 2
+                                    $DlFileSize = if (Test-Path $DriverExePath) { (Get-Item $DriverExePath).Length } else { 0 }
+                                    Write-DATLog -Message "  WARNING: Failed to extract $($IndvDriver.FileName) (downloaded $([math]::Round($DlFileSize / 1MB, 2)) MB) - skipping this driver" -Severity 2
+                                    # Log first bytes to detect HTML error pages masquerading as EXEs
+                                    if ($DlFileSize -gt 0 -and $DlFileSize -lt 5MB) {
+                                        try {
+                                            $Head = [System.IO.File]::ReadAllBytes($DriverExePath) | Select-Object -First 64
+                                            $HeadStr = [System.Text.Encoding]::ASCII.GetString($Head)
+                                            if ($HeadStr -match '<html|<!DOCTYPE|<HTML') {
+                                                Write-DATLog -Message "  WARNING: Downloaded file appears to be HTML, not an EXE - URL may be incorrect" -Severity 3
+                                            }
+                                        } catch { }
+                                    }
                                 }
                             } catch {
                                 Write-DATLog -Message "  WARNING: Failed to download $($IndvDriver.Name) - $($_.Exception.Message) - skipping" -Severity 2

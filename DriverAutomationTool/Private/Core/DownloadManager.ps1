@@ -59,6 +59,8 @@ function Invoke-DATDownload {
     $FileName = Split-Path $Url -Leaf
     $JobName = 'DAT_{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 12)
 
+    Write-DATLog -Message "Starting download: $Url" -Severity 1
+
     # Overall timeout stopwatch (0 = no limit)
     $OverallTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -253,10 +255,15 @@ function Invoke-DATWebDownload {
     $FileStream = $null
 
     try {
+        # Ensure TLS 1.2 is available (required by Dell CDN and most modern HTTPS servers)
+        if ([System.Net.ServicePointManager]::SecurityProtocol -notmatch 'Tls12') {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        }
+
         $Request = [System.Net.HttpWebRequest]::Create($Url)
         $Request.Method = 'GET'
         $Request.AllowAutoRedirect = $true
-        $Request.UserAgent = 'DriverAutomationTool'
+        $Request.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
         # Connection + initial response timeout (60s default, or the full timeout if set)
         $ConnTimeout = if ($TimeoutSeconds -gt 0) {
