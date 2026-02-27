@@ -398,13 +398,6 @@ function New-DATMainForm {
     $OptionsGroup.Controls.Add($UpdateIndividualCheckBox)
     $Controls['UpdateIndividualCheckBox'] = $UpdateIndividualCheckBox
 
-    $VerifyHashCheckBox = New-Object System.Windows.Forms.CheckBox
-    $VerifyHashCheckBox.Text = 'Verify download hash (Dell)'
-    $VerifyHashCheckBox.Location = New-Object System.Drawing.Point(530, 74)
-    $VerifyHashCheckBox.AutoSize = $true
-    $OptionsGroup.Controls.Add($VerifyHashCheckBox)
-    $Controls['VerifyHashCheckBox'] = $VerifyHashCheckBox
-
     # Deployment Platform selection
     $DeployPlatformLabel = New-Object System.Windows.Forms.Label
     $DeployPlatformLabel.Text = 'Deployment Platform:'
@@ -438,6 +431,13 @@ function New-DATMainForm {
     $CompressionTypeCombo.Enabled = $false
     $OptionsGroup.Controls.Add($CompressionTypeCombo)
     $Controls['CompressionTypeCombo'] = $CompressionTypeCombo
+
+    $VerifyHashCheckBox = New-Object System.Windows.Forms.CheckBox
+    $VerifyHashCheckBox.Text = 'Verify download hash (Dell)'
+    $VerifyHashCheckBox.Location = New-Object System.Drawing.Point(280, 131)
+    $VerifyHashCheckBox.AutoSize = $true
+    $OptionsGroup.Controls.Add($VerifyHashCheckBox)
+    $Controls['VerifyHashCheckBox'] = $VerifyHashCheckBox
 
     # Distribution Points group (right side)
     $DPGroup = New-Object System.Windows.Forms.GroupBox
