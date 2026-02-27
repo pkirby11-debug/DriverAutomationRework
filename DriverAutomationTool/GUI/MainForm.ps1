@@ -569,14 +569,21 @@ function Initialize-DATMainForm {
                 default        { 'All' }
             }
 
-            $Packages = Find-DATExistingPackages -Type $TypeFilter
+            $FindParams = @{ Type = $TypeFilter }
+            if ($Controls['PkgIncludeDriverPkgsCheckBox'].Checked) {
+                $FindParams['IncludeDriverPackages'] = $true
+            }
+
+            $Packages = Find-DATExistingPackages @FindParams
             foreach ($Pkg in $Packages) {
+                $PkgTypeLabel = if ($Pkg.PackageType -eq 'DriverPackage') { 'Driver Pkg' } else { 'Standard' }
                 $Controls['PkgGrid'].Rows.Add(
                     $false,
                     $Pkg.PackageID,
                     $Pkg.Name,
                     $Pkg.Version,
                     $Pkg.Manufacturer,
+                    $PkgTypeLabel,
                     $Pkg.SourcePath
                 )
             }

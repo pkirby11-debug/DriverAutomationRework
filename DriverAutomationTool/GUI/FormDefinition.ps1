@@ -574,6 +574,13 @@ function New-DATMainForm {
     $PkgFilterPanel.Controls.Add($PkgDeleteButton)
     $Controls['PkgDeleteButton'] = $PkgDeleteButton
 
+    $PkgIncludeDriverPkgsCheckBox = New-Object System.Windows.Forms.CheckBox
+    $PkgIncludeDriverPkgsCheckBox.Text = 'Include Driver Packages'
+    $PkgIncludeDriverPkgsCheckBox.Location = New-Object System.Drawing.Point(480, 12)
+    $PkgIncludeDriverPkgsCheckBox.AutoSize = $true
+    $PkgFilterPanel.Controls.Add($PkgIncludeDriverPkgsCheckBox)
+    $Controls['PkgIncludeDriverPkgsCheckBox'] = $PkgIncludeDriverPkgsCheckBox
+
     # Action row (second row in filter panel)
     $PkgActionLabel = New-Object System.Windows.Forms.Label
     $PkgActionLabel.Text = 'Action:'
@@ -621,9 +628,10 @@ function New-DATMainForm {
     foreach ($Col in @(
         @{ Name = 'Selected'; Type = 'CheckBox'; Width = 30 }
         @{ Name = 'PackageID'; Type = 'Text'; Width = 80 }
-        @{ Name = 'Name'; Type = 'Text'; FillWeight = 40 }
+        @{ Name = 'Name'; Type = 'Text'; FillWeight = 35 }
         @{ Name = 'Version'; Type = 'Text'; Width = 80 }
         @{ Name = 'Manufacturer'; Type = 'Text'; Width = 100 }
+        @{ Name = 'PackageType'; Type = 'Text'; Width = 90 }
         @{ Name = 'SourcePath'; Type = 'Text'; FillWeight = 30 }
     )) {
         if ($Col.Type -eq 'CheckBox') {

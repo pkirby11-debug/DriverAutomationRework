@@ -1073,12 +1073,14 @@ function Remove-DATLegacyPackage {
     try {
         Set-Location -Path "$($script:CMSiteCode):"
 
-        $Package = Get-CMPackage -Id $PackageID -Fast -ErrorAction SilentlyContinue
-        if (-not $Package) {
-            Write-DATLog -Message "Package $PackageID not found" -Severity 2
+        $PkgLookup = Get-DATPackageAuto -PackageID $PackageID
+        if (-not $PkgLookup) {
+            Write-DATLog -Message "Package $PackageID not found (checked both standard and driver packages)" -Severity 2
             return
         }
 
+        $Package = $PkgLookup.Package
+        $PackageType = $PkgLookup.PackageType
         $PackageName = $Package.Name
         $SourcePath = $Package.PkgSourcePath
 
@@ -1103,7 +1105,11 @@ function Remove-DATLegacyPackage {
             while (-not $Removed -and $Attempt -lt $MaxRetries) {
                 $Attempt++
                 try {
-                    Remove-CMPackage -Id $PackageID -Force -ErrorAction Stop
+                    if ($PackageType -eq 'DriverPackage') {
+                        Remove-CMDriverPackage -Id $PackageID -Force -ErrorAction Stop
+                    } else {
+                        Remove-CMPackage -Id $PackageID -Force -ErrorAction Stop
+                    }
                     $Removed = $true
                 } catch {
                     $ErrMsg = $_.Exception.Message
@@ -1123,15 +1129,22 @@ function Remove-DATLegacyPackage {
                         # Final attempt failed - try WMI direct deletion as last resort
                         Write-DATLog -Message "  All CM cmdlet attempts failed. Trying direct WMI package deletion..." -Severity 2
                         try {
+                            $WmiClass = if ($PackageType -eq 'DriverPackage') { 'SMS_DriverPackage' } else { 'SMS_Package' }
                             $WmiPkg = Get-WmiObject -ComputerName $SiteServer `
-                                -Namespace $WmiNamespace -Class 'SMS_Package' `
+                                -Namespace $WmiNamespace -Class $WmiClass `
                                 -Filter "PackageID = '$PackageID'" -ErrorAction Stop
+                            if (-not $WmiPkg -and $WmiClass -eq 'SMS_Package') {
+                                # Fallback: try driver package class in case type detection was wrong
+                                $WmiPkg = Get-WmiObject -ComputerName $SiteServer `
+                                    -Namespace $WmiNamespace -Class 'SMS_DriverPackage' `
+                                    -Filter "PackageID = '$PackageID'" -ErrorAction Stop
+                            }
                             if ($WmiPkg) {
                                 $WmiPkg.Delete() | Out-Null
-                                Write-DATLog -Message "  Package removed via direct WMI deletion" -Severity 1
+                                Write-DATLog -Message "  Package removed via direct WMI deletion ($WmiClass)" -Severity 1
                                 $Removed = $true
                             } else {
-                                throw "Package $PackageID not found via WMI"
+                                throw "Package $PackageID not found via WMI (tried SMS_Package and SMS_DriverPackage)"
                             }
                         } catch {
                             Write-DATLog -Message "  WMI deletion also failed: $($_.Exception.Message)" -Severity 3
@@ -1223,6 +1236,8 @@ function Find-DATExistingPackages {
         Filter by model (matches in package name).
     .PARAMETER Type
         Filter by type: 'Drivers', 'BIOS', or 'All'.
+    .PARAMETER IncludeDriverPackages
+        Also search CM driver packages (SMS_DriverPackage) in addition to standard packages.
     #>
     [CmdletBinding()]
     param(
@@ -1230,7 +1245,9 @@ function Find-DATExistingPackages {
         [string]$Model,
 
         [ValidateSet('Drivers', 'BIOS', 'All')]
-        [string]$Type = 'All'
+        [string]$Type = 'All',
+
+        [switch]$IncludeDriverPackages
     )
 
     Assert-DATConfigMgrConnected
@@ -1243,18 +1260,42 @@ function Find-DATExistingPackages {
         if ($Manufacturer) { $Filter = "$Manufacturer*" }
         if ($Model) { $Filter = "*$Model*" }
 
-        $Packages = Get-CMPackage -Name $Filter -Fast -ErrorAction SilentlyContinue
+        # Query standard packages
+        $StdPackages = @(Get-CMPackage -Name $Filter -Fast -ErrorAction SilentlyContinue)
 
         if ($Type -ne 'All') {
-            $Packages = $Packages | Where-Object {
+            $StdPackages = @($StdPackages | Where-Object {
                 $_.Description -match $Type -or $_.Name -match $Type
-            }
+            })
         }
 
-        return $Packages | Select-Object @{N='PackageID';E={[string]$_.PackageID}}, Name, Version, Manufacturer,
+        $Results = @($StdPackages | Select-Object @{N='PackageID';E={[string]$_.PackageID}}, Name, Version, Manufacturer,
             @{N='Description';E={$_.Description}},
             @{N='SourcePath';E={$_.PkgSourcePath}},
-            @{N='LastModified';E={$_.LastRefreshTime}}
+            @{N='LastModified';E={$_.LastRefreshTime}},
+            @{N='PackageType';E={'Standard'}})
+
+        # Also query CM driver packages if requested
+        if ($IncludeDriverPackages) {
+            $DrvPackages = @(Get-CMDriverPackage -Name $Filter -ErrorAction SilentlyContinue)
+
+            if ($Type -ne 'All') {
+                $DrvPackages = @($DrvPackages | Where-Object {
+                    $_.Description -match $Type -or $_.Name -match $Type
+                })
+            }
+
+            $DrvResults = @($DrvPackages | Select-Object @{N='PackageID';E={[string]$_.PackageID}}, Name, Version,
+                @{N='Manufacturer';E={$_.Manufacturer}},
+                @{N='Description';E={$_.Description}},
+                @{N='SourcePath';E={$_.PkgSourcePath}},
+                @{N='LastModified';E={$_.LastRefreshTime}},
+                @{N='PackageType';E={'DriverPackage'}})
+
+            $Results = $Results + $DrvResults
+        }
+
+        return $Results
     } finally {
         Set-Location -Path $OriginalLocation
     }
@@ -1319,6 +1360,37 @@ function Set-DATPackageFolder {
     }
 }
 
+function Get-DATPackageAuto {
+    <#
+    .SYNOPSIS
+        Detects whether a PackageID is a standard package or CM driver package.
+    .DESCRIPTION
+        Tries Get-CMPackage first, then Get-CMDriverPackage. Returns the package
+        object and its type so callers can use the correct cmdlets.
+    .PARAMETER PackageID
+        The ConfigMgr package ID to look up.
+    .OUTPUTS
+        PSCustomObject with Package and PackageType ('Standard' or 'DriverPackage'), or $null if not found.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$PackageID
+    )
+
+    $Pkg = Get-CMPackage -Id $PackageID -Fast -ErrorAction SilentlyContinue
+    if ($Pkg) {
+        return [PSCustomObject]@{ Package = $Pkg; PackageType = 'Standard' }
+    }
+
+    $Pkg = Get-CMDriverPackage -Id $PackageID -ErrorAction SilentlyContinue
+    if ($Pkg) {
+        return [PSCustomObject]@{ Package = $Pkg; PackageType = 'DriverPackage' }
+    }
+
+    return $null
+}
+
 function Assert-DATConfigMgrConnected {
     <#
     .SYNOPSIS
@@ -1357,7 +1429,13 @@ function Rename-DATPackageState {
     try {
         Set-Location -Path "$($script:CMSiteCode):"
 
-        $Package = Get-CMPackage -Id $PackageID -Fast -ErrorAction Stop
+        $PkgLookup = Get-DATPackageAuto -PackageID $PackageID
+        if (-not $PkgLookup) {
+            throw "Package $PackageID not found (checked both standard and driver packages)"
+        }
+
+        $Package = $PkgLookup.Package
+        $PackageType = $PkgLookup.PackageType
         $CurrentName = $Package.Name
 
         # Strip any existing state prefix (Pilot or Retired)
@@ -1375,7 +1453,11 @@ function Rename-DATPackageState {
         }
 
         if ($PSCmdlet.ShouldProcess("$CurrentName -> $NewName", 'Rename package')) {
-            Set-CMPackage -Id $PackageID -NewName $NewName
+            if ($PackageType -eq 'DriverPackage') {
+                Set-CMDriverPackage -Id $PackageID -NewName $NewName
+            } else {
+                Set-CMPackage -Id $PackageID -NewName $NewName
+            }
             Write-DATLog -Message "Package $PackageID renamed: '$CurrentName' -> '$NewName' (State: $State)" -Severity 1
         }
     } catch {
@@ -1410,7 +1492,13 @@ function Move-DATPackageOSVersion {
     try {
         Set-Location -Path "$($script:CMSiteCode):"
 
-        $Package = Get-CMPackage -Id $PackageID -Fast -ErrorAction Stop
+        $PkgLookup = Get-DATPackageAuto -PackageID $PackageID
+        if (-not $PkgLookup) {
+            throw "Package $PackageID not found (checked both standard and driver packages)"
+        }
+
+        $Package = $PkgLookup.Package
+        $PackageType = $PkgLookup.PackageType
         $CurrentName = $Package.Name
 
         # Match existing Windows version pattern in the package name
@@ -1430,7 +1518,11 @@ function Move-DATPackageOSVersion {
         }
 
         if ($PSCmdlet.ShouldProcess("$CurrentName -> $NewName", 'Rename package OS version')) {
-            Set-CMPackage -Id $PackageID -NewName $NewName
+            if ($PackageType -eq 'DriverPackage') {
+                Set-CMDriverPackage -Id $PackageID -NewName $NewName
+            } else {
+                Set-CMPackage -Id $PackageID -NewName $NewName
+            }
             Write-DATLog -Message "Package $PackageID OS version changed: '$CurrentName' -> '$NewName'" -Severity 1
         }
     } catch {
@@ -1478,7 +1570,12 @@ function Invoke-DATPatchPackage {
     try {
         Set-Location -Path "$($script:CMSiteCode):"
 
-        $Package = Get-CMPackage -Id $PackageID -Fast -ErrorAction Stop
+        $PkgLookup = Get-DATPackageAuto -PackageID $PackageID
+        if (-not $PkgLookup) {
+            throw "Package $PackageID not found (checked both standard and driver packages)"
+        }
+
+        $Package = $PkgLookup.Package
         $SourcePath = $Package.PkgSourcePath
 
         if (-not $SourcePath -or -not (Test-Path $SourcePath)) {
