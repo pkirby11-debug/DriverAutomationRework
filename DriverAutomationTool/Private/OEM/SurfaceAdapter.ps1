@@ -140,24 +140,60 @@ function Get-SurfaceDriverPack {
     }
 
     if (-not $PageContent) {
-        # Scrape the Download Center confirmation page to find direct MSI links
-        $ConfirmUrl = "$($Sources.surface.downloadCenterBase)confirmation.aspx?id=$DownloadID"
-        Write-DATLog -Message "Querying Microsoft Download Center for $Model (ID: $DownloadID)" -Severity 1
+        # Scrape the Download Center page to find direct MSI download links.
+        # Use Invoke-WebRequest with browser-like headers instead of Invoke-DATDownload
+        # (which is designed for file transfers and uses BITS/raw sockets).
+        # Try confirmation.aspx first (direct download links), fall back to details.aspx.
+        $BaseUrl = $Sources.surface.downloadCenterBase.TrimEnd('/')
 
-        $TempDir = Get-DATTempPath -Prefix 'SurfaceDownload'
-        try {
-            $PagePath = Join-Path $TempDir 'download_page.html'
-            Invoke-DATDownload -Url $ConfirmUrl -DestinationPath $PagePath -MaxRetries 2
-            $PageContent = Get-Content -Path $PagePath -Raw
+        # Ensure TLS 1.2 for microsoft.com
+        if ([System.Net.ServicePointManager]::SecurityProtocol -notmatch 'Tls12') {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        }
 
-            if ($PageContent) {
-                Set-DATCachedItem -Key $CacheKey -SourcePath $PagePath -SourceUrl $ConfirmUrl
+        $WebParams = @{
+            UseBasicParsing = $true
+            TimeoutSec      = 60
+            Headers         = @{
+                'Accept'          = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                'Accept-Language' = 'en-US,en;q=0.5'
             }
-        } catch {
-            Write-DATLog -Message "Failed to query Download Center for $Model`: $($_.Exception.Message)" -Severity 3
+            UserAgent       = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            ErrorAction     = 'Stop'
+        }
+
+        $UrlsToTry = @(
+            "$BaseUrl/confirmation.aspx?id=$DownloadID"
+            "$BaseUrl/details.aspx?id=$DownloadID"
+        )
+
+        foreach ($PageUrl in $UrlsToTry) {
+            Write-DATLog -Message "Querying Microsoft Download Center for $Model (ID: $DownloadID): $PageUrl" -Severity 1
+            try {
+                $Response = Invoke-WebRequest -Uri $PageUrl @WebParams
+                if ($Response.StatusCode -eq 200 -and $Response.Content) {
+                    $PageContent = $Response.Content
+                    Write-DATLog -Message "Download Center page retrieved ($([math]::Round($PageContent.Length / 1KB, 1)) KB)" -Severity 1
+
+                    # Cache the successful page content
+                    $TempDir = Get-DATTempPath -Prefix 'SurfaceDownload'
+                    try {
+                        $PagePath = Join-Path $TempDir 'download_page.html'
+                        $PageContent | Set-Content -Path $PagePath -Encoding UTF8
+                        Set-DATCachedItem -Key $CacheKey -SourcePath $PagePath -SourceUrl $PageUrl
+                    } finally {
+                        Remove-DATTempPath -Path $TempDir
+                    }
+                    break
+                }
+            } catch {
+                Write-DATLog -Message "Download Center query failed for $PageUrl`: $($_.Exception.Message)" -Severity 2
+            }
+        }
+
+        if (-not $PageContent) {
+            Write-DATLog -Message "Failed to query Microsoft Download Center for $Model (ID: $DownloadID) - all URLs returned errors" -Severity 3
             return $null
-        } finally {
-            Remove-DATTempPath -Path $TempDir
         }
     }
 
