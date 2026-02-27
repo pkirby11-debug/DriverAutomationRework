@@ -33,6 +33,11 @@ function Invoke-DATDownload {
 
         [string]$ExpectedHash,
 
+        [long]$ExpectedSize = 0,
+
+        [ValidateSet('MD5', 'SHA256')]
+        [string]$HashAlgorithm = 'MD5',
+
         [int]$MaxRetries = 4,
 
         [int]$TimeoutSeconds = 0,
@@ -118,14 +123,25 @@ function Invoke-DATDownload {
         throw "Failed to download $Url after $MaxRetries retries."
     }
 
+    # Verify file size if expected size provided
+    if ($ExpectedSize -gt 0 -and (Test-Path $DestinationPath)) {
+        $ActualSize = (Get-Item $DestinationPath).Length
+        if ($ActualSize -ne $ExpectedSize) {
+            $DeltaMB = [math]::Round([math]::Abs($ExpectedSize - $ActualSize) / 1MB, 1)
+            Remove-Item $DestinationPath -Force -ErrorAction SilentlyContinue
+            throw "Size mismatch for $FileName. Expected: $ExpectedSize bytes, Got: $ActualSize bytes (off by ${DeltaMB}MB). Download may be incomplete or corrupt."
+        }
+        Write-DATLog -Message "Size verified for $FileName ($ActualSize bytes)" -Severity 1
+    }
+
     # Verify hash if provided
     if ($ExpectedHash -and (Test-Path $DestinationPath)) {
-        $ActualHash = (Get-FileHash -Path $DestinationPath -Algorithm SHA256).Hash
+        $ActualHash = (Get-FileHash -Path $DestinationPath -Algorithm $HashAlgorithm).Hash
         if ($ActualHash -ne $ExpectedHash) {
             Remove-Item $DestinationPath -Force -ErrorAction SilentlyContinue
-            throw "Hash mismatch for $FileName. Expected: $ExpectedHash, Got: $ActualHash"
+            throw "Hash mismatch for $FileName ($HashAlgorithm). Expected: $ExpectedHash, Got: $ActualHash"
         }
-        Write-DATLog -Message "Hash verified for $FileName" -Severity 1
+        Write-DATLog -Message "Hash verified for $FileName ($HashAlgorithm)" -Severity 1
     }
 
     return $DestinationPath

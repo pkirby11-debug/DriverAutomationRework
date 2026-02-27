@@ -362,6 +362,9 @@ function Initialize-DATMainForm {
         if ($Controls['UpdateIndividualCheckBox'].Checked) {
             $SyncParams['UpdateIndividualDrivers'] = $true
         }
+        if ($Controls['VerifyHashCheckBox'].Checked) {
+            $SyncParams['VerifyDownloadHash'] = $true
+        }
 
         # Run sync in a background runspace so the GUI stays responsive
         $Controls['StatusLabel'].Text = 'Sync in progress...'
@@ -535,6 +538,7 @@ function Initialize-DATMainForm {
                     cleanUnusedDrivers = $Controls['CleanUnusedCheckBox'].Checked
                     cleanDownloads = $Controls['CleanDownloadsCheckBox'].Checked
                     updateIndividualDrivers = $Controls['UpdateIndividualCheckBox'].Checked
+                    verifyDownloadHash = $Controls['VerifyHashCheckBox'].Checked
                     deploymentPlatform = $Controls['DeployPlatformCombo'].Text
                     compressPackage = $Controls['CompressPackageCheckBox'].Checked
                     compressionType = $Controls['CompressionTypeCombo'].Text
@@ -752,6 +756,7 @@ function Initialize-DATMainForm {
                 if ($Config.options.cleanSource) { $Controls['CleanSourceCheckBox'].Checked = $true }
                 if ($Config.options.cleanDownloads) { $Controls['CleanDownloadsCheckBox'].Checked = $true }
                 if ($Config.options.updateIndividualDrivers) { $Controls['UpdateIndividualCheckBox'].Checked = $true }
+                if ($Config.options.verifyDownloadHash) { $Controls['VerifyHashCheckBox'].Checked = $true }
 
                 if ($Config.options.deploymentPlatform) {
                     $Idx = $Controls['DeployPlatformCombo'].Items.IndexOf($Config.options.deploymentPlatform)

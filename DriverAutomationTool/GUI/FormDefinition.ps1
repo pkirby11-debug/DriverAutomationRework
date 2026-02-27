@@ -398,6 +398,13 @@ function New-DATMainForm {
     $OptionsGroup.Controls.Add($UpdateIndividualCheckBox)
     $Controls['UpdateIndividualCheckBox'] = $UpdateIndividualCheckBox
 
+    $VerifyHashCheckBox = New-Object System.Windows.Forms.CheckBox
+    $VerifyHashCheckBox.Text = 'Verify download hash (Dell)'
+    $VerifyHashCheckBox.Location = New-Object System.Drawing.Point(530, 74)
+    $VerifyHashCheckBox.AutoSize = $true
+    $OptionsGroup.Controls.Add($VerifyHashCheckBox)
+    $Controls['VerifyHashCheckBox'] = $VerifyHashCheckBox
+
     # Deployment Platform selection
     $DeployPlatformLabel = New-Object System.Windows.Forms.Label
     $DeployPlatformLabel.Text = 'Deployment Platform:'

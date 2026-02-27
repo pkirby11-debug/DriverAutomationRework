@@ -117,6 +117,8 @@ function Invoke-DATSync {
         [ValidateSet('ZIP', 'WIM')]
         [string]$CompressionType = 'ZIP',
 
+        [switch]$VerifyDownloadHash,
+
         [switch]$ForceRefresh,
         [string]$WebhookUrl
     )
@@ -148,6 +150,7 @@ function Invoke-DATSync {
         $CleanUnusedDrivers = [switch]$Config.options.cleanUnusedDrivers
         $CleanDownloads = [switch]$Config.options.cleanDownloads
         $UpdateIndividualDrivers = [switch]$Config.options.updateIndividualDrivers
+        $VerifyDownloadHash = [switch]$Config.options.verifyDownloadHash
         $WebhookUrl = $Config.logging.webhookUrl
 
         Write-DATLog -Message "Loaded configuration from $ConfigFile" -Severity 1
@@ -218,6 +221,7 @@ function Invoke-DATSync {
                             -CompressPackage:$CompressPackage -CompressionType $CompressionType `
                             -DeploymentPlatform $DeploymentPlatform `
                             -UpdateIndividualDrivers:$UpdateIndividualDrivers `
+                            -VerifyDownloadHash:$VerifyDownloadHash `
                             -DistributionPoints $DistributionPoints `
                             -DistributionPointGroups $DistributionPointGroups
 
@@ -247,6 +251,7 @@ function Invoke-DATSync {
                             -EnableBDR:$EnableBDR -RemoveLegacy:$RemoveLegacy -CleanSource:$CleanSource `
                             -CompressPackage:$CompressPackage -CompressionType $CompressionType `
                             -DeploymentPlatform $DeploymentPlatform `
+                            -VerifyDownloadHash:$VerifyDownloadHash `
                             -DistributionPoints $DistributionPoints `
                             -DistributionPointGroups $DistributionPointGroups
 
@@ -344,6 +349,8 @@ function Invoke-DATSyncSinglePackage {
 
         [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg')]
         [string]$DeploymentPlatform = 'ConfigMgr - Standard Pkg',
+
+        [switch]$VerifyDownloadHash,
 
         [string[]]$DistributionPoints,
         [string[]]$DistributionPointGroups
@@ -566,23 +573,68 @@ function Invoke-DATSyncSinglePackage {
     }
 
     if ($Existing -and -not ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers')) {
-        Write-DATLog -Message "Package already exists at version $Version`: $PackageName - Skipping" -Severity 1
-
         # If multiple packages exist with the same name, use the first one
         $ExistingPkg = if ($Existing -is [array]) { $Existing[0] } else { $Existing }
 
+        # Validate package source integrity before skipping
+        $IntegrityOk = $true
+        $IntegrityReason = ''
 
-        Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
-            -Version $Version -PackageID $ExistingPkg.PackageID -Status 'Skipped'
+        if ($ExistingPkg.SourcePath) {
+            if (-not (Test-Path $ExistingPkg.SourcePath)) {
+                $IntegrityOk = $false
+                $IntegrityReason = "Package source path missing: $($ExistingPkg.SourcePath)"
+            } else {
+                $ParentDir = Split-Path $ExistingPkg.SourcePath -Parent
+                $ManifestPath = Join-Path $ParentDir '.integrity.json'
+                if (Test-Path $ManifestPath) {
+                    try {
+                        $Manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
+                        $CurrentFiles = @(Get-ChildItem $ExistingPkg.SourcePath -Recurse -File -ErrorAction SilentlyContinue)
+                        $CurrentBytes = ($CurrentFiles | Measure-Object -Property Length -Sum).Sum
 
-        return [PSCustomObject]@{
-            Manufacturer = $Make
-            Model        = $ModelName
-            Type         = $Type
-            Version      = $Version
-            PackageID    = $ExistingPkg.PackageID
-            Status       = 'Skipped'
-            Message      = 'Already at latest version'
+                        if ($CurrentFiles.Count -eq 0) {
+                            $IntegrityOk = $false
+                            $IntegrityReason = 'Package source directory is empty'
+                        } elseif ($Manifest.fileCount -gt 0 -and $CurrentFiles.Count -lt ($Manifest.fileCount * 0.5)) {
+                            $IntegrityOk = $false
+                            $IntegrityReason = "File count mismatch: expected ~$($Manifest.fileCount), found $($CurrentFiles.Count)"
+                        } elseif ($Manifest.totalBytes -gt 0 -and $CurrentBytes -lt ($Manifest.totalBytes * 0.5)) {
+                            $IntegrityOk = $false
+                            $IntegrityReason = "Size mismatch: expected ~$([math]::Round($Manifest.totalBytes / 1MB))MB, found $([math]::Round($CurrentBytes / 1MB))MB"
+                        }
+                    } catch {
+                        Write-DATLog -Message "Warning: Could not read integrity manifest: $($_.Exception.Message)" -Severity 2
+                    }
+                } else {
+                    # No manifest exists (pre-integrity package) - just check source isn't empty
+                    $FileCount = @(Get-ChildItem $ExistingPkg.SourcePath -Recurse -File -ErrorAction SilentlyContinue).Count
+                    if ($FileCount -eq 0) {
+                        $IntegrityOk = $false
+                        $IntegrityReason = 'Package source directory is empty (no integrity manifest)'
+                    }
+                }
+            }
+        }
+
+        if (-not $IntegrityOk) {
+            Write-DATLog -Message "INTEGRITY CHECK FAILED for $PackageName v$Version: $IntegrityReason - forcing re-download" -Severity 2
+            # Fall through to download instead of returning Skipped
+        } else {
+            Write-DATLog -Message "Package already exists at version $Version`: $PackageName - Skipping" -Severity 1
+
+            Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
+                -Version $Version -PackageID $ExistingPkg.PackageID -Status 'Skipped'
+
+            return [PSCustomObject]@{
+                Manufacturer = $Make
+                Model        = $ModelName
+                Type         = $Type
+                Version      = $Version
+                PackageID    = $ExistingPkg.PackageID
+                Status       = 'Skipped'
+                Message      = 'Already at latest version'
+            }
         }
     }
 
@@ -602,8 +654,20 @@ function Invoke-DATSyncSinglePackage {
 
     $StopWatch = [System.Diagnostics.Stopwatch]::StartNew()
     if ($PSCmdlet.ShouldProcess($DownloadUrl, 'Download')) {
-        $ExpectedHash = $PackageInfo.HashMD5  # Use what's available
-        Invoke-DATDownload -Url $DownloadUrl -DestinationPath $DownloadDest
+        $DownloadParams = @{
+            Url             = $DownloadUrl
+            DestinationPath = $DownloadDest
+        }
+        # Size verification (always, when catalog provides it)
+        if ($PackageInfo.Size) {
+            $DownloadParams['ExpectedSize'] = [long]$PackageInfo.Size
+        }
+        # Hash verification (optional, controlled by config)
+        if ($VerifyDownloadHash -and $PackageInfo.HashMD5) {
+            $DownloadParams['ExpectedHash'] = $PackageInfo.HashMD5
+            $DownloadParams['HashAlgorithm'] = 'MD5'
+        }
+        Invoke-DATDownload @DownloadParams
     }
     $StopWatch.Stop()
 
@@ -827,7 +891,20 @@ function Invoke-DATSyncSinglePackage {
                             try {
                                 # Download individual driver .exe to temp (10 min timeout per driver)
                                 $DriverExePath = Join-Path $OverlayTempDir $IndvDriver.FileName
-                                $DlResult = Invoke-DATDownload -Url $IndvDriver.Url -DestinationPath $DriverExePath -MaxRetries 2 -TimeoutSeconds 600
+                                $IndvDlParams = @{
+                                    Url             = $IndvDriver.Url
+                                    DestinationPath = $DriverExePath
+                                    MaxRetries      = 2
+                                    TimeoutSeconds  = 600
+                                }
+                                if ($IndvDriver.Size) {
+                                    $IndvDlParams['ExpectedSize'] = [long]$IndvDriver.Size
+                                }
+                                if ($VerifyDownloadHash -and $IndvDriver.HashMD5) {
+                                    $IndvDlParams['ExpectedHash'] = $IndvDriver.HashMD5
+                                    $IndvDlParams['HashAlgorithm'] = 'MD5'
+                                }
+                                $DlResult = Invoke-DATDownload @IndvDlParams
                                 if (-not $DlResult) {
                                     Write-DATLog -Message "  WARNING: Download timed out for $($IndvDriver.Name) - skipping this driver" -Severity 2
                                     continue
@@ -1095,6 +1172,27 @@ function Invoke-DATSyncSinglePackage {
     if ((Test-Path $DownloadDir) -and
         @(Get-ChildItem $DownloadDir -File -ErrorAction SilentlyContinue).Count -eq 0) {
         Remove-Item -Path $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # Write integrity manifest for future validation
+    try {
+        $IntegrityDir = Split-Path $PackageSourceDir -Parent
+        $IntegrityPath = Join-Path $IntegrityDir '.integrity.json'
+        $SourceFiles = @(Get-ChildItem $PackageSourceDir -Recurse -File -ErrorAction SilentlyContinue)
+        $TotalBytes = ($SourceFiles | Measure-Object -Property Length -Sum).Sum
+        $Integrity = @{
+            version      = $Version
+            fileCount    = $SourceFiles.Count
+            totalBytes   = if ($TotalBytes) { $TotalBytes } else { 0 }
+            createdAt    = (Get-Date -Format 'o')
+            catalogHash  = $PackageInfo.HashMD5
+            catalogSize  = $PackageInfo.Size
+            sourcePath   = $PackageSourceDir
+        }
+        $Integrity | ConvertTo-Json -Depth 3 | Set-Content -Path $IntegrityPath -Force
+        Write-DATLog -Message "Integrity manifest written: $($SourceFiles.Count) files, $([math]::Round($TotalBytes / 1MB, 1))MB" -Severity 1
+    } catch {
+        Write-DATLog -Message "Warning: Could not write integrity manifest: $($_.Exception.Message)" -Severity 2
     }
 
     # Log summary
