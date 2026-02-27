@@ -618,7 +618,7 @@ function Invoke-DATSyncSinglePackage {
         }
 
         if (-not $IntegrityOk) {
-            Write-DATLog -Message "INTEGRITY CHECK FAILED for $PackageName v$Version: $IntegrityReason - forcing re-download" -Severity 2
+            Write-DATLog -Message "INTEGRITY CHECK FAILED for $PackageName v$Version`: $IntegrityReason - forcing re-download" -Severity 2
             # Fall through to download instead of returning Skipped
         } else {
             Write-DATLog -Message "Package already exists at version $Version`: $PackageName - Skipping" -Severity 1
