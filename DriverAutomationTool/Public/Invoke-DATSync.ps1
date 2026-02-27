@@ -370,7 +370,9 @@ function Invoke-DATSyncSinglePackage {
     # The TS script parses: $Description.Split(":").Replace("(", "").Replace(")", "")[1]
     # Expected format: "(Models included:SYSTEMSKU)"
     $SystemSKU = if ($PackageInfo.SystemID) { $PackageInfo.SystemID }
+                 elseif ($PackageInfo.AllMachineTypes) { $PackageInfo.AllMachineTypes }
                  elseif ($PackageInfo.MachineType) { $PackageInfo.MachineType }
+                 elseif ($PackageInfo.Model) { $PackageInfo.Model }
                  else { '' }
     $PackageDescription = if ($SystemSKU) { "(Models included:$SystemSKU)" } else { '' }
 

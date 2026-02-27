@@ -269,16 +269,23 @@ function Get-LenovoDriverPack {
 
         if ($BestPack) {
             $PackUrl = $BestPack.InnerText.Trim()
+
+            # Get ALL machine types for this model so the package description
+            # includes every variant (e.g., "20U7;20U8") for TS script matching
+            $AllTypes = Find-LenovoMachineType -Model $Model
+            $AllMachineTypesStr = if ($AllTypes) { $AllTypes -join ';' } else { $MachineType }
+
             $DriverPack = [PSCustomObject]@{
-                Manufacturer = 'Lenovo'
-                Model        = $Model
-                MachineType  = $MachineType
-                OS           = $OperatingSystem
-                Architecture = 'x64'
-                Version      = $BestPack.version
-                ReleaseDate  = $BestPack.date
-                Url          = $PackUrl
-                FileName     = Split-Path $PackUrl -Leaf
+                Manufacturer    = 'Lenovo'
+                Model           = $Model
+                MachineType     = $MachineType
+                AllMachineTypes = $AllMachineTypesStr
+                OS              = $OperatingSystem
+                Architecture    = 'x64'
+                Version         = $BestPack.version
+                ReleaseDate     = $BestPack.date
+                Url             = $PackUrl
+                FileName        = Split-Path $PackUrl -Leaf
             }
             break
         }
