@@ -27,7 +27,7 @@ function Update-SurfaceCatalogCache {
         throw "Surface configuration missing from OEMSources.json. Ensure a 'surface.models' section exists."
     }
 
-    $ModelCount = ($Sources.surface.models | Get-Member -MemberType NoteProperty).Count
+    $ModelCount = $Sources.surface.models.Count
     Write-DATLog -Message "Surface catalog loaded: $ModelCount model(s) configured in OEMSources.json" -Severity 1
 }
 
@@ -48,10 +48,9 @@ function Get-SurfaceModelList {
 
     $Models = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-    foreach ($Prop in ($Sources.surface.models | Get-Member -MemberType NoteProperty)) {
-        $ModelName = $Prop.Name
-        $ModelInfo = $Sources.surface.models.$ModelName
-        $DownloadID = if ($ModelInfo -is [PSCustomObject]) { $ModelInfo.id } else { $ModelInfo }
+    foreach ($ModelName in $Sources.surface.models.Keys) {
+        $ModelInfo = $Sources.surface.models[$ModelName]
+        $DownloadID = if ($ModelInfo -is [hashtable] -or $ModelInfo -is [PSCustomObject]) { $ModelInfo.id } else { $ModelInfo }
 
         $Models.Add([PSCustomObject]@{
             Manufacturer = 'Microsoft'
@@ -102,21 +101,20 @@ function Get-SurfaceDriverPack {
     $ModelInfo = $Sources.surface.models.$Model
     if (-not $ModelInfo) {
         # Try fuzzy match
-        $AllModels = $Sources.surface.models | Get-Member -MemberType NoteProperty
-        $FuzzyMatch = $AllModels | Where-Object { $Model -like "*$($_.Name)*" -or $_.Name -like "*$Model*" } | Select-Object -First 1
+        $FuzzyMatch = $Sources.surface.models.Keys | Where-Object { $Model -like "*$_*" -or $_ -like "*$Model*" } | Select-Object -First 1
         if ($FuzzyMatch) {
-            $ModelInfo = $Sources.surface.models.($FuzzyMatch.Name)
-            $Model = $FuzzyMatch.Name
+            $ModelInfo = $Sources.surface.models[$FuzzyMatch]
+            $Model = $FuzzyMatch
             Write-DATLog -Message "Fuzzy-matched Surface model to: $Model" -Severity 1
         }
     }
 
     if (-not $ModelInfo) {
-        Write-DATLog -Message "Surface model '$Model' not found in OEMSources.json. Available: $(($Sources.surface.models | Get-Member -MemberType NoteProperty).Name -join ', ')" -Severity 2
+        Write-DATLog -Message "Surface model '$Model' not found in OEMSources.json. Available: $($Sources.surface.models.Keys -join ', ')" -Severity 2
         return $null
     }
 
-    $DownloadID = if ($ModelInfo -is [PSCustomObject]) { $ModelInfo.id } else { $ModelInfo }
+    $DownloadID = if ($ModelInfo -is [hashtable] -or $ModelInfo -is [PSCustomObject]) { $ModelInfo.id } else { $ModelInfo }
 
     # Resolve target Windows build number from OS name
     $TargetBuild = $null
