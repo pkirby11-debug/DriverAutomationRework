@@ -734,14 +734,14 @@ function Invoke-DATSyncSinglePackage {
                 # Microsoft Surface driver packs are MSI files.
                 # Use msiexec /a (administrative install) to extract content without installing.
                 Write-DATLog -Message "Extracting MSI package: $FileName" -Severity 1
-                $MsiTimeout = 600000  # 10 minutes (Surface MSIs can be ~1 GB)
+                $MsiTimeout = 1800000  # 30 minutes (Surface MSIs can be large)
                 try {
                     $MsiArgs = "/a `"$DownloadDest`" /qn TARGETDIR=`"$PackageSourceDir`""
                     $Proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $MsiArgs `
                         -NoNewWindow -PassThru -ErrorAction Stop
                     $Completed = $Proc.WaitForExit($MsiTimeout)
                     if (-not $Completed) {
-                        Write-DATLog -Message "MSI extraction timed out after 10 minutes - killing process" -Severity 3
+                        Write-DATLog -Message "MSI extraction timed out after 30 minutes - killing process" -Severity 2
                         $Proc.Kill()
                     } elseif ($Proc.ExitCode -ne 0) {
                         Write-DATLog -Message "MSI extraction returned exit code $($Proc.ExitCode)" -Severity 2
@@ -755,7 +755,7 @@ function Invoke-DATSyncSinglePackage {
                 Expand-Archive -Path $DownloadDest -DestinationPath $PackageSourceDir -Force
             } elseif ($FileName -like '*.exe') {
                 Write-DATLog -Message "Extracting self-extracting EXE: $FileName ($Make)" -Severity 1
-                $ExeTimeout = 300000  # 5 minutes
+                $ExeTimeout = 1800000  # 30 minutes (large driver packs can be 6GB+)
 
                 if ($Make -eq 'Lenovo') {
                     # Lenovo SCCM packs use InnoSetup: /VERYSILENT suppresses all UI
@@ -768,7 +768,7 @@ function Invoke-DATSyncSinglePackage {
                             -NoNewWindow -PassThru -ErrorAction Stop
                         $Completed = $Proc.WaitForExit($ExeTimeout)
                         if (-not $Completed) {
-                            Write-DATLog -Message "Lenovo extraction timed out after 5 minutes - killing process" -Severity 3
+                            Write-DATLog -Message "Lenovo extraction timed out after 30 minutes - killing process" -Severity 2
                             $Proc.Kill()
                         } elseif ($Proc.ExitCode -ne 0) {
                             Write-DATLog -Message "Lenovo extraction returned exit code $($Proc.ExitCode)" -Severity 2
@@ -784,7 +784,7 @@ function Invoke-DATSyncSinglePackage {
                             -NoNewWindow -PassThru -ErrorAction Stop
                         $Completed = $Proc.WaitForExit($ExeTimeout)
                         if (-not $Completed) {
-                            Write-DATLog -Message "EXE extraction timed out after 5 minutes - killing process" -Severity 3
+                            Write-DATLog -Message "EXE extraction timed out after 30 minutes - killing process" -Severity 2
                             $Proc.Kill()
                         } elseif ($Proc.ExitCode -ne 0) {
                             Write-DATLog -Message "EXE extraction attempt 1 returned exit code $($Proc.ExitCode), trying alternate method" -Severity 2
@@ -802,7 +802,7 @@ function Invoke-DATSyncSinglePackage {
                                 -NoNewWindow -PassThru -ErrorAction Stop
                             $Completed = $Proc2.WaitForExit($ExeTimeout)
                             if (-not $Completed) {
-                                Write-DATLog -Message "EXE extraction (attempt 2) timed out after 5 minutes - killing process" -Severity 3
+                                Write-DATLog -Message "EXE extraction (attempt 2) timed out after 30 minutes - killing process" -Severity 2
                                 $Proc2.Kill()
                             } elseif ($Proc2.ExitCode -ne 0) {
                                 Write-DATLog -Message "EXE extraction attempt 2 returned exit code $($Proc2.ExitCode)" -Severity 3
@@ -929,7 +929,7 @@ function Invoke-DATSyncSinglePackage {
                                 New-Item -Path $ExtractDir -ItemType Directory -Force | Out-Null
 
                                 $OverlayExtracted = $false
-                                $OvlTimeout = 300000  # 5 minutes
+                                $OvlTimeout = 900000  # 15 minutes
 
                                 # Helper: check if extraction produced files
                                 $CheckExtracted = {

@@ -435,21 +435,39 @@ function Initialize-DATMainForm {
             try {
                 $Results = $script:SyncRunspace.EndInvoke($script:SyncHandle)
 
-                # Check for errors in the runspace streams
-                $RunspaceErrors = $script:SyncRunspace.Streams.Error
-                if ($RunspaceErrors -and $RunspaceErrors.Count -gt 0) {
-                    $ErrMsg = $RunspaceErrors[0].Exception.Message
-                    $Controls['StatusLabel'].Text = 'Sync failed'
-                    Show-DATFormMessage -Message "Sync failed: $ErrMsg" -Type Error
-                } else {
+                # Use actual sync results to determine success/failure.
+                # The error stream may contain non-fatal warnings (e.g. extraction
+                # timeouts that still produced files) so don't use it as the primary
+                # success indicator.
+                if ($Results -and @($Results).Count -gt 0) {
                     $SuccessCount = @($Results | Where-Object { $_.Status -eq 'Success' }).Count
                     $SkipCount = @($Results | Where-Object { $_.Status -eq 'Skipped' }).Count
+                    $ErrorCount = @($Results | Where-Object { $_.Status -eq 'Error' }).Count
 
-                    $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $SkipCount skipped"
                     $Controls['ProgressBar'].Style = 'Continuous'
                     $Controls['ProgressBar'].Value = $Controls['ProgressBar'].Maximum
 
-                    Show-DATFormMessage -Message "Sync complete!`n`nSuccess: $SuccessCount`nSkipped: $SkipCount" -Type Information
+                    if ($ErrorCount -gt 0 -and $SuccessCount -eq 0) {
+                        $Controls['StatusLabel'].Text = "Sync failed - $ErrorCount error(s)"
+                        Show-DATFormMessage -Message "Sync failed!`n`nErrors: $ErrorCount`nSkipped: $SkipCount" -Type Error
+                    } elseif ($ErrorCount -gt 0) {
+                        $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $ErrorCount error(s)"
+                        Show-DATFormMessage -Message "Sync complete with warnings.`n`nSuccess: $SuccessCount`nSkipped: $SkipCount`nErrors: $ErrorCount" -Type Warning
+                    } else {
+                        $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $SkipCount skipped"
+                        Show-DATFormMessage -Message "Sync complete!`n`nSuccess: $SuccessCount`nSkipped: $SkipCount" -Type Information
+                    }
+                } else {
+                    # No results returned - check error stream for fatal errors
+                    $RunspaceErrors = $script:SyncRunspace.Streams.Error
+                    if ($RunspaceErrors -and $RunspaceErrors.Count -gt 0) {
+                        $ErrMsg = $RunspaceErrors[0].Exception.Message
+                        $Controls['StatusLabel'].Text = 'Sync failed'
+                        Show-DATFormMessage -Message "Sync failed: $ErrMsg" -Type Error
+                    } else {
+                        $Controls['StatusLabel'].Text = 'Sync complete - no packages to process'
+                        Show-DATFormMessage -Message "Sync complete - no packages were selected for processing." -Type Information
+                    }
                 }
             } catch {
                 $Controls['StatusLabel'].Text = 'Sync failed'
