@@ -105,7 +105,8 @@ function Update-DellModelCatalog {
     .PARAMETER CacheTTLHours
         Cache time-to-live in hours. Default: 24.
     .OUTPUTS
-        Path to the cached per-model XML file, or $null if not available.
+        Array of paths to cached per-model XML files, or $null if not available.
+        Returns multiple paths when SystemIDs span different GroupManifests (catalog groups).
     #>
     [CmdletBinding()]
     param(
@@ -153,71 +154,91 @@ function Update-DellModelCatalog {
         }
     }
 
-    # Step 2: Parse index XML to find per-model catalog path by SystemID
+    # Step 2: Parse index XML to find ALL unique per-model catalog paths by SystemID.
+    # Different SystemIDs can map to different GroupManifests (catalog groups).
+    # E.g., a model with SystemIDs "0D03;0D04;0D05;0D06;0D1A;0D1B" may span
+    # multiple catalog CABs — we need to check all of them for complete coverage.
     $IndexXml = Read-DATXml -Path $CachedIndex
     $SystemIDs = $SystemID.Split(';') | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
 
-    $MatchingManifest = $null
+    $MatchingManifests = [System.Collections.Generic.List[object]]::new()
+    $SeenPaths = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+
     foreach ($GroupManifest in $IndexXml.ManifestIndex.GroupManifest) {
         $ManifestSysIDs = @($GroupManifest.SupportedSystems.Brand.Model.systemID) |
             ForEach-Object { if ($_) { $_.Trim().ToUpper() } }
 
         foreach ($SysID in $SystemIDs) {
             if ($ManifestSysIDs -contains $SysID) {
-                $MatchingManifest = $GroupManifest
-                break
+                $ManifestPath = $GroupManifest.ManifestInformation.path
+                if ($ManifestPath -and $SeenPaths.Add($ManifestPath)) {
+                    $MatchingManifests.Add($GroupManifest)
+                }
+                break  # This SystemID matched, move to next GroupManifest
             }
         }
-        if ($MatchingManifest) { break }
     }
 
-    if (-not $MatchingManifest) {
+    if ($MatchingManifests.Count -eq 0) {
         Write-DATLog -Message "No per-model catalog found in CatalogIndexPC for SystemID: $SystemID" -Severity 2
         return $null
     }
 
-    $ModelCatalogPath = $MatchingManifest.ManifestInformation.path
-    if (-not $ModelCatalogPath) {
-        Write-DATLog -Message "ManifestInformation.path is empty for SystemID: $SystemID" -Severity 2
+    Write-DATLog -Message "Found $($MatchingManifests.Count) unique catalog(s) for SystemIDs: $SystemID" -Severity 1
+
+    # Step 3: Download and cache each unique per-model catalog
+    $CachedPaths = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($Manifest in $MatchingManifests) {
+        $ModelCatalogPath = $Manifest.ManifestInformation.path
+        if (-not $ModelCatalogPath) { continue }
+
+        $ModelCatalogName = Split-Path $ModelCatalogPath -Leaf
+        # Use catalog filename (without extension) as cache key for uniqueness
+        $CatalogBaseName = [System.IO.Path]::GetFileNameWithoutExtension($ModelCatalogName)
+        $ModelCacheKey = "Dell_ModelCatalog_${CatalogBaseName}.xml"
+
+        $CachedModel = if (-not $ForceRefresh) {
+            Get-DATCachedItem -Key $ModelCacheKey -MaxAgeHours $CacheTTLHours
+        } else { $null }
+
+        if (-not $CachedModel) {
+            $ModelCatalogUrl = '{0}/{1}' -f $DellSources.baseUrl.TrimEnd('/'), ($ModelCatalogPath -replace '^/', '')
+            Write-DATLog -Message "Downloading per-model catalog: $ModelCatalogUrl" -Severity 1
+
+            $TempDir = Get-DATTempPath -Prefix 'DellModelCat'
+            try {
+                $CabPath = Join-Path $TempDir $ModelCatalogName
+                $null = Invoke-DATDownload -Url $ModelCatalogUrl -DestinationPath $CabPath
+
+                $ExtractedFiles = Expand-DATCabinet -CabPath $CabPath -DestinationPath $TempDir -Filter '*.xml'
+                $XmlFile = $ExtractedFiles | Where-Object { $_ -like '*.xml' } | Select-Object -First 1
+
+                if ($XmlFile) {
+                    $CachedModel = Set-DATCachedItem -Key $ModelCacheKey -SourcePath $XmlFile -SourceUrl $ModelCatalogUrl
+                    Write-DATLog -Message "Per-model catalog cached: $ModelCacheKey" -Severity 1
+                } else {
+                    Write-DATLog -Message "No XML found in per-model catalog: $ModelCatalogName" -Severity 2
+                    continue
+                }
+            } catch {
+                Write-DATLog -Message "Failed to download/extract per-model catalog ${ModelCatalogName}: $($_.Exception.Message)" -Severity 2
+                continue
+            } finally {
+                Remove-DATTempPath -Path $TempDir
+            }
+        }
+
+        $CachedPaths.Add([string]$CachedModel)
+    }
+
+    if ($CachedPaths.Count -eq 0) {
+        Write-DATLog -Message "Failed to download any per-model catalogs for SystemID: $SystemID" -Severity 2
         return $null
     }
 
-    $ModelCatalogName = Split-Path $ModelCatalogPath -Leaf
-    Write-DATLog -Message "Found per-model catalog for SystemID $($SystemIDs[0]): $ModelCatalogName" -Severity 1
-
-    # Step 3: Download and cache the per-model catalog
-    $PrimaryID = $SystemIDs[0]
-    $ModelCacheKey = "Dell_ModelCatalog_${PrimaryID}.xml"
-    $CachedModel = if (-not $ForceRefresh) { Get-DATCachedItem -Key $ModelCacheKey -MaxAgeHours $CacheTTLHours } else { $null }
-
-    if (-not $CachedModel) {
-        $ModelCatalogUrl = '{0}/{1}' -f $DellSources.baseUrl.TrimEnd('/'), ($ModelCatalogPath -replace '^/', '')
-        Write-DATLog -Message "Downloading per-model catalog: $ModelCatalogUrl" -Severity 1
-
-        $TempDir = Get-DATTempPath -Prefix 'DellModelCat'
-        try {
-            $CabPath = Join-Path $TempDir $ModelCatalogName
-            $null = Invoke-DATDownload -Url $ModelCatalogUrl -DestinationPath $CabPath
-
-            $ExtractedFiles = Expand-DATCabinet -CabPath $CabPath -DestinationPath $TempDir -Filter '*.xml'
-            $XmlFile = $ExtractedFiles | Where-Object { $_ -like '*.xml' } | Select-Object -First 1
-
-            if ($XmlFile) {
-                $CachedModel = Set-DATCachedItem -Key $ModelCacheKey -SourcePath $XmlFile -SourceUrl $ModelCatalogUrl
-                Write-DATLog -Message "Per-model catalog cached: $ModelCacheKey" -Severity 1
-            } else {
-                Write-DATLog -Message "No XML found in per-model catalog: $ModelCatalogName" -Severity 3
-                return $null
-            }
-        } catch {
-            Write-DATLog -Message "Failed to download/extract per-model catalog: $($_.Exception.Message)" -Severity 3
-            return $null
-        } finally {
-            Remove-DATTempPath -Path $TempDir
-        }
-    }
-
-    return [string]$CachedModel
+    return @($CachedPaths)
 }
 
 function Get-DellModelList {
@@ -545,48 +566,44 @@ function Get-DellIndividualDrivers {
         [string[]]$MissingCategories
     )
 
-    # Try per-model catalog first (CatalogIndexPC chain - more current than legacy CatalogPC).
+    # Try per-model catalogs first (CatalogIndexPC chain - more current than legacy CatalogPC).
     # The per-model catalogs are what Dell Command Update actually uses and contain the
     # latest driver entries. CatalogPC.cab is retained as a fallback for older models
     # that might not appear in CatalogIndexPC.
+    # When a model has multiple SystemIDs, they may map to different GroupManifests
+    # (catalog groups), so we check ALL matching catalogs for complete coverage.
     $UsingModelCatalog = $false
-    $CatalogPath = $null
+    $CatalogPaths = @()
     try {
-        $ModelCatalogPath = Update-DellModelCatalog -SystemID $SystemID
-        if ($ModelCatalogPath) {
-            $CatalogPath = $ModelCatalogPath
+        $ModelCatalogPaths = @(Update-DellModelCatalog -SystemID $SystemID)
+        if ($ModelCatalogPaths -and $ModelCatalogPaths.Count -gt 0) {
+            $CatalogPaths = $ModelCatalogPaths
             $UsingModelCatalog = $true
-            Write-DATLog -Message "Using per-model catalog for individual driver lookup (CatalogIndexPC chain)" -Severity 1
+            Write-DATLog -Message "Using $($CatalogPaths.Count) per-model catalog(s) for individual driver lookup (CatalogIndexPC chain)" -Severity 1
         }
     } catch {
         Write-DATLog -Message "Per-model catalog lookup failed: $($_.Exception.Message) - falling back to CatalogPC" -Severity 2
     }
 
     # Fallback to legacy CatalogPC
-    if (-not $CatalogPath) {
+    if ($CatalogPaths.Count -eq 0) {
         Write-DATLog -Message "Falling back to CatalogPC for individual driver lookup" -Severity 1
-        $CatalogPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
-        if (-not $CatalogPath) {
+        $FallbackPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
+        if (-not $FallbackPath) {
             Update-DellCatalogCache
-            $CatalogPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
+            $FallbackPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
+        }
+        if ($FallbackPath) {
+            $CatalogPaths = @($FallbackPath)
         }
     }
 
-    if (-not $CatalogPath) {
+    if ($CatalogPaths.Count -eq 0) {
         Write-DATLog -Message "No Dell catalog available for individual driver lookup" -Severity 2
         return $null
     }
 
-    $Xml = Read-DATXml -Path $CatalogPath
     $Sources = Get-DATOEMSources
-
-    # Select the correct download base URL based on which catalog we're using.
-    # Per-model catalog entries use dl.dell.com; CatalogPC entries use downloads.dell.com.
-    $DriverBaseUrl = if ($UsingModelCatalog -and $Sources.dell.dlBaseUrl) {
-        $Sources.dell.dlBaseUrl
-    } else {
-        $Sources.dell.baseUrl
-    }
 
     # Build compatible OS code patterns for filtering.
     # Dell uses TWO different OS code formats across their catalogs:
@@ -647,190 +664,205 @@ function Get-DellIndividualDrivers {
     # firmware components (e.g., "Intel Thunderbolt Controller Firmware").
     $ExcludePattern = '\bBIOS\b|SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Digital Delivery|\bApplication\b|\bUtility\b'
 
-    # Diagnostic counters
-    $TotalScanned = 0
-    $SkippedPkgType = 0
-    $SkippedNoName = 0
-    $SkippedExcluded = 0
-    $SkippedNoSysMatch = 0
-    $SkippedWrongOS = 0
-    $SkippedDate = 0
-
-    # --- Diagnostic pre-scan: count SystemID matches regardless of other filters ---
-    # This reveals whether the catalog has entries for this model at all, and what
-    # packageTypes they use (in case Dell uses non-LWXP types for newer drivers).
-    $PreScanTotal = 0
-    $PreScanPkgTypes = @{}
-    foreach ($Component in $Xml.Manifest.SoftwareComponent) {
-        $CompSysIDs = @($Component.SupportedSystems.Brand.Model.SystemID) |
-            ForEach-Object { if ($_) { $_.Trim().ToUpper() } }
-        $Hit = $false
-        foreach ($SysID in $SystemIDs) {
-            if ($CompSysIDs -contains $SysID.Trim().ToUpper()) { $Hit = $true; break }
-        }
-        if ($Hit) {
-            $PreScanTotal++
-            $PT = if ($Component.packageType) { $Component.packageType } else { '(none)' }
-            if (-not $PreScanPkgTypes.ContainsKey($PT)) { $PreScanPkgTypes[$PT] = 0 }
-            $PreScanPkgTypes[$PT]++
-        }
-    }
-    $PkgTypeSummary = ($PreScanPkgTypes.GetEnumerator() | Sort-Object Name |
-        ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '
-    Write-DATLog -Message "Pre-scan: $PreScanTotal total components match SystemID $SystemID. PackageType breakdown: $PkgTypeSummary" -Severity 1
-
-    # Find matching SoftwareComponents
+    # Scan all catalog(s) and collect matching drivers.
+    # When multiple catalogs are available (multi-SystemID models), each catalog is
+    # scanned independently and results are merged. Deduplication happens at the end.
     $MatchedDrivers = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-    foreach ($Component in $Xml.Manifest.SoftwareComponent) {
-        $TotalScanned++
+    foreach ($CatalogPath in $CatalogPaths) {
+        $CatalogFileName = Split-Path $CatalogPath -Leaf
+        $Xml = Read-DATXml -Path $CatalogPath
 
-        # Use packageType attribute for primary filtering - more reliable than name matching.
-        # CatalogPC.xml uses: LWXP (drivers), BIOS, FRMW (firmware), APP (applications).
-        # Per-model catalogs also use: LW64 (64-bit Windows drivers).
-        # Accept any LW* prefix as a driver type; exclude BIOS, FRMW, APP, etc.
-        $PkgType = $Component.packageType
-        if ($PkgType -and $PkgType -notmatch '^LW') {
-            $SkippedPkgType++
-            continue
+        # Select the correct download base URL based on which catalog we're using.
+        # Per-model catalog entries use dl.dell.com; CatalogPC entries use downloads.dell.com.
+        $DriverBaseUrl = if ($UsingModelCatalog -and $Sources.dell.dlBaseUrl) {
+            $Sources.dell.dlBaseUrl
+        } else {
+            $Sources.dell.baseUrl
         }
 
-        # Get display name
-        $DisplayName = $Component.Name.Display.'#cdata-section'
-        if (-not $DisplayName) {
-            $SkippedNoName++
-            continue
-        }
+        # Diagnostic counters (per-catalog)
+        $TotalScanned = 0
+        $SkippedPkgType = 0
+        $SkippedNoName = 0
+        $SkippedExcluded = 0
+        $SkippedNoSysMatch = 0
+        $SkippedWrongOS = 0
+        $SkippedDate = 0
 
-        # Secondary exclusion by name - catch Dell-specific tools that got past packageType
-        if ($DisplayName -match $ExcludePattern) {
-            $SkippedExcluded++
-            continue
-        }
-
-        # Check SystemID match (case-insensitive)
-        $ComponentSystems = @($Component.SupportedSystems.Brand.Model.SystemID) |
-            ForEach-Object { if ($_) { $_.Trim().ToUpper() } }
-
-        $SysMatch = $false
-        foreach ($SysID in $SystemIDs) {
-            $SysIDUpper = $SysID.Trim().ToUpper()
-            if ($ComponentSystems -contains $SysIDUpper) {
-                $SysMatch = $true
-                break
+        # --- Diagnostic pre-scan: count SystemID matches regardless of other filters ---
+        # This reveals whether the catalog has entries for this model at all, and what
+        # packageTypes they use (in case Dell uses non-LWXP types for newer drivers).
+        $PreScanTotal = 0
+        $PreScanPkgTypes = @{}
+        foreach ($Component in $Xml.Manifest.SoftwareComponent) {
+            $CompSysIDs = @($Component.SupportedSystems.Brand.Model.SystemID) |
+                ForEach-Object { if ($_) { $_.Trim().ToUpper() } }
+            $Hit = $false
+            foreach ($SysID in $SystemIDs) {
+                if ($CompSysIDs -contains $SysID.Trim().ToUpper()) { $Hit = $true; break }
+            }
+            if ($Hit) {
+                $PreScanTotal++
+                $PT = if ($Component.packageType) { $Component.packageType } else { '(none)' }
+                if (-not $PreScanPkgTypes.ContainsKey($PT)) { $PreScanPkgTypes[$PT] = 0 }
+                $PreScanPkgTypes[$PT]++
             }
         }
-        if (-not $SysMatch) {
-            $SkippedNoSysMatch++
-            continue
-        }
+        $PkgTypeSummary = ($PreScanPkgTypes.GetEnumerator() | Sort-Object Name |
+            ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '
+        Write-DATLog -Message "Pre-scan [$CatalogFileName]: $PreScanTotal total components match SystemID. PackageType breakdown: $PkgTypeSummary" -Severity 1
 
-        # Check OS compatibility - skip drivers for wrong OS (e.g., Windows 7 in a Win11 package)
-        # Dell CatalogPC.xml uses short OS edition codes: W10H4 (Win10 Home x64),
-        # W10P4 (Win10 Pro x64), W11P4 (Win11 Pro x64), etc.
-        # DriverPackCatalog.xml uses long codes: Windows10, Windows11.
-        # Our patterns handle both formats.
-        if ($CompatibleOsPatterns) {
-            $ComponentOsCodes = @($Component.SupportedOperatingSystems.OperatingSystem.osCode) |
-                Where-Object { $_ }
-            if ($ComponentOsCodes.Count -gt 0) {
-                $OsMatch = $false
-                foreach ($Code in $ComponentOsCodes) {
-                    foreach ($Pattern in $CompatibleOsPatterns) {
-                        if ($Code -like $Pattern) {
-                            $OsMatch = $true
-                            break
-                        }
-                    }
-                    if ($OsMatch) { break }
+        # Find matching SoftwareComponents in this catalog
+        $CatalogMatched = 0
+
+        foreach ($Component in $Xml.Manifest.SoftwareComponent) {
+            $TotalScanned++
+
+            # Use packageType attribute for primary filtering - more reliable than name matching.
+            # CatalogPC.xml uses: LWXP (drivers), BIOS, FRMW (firmware), APP (applications).
+            # Per-model catalogs also use: LW64 (64-bit Windows drivers).
+            # Accept any LW* prefix as a driver type; exclude BIOS, FRMW, APP, etc.
+            $PkgType = $Component.packageType
+            if ($PkgType -and $PkgType -notmatch '^LW') {
+                $SkippedPkgType++
+                continue
+            }
+
+            # Get display name
+            $DisplayName = $Component.Name.Display.'#cdata-section'
+            if (-not $DisplayName) {
+                $SkippedNoName++
+                continue
+            }
+
+            # Secondary exclusion by name - catch Dell-specific tools that got past packageType
+            if ($DisplayName -match $ExcludePattern) {
+                $SkippedExcluded++
+                continue
+            }
+
+            # Check SystemID match (case-insensitive)
+            $ComponentSystems = @($Component.SupportedSystems.Brand.Model.SystemID) |
+                ForEach-Object { if ($_) { $_.Trim().ToUpper() } }
+
+            $SysMatch = $false
+            foreach ($SysID in $SystemIDs) {
+                $SysIDUpper = $SysID.Trim().ToUpper()
+                if ($ComponentSystems -contains $SysIDUpper) {
+                    $SysMatch = $true
+                    break
                 }
-                if (-not $OsMatch) {
-                    # Log the first few rejected OS codes for diagnostics
-                    if ($SkippedWrongOS -lt 3) {
-                        Write-DATLog -Message "  OS filter skip: '$DisplayName' has OS codes: $($ComponentOsCodes -join ', ')" -Severity 1
+            }
+            if (-not $SysMatch) {
+                $SkippedNoSysMatch++
+                continue
+            }
+
+            # Check OS compatibility - skip drivers for wrong OS (e.g., Windows 7 in a Win11 package)
+            # Dell CatalogPC.xml uses short OS edition codes: W10H4 (Win10 Home x64),
+            # W10P4 (Win10 Pro x64), W11P4 (Win11 Pro x64), etc.
+            # DriverPackCatalog.xml uses long codes: Windows10, Windows11.
+            # Our patterns handle both formats.
+            if ($CompatibleOsPatterns) {
+                $ComponentOsCodes = @($Component.SupportedOperatingSystems.OperatingSystem.osCode) |
+                    Where-Object { $_ }
+                if ($ComponentOsCodes.Count -gt 0) {
+                    $OsMatch = $false
+                    foreach ($Code in $ComponentOsCodes) {
+                        foreach ($Pattern in $CompatibleOsPatterns) {
+                            if ($Code -like $Pattern) {
+                                $OsMatch = $true
+                                break
+                            }
+                        }
+                        if ($OsMatch) { break }
                     }
-                    $SkippedWrongOS++
+                    if (-not $OsMatch) {
+                        # Log the first few rejected OS codes for diagnostics
+                        if ($SkippedWrongOS -lt 3) {
+                            Write-DATLog -Message "  OS filter skip: '$DisplayName' has OS codes: $($ComponentOsCodes -join ', ')" -Severity 1
+                        }
+                        $SkippedWrongOS++
+                        continue
+                    }
+                }
+                # If no OS codes listed, include the driver (don't filter it out)
+            }
+
+            # Parse component date
+            try {
+                $ComponentDate = [datetime]::Parse($Component.dateTime)
+            } catch {
+                continue
+            }
+
+            # Classify into category
+            $ResolvedCategory = $null
+            foreach ($Cat in $CategoryPatterns.Keys) {
+                if ($DisplayName -match $CategoryPatterns[$Cat]) {
+                    $ResolvedCategory = $Cat
+                    break
+                }
+            }
+
+            if (-not $ResolvedCategory) {
+                # Driver passed all filters but doesn't match a known category -
+                # classify as "Other" so it still gets included in the overlay.
+                $ResolvedCategory = 'Other'
+            }
+
+            # Date filter - for categories present in the base pack, only include newer drivers.
+            # For missing categories, include ALL drivers (we need them regardless of date).
+            # Use per-category DriverVer baseline when available (more accurate than pack date),
+            # falling back to the global pack release date.
+            $IsMissing = $MissingSet.Contains($ResolvedCategory)
+            if (-not $IsMissing) {
+                $EffectiveBaseline = $BaselineParsed
+                if ($CategoryBaselines -and $CategoryBaselines.ContainsKey($ResolvedCategory)) {
+                    $EffectiveBaseline = $CategoryBaselines[$ResolvedCategory]
+                }
+                if ($ComponentDate -le $EffectiveBaseline) {
+                    $SkippedDate++
                     continue
                 }
             }
-            # If no OS codes listed, include the driver (don't filter it out)
-        }
 
-        # Parse component date
-        try {
-            $ComponentDate = [datetime]::Parse($Component.dateTime)
-        } catch {
-            continue
-        }
-
-        # Classify into category
-        $ResolvedCategory = $null
-        foreach ($Cat in $CategoryPatterns.Keys) {
-            if ($DisplayName -match $CategoryPatterns[$Cat]) {
-                $ResolvedCategory = $Cat
-                break
-            }
-        }
-
-        if (-not $ResolvedCategory) {
-            # Driver passed all filters but doesn't match a known category -
-            # classify as "Other" so it still gets included in the overlay.
-            $ResolvedCategory = 'Other'
-        }
-
-        # Date filter - for categories present in the base pack, only include newer drivers.
-        # For missing categories, include ALL drivers (we need them regardless of date).
-        # Use per-category DriverVer baseline when available (more accurate than pack date),
-        # falling back to the global pack release date.
-        $IsMissing = $MissingSet.Contains($ResolvedCategory)
-        if (-not $IsMissing) {
-            $EffectiveBaseline = $BaselineParsed
-            if ($CategoryBaselines -and $CategoryBaselines.ContainsKey($ResolvedCategory)) {
-                $EffectiveBaseline = $CategoryBaselines[$ResolvedCategory]
-            }
-            if ($ComponentDate -le $EffectiveBaseline) {
-                $SkippedDate++
+            # Build download URL using the appropriate base URL for the catalog source.
+            # Per-model catalog SoftwareComponent elements store the relative path in
+            # the 'path' attribute (e.g. "FOLDER.../driver.exe").  Prepend the base URL.
+            $DownloadPath = $Component.path -replace '^/', ''
+            if (-not $DownloadPath) {
+                Write-DATLog -Message "WARNING: SoftwareComponent '$DisplayName' has no path attribute - skipping" -Severity 2
                 continue
             }
+            $DownloadUrl = '{0}/{1}' -f $DriverBaseUrl.TrimEnd('/'), $DownloadPath
+
+            $MatchedDrivers.Add([PSCustomObject]@{
+                Category    = $ResolvedCategory
+                Name        = $DisplayName
+                Version     = $Component.dellVersion
+                ReleaseDate = $Component.dateTime
+                ParsedDate  = $ComponentDate
+                Url         = $DownloadUrl
+                FileName    = Split-Path $DownloadUrl -Leaf
+                HashMD5     = $Component.hashMD5
+                Size        = $Component.size
+                IsMissing   = $IsMissing
+            })
+            $CatalogMatched++
         }
 
-        # Build download URL using the appropriate base URL for the catalog source.
-        # Per-model catalog SoftwareComponent elements store the relative path in
-        # the 'path' attribute (e.g. "FOLDER.../driver.exe").  Prepend the base URL.
-        $DownloadPath = $Component.path -replace '^/', ''
-        if (-not $DownloadPath) {
-            Write-DATLog -Message "WARNING: SoftwareComponent '$DisplayName' has no path attribute - skipping" -Severity 2
-            continue
-        }
-        $DownloadUrl = '{0}/{1}' -f $DriverBaseUrl.TrimEnd('/'), $DownloadPath
-
-        $MatchedDrivers.Add([PSCustomObject]@{
-            Category    = $ResolvedCategory
-            Name        = $DisplayName
-            Version     = $Component.dellVersion
-            ReleaseDate = $Component.dateTime
-            ParsedDate  = $ComponentDate
-            Url         = $DownloadUrl
-            FileName    = Split-Path $DownloadUrl -Leaf
-            HashMD5     = $Component.hashMD5
-            Size        = $Component.size
-            IsMissing   = $IsMissing
-        })
-    }
-
-    # Log diagnostic summary
-    $CatalogSource = if ($UsingModelCatalog) { 'per-model (CatalogIndexPC)' } else { 'CatalogPC (legacy)' }
-    Write-DATLog -Message ("Dell catalog scan [$CatalogSource]: $TotalScanned components scanned, " +
-        "$SkippedPkgType non-driver (packageType), $SkippedExcluded excluded (name), " +
-        "$SkippedNoSysMatch wrong SystemID, $SkippedWrongOS wrong OS, " +
-        "$SkippedDate older than baseline, $($MatchedDrivers.Count) matched") -Severity 1
-    Write-DATLog -Message "  Base URL: $DriverBaseUrl" -Severity 1
-    if ($MatchedDrivers.Count -gt 0) {
-        Write-DATLog -Message "  Sample download URL: $($MatchedDrivers[0].Url)" -Severity 1
+        # Log diagnostic summary for this catalog
+        $CatalogSource = if ($UsingModelCatalog) { 'per-model' } else { 'CatalogPC (legacy)' }
+        Write-DATLog -Message ("Catalog scan [$CatalogFileName] ($CatalogSource): $TotalScanned scanned, " +
+            "$SkippedPkgType non-driver, $SkippedExcluded excluded, " +
+            "$SkippedNoSysMatch wrong SystemID, $SkippedWrongOS wrong OS, " +
+            "$SkippedDate older than baseline, $CatalogMatched matched") -Severity 1
     }
 
     if ($MatchedDrivers.Count -eq 0) {
-        $Msg = "No individual drivers found for SystemID $SystemID"
+        $Msg = "No individual drivers found for SystemID $SystemID across $($CatalogPaths.Count) catalog(s)"
         if ($MissingSet.Count -gt 0) {
             $Msg += " (checked missing categories: $($MissingCategories -join ', '))"
         }
