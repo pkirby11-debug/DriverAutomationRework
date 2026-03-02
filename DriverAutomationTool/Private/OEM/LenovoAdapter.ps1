@@ -390,15 +390,21 @@ function Get-LenovoBIOSUpdate {
             return $null
         }
 
+        # Get ALL machine types for this model so the BIOS package description
+        # includes every variant for TS script matching (consistent with driver packages)
+        $AllTypes = Find-LenovoMachineType -Model $Model
+        $AllMachineTypesStr = if ($AllTypes) { $AllTypes -join ';' } else { $MachineType }
+
         $Result = [PSCustomObject]@{
-            Manufacturer = 'Lenovo'
-            Model        = $Model
-            MachineType  = $MachineType
-            Type         = 'BIOS'
-            Version      = $Latest.version
-            ReleaseDate  = $Latest.ReleaseDate
-            Url          = $DownloadUrl
-            FileName     = Split-Path $DownloadUrl -Leaf
+            Manufacturer    = 'Lenovo'
+            Model           = $Model
+            MachineType     = $MachineType
+            AllMachineTypes = $AllMachineTypesStr
+            Type            = 'BIOS'
+            Version         = $Latest.version
+            ReleaseDate     = $Latest.ReleaseDate
+            Url             = $DownloadUrl
+            FileName        = Split-Path $DownloadUrl -Leaf
         }
 
         Write-DATLog -Message "Found Lenovo BIOS update: v$($Result.Version) ($($Result.ReleaseDate)) for $Model" -Severity 1

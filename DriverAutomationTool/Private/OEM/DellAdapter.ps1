@@ -402,6 +402,11 @@ function Get-DellBIOSUpdate {
     <#
     .SYNOPSIS
         Finds the latest Dell BIOS update for a specific model.
+    .DESCRIPTION
+        Uses the CatalogIndexPC per-model catalogs — the same source used for driver
+        packages. These are kept current by Dell, unlike the legacy CatalogPC.cab.
+        Searches the per-model Manifest.SoftwareComponent entries for BIOS components
+        matching the model's SystemID(s) and returns the newest one.
     .PARAMETER Model
         The Dell model name.
     .PARAMETER SystemID
@@ -417,13 +422,6 @@ function Get-DellBIOSUpdate {
         [string]$SystemID
     )
 
-    $CatalogPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
-    if (-not $CatalogPath) {
-        Update-DellCatalogCache
-        $CatalogPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
-    }
-
-    $Xml = Read-DATXml -Path $CatalogPath
     $Sources = Get-DATOEMSources
 
     # If no SystemID provided, try to find it from the driver catalog
@@ -449,34 +447,44 @@ function Get-DellBIOSUpdate {
     # Parse semicolon-delimited SystemIDs
     $SystemIDs = $SystemID.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 
-    # Search CatalogPC for BIOS components
-    $BiosMatches = foreach ($Component in $Xml.Manifest.SoftwareComponent) {
-        if ($Component.Name.Display.'#cdata-section' -notmatch 'BIOS') { continue }
-
-        # Normalize case for SystemID matching (CatalogPC uses SupportedSystems.Brand.Model.SystemID)
-        $ComponentSystems = @($Component.SupportedSystems.Brand.Model.SystemID) |
-            ForEach-Object { if ($_) { $_.Trim().ToUpper() } }
-        $Match = $false
-
-        foreach ($SysID in $SystemIDs) {
-            $SysIDUpper = $SysID.Trim().ToUpper()
-            if ($ComponentSystems -contains $SysIDUpper) {
-                $Match = $true
-                break
-            }
-        }
-
-        if ($Match) {
-            $Component
-        }
-    }
-
-    if (-not $BiosMatches) {
-        Write-DATLog -Message "No BIOS update found for Dell $Model (SystemID: $SystemID)" -Severity 2
+    # Get per-model catalogs from CatalogIndexPC (same source used for driver packages)
+    $ModelCatalogPaths = Update-DellModelCatalog -SystemID $SystemID
+    if (-not $ModelCatalogPaths) {
+        Write-DATLog -Message "No per-model catalog available for Dell $Model (SystemID: $SystemID)" -Severity 2
         return $null
     }
 
-    # Get the latest by release date
+    # Search per-model catalogs for BIOS components matching our SystemIDs
+    $BiosMatches = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($ModelCatPath in $ModelCatalogPaths) {
+        $ModelXml = Read-DATXml -Path $ModelCatPath
+
+        foreach ($Component in $ModelXml.Manifest.SoftwareComponent) {
+            if ($Component.Name.Display.'#cdata-section' -notmatch 'BIOS') { continue }
+
+            $ComponentSystems = @($Component.SupportedSystems.Brand.Model.SystemID) |
+                ForEach-Object { if ($_) { $_.Trim().ToUpper() } }
+
+            foreach ($SysID in $SystemIDs) {
+                if ($ComponentSystems -contains $SysID.Trim().ToUpper()) {
+                    $BiosMatches.Add($Component)
+                    break
+                }
+            }
+        }
+
+        if ($BiosMatches.Count -gt 0) {
+            Write-DATLog -Message "Found $($BiosMatches.Count) BIOS component(s) in per-model catalog: $(Split-Path $ModelCatPath -Leaf)" -Severity 1
+        }
+    }
+
+    if ($BiosMatches.Count -eq 0) {
+        Write-DATLog -Message "No BIOS update found for Dell $Model (SystemID: $SystemID) in per-model catalogs" -Severity 2
+        return $null
+    }
+
+    # Select the newest BIOS by release date
     $Latest = $BiosMatches | Sort-Object { $_.dateTime } -Descending | Select-Object -First 1
 
     $DownloadPath = $Latest.path -replace '^/', ''
