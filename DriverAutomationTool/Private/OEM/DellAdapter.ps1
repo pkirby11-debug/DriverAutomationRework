@@ -736,8 +736,11 @@ function Get-DellIndividualDrivers {
                 continue
             }
 
-            # Secondary exclusion by name - catch Dell-specific tools that got past packageType
-            if ($DisplayName -match $ExcludePattern) {
+            # Secondary exclusion by name - catch Dell-specific tools that got past packageType.
+            # Skip exclusion if the name also contains "Driver" - these are legitimate driver
+            # packages that bundle companion apps (e.g., "Intel Graphics Driver and Intel
+            # Graphics Software Application" should NOT be excluded despite containing "Application").
+            if ($DisplayName -match $ExcludePattern -and $DisplayName -notmatch '\bDriver\b') {
                 $SkippedExcluded++
                 continue
             }
