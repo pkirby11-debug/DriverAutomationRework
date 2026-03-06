@@ -472,12 +472,13 @@ function Compress-DATPackage {
                 Write-DATLog -Message "Warning: DISM /Capture-Image typically requires administrator privileges. If compression fails, run the DAT Tool as Administrator." -Severity 2
             }
 
-            # DISM does NOT support UNC paths - must use local temp directory
-            # (Same approach as original script lines 20288-20308)
+            # DISM does NOT support UNC paths - must use local directory.
+            # Use Documents instead of %TEMP% to reduce AV false positives — AV products
+            # aggressively scan %TEMP% since it's a common malware staging location.
             # IMPORTANT: The WIM output file must be in a SEPARATE directory from the
             # capture source, otherwise DISM gets exit code 5 (Access Denied) because it
             # locks the output file while also trying to read the same directory as source.
-            $WimTempBase = Join-Path $env:TEMP 'DAT_WimTemp'
+            $WimTempBase = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'DAT_WimTemp'
             $WimTempSource = Join-Path $WimTempBase 'Source'
             $WimTempOutput = Join-Path $WimTempBase 'Output'
             if (Test-Path $WimTempBase) { Remove-Item -Path $WimTempBase -Recurse -Force }
@@ -487,17 +488,47 @@ function Compress-DATPackage {
             Write-DATLog -Message "Copying drivers to local temp for WIM creation: $WimTempSource" -Severity 1
             Copy-Item -Path "$SourcePath\*" -Destination $WimTempSource -Recurse -Force
 
+            # Brief delay after copy to allow AV scanning to complete on newly-copied
+            # .sys/.dll files. Corporate AV products lock files during real-time scanning,
+            # causing DISM to fail with Access Denied (0x80070005) if it tries to read them
+            # before the scan finishes.
+            Write-DATLog -Message "Waiting 10 seconds for AV scanning to complete before WIM capture..." -Severity 1
+            Start-Sleep -Seconds 10
+
             $LocalWim = Join-Path $WimTempOutput 'DriverPackage.wim'
             $DismArgs = "/Capture-Image /ImageFile:`"$LocalWim`" /CaptureDir:`"$WimTempSource`" /Name:`"$PackageName`" /Compress:max"
             Write-DATLog -Message "DISM args: $DismArgs" -Severity 1
-            $DismLog = Join-Path $WimTempOutput 'DismAction.log'
-            $Proc = Start-Process -FilePath 'dism.exe' -ArgumentList $DismArgs -Wait -NoNewWindow -PassThru -RedirectStandardOutput $DismLog -ErrorAction Stop
 
-            if ($Proc.ExitCode -ne 0) {
+            # Retry DISM capture up to 3 times with increasing delay to handle AV file locks
+            $MaxDismRetries = 3
+            $DismSuccess = $false
+            for ($DismAttempt = 1; $DismAttempt -le $MaxDismRetries; $DismAttempt++) {
+                $DismLog = Join-Path $WimTempOutput "DismAction_attempt${DismAttempt}.log"
+                $Proc = Start-Process -FilePath 'dism.exe' -ArgumentList $DismArgs -Wait -NoNewWindow -PassThru -RedirectStandardOutput $DismLog -ErrorAction Stop
+
+                if ($Proc.ExitCode -eq 0) {
+                    $DismSuccess = $true
+                    break
+                }
+
+                # Exit code 5 = Access Denied (AV file lock) - worth retrying
+                if ($Proc.ExitCode -eq 5 -and $DismAttempt -lt $MaxDismRetries) {
+                    $RetryDelay = $DismAttempt * 15
+                    Write-DATLog -Message "DISM capture failed with Access Denied (exit code 5) - AV may still be scanning. Retrying in $RetryDelay seconds (attempt $DismAttempt/$MaxDismRetries)..." -Severity 2
+                    # Remove partial WIM if created
+                    Remove-Item $LocalWim -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds $RetryDelay
+                } elseif ($Proc.ExitCode -ne 0) {
+                    # Non-AV error or final retry exhausted - fail immediately
+                    break
+                }
+            }
+
+            if (-not $DismSuccess) {
                 # Read DISM log for diagnostic details
                 $DismLogContent = if (Test-Path $DismLog) { Get-Content $DismLog -Tail 20 -ErrorAction SilentlyContinue | Out-String } else { 'No DISM log found' }
                 Write-DATLog -Message "DISM log output: $DismLogContent" -Severity 3
-                throw "DISM WIM compression failed with exit code $($Proc.ExitCode)"
+                throw "DISM WIM compression failed with exit code $($Proc.ExitCode) after $DismAttempt attempt(s)"
             }
 
             if (-not (Test-Path $LocalWim)) {
