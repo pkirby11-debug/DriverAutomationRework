@@ -687,30 +687,10 @@ function Distribute-DATContent {
             }
         }
 
-        # Distribute to selected DPs (initial distribution or adding new DPs)
-        if ($DistributionPoints -and $DistributionPoints.Count -gt 0) {
-            foreach ($DP in $DistributionPoints) {
-                if ($PSCmdlet.ShouldProcess("$PackageID to $DP", 'Distribute content')) {
-                    try {
-                        Start-CMContentDistribution -PackageId $PackageID `
-                            -DistributionPointName $DP -ErrorAction Stop
-                        Write-DATLog -Message "Content distribution started: $PackageID -> $DP" -Severity 1
-                    } catch {
-                        if ($_.Exception.Message -match 'already been distributed|No content destination') {
-                            if ($IsUpdate) {
-                                Write-DATLog -Message "DP $DP already has $PackageID - content refresh was triggered above" -Severity 1
-                            } else {
-                                Write-DATLog -Message "Content already distributed: $PackageID -> $DP" -Severity 1
-                            }
-                        } else {
-                            Write-DATLog -Message "Failed to distribute $PackageID to DP $DP`: $($_.Exception.Message)" -Severity 3
-                        }
-                    }
-                }
-            }
-        }
-
-        # Distribute to selected DPGs (initial distribution or adding new DPGs)
+        # Distribute to selected DPGs FIRST - DP Groups must be distributed before
+        # individual DPs, otherwise ConfigMgr sees the content already on member DPs
+        # and may fail to create the group association. This causes the DP Group to
+        # appear as "not applied" in the console even though its member DPs have content.
         if ($DistributionPointGroups -and $DistributionPointGroups.Count -gt 0) {
             foreach ($DPG in $DistributionPointGroups) {
                 if ($PSCmdlet.ShouldProcess("$PackageID to $DPG", 'Distribute content')) {
@@ -727,6 +707,29 @@ function Distribute-DATContent {
                             }
                         } else {
                             Write-DATLog -Message "Failed to distribute $PackageID to DPG '$DPG'`: $($_.Exception.Message)" -Severity 3
+                        }
+                    }
+                }
+            }
+        }
+
+        # Then distribute to any additional individual DPs (that aren't already covered by a DPG)
+        if ($DistributionPoints -and $DistributionPoints.Count -gt 0) {
+            foreach ($DP in $DistributionPoints) {
+                if ($PSCmdlet.ShouldProcess("$PackageID to $DP", 'Distribute content')) {
+                    try {
+                        Start-CMContentDistribution -PackageId $PackageID `
+                            -DistributionPointName $DP -ErrorAction Stop
+                        Write-DATLog -Message "Content distribution started: $PackageID -> $DP" -Severity 1
+                    } catch {
+                        if ($_.Exception.Message -match 'already been distributed|No content destination') {
+                            if ($IsUpdate) {
+                                Write-DATLog -Message "DP $DP already has $PackageID - content refresh was triggered above" -Severity 1
+                            } else {
+                                Write-DATLog -Message "Content already distributed: $PackageID -> $DP" -Severity 1
+                            }
+                        } else {
+                            Write-DATLog -Message "Failed to distribute $PackageID to DP $DP`: $($_.Exception.Message)" -Severity 3
                         }
                     }
                 }
