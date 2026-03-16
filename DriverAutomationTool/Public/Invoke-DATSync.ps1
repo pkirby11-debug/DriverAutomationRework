@@ -109,7 +109,7 @@ function Invoke-DATSync {
         [switch]$CleanDownloads,
         [switch]$UpdateIndividualDrivers,
 
-        [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg')]
+        [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg', 'ConfigMgr - Standard Pkg (Test)', 'ConfigMgr - Driver Pkg (Test)')]
         [string]$DeploymentPlatform = 'ConfigMgr - Standard Pkg',
 
         [switch]$CompressPackage,
@@ -268,7 +268,7 @@ function Invoke-DATSync {
     }
 
     # Post-sync cleanup: unused drivers (only for Driver Pkg mode)
-    if ($CleanUnusedDrivers -and $DeploymentPlatform -eq 'ConfigMgr - Driver Pkg') {
+    if ($CleanUnusedDrivers -and $DeploymentPlatform -like 'ConfigMgr - Driver Pkg*') {
         try {
             Remove-DATUnusedDrivers
         } catch {
@@ -347,7 +347,7 @@ function Invoke-DATSyncSinglePackage {
         [ValidateSet('ZIP', 'WIM')]
         [string]$CompressionType = 'ZIP',
 
-        [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg')]
+        [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg', 'ConfigMgr - Standard Pkg (Test)', 'ConfigMgr - Driver Pkg (Test)')]
         [string]$DeploymentPlatform = 'ConfigMgr - Standard Pkg',
 
         [switch]$VerifyDownloadHash,
@@ -365,12 +365,17 @@ function Invoke-DATSyncSinglePackage {
     # Standard Pkg + Drivers: "Drivers - Make Model - OS Architecture"
     # Standard Pkg + BIOS:    "BIOS Update - Make Model"
     # Driver Pkg + Drivers:   "Make Model - OS Architecture"
+    # Test variants prefix with "Test - "
+    $IsTestPackage = $DeploymentPlatform -like '*(Test)'
     if ($Type -eq 'BIOS') {
         $PackageName = "BIOS Update - $Make $ModelName"
-    } elseif ($DeploymentPlatform -eq 'ConfigMgr - Standard Pkg') {
+    } elseif ($DeploymentPlatform -like 'ConfigMgr - Standard Pkg*') {
         $PackageName = "Drivers - $Make $ModelName - $OperatingSystem $Architecture"
     } else {
         $PackageName = "$Make $ModelName - $OperatingSystem $Architecture"
+    }
+    if ($IsTestPackage) {
+        $PackageName = "Test - $PackageName"
     }
 
     # Build Description with SystemID/MachineType for TS script matching
@@ -384,7 +389,7 @@ function Invoke-DATSyncSinglePackage {
     $PackageDescription = if ($SystemSKU) { "(Models included:$SystemSKU)" } else { '' }
 
     # Check if this version already exists (use correct lookup based on deployment platform)
-    $IsDriverPkg = ($DeploymentPlatform -eq 'ConfigMgr - Driver Pkg')
+    $IsDriverPkg = ($DeploymentPlatform -like 'ConfigMgr - Driver Pkg*')
 
     # Find ALL existing packages for this model/type (any version) - used for duplicate prevention
     $AllExisting = if ($IsDriverPkg) {

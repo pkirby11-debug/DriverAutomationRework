@@ -283,7 +283,7 @@ function Initialize-DATMainForm {
     # --- Deployment Platform Change: enable/disable Clean Unused Drivers ---
     $Controls['DeployPlatformCombo'].Add_SelectedIndexChanged({
         if ($script:Initializing) { return }
-        $IsDriverPkg = $Controls['DeployPlatformCombo'].Text -eq 'ConfigMgr - Driver Pkg'
+        $IsDriverPkg = $Controls['DeployPlatformCombo'].Text -in @('ConfigMgr - Driver Pkg', 'ConfigMgr - Driver Pkg (Test)')
         $Controls['CleanUnusedCheckBox'].Enabled = $IsDriverPkg
         if (-not $IsDriverPkg) {
             $Controls['CleanUnusedCheckBox'].Checked = $false
@@ -716,7 +716,7 @@ function Initialize-DATMainForm {
 
         # Determine action description for confirmation dialog
         $ActionDesc = switch -Wildcard ($Action) {
-            'Move to Production' { "move $($SelectedRows.Count) package(s) to Production (remove Pilot/Retired prefix)" }
+            'Move to Production' { "move $($SelectedRows.Count) package(s) to Production (remove Test/Pilot/Retired prefix, existing production packages will be retired)" }
             'Move to Pilot'      { "mark $($SelectedRows.Count) package(s) as Pilot" }
             'Mark as Retired'    { "mark $($SelectedRows.Count) package(s) as Retired" }
             'Move to Windows *'  { "change $($SelectedRows.Count) package(s) to target $($Action -replace 'Move to ', '')" }
@@ -783,7 +783,7 @@ function Initialize-DATMainForm {
 
                 # Load CleanUnused AFTER platform selection (platform change handler enables/disables it)
                 if ($Config.options.cleanUnusedDrivers -and
-                    $Controls['DeployPlatformCombo'].Text -eq 'ConfigMgr - Driver Pkg') {
+                    $Controls['DeployPlatformCombo'].Text -in @('ConfigMgr - Driver Pkg', 'ConfigMgr - Driver Pkg (Test)')) {
                     $Controls['CleanUnusedCheckBox'].Checked = $true
                 }
 
@@ -816,7 +816,7 @@ function Initialize-DATMainForm {
                     $Controls['DellCheckBox'].Enabled = $false
                 }
 
-                $IsDriverPkg = $Controls['DeployPlatformCombo'].Text -eq 'ConfigMgr - Driver Pkg'
+                $IsDriverPkg = $Controls['DeployPlatformCombo'].Text -in @('ConfigMgr - Driver Pkg', 'ConfigMgr - Driver Pkg (Test)')
                 $Controls['CleanUnusedCheckBox'].Enabled = $IsDriverPkg
 
                 $Controls['CompressionTypeCombo'].Enabled = $Controls['CompressPackageCheckBox'].Checked

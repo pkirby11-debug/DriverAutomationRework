@@ -1411,6 +1411,9 @@ function Rename-DATPackageState {
     <#
     .SYNOPSIS
         Renames a ConfigMgr package to reflect a lifecycle state (Production, Pilot, Retired).
+    .DESCRIPTION
+        When moving to Production, if an existing production package with the same name
+        is found, it will be automatically renamed to Retired before the promotion.
     .PARAMETER PackageID
         The ConfigMgr package ID.
     .PARAMETER State
@@ -1441,8 +1444,8 @@ function Rename-DATPackageState {
         $PackageType = $PkgLookup.PackageType
         $CurrentName = $Package.Name
 
-        # Strip any existing state prefix (Pilot or Retired)
-        $CleanName = $CurrentName -replace '^\s*(Pilot|Retired)\s*-\s*', ''
+        # Strip any existing state prefix (Test, Pilot, or Retired)
+        $CleanName = $CurrentName -replace '^\s*(Test|Pilot|Retired)\s*-\s*', ''
 
         $NewName = switch ($State) {
             'Production' { $CleanName }
@@ -1453,6 +1456,33 @@ function Rename-DATPackageState {
         if ($NewName -eq $CurrentName) {
             Write-DATLog -Message "Package $PackageID is already in '$State' state: $CurrentName" -Severity 1
             return
+        }
+
+        # When promoting to Production, check if an existing production package has the same name
+        # and auto-retire it to prevent naming conflicts
+        if ($State -eq 'Production') {
+            $ExistingProd = if ($PackageType -eq 'DriverPackage') {
+                Get-CMDriverPackage -Name $CleanName -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PackageID -ne $PackageID }
+            } else {
+                Get-CMPackage -Name $CleanName -Fast -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PackageID -ne $PackageID }
+            }
+
+            if ($ExistingProd) {
+                foreach ($Prod in @($ExistingProd)) {
+                    $RetiredName = "Retired - $($Prod.Name)"
+                    Write-DATLog -Message "Retiring existing production package $($Prod.PackageID): '$($Prod.Name)' -> '$RetiredName'" -Severity 2
+                    if ($PSCmdlet.ShouldProcess("$($Prod.Name) -> $RetiredName", 'Retire existing production package')) {
+                        if ($PackageType -eq 'DriverPackage') {
+                            Set-CMDriverPackage -Id $Prod.PackageID -NewName $RetiredName
+                        } else {
+                            Set-CMPackage -Id $Prod.PackageID -NewName $RetiredName
+                        }
+                        Write-DATLog -Message "Retired existing production package $($Prod.PackageID): '$($Prod.Name)' -> '$RetiredName'" -Severity 1
+                    }
+                }
+            }
         }
 
         if ($PSCmdlet.ShouldProcess("$CurrentName -> $NewName", 'Rename package')) {
