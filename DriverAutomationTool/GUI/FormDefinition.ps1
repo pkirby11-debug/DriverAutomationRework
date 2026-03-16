@@ -622,6 +622,20 @@ function New-DATMainForm {
     $PkgFilterPanel.Controls.Add($PkgApplyButton)
     $Controls['PkgApplyButton'] = $PkgApplyButton
 
+    $PkgSelectAllButton = New-Object System.Windows.Forms.Button
+    $PkgSelectAllButton.Text = 'Select All'
+    $PkgSelectAllButton.Location = New-Object System.Drawing.Point(440, 44)
+    $PkgSelectAllButton.Width = 90
+    $PkgFilterPanel.Controls.Add($PkgSelectAllButton)
+    $Controls['PkgSelectAllButton'] = $PkgSelectAllButton
+
+    $PkgSelectNoneButton = New-Object System.Windows.Forms.Button
+    $PkgSelectNoneButton.Text = 'Select None'
+    $PkgSelectNoneButton.Location = New-Object System.Drawing.Point(540, 44)
+    $PkgSelectNoneButton.Width = 90
+    $PkgFilterPanel.Controls.Add($PkgSelectNoneButton)
+    $Controls['PkgSelectNoneButton'] = $PkgSelectNoneButton
+
     # Package grid
     $PkgGrid = New-Object System.Windows.Forms.DataGridView
     $PkgGrid.Dock = 'Fill'

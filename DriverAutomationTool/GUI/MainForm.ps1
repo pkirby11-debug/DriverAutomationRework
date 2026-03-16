@@ -618,6 +618,19 @@ function Initialize-DATMainForm {
         }
     })
 
+    # --- Package Management - Select All / Select None ---
+    $Controls['PkgSelectAllButton'].Add_Click({
+        foreach ($Row in $Controls['PkgGrid'].Rows) {
+            $Row.Cells[0].Value = $true
+        }
+    })
+
+    $Controls['PkgSelectNoneButton'].Add_Click({
+        foreach ($Row in $Controls['PkgGrid'].Rows) {
+            $Row.Cells[0].Value = $false
+        }
+    })
+
     # --- Package Management - Delete ---
     $Controls['PkgDeleteButton'].Add_Click({
         $SelectedRows = $Controls['PkgGrid'].Rows | Where-Object { $_.Cells[0].Value -eq $true }
