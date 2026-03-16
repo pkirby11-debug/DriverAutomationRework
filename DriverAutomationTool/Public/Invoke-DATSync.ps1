@@ -676,9 +676,13 @@ function Invoke-DATSyncSinglePackage {
     }
     $StopWatch.Stop()
 
-    # Prepare package source directory
+    # Prepare package source directory (Test packages use a separate 'Test' subfolder)
     $OsShort = $OperatingSystem -replace 'Windows ', 'Win'
-    $PackageSourceDir = Join-Path $PackagePath "$Make\$ModelName\$Type\$OsShort-$Architecture"
+    if ($IsTestPackage) {
+        $PackageSourceDir = Join-Path $PackagePath "Test\$Make\$ModelName\$Type\$OsShort-$Architecture"
+    } else {
+        $PackageSourceDir = Join-Path $PackagePath "$Make\$ModelName\$Type\$OsShort-$Architecture"
+    }
     if (Test-Path $PackageSourceDir) {
         Remove-Item -Path $PackageSourceDir -Recurse -Force
     }
