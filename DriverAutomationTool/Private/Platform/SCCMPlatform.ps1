@@ -125,7 +125,7 @@ function Get-DATSiteCode {
             -Class SMS_ProviderLocation -ErrorAction Stop |
             Select-Object -First 1
 
-        $Code = $SiteInfo.SiteCode
+        $Code = $SiteInfo.SiteCode.Trim()
         Write-DATLog -Message "Auto-discovered site code: $Code" -Severity 1
         return $Code
     } catch {
@@ -180,7 +180,7 @@ function New-DATDriverPackage {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         if (-not $Description) {
             $Description = "Driver Pack - $Manufacturer $Model - Version $Version"
@@ -424,7 +424,7 @@ function New-DATCMDriverPackage {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         if (-not $Description) {
             $Description = "Driver Pack (Driver Pkg) - $Manufacturer $Model - Version $Version"
@@ -583,7 +583,7 @@ function Find-DATExistingDriverPackages {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         $Filter = '*'
         if ($Manufacturer) { $Filter = "$Manufacturer*" }
@@ -640,7 +640,7 @@ function Distribute-DATContent {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         # Release any SEDO lock before distributing - creation or Set-CM* calls
         # may have left a lock that blocks Start-CMContentDistribution.
@@ -1074,7 +1074,7 @@ function Remove-DATLegacyPackage {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         $PkgLookup = Get-DATPackageAuto -PackageID $PackageID
         if (-not $PkgLookup) {
@@ -1216,7 +1216,7 @@ function Remove-DATUnusedDrivers {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         Write-DATLog -Message "======== Clean Up Unused Drivers ========" -Severity 1
 
@@ -1285,7 +1285,7 @@ function Find-DATExistingPackages {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         $Filter = '*'
         if ($Manufacturer) { $Filter = "$Manufacturer*" }
@@ -1357,7 +1357,7 @@ function Set-DATPackageFolder {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         # Use the correct console root node based on object type
         $RootNode = "$($script:CMSiteCode):\$ObjectType"
@@ -1433,6 +1433,13 @@ function Assert-DATConfigMgrConnected {
     if (-not $script:CMConnected) {
         throw "Not connected to ConfigMgr. Run Connect-DATConfigMgr first."
     }
+    # Verify PSDrive still exists (can disappear if module was re-imported or session recycled)
+    if ($script:CMSiteCode) {
+        $CMDrive = Get-PSDrive -Name $script:CMSiteCode -PSProvider CMSite -ErrorAction SilentlyContinue
+        if (-not $CMDrive) {
+            throw "ConfigMgr PSDrive '$($script:CMSiteCode):' no longer exists. Re-run Connect-DATConfigMgr."
+        }
+    }
 }
 
 function Rename-DATPackageState {
@@ -1461,7 +1468,7 @@ function Rename-DATPackageState {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         $PkgLookup = Get-DATPackageAuto -PackageID $PackageID
         if (-not $PkgLookup) {
@@ -1551,7 +1558,7 @@ function Move-DATPackageOSVersion {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         $PkgLookup = Get-DATPackageAuto -PackageID $PackageID
         if (-not $PkgLookup) {
@@ -1629,7 +1636,7 @@ function Invoke-DATPatchPackage {
 
     $OriginalLocation = Get-Location
     try {
-        Set-Location -Path "$($script:CMSiteCode):"
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
         $PkgLookup = Get-DATPackageAuto -PackageID $PackageID
         if (-not $PkgLookup) {
