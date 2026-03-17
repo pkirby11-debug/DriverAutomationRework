@@ -1409,7 +1409,7 @@ function Get-DATPackageAuto {
         [string]$PackageID
     )
 
-    $Pkg = Get-CMPackage -Id $PackageID -Fast -ErrorAction SilentlyContinue
+    $Pkg = Get-CMPackage -Id $PackageID -ErrorAction SilentlyContinue
     if ($Pkg) {
         return [PSCustomObject]@{ Package = $Pkg; PackageType = 'Standard' }
     }
