@@ -60,6 +60,13 @@ function Invoke-DATSync {
     .EXAMPLE
         Invoke-DATSync -Manufacturer Dell -Models "OptiPlex 7090" -OperatingSystem "Windows 11 24H2" `
             -SiteServer "CM01" -SiteCode "PS1" -DownloadPath "\\server\Drivers$" -PackagePath "\\server\Packages$"
+    .NOTES
+        Version history:
+        1.0.0 - Initial release
+        1.5.1 - (2026-03-17) - Fixed double manufacturer prefix in ConfigMgr package names for Lenovo consumer
+                               models whose catalog names already include "Lenovo" (e.g., "Lenovo V15 Gen 4").
+                               Package names were generated as "Drivers - Lenovo Lenovo V15 Gen 4 - ..." causing
+                               the apply script's model extraction to produce the wrong model name for WMI matching.
     #>
     [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Parameters')]
     param(

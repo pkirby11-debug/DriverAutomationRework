@@ -1,5 +1,11 @@
 # SCCM/ConfigMgr Platform Integration
 # Handles ConfigMgr connection, package creation, content distribution, and cleanup.
+#
+# Version history:
+#   1.0.0 - Initial release
+#   1.5.1 - (2026-03-17) - Fixed missing -Manufacturer parameter on Set-CMPackage in the New-DATDriverPackage
+#                          update path. Existing packages updated via DAT sync were silently losing their
+#                          Manufacturer field, causing the apply script's manufacturer filter to drop them.
 
 function Connect-DATConfigMgr {
     <#
