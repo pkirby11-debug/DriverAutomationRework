@@ -1159,13 +1159,14 @@ function Remove-DATLegacyPackage {
             Write-DATLog -Message "Successfully removed package: $PackageName ($PackageID)" -Severity 1
 
             # Step 3: Clean up source content if requested
-            if ($CleanSource -and $SourcePath -and (Test-Path $SourcePath)) {
+            # Use .NET directly to avoid CMSite PSDrive provider intercepting Test-Path
+            if ($CleanSource -and $SourcePath -and [System.IO.Directory]::Exists($SourcePath)) {
                 Remove-Item -Path $SourcePath -Recurse -Force -ErrorAction SilentlyContinue
                 Write-DATLog -Message "Removed source content: $SourcePath" -Severity 1
 
                 # Also clean up sibling artifacts (extracted folder, compressed folder, .integrity.json)
                 $ParentDir = Split-Path $SourcePath -Parent
-                if ($ParentDir -and (Test-Path $ParentDir)) {
+                if ($ParentDir -and [System.IO.Directory]::Exists($ParentDir)) {
                     $SourceLeaf = Split-Path $SourcePath -Leaf
                     # Remove the corresponding extracted or compressed sibling folder
                     if ($SourceLeaf -like 'Compressed-*') {
@@ -1174,18 +1175,18 @@ function Remove-DATLegacyPackage {
                         $SiblingLeaf = "Compressed-$SourceLeaf"
                     }
                     $SiblingPath = Join-Path $ParentDir $SiblingLeaf
-                    if (Test-Path $SiblingPath) {
+                    if ([System.IO.Directory]::Exists($SiblingPath)) {
                         Remove-Item -Path $SiblingPath -Recurse -Force -ErrorAction SilentlyContinue
                         Write-DATLog -Message "Removed sibling source content: $SiblingPath" -Severity 1
                     }
                     # Remove integrity manifest
                     $ManifestPath = Join-Path $ParentDir '.integrity.json'
-                    if (Test-Path $ManifestPath) {
+                    if ([System.IO.File]::Exists($ManifestPath)) {
                         Remove-Item -Path $ManifestPath -Force -ErrorAction SilentlyContinue
                         Write-DATLog -Message "Removed integrity manifest: $ManifestPath" -Severity 1
                     }
                     # Remove parent directory if now empty
-                    if (@(Get-ChildItem $ParentDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+                    if ([System.IO.Directory]::GetFileSystemEntries($ParentDir).Count -eq 0) {
                         Remove-Item -Path $ParentDir -Force -ErrorAction SilentlyContinue
                         Write-DATLog -Message "Removed empty parent directory: $ParentDir" -Severity 1
                     }
