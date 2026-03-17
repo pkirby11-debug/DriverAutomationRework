@@ -1166,6 +1166,13 @@ function Remove-DATLegacyPackage {
 
             # Step 3: Clean up source content if requested
             # Use .NET directly to avoid CMSite PSDrive provider intercepting Test-Path
+            Write-DATLog -Message "CleanSource check: CleanSource=$CleanSource, SourcePath='$SourcePath'" -Severity 1
+            if ($SourcePath) {
+                $SourceExists = [System.IO.Directory]::Exists($SourcePath)
+                Write-DATLog -Message "CleanSource check: Directory exists = $SourceExists" -Severity 1
+            } else {
+                Write-DATLog -Message "CleanSource check: SourcePath is empty - package had no source path in CM" -Severity 2
+            }
             if ($CleanSource -and $SourcePath -and [System.IO.Directory]::Exists($SourcePath)) {
                 Remove-Item -Path $SourcePath -Recurse -Force -ErrorAction SilentlyContinue
                 Write-DATLog -Message "Removed source content: $SourcePath" -Severity 1
