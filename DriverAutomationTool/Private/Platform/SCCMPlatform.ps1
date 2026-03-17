@@ -94,7 +94,7 @@ function Connect-DATConfigMgr {
     $CMDrive = Get-PSDrive -Name $SiteCode -PSProvider CMSite -ErrorAction SilentlyContinue
     if (-not $CMDrive) {
         try {
-            New-PSDrive -Name $SiteCode -PSProvider CMSite -Root $SiteServer -ErrorAction Stop | Out-Null
+            New-PSDrive -Name $SiteCode -PSProvider CMSite -Root $SiteServer -Scope Global -ErrorAction Stop | Out-Null
         } catch {
             throw "Failed to create ConfigMgr PSDrive for site $SiteCode`: $($_.Exception.Message)"
         }
@@ -1438,7 +1438,7 @@ function Assert-DATConfigMgrConnected {
         $CMDrive = Get-PSDrive -Name $script:CMSiteCode -PSProvider CMSite -ErrorAction SilentlyContinue
         if (-not $CMDrive) {
             try {
-                New-PSDrive -Name $script:CMSiteCode -PSProvider CMSite -Root $script:CMSiteServer -ErrorAction Stop | Out-Null
+                New-PSDrive -Name $script:CMSiteCode -PSProvider CMSite -Root $script:CMSiteServer -Scope Global -ErrorAction Stop | Out-Null
                 Write-DATLog -Message "ConfigMgr PSDrive '$($script:CMSiteCode):' recreated in current runspace" -Severity 1
             } catch {
                 throw "ConfigMgr PSDrive '$($script:CMSiteCode):' missing and could not be recreated: $($_.Exception.Message)"
