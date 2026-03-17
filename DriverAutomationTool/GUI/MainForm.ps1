@@ -402,18 +402,23 @@ function Initialize-DATMainForm {
             $script:SyncTimer.Stop()
             $script:SyncTimer.Dispose()
         }
+
+        # Capture controls in script scope so the timer tick can access them
+        # ($Controls is a function parameter and won't be in scope when the timer fires)
+        $script:TimerControls = $Controls
+
         $script:SyncTimer = New-Object System.Windows.Forms.Timer
         $script:SyncTimer.Interval = 500
 
-        $script:SyncTimer.Add_Tick(({
+        $script:SyncTimer.Add_Tick({
             # Drain log queue and update the Progress tab
             if ($script:LogQueue) {
                 $msg = $null
                 while ($script:LogQueue.TryDequeue([ref]$msg)) {
-                    $Controls['LogListBox'].Items.Add($msg)
+                    $script:TimerControls['LogListBox'].Items.Add($msg)
                 }
-                if ($Controls['LogListBox'].Items.Count -gt 0) {
-                    $Controls['LogListBox'].TopIndex = $Controls['LogListBox'].Items.Count - 1
+                if ($script:TimerControls['LogListBox'].Items.Count -gt 0) {
+                    $script:TimerControls['LogListBox'].TopIndex = $script:TimerControls['LogListBox'].Items.Count - 1
                 }
             }
 
@@ -426,10 +431,10 @@ function Initialize-DATMainForm {
             if ($script:LogQueue) {
                 $msg = $null
                 while ($script:LogQueue.TryDequeue([ref]$msg)) {
-                    $Controls['LogListBox'].Items.Add($msg)
+                    $script:TimerControls['LogListBox'].Items.Add($msg)
                 }
-                if ($Controls['LogListBox'].Items.Count -gt 0) {
-                    $Controls['LogListBox'].TopIndex = $Controls['LogListBox'].Items.Count - 1
+                if ($script:TimerControls['LogListBox'].Items.Count -gt 0) {
+                    $script:TimerControls['LogListBox'].TopIndex = $script:TimerControls['LogListBox'].Items.Count - 1
                 }
             }
 
@@ -445,17 +450,17 @@ function Initialize-DATMainForm {
                     $SkipCount = @($Results | Where-Object { $_.Status -eq 'Skipped' }).Count
                     $ErrorCount = @($Results | Where-Object { $_.Status -eq 'Error' }).Count
 
-                    $Controls['ProgressBar'].Style = 'Continuous'
-                    $Controls['ProgressBar'].Value = $Controls['ProgressBar'].Maximum
+                    $script:TimerControls['ProgressBar'].Style = 'Continuous'
+                    $script:TimerControls['ProgressBar'].Value = $script:TimerControls['ProgressBar'].Maximum
 
                     if ($ErrorCount -gt 0 -and $SuccessCount -eq 0) {
-                        $Controls['StatusLabel'].Text = "Sync failed - $ErrorCount error(s)"
+                        $script:TimerControls['StatusLabel'].Text = "Sync failed - $ErrorCount error(s)"
                         Show-DATFormMessage -Message "Sync failed!`n`nErrors: $ErrorCount`nSkipped: $SkipCount" -Type Error
                     } elseif ($ErrorCount -gt 0) {
-                        $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $ErrorCount error(s)"
+                        $script:TimerControls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $ErrorCount error(s)"
                         Show-DATFormMessage -Message "Sync complete with warnings.`n`nSuccess: $SuccessCount`nSkipped: $SkipCount`nErrors: $ErrorCount" -Type Warning
                     } else {
-                        $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $SkipCount skipped"
+                        $script:TimerControls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $SkipCount skipped"
                         Show-DATFormMessage -Message "Sync complete!`n`nSuccess: $SuccessCount`nSkipped: $SkipCount" -Type Information
                     }
                 } else {
@@ -463,15 +468,15 @@ function Initialize-DATMainForm {
                     $RunspaceErrors = $script:SyncRunspace.Streams.Error
                     if ($RunspaceErrors -and $RunspaceErrors.Count -gt 0) {
                         $ErrMsg = $RunspaceErrors[0].Exception.Message
-                        $Controls['StatusLabel'].Text = 'Sync failed'
+                        $script:TimerControls['StatusLabel'].Text = 'Sync failed'
                         Show-DATFormMessage -Message "Sync failed: $ErrMsg" -Type Error
                     } else {
-                        $Controls['StatusLabel'].Text = 'Sync complete - no packages to process'
+                        $script:TimerControls['StatusLabel'].Text = 'Sync complete - no packages to process'
                         Show-DATFormMessage -Message "Sync complete - no packages were selected for processing." -Type Information
                     }
                 }
             } catch {
-                $Controls['StatusLabel'].Text = 'Sync failed'
+                $script:TimerControls['StatusLabel'].Text = 'Sync failed'
                 Show-DATFormMessage -Message "Sync failed: $($_.Exception.Message)" -Type Error
             } finally {
                 if ($script:SyncRunspace) {
@@ -480,11 +485,11 @@ function Initialize-DATMainForm {
                 }
                 $script:SyncHandle = $null
                 $script:LogQueue = $null
-                $Controls['StartButton'].Enabled = $true
-                $Controls['StopButton'].Enabled = $false
-                $Controls['ProgressBar'].Style = 'Continuous'
+                $script:TimerControls['StartButton'].Enabled = $true
+                $script:TimerControls['StopButton'].Enabled = $false
+                $script:TimerControls['ProgressBar'].Style = 'Continuous'
             }
-        }).GetNewClosure())
+        })
 
         $script:SyncTimer.Start()
     })
