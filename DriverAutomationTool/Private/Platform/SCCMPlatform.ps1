@@ -1162,6 +1162,34 @@ function Remove-DATLegacyPackage {
             if ($CleanSource -and $SourcePath -and (Test-Path $SourcePath)) {
                 Remove-Item -Path $SourcePath -Recurse -Force -ErrorAction SilentlyContinue
                 Write-DATLog -Message "Removed source content: $SourcePath" -Severity 1
+
+                # Also clean up sibling artifacts (extracted folder, compressed folder, .integrity.json)
+                $ParentDir = Split-Path $SourcePath -Parent
+                if ($ParentDir -and (Test-Path $ParentDir)) {
+                    $SourceLeaf = Split-Path $SourcePath -Leaf
+                    # Remove the corresponding extracted or compressed sibling folder
+                    if ($SourceLeaf -like 'Compressed-*') {
+                        $SiblingLeaf = $SourceLeaf -replace '^Compressed-', ''
+                    } else {
+                        $SiblingLeaf = "Compressed-$SourceLeaf"
+                    }
+                    $SiblingPath = Join-Path $ParentDir $SiblingLeaf
+                    if (Test-Path $SiblingPath) {
+                        Remove-Item -Path $SiblingPath -Recurse -Force -ErrorAction SilentlyContinue
+                        Write-DATLog -Message "Removed sibling source content: $SiblingPath" -Severity 1
+                    }
+                    # Remove integrity manifest
+                    $ManifestPath = Join-Path $ParentDir '.integrity.json'
+                    if (Test-Path $ManifestPath) {
+                        Remove-Item -Path $ManifestPath -Force -ErrorAction SilentlyContinue
+                        Write-DATLog -Message "Removed integrity manifest: $ManifestPath" -Severity 1
+                    }
+                    # Remove parent directory if now empty
+                    if (@(Get-ChildItem $ParentDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+                        Remove-Item -Path $ParentDir -Force -ErrorAction SilentlyContinue
+                        Write-DATLog -Message "Removed empty parent directory: $ParentDir" -Severity 1
+                    }
+                }
             }
         }
     } catch {
