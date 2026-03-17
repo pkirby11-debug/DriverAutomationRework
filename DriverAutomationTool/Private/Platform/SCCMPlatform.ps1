@@ -1433,11 +1433,16 @@ function Assert-DATConfigMgrConnected {
     if (-not $script:CMConnected) {
         throw "Not connected to ConfigMgr. Run Connect-DATConfigMgr first."
     }
-    # Verify PSDrive still exists (can disappear if module was re-imported or session recycled)
-    if ($script:CMSiteCode) {
+    # Verify PSDrive exists — auto-recreate if missing (e.g. background runspace, session recycle)
+    if ($script:CMSiteCode -and $script:CMSiteServer) {
         $CMDrive = Get-PSDrive -Name $script:CMSiteCode -PSProvider CMSite -ErrorAction SilentlyContinue
         if (-not $CMDrive) {
-            throw "ConfigMgr PSDrive '$($script:CMSiteCode):' no longer exists. Re-run Connect-DATConfigMgr."
+            try {
+                New-PSDrive -Name $script:CMSiteCode -PSProvider CMSite -Root $script:CMSiteServer -ErrorAction Stop | Out-Null
+                Write-DATLog -Message "ConfigMgr PSDrive '$($script:CMSiteCode):' recreated in current runspace" -Severity 1
+            } catch {
+                throw "ConfigMgr PSDrive '$($script:CMSiteCode):' missing and could not be recreated: $($_.Exception.Message)"
+            }
         }
     }
 }
