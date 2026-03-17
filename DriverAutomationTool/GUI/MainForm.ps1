@@ -85,12 +85,13 @@ function Initialize-DATMainForm {
     $LogListBox = $Controls['LogListBox']
     Register-DATLogSubscriber -Action {
         param($Event)
-        if ($LogListBox -and -not $LogListBox.IsDisposed) {
+        if ($LogListBox -and -not $LogListBox.IsDisposed -and $LogListBox.IsHandleCreated) {
             try {
-                $LogListBox.Invoke([Action]{
-                    $Entry = "[{0}] {1}" -f $Event.Timestamp.ToString('HH:mm:ss'), $Event.Message
-                    $LogListBox.Items.Add($Entry) | Out-Null
-                    $LogListBox.TopIndex = [math]::Max(0, $LogListBox.Items.Count - 1)
+                $entry  = "[{0}] {1}" -f $Event.Timestamp.ToString('HH:mm:ss'), $Event.Message
+                $lb     = $LogListBox
+                $lb.Invoke([System.Windows.Forms.MethodInvoker]{
+                    $lb.Items.Add($entry) | Out-Null
+                    $lb.TopIndex = [math]::Max(0, $lb.Items.Count - 1)
                 })
             } catch { }
         }
