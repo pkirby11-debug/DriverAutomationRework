@@ -405,7 +405,7 @@ function Initialize-DATMainForm {
         $script:SyncTimer = New-Object System.Windows.Forms.Timer
         $script:SyncTimer.Interval = 500
 
-        $script:SyncTimer.Add_Tick({
+        $script:SyncTimer.Add_Tick(({
             # Drain log queue and update the Progress tab
             if ($script:LogQueue) {
                 $msg = $null
@@ -484,7 +484,7 @@ function Initialize-DATMainForm {
                 $Controls['StopButton'].Enabled = $false
                 $Controls['ProgressBar'].Style = 'Continuous'
             }
-        })
+        }).GetNewClosure())
 
         $script:SyncTimer.Start()
     })
