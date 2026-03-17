@@ -366,13 +366,16 @@ function Invoke-DATSyncSinglePackage {
     # Standard Pkg + BIOS:    "BIOS Update - Make Model"
     # Driver Pkg + Drivers:   "Make Model - OS Architecture"
     # Test variants prefix with "Test - "
+    # Some Lenovo catalog model names already start with "Lenovo" (e.g. "Lenovo V15 Gen 4").
+    # Strip a leading manufacturer prefix from ModelName to avoid "Drivers - Lenovo Lenovo V15..."
+    $DisplayModelName = if ($ModelName -like "$Make *") { $ModelName.Substring($Make.Length).TrimStart() } else { $ModelName }
     $IsTestPackage = $DeploymentPlatform -like '*(Test)'
     if ($Type -eq 'BIOS') {
-        $PackageName = "BIOS Update - $Make $ModelName"
+        $PackageName = "BIOS Update - $Make $DisplayModelName"
     } elseif ($DeploymentPlatform -like 'ConfigMgr - Standard Pkg*') {
-        $PackageName = "Drivers - $Make $ModelName - $OperatingSystem $Architecture"
+        $PackageName = "Drivers - $Make $DisplayModelName - $OperatingSystem $Architecture"
     } else {
-        $PackageName = "$Make $ModelName - $OperatingSystem $Architecture"
+        $PackageName = "$Make $DisplayModelName - $OperatingSystem $Architecture"
     }
     if ($IsTestPackage) {
         $PackageName = "Test - $PackageName"

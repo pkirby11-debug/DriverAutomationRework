@@ -210,7 +210,7 @@ function New-DATDriverPackage {
                     -SiteServer $SiteServer -WmiNamespace $WmiNamespace | Out-Null
 
                 try {
-                    Set-CMPackage -Id $PackageID -Version $Version -Description $Description -Path $SourcePath -ErrorAction Stop
+                    Set-CMPackage -Id $PackageID -Version $Version -Description $Description -Path $SourcePath -Manufacturer $Manufacturer -ErrorAction Stop
                 } catch {
                     Write-DATLog -Message "Warning: Could not update package $PackageID (may be locked): $($_.Exception.Message)" -Severity 2
                     Write-DATLog -Message "Continuing with existing package - will still ensure correct folder placement" -Severity 2
