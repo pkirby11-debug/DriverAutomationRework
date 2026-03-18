@@ -602,7 +602,7 @@ function Initialize-DATMainForm {
                 $FindParams['IncludeDriverPackages'] = $true
             }
 
-            $Packages = Find-DATExistingPackages @FindParams
+            $Packages = Find-DATExistingPackages @FindParams | Sort-Object Name
             foreach ($Pkg in $Packages) {
                 $PkgTypeLabel = if ($Pkg.PackageType -eq 'DriverPackage') { 'Driver Pkg' } else { 'Standard' }
                 $Controls['PkgGrid'].Rows.Add(
@@ -637,9 +637,24 @@ function Initialize-DATMainForm {
         }
     })
 
+    # --- Package Management - Search ---
+    $Controls['PkgSearchBox'].Add_TextChanged({
+        $SearchText = $Controls['PkgSearchBox'].Text
+        foreach ($Row in $Controls['PkgGrid'].Rows) {
+            if ([string]::IsNullOrEmpty($SearchText)) {
+                $Row.Visible = $true
+            } else {
+                $Name         = $Row.Cells['Name'].Value
+                $Manufacturer = $Row.Cells['Manufacturer'].Value
+                $Row.Visible  = (($Name -and $Name -like "*$SearchText*") -or
+                                 ($Manufacturer -and $Manufacturer -like "*$SearchText*"))
+            }
+        }
+    })
+
     # --- Package Management - Delete ---
     $Controls['PkgDeleteButton'].Add_Click({
-        $SelectedRows = $Controls['PkgGrid'].Rows | Where-Object { $_.Cells[0].Value -eq $true }
+        $SelectedRows = @($Controls['PkgGrid'].Rows | Where-Object { $_.Cells[0].Value -eq $true })
         if ($SelectedRows.Count -eq 0) {
             Show-DATFormMessage -Message 'Select packages to remove.' -Type Warning
             return
@@ -649,39 +664,116 @@ function Initialize-DATMainForm {
             -Message "Remove $($SelectedRows.Count) selected package(s)? This cannot be undone." `
             -Type Question
 
-        if ($Confirm -eq 'Yes') {
-            $Succeeded = [System.Collections.Generic.List[string]]::new()
-            $Failed    = [System.Collections.Generic.List[string]]::new()
+        if ($Confirm -ne 'Yes') { return }
 
-            foreach ($Row in $SelectedRows) {
-                $PkgID   = $Row.Cells['PackageID'].Value
-                $PkgName = $Row.Cells['Name'].Value
+        # Capture everything needed by the runspace before going background
+        $PackagesToRemove = @($SelectedRows | ForEach-Object {
+            @{ ID = $_.Cells['PackageID'].Value; Name = $_.Cells['Name'].Value }
+        })
+        $CleanSource = $Controls['CleanSourceCheckBox'].Checked
+        $ConnParams  = @{ SiteServer = $Controls['SiteServerInput'].Text; SiteCode = $Controls['SiteCodeInput'].Text }
+        if ($Controls['UseSSLCheckBox'].Checked) { $ConnParams['UseSSL'] = $true }
+        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+
+        # Disable controls and show progress
+        $Controls['PkgDeleteButton'].Enabled  = $false
+        $Controls['PkgRefreshButton'].Enabled = $false
+        $Controls['PkgApplyButton'].Enabled   = $false
+        $Controls['StatusStripLabel'].Text    = "Removing $($PackagesToRemove.Count) package(s)..."
+
+        $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+        $DeleteScript = {
+            param($ModulePath, $ConnParams, $PackagesToRemove, $CleanSource, $LogQueue)
+
+            Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+            Register-DATQueueLogSubscriber -LogQueue $LogQueue
+            Connect-DATConfigMgr @ConnParams
+
+            $Results = [System.Collections.Generic.List[hashtable]]::new()
+            foreach ($Pkg in $PackagesToRemove) {
                 try {
-                    Remove-DATLegacyPackage -PackageID $PkgID -CleanSource:$Controls['CleanSourceCheckBox'].Checked
-                    $Succeeded.Add("$PkgID ($PkgName)")
+                    Remove-DATLegacyPackage -PackageID $Pkg.ID -CleanSource:$CleanSource
+                    $Results.Add(@{ ID = $Pkg.ID; Name = $Pkg.Name; Status = 'Success' })
                 } catch {
-                    $ErrMsg = $_.Exception.Message
-                    Write-DATLog -Message "Failed to remove $PkgID`: $ErrMsg" -Severity 3
-                    $Failed.Add("$PkgID ($PkgName): $ErrMsg")
+                    $Results.Add(@{ ID = $Pkg.ID; Name = $Pkg.Name; Status = 'Failed'; Error = $_.Exception.Message })
+                }
+            }
+            return $Results
+        }
+
+        $script:DeleteRunspace = [System.Management.Automation.PowerShell]::Create()
+        $script:DeleteRunspace.AddScript($DeleteScript).AddArgument($ModulePath).AddArgument($ConnParams).AddArgument($PackagesToRemove).AddArgument($CleanSource).AddArgument($script:LogQueue) | Out-Null
+        $script:DeleteHandle = $script:DeleteRunspace.BeginInvoke()
+
+        $script:TimerControls = $Controls
+
+        if ($script:DeleteTimer) { $script:DeleteTimer.Stop(); $script:DeleteTimer.Dispose() }
+        $script:DeleteTimer = New-Object System.Windows.Forms.Timer
+        $script:DeleteTimer.Interval = 500
+
+        $script:DeleteTimer.Add_Tick({
+            # Drain log queue to the Progress tab
+            if ($script:LogQueue) {
+                $LogMsg = $null
+                while ($script:LogQueue.TryDequeue([ref]$LogMsg)) {
+                    $script:TimerControls['LogListBox'].Items.Add($LogMsg)
+                }
+                if ($script:TimerControls['LogListBox'].Items.Count -gt 0) {
+                    $script:TimerControls['LogListBox'].TopIndex = $script:TimerControls['LogListBox'].Items.Count - 1
                 }
             }
 
-            # Refresh the grid
-            $Controls['PkgRefreshButton'].PerformClick()
+            if ($null -eq $script:DeleteHandle -or -not $script:DeleteHandle.IsCompleted) { return }
 
-            # Report results
-            if ($Failed.Count -eq 0) {
-                Show-DATFormMessage -Message "Removed $($Succeeded.Count) package(s) successfully." -Type Information
-            } elseif ($Succeeded.Count -eq 0) {
-                Show-DATFormMessage `
-                    -Message "All $($Failed.Count) package removal(s) failed.`n`n$($Failed -join "`n")`n`nCheck the DAT log for details." `
-                    -Type Error
-            } else {
-                Show-DATFormMessage `
-                    -Message "$($Succeeded.Count) removed, $($Failed.Count) failed.`n`nFailed:`n$($Failed -join "`n")`n`nCheck the DAT log for details." `
-                    -Type Warning
+            $script:DeleteTimer.Stop()
+
+            # Final log drain
+            if ($script:LogQueue) {
+                $LogMsg = $null
+                while ($script:LogQueue.TryDequeue([ref]$LogMsg)) {
+                    $script:TimerControls['LogListBox'].Items.Add($LogMsg)
+                }
+                if ($script:TimerControls['LogListBox'].Items.Count -gt 0) {
+                    $script:TimerControls['LogListBox'].TopIndex = $script:TimerControls['LogListBox'].Items.Count - 1
+                }
             }
-        }
+
+            # Re-enable controls
+            $script:TimerControls['PkgDeleteButton'].Enabled  = $true
+            $script:TimerControls['PkgRefreshButton'].Enabled = $true
+            $script:TimerControls['PkgApplyButton'].Enabled   = $true
+
+            try {
+                $Results   = $script:DeleteRunspace.EndInvoke($script:DeleteHandle)
+                $Succeeded = @($Results | Where-Object { $_.Status -eq 'Success' })
+                $Failed    = @($Results | Where-Object { $_.Status -eq 'Failed' })
+
+                $script:DeleteRunspace.Dispose()
+
+                # Refresh grid and clear search so all packages are visible
+                $script:TimerControls['PkgSearchBox'].Text = ''
+                $script:TimerControls['PkgRefreshButton'].PerformClick()
+                $script:TimerControls['StatusStripLabel'].Text = "Removed $($Succeeded.Count) package(s)"
+
+                if ($Failed.Count -eq 0) {
+                    Show-DATFormMessage -Message "Removed $($Succeeded.Count) package(s) successfully." -Type Information
+                } elseif ($Succeeded.Count -eq 0) {
+                    $FailList = ($Failed | ForEach-Object { "$($_.ID) ($($_.Name)): $($_.Error)" }) -join "`n"
+                    Show-DATFormMessage -Message "All $($Failed.Count) package removal(s) failed.`n`n$FailList`n`nCheck the DAT log for details." -Type Error
+                } else {
+                    $FailList = ($Failed | ForEach-Object { "$($_.ID) ($($_.Name)): $($_.Error)" }) -join "`n"
+                    Show-DATFormMessage -Message "$($Succeeded.Count) removed, $($Failed.Count) failed.`n`nFailed:`n$FailList`n`nCheck the DAT log for details." -Type Warning
+                }
+            } catch {
+                $script:TimerControls['StatusStripLabel'].Text = 'Package removal failed'
+                Show-DATFormMessage -Message "Package removal failed: $($_.Exception.Message)" -Type Error
+            } finally {
+                $script:DeleteHandle = $null
+            }
+        })
+
+        $script:DeleteTimer.Start()
     })
 
     # --- Package Management - Apply Action ---

@@ -555,7 +555,7 @@ function New-DATMainForm {
     # Filter panel (added to tab later for correct dock order)
     $PkgFilterPanel = New-Object System.Windows.Forms.Panel
     $PkgFilterPanel.Dock = 'Top'
-    $PkgFilterPanel.Height = 85
+    $PkgFilterPanel.Height = 120
 
     $PkgRefreshButton = New-Object System.Windows.Forms.Button
     $PkgRefreshButton.Text = 'Refresh Packages'
@@ -635,6 +635,19 @@ function New-DATMainForm {
     $PkgSelectNoneButton.Width = 90
     $PkgFilterPanel.Controls.Add($PkgSelectNoneButton)
     $Controls['PkgSelectNoneButton'] = $PkgSelectNoneButton
+
+    # Search row (third row in filter panel)
+    $PkgSearchLabel = New-Object System.Windows.Forms.Label
+    $PkgSearchLabel.Text = 'Search:'
+    $PkgSearchLabel.Location = New-Object System.Drawing.Point(10, 88)
+    $PkgSearchLabel.AutoSize = $true
+    $PkgFilterPanel.Controls.Add($PkgSearchLabel)
+
+    $PkgSearchBox = New-Object System.Windows.Forms.TextBox
+    $PkgSearchBox.Location = New-Object System.Drawing.Point(70, 85)
+    $PkgSearchBox.Width = 350
+    $PkgFilterPanel.Controls.Add($PkgSearchBox)
+    $Controls['PkgSearchBox'] = $PkgSearchBox
 
     # Package grid
     $PkgGrid = New-Object System.Windows.Forms.DataGridView
