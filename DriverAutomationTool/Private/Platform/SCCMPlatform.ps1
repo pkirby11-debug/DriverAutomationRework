@@ -1174,8 +1174,12 @@ function Remove-DATLegacyPackage {
                 Write-DATLog -Message "CleanSource check: SourcePath is empty - package had no source path in CM" -Severity 2
             }
             if ($CleanSource -and $SourcePath -and [System.IO.Directory]::Exists($SourcePath)) {
-                Remove-Item -Path $SourcePath -Recurse -Force -ErrorAction SilentlyContinue
-                Write-DATLog -Message "Removed source content: $SourcePath" -Severity 1
+                try {
+                    [System.IO.Directory]::Delete($SourcePath, $true)
+                    Write-DATLog -Message "Removed source content: $SourcePath" -Severity 1
+                } catch {
+                    Write-DATLog -Message "Failed to remove source content '$SourcePath': $($_.Exception.Message)" -Severity 3
+                }
 
                 # Also clean up sibling artifacts (extracted folder, compressed folder, .integrity.json)
                 $ParentDir = Split-Path $SourcePath -Parent
@@ -1189,19 +1193,31 @@ function Remove-DATLegacyPackage {
                     }
                     $SiblingPath = Join-Path $ParentDir $SiblingLeaf
                     if ([System.IO.Directory]::Exists($SiblingPath)) {
-                        Remove-Item -Path $SiblingPath -Recurse -Force -ErrorAction SilentlyContinue
-                        Write-DATLog -Message "Removed sibling source content: $SiblingPath" -Severity 1
+                        try {
+                            [System.IO.Directory]::Delete($SiblingPath, $true)
+                            Write-DATLog -Message "Removed sibling source content: $SiblingPath" -Severity 1
+                        } catch {
+                            Write-DATLog -Message "Failed to remove sibling source content '$SiblingPath': $($_.Exception.Message)" -Severity 3
+                        }
                     }
                     # Remove integrity manifest
                     $ManifestPath = Join-Path $ParentDir '.integrity.json'
                     if ([System.IO.File]::Exists($ManifestPath)) {
-                        Remove-Item -Path $ManifestPath -Force -ErrorAction SilentlyContinue
-                        Write-DATLog -Message "Removed integrity manifest: $ManifestPath" -Severity 1
+                        try {
+                            [System.IO.File]::Delete($ManifestPath)
+                            Write-DATLog -Message "Removed integrity manifest: $ManifestPath" -Severity 1
+                        } catch {
+                            Write-DATLog -Message "Failed to remove integrity manifest '$ManifestPath': $($_.Exception.Message)" -Severity 3
+                        }
                     }
                     # Remove parent directory if now empty
                     if ([System.IO.Directory]::GetFileSystemEntries($ParentDir).Count -eq 0) {
-                        Remove-Item -Path $ParentDir -Force -ErrorAction SilentlyContinue
-                        Write-DATLog -Message "Removed empty parent directory: $ParentDir" -Severity 1
+                        try {
+                            [System.IO.Directory]::Delete($ParentDir, $false)
+                            Write-DATLog -Message "Removed empty parent directory: $ParentDir" -Severity 1
+                        } catch {
+                            Write-DATLog -Message "Failed to remove empty parent directory '$ParentDir': $($_.Exception.Message)" -Severity 3
+                        }
                     }
                 }
             }
