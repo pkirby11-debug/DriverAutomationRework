@@ -688,18 +688,10 @@ function Initialize-DATMainForm {
 
             Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
             Register-DATQueueLogSubscriber -LogQueue $LogQueue
-            Connect-DATConfigMgr @ConnParams
 
-            $Results = [System.Collections.Generic.List[hashtable]]::new()
-            foreach ($Pkg in $PackagesToRemove) {
-                try {
-                    Remove-DATLegacyPackage -PackageID $Pkg.ID -CleanSource:$CleanSource
-                    $Results.Add(@{ ID = $Pkg.ID; Name = $Pkg.Name; Status = 'Success' })
-                } catch {
-                    $Results.Add(@{ ID = $Pkg.ID; Name = $Pkg.Name; Status = 'Failed'; Error = $_.Exception.Message })
-                }
-            }
-            return $Results
+            # Invoke-DATRemovePackages is a public exported function that handles
+            # Connect-DATConfigMgr + Remove-DATLegacyPackage internally
+            return Invoke-DATRemovePackages @ConnParams -Packages $PackagesToRemove -CleanSource:$CleanSource
         }
 
         $script:DeleteRunspace = [System.Management.Automation.PowerShell]::Create()

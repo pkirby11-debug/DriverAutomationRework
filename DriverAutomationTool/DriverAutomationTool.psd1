@@ -14,6 +14,7 @@
         'Start-DATGui'
         'Export-DATReport'
         'Register-DATQueueLogSubscriber'
+        'Invoke-DATRemovePackages'
     )
     CmdletsToExport   = @()
     VariablesToExport  = @()
