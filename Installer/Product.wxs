@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+    WiX v4 installer for DriverAutomationTool PowerShell module.
+    Installs the module into the system-wide PowerShell Modules directory
+    so it's available to all users via Import-Module.
+-->
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+    <!-- Update these values when releasing a new version -->
+    <?define ProductVersion = "1.5.2" ?>
+    <?define ProductName = "Driver Automation Tool" ?>
+    <?define Manufacturer = "Driver Automation Tool Contributors" ?>
+    <?define UpgradeCode = "B8A3F2D1-7E4C-4A9B-8D6F-1C3E5A7B9D0F" ?>
+
+    <Package
+        Name="$(var.ProductName)"
+        Version="$(var.ProductVersion)"
+        Manufacturer="$(var.Manufacturer)"
+        UpgradeCode="$(var.UpgradeCode)"
+        Compressed="yes"
+        InstallerVersion="200">
+
+        <!-- Single MSI file (embedded cab) -->
+        <MediaTemplate EmbedCab="yes" />
+
+        <!-- Upgrade handling: remove older versions during install -->
+        <MajorUpgrade
+            DowngradeErrorMessage="A newer version of $(var.ProductName) is already installed."
+            Schedule="afterInstallInitialize" />
+
+        <!-- Install to system-wide PowerShell modules directory -->
+        <StandardDirectory Id="CommonAppDataFolder">
+            <Directory Id="PSModulesParent" Name="WindowsPowerShell">
+                <Directory Id="PSModulesDir" Name="Modules">
+                    <Directory Id="INSTALLFOLDER" Name="DriverAutomationTool" />
+                </Directory>
+            </Directory>
+        </StandardDirectory>
+
+        <!-- Also support Program Files modules path as alternative -->
+        <Property Id="PSHOME_MODULES">
+            <DirectorySearch Id="PSHomeSearch" Path="[WindowsFolder]System32\WindowsPowerShell\v1.0\Modules" />
+        </Property>
+
+        <!-- ==================== Component Group: Root Module Files ==================== -->
+        <ComponentGroup Id="RootFiles" Directory="INSTALLFOLDER">
+            <Component Id="ModuleManifest" Guid="C1A2B3D4-E5F6-7890-ABCD-EF1234567890">
+                <File Source="$(var.SourceDir)\DriverAutomationTool.psd1" KeyPath="yes" />
+            </Component>
+            <Component Id="RootModule" Guid="C1A2B3D4-E5F6-7890-ABCD-EF1234567891">
+                <File Source="$(var.SourceDir)\DriverAutomationTool.psm1" KeyPath="yes" />
+            </Component>
+        </ComponentGroup>
+
+        <!-- ==================== Component Group: Config Files ==================== -->
+        <DirectoryRef Id="INSTALLFOLDER">
+            <Directory Id="ConfigDir" Name="Config" />
+        </DirectoryRef>
+
+        <ComponentGroup Id="ConfigFiles" Directory="ConfigDir">
+            <Component Id="DefaultsJson" Guid="C1A2B3D4-E5F6-7890-ABCD-EF1234567892">
+                <File Source="$(var.SourceDir)\Config\defaults.json" KeyPath="yes" />
+            </Component>
+            <Component Id="OEMSourcesJson" Guid="C1A2B3D4-E5F6-7890-ABCD-EF1234567893">
+                <File Source="$(var.SourceDir)\Config\OEMSources.json" KeyPath="yes" />
+            </Component>
+        </ComponentGroup>
+
+        <!-- ==================== Component Group: Public Functions ==================== -->
+        <DirectoryRef Id="INSTALLFOLDER">
+            <Directory Id="PublicDir" Name="Public" />
+        </DirectoryRef>
+
+        <ComponentGroup Id="PublicFiles" Directory="PublicDir">
+            <Component Id="GetDATDriverPack" Guid="D2B3C4E5-F6A7-8901-BCDE-F12345678901">
+                <File Source="$(var.SourceDir)\Public\Get-DATDriverPack.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="GetDATBIOSUpdate" Guid="D2B3C4E5-F6A7-8901-BCDE-F12345678902">
+                <File Source="$(var.SourceDir)\Public\Get-DATBIOSUpdate.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="InvokeDATSync" Guid="D2B3C4E5-F6A7-8901-BCDE-F12345678903">
+                <File Source="$(var.SourceDir)\Public\Invoke-DATSync.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="TestDATCatalogHealth" Guid="D2B3C4E5-F6A7-8901-BCDE-F12345678904">
+                <File Source="$(var.SourceDir)\Public\Test-DATCatalogHealth.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="UpdateDATCatalogSources" Guid="D2B3C4E5-F6A7-8901-BCDE-F12345678905">
+                <File Source="$(var.SourceDir)\Public\Update-DATCatalogSources.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="StartDATGui" Guid="D2B3C4E5-F6A7-8901-BCDE-F12345678906">
+                <File Source="$(var.SourceDir)\Public\Start-DATGui.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="ExportDATReport" Guid="D2B3C4E5-F6A7-8901-BCDE-F12345678907">
+                <File Source="$(var.SourceDir)\Public\Export-DATReport.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="RegisterDATQueueLogSubscriber" Guid="D2B3C4E5-F6A7-8901-BCDE-F12345678908">
+                <File Source="$(var.SourceDir)\Public\Register-DATQueueLogSubscriber.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="InvokeDATRemovePackages" Guid="D2B3C4E5-F6A7-8901-BCDE-F12345678909">
+                <File Source="$(var.SourceDir)\Public\Invoke-DATRemovePackages.ps1" KeyPath="yes" />
+            </Component>
+        </ComponentGroup>
+
+        <!-- ==================== Component Group: Private/Core ==================== -->
+        <DirectoryRef Id="INSTALLFOLDER">
+            <Directory Id="PrivateDir" Name="Private">
+                <Directory Id="CoreDir" Name="Core" />
+                <Directory Id="OEMDir" Name="OEM" />
+                <Directory Id="PlatformDir" Name="Platform" />
+            </Directory>
+        </DirectoryRef>
+
+        <ComponentGroup Id="CoreFiles" Directory="CoreDir">
+            <Component Id="LogManager" Guid="E3C4D5F6-A7B8-9012-CDEF-123456789A01">
+                <File Source="$(var.SourceDir)\Private\Core\LogManager.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="ConfigManager" Guid="E3C4D5F6-A7B8-9012-CDEF-123456789A02">
+                <File Source="$(var.SourceDir)\Private\Core\ConfigManager.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="CacheManager" Guid="E3C4D5F6-A7B8-9012-CDEF-123456789A03">
+                <File Source="$(var.SourceDir)\Private\Core\CacheManager.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="CatalogParser" Guid="E3C4D5F6-A7B8-9012-CDEF-123456789A04">
+                <File Source="$(var.SourceDir)\Private\Core\CatalogParser.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="DownloadManager" Guid="E3C4D5F6-A7B8-9012-CDEF-123456789A05">
+                <File Source="$(var.SourceDir)\Private\Core\DownloadManager.ps1" KeyPath="yes" />
+            </Component>
+        </ComponentGroup>
+
+        <!-- ==================== Component Group: Private/OEM ==================== -->
+        <ComponentGroup Id="OEMFiles" Directory="OEMDir">
+            <Component Id="DellAdapter" Guid="F4D5E6A7-B8C9-0123-DEF1-23456789AB01">
+                <File Source="$(var.SourceDir)\Private\OEM\DellAdapter.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="LenovoAdapter" Guid="F4D5E6A7-B8C9-0123-DEF1-23456789AB02">
+                <File Source="$(var.SourceDir)\Private\OEM\LenovoAdapter.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="SurfaceAdapter" Guid="F4D5E6A7-B8C9-0123-DEF1-23456789AB03">
+                <File Source="$(var.SourceDir)\Private\OEM\SurfaceAdapter.ps1" KeyPath="yes" />
+            </Component>
+        </ComponentGroup>
+
+        <!-- ==================== Component Group: Private/Platform ==================== -->
+        <ComponentGroup Id="PlatformFiles" Directory="PlatformDir">
+            <Component Id="SCCMPlatform" Guid="A5E6F7B8-C9D0-1234-EF12-3456789ABC01">
+                <File Source="$(var.SourceDir)\Private\Platform\SCCMPlatform.ps1" KeyPath="yes" />
+            </Component>
+        </ComponentGroup>
+
+        <!-- ==================== Component Group: GUI ==================== -->
+        <DirectoryRef Id="INSTALLFOLDER">
+            <Directory Id="GUIDir" Name="GUI" />
+        </DirectoryRef>
+
+        <ComponentGroup Id="GUIFiles" Directory="GUIDir">
+            <Component Id="FormDefinition" Guid="B6F7A8C9-D0E1-2345-F123-456789ABCD01">
+                <File Source="$(var.SourceDir)\GUI\FormDefinition.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="MainForm" Guid="B6F7A8C9-D0E1-2345-F123-456789ABCD02">
+                <File Source="$(var.SourceDir)\GUI\MainForm.ps1" KeyPath="yes" />
+            </Component>
+            <Component Id="FormHelpers" Guid="B6F7A8C9-D0E1-2345-F123-456789ABCD03">
+                <File Source="$(var.SourceDir)\GUI\FormHelpers.ps1" KeyPath="yes" />
+            </Component>
+        </ComponentGroup>
+
+        <!-- ==================== Feature: Full Install ==================== -->
+        <Feature Id="Complete" Title="$(var.ProductName)" Level="1">
+            <ComponentGroupRef Id="RootFiles" />
+            <ComponentGroupRef Id="ConfigFiles" />
+            <ComponentGroupRef Id="PublicFiles" />
+            <ComponentGroupRef Id="CoreFiles" />
+            <ComponentGroupRef Id="OEMFiles" />
+            <ComponentGroupRef Id="PlatformFiles" />
+            <ComponentGroupRef Id="GUIFiles" />
+        </Feature>
+
+        <!-- Minimal UI (progress bar only, no wizard) -->
+        <UIRef Id="WixUI_Minimal" />
+        <WixVariable Id="WixUILicenseRtf" Value="$(var.SourceDir)\..\License.rtf" />
+
+    </Package>
+</Wix>

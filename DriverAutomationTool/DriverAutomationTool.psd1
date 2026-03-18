@@ -21,8 +21,9 @@
     AliasesToExport    = @()
     PrivateData        = @{
         PSData = @{
-            Tags       = @('SCCM', 'ConfigMgr', 'Drivers', 'BIOS', 'Dell', 'Lenovo', 'OSD')
-            ProjectUri = ''
+            Tags       = @('SCCM', 'ConfigMgr', 'Drivers', 'BIOS', 'Dell', 'Lenovo', 'Microsoft', 'Surface', 'OSD', 'Automation')
+            ProjectUri = 'https://github.com/kevinphillips/DriverAutomationRework'
+            LicenseUri = 'https://github.com/kevinphillips/DriverAutomationRework/blob/main/LICENSE'
         }
     }
 }
