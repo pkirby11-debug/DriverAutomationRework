@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
 <!--
-    WiX v4 installer for DriverAutomationTool PowerShell module.
+    WiX v6 installer for DriverAutomationTool PowerShell module.
     Installs the module into the system-wide PowerShell Modules directory
     so it's available to all users via Import-Module.
 -->
 
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
 
     <!-- Update these values when releasing a new version -->
     <?define ProductVersion = "1.5.2" ?>
