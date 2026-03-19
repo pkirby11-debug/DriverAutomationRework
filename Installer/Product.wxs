@@ -179,9 +179,7 @@
             <ComponentGroupRef Id="GUIFiles" />
         </Feature>
 
-        <!-- Minimal UI (progress bar only, no wizard) -->
-        <UIRef Id="WixUI_Minimal" />
-        <WixVariable Id="WixUILicenseRtf" Value="$(var.SourceDir)\..\License.rtf" />
+        <!-- No UI - silent install for enterprise/SCCM deployment -->
 
     </Package>
 </Wix>

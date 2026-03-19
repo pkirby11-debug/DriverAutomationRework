@@ -76,7 +76,6 @@ Write-Host "  Output:  $msiPath" -ForegroundColor Gray
 # Build the MSI using WiX v4 CLI
 wix build $wxsFile `
     -d "SourceDir=$sourceDir" `
-    -ext WixToolset.UI.wixext `
     -o $msiPath
 
 if ($LASTEXITCODE -ne 0) {
