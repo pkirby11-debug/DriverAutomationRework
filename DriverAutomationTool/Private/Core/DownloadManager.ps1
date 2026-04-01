@@ -454,8 +454,10 @@ function Compress-DATINFCache {
         return $null
     }
 
-    # Stage INF files into a temp directory preserving relative folder structure
-    $TempStaging = Join-Path ([System.IO.Path]::GetTempPath()) "DAT_INFCache_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    # Stage INF files into a temp directory preserving relative folder structure.
+    # Use ProgramData rather than user temp — user profile temp dirs may not exist
+    # on servers running under service/domain admin accounts with incomplete profiles.
+    $TempStaging = Join-Path $env:ProgramData "DriverAutomationTool\DAT_INFCache_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
     New-Item -Path $TempStaging -ItemType Directory -Force | Out-Null
 
     try {
@@ -512,7 +514,7 @@ function Expand-DATINFCache {
         return $null
     }
 
-    $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) "DAT_INFScan_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $TempDir = Join-Path $env:ProgramData "DriverAutomationTool\DAT_INFScan_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
     New-Item -Path $TempDir -ItemType Directory -Force | Out-Null
 
     try {
@@ -588,12 +590,15 @@ function Compress-DATPackage {
             }
 
             # DISM does NOT support UNC paths - must use local directory.
-            # Use Documents instead of %TEMP% to reduce AV false positives — AV products
-            # aggressively scan %TEMP% since it's a common malware staging location.
+            # Use ProgramData instead of %TEMP% or user Documents to avoid two issues:
+            #   1. AV products aggressively scan %TEMP% (common malware staging location)
+            #   2. User profile folders (Documents) may not exist on servers where the tool
+            #      runs under service accounts or domain admin accounts with incomplete profiles
+            # ProgramData (C:\ProgramData) is always present on any Windows machine.
             # IMPORTANT: The WIM output file must be in a SEPARATE directory from the
             # capture source, otherwise DISM gets exit code 5 (Access Denied) because it
             # locks the output file while also trying to read the same directory as source.
-            $WimTempBase = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'DAT_WimTemp'
+            $WimTempBase = Join-Path $env:ProgramData 'DriverAutomationTool\DAT_WimTemp'
             $WimTempSource = Join-Path $WimTempBase 'Source'
             $WimTempOutput = Join-Path $WimTempBase 'Output'
             if (Test-Path $WimTempBase) { Remove-Item -Path $WimTempBase -Recurse -Force }
