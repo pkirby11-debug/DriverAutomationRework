@@ -455,10 +455,29 @@ function Invoke-DATSyncSinglePackage {
                 # compression) preserves the original INF files for category detection.
                 if ($PresentCats.Count -eq 0) {
                     $SourceLeaf = Split-Path $ExPkg.SourcePath -Leaf
-                    Write-DATLog -Message "Smart check: no INFs in package source (leaf: '$SourceLeaf'), checking for extracted sibling directory" -Severity 1
-                    if ($SourceLeaf -like 'Compressed-*') {
+                    $SourceParent = Split-Path $ExPkg.SourcePath -Parent
+                    Write-DATLog -Message "Smart check: no INFs in package source (leaf: '$SourceLeaf'), checking for INF cache or extracted sibling" -Severity 1
+
+                    # Priority 1: Check for INFCache.zip (compact archive of just .inf files)
+                    $INFCachePath = Join-Path $SourceParent 'INFCache.zip'
+                    if (Test-Path $INFCachePath) {
+                        Write-DATLog -Message "Smart check: found INF cache, expanding for scan: $INFCachePath" -Severity 1
+                        $INFCacheTempDir = Expand-DATINFCache -CachePath $INFCachePath
+                        if ($INFCacheTempDir) {
+                            try {
+                                $InfScanResult = Get-DATBasePackCategories -Path $INFCacheTempDir
+                                $PresentCats = $InfScanResult.Categories
+                                $CachedCategoryDates = $InfScanResult.CategoryDates
+                            } finally {
+                                Remove-Item -Path $INFCacheTempDir -Recurse -Force -ErrorAction SilentlyContinue
+                            }
+                        }
+                    }
+
+                    # Priority 2: Fall back to extracted sibling directory (legacy layout)
+                    if ($PresentCats.Count -eq 0 -and $SourceLeaf -like 'Compressed-*') {
                         $ExtractedLeaf = $SourceLeaf -replace '^Compressed-', ''
-                        $ExtractedPath = Join-Path (Split-Path $ExPkg.SourcePath -Parent) $ExtractedLeaf
+                        $ExtractedPath = Join-Path $SourceParent $ExtractedLeaf
                         Write-DATLog -Message "Smart check: looking for extracted directory: $ExtractedPath (exists: $(Test-Path $ExtractedPath))" -Severity 1
                         if (Test-Path $ExtractedPath) {
                             Write-DATLog -Message "Smart check: found extracted directory, scanning for INF files" -Severity 1
@@ -466,7 +485,7 @@ function Invoke-DATSyncSinglePackage {
                             $PresentCats = $InfScanResult.Categories
                             $CachedCategoryDates = $InfScanResult.CategoryDates
                         }
-                    } else {
+                    } elseif ($PresentCats.Count -eq 0 -and $SourceLeaf -notlike 'Compressed-*') {
                         Write-DATLog -Message "Smart check: source directory name does not start with 'Compressed-' - cannot derive extracted path" -Severity 2
                     }
                 }
@@ -1102,9 +1121,25 @@ function Invoke-DATSyncSinglePackage {
             # Use the compressed output directory as the package source
             $PackageSourceDir = Split-Path $CompressedPath -Parent
 
-            # NOTE: $OrigExtractDir is intentionally kept. It contains INF files needed
-            # by the smart check on future runs to detect which driver categories are
-            # present. The compressed directory only has the WIM file.
+        }
+    }
+
+    # Create an INF cache from the extracted directory and remove the full extracted
+    # content to reclaim NAS storage. The INF cache (INFCache.zip) preserves only the
+    # .inf files needed by future smart-check runs for category/version detection,
+    # reducing storage from potentially 5GB+ down to a few MB per model.
+    if ($OrigExtractDir -and (Test-Path $OrigExtractDir)) {
+        try {
+            $INFCacheParent = Split-Path $OrigExtractDir -Parent
+            $INFCachePath = Compress-DATINFCache -SourcePath $OrigExtractDir -OutputDirectory $INFCacheParent
+            if ($INFCachePath) {
+                Write-DATLog -Message "Removing full extracted directory to reclaim storage: $OrigExtractDir" -Severity 1
+                Remove-Item -Path $OrigExtractDir -Recurse -Force
+            } else {
+                Write-DATLog -Message "INF cache creation returned nothing - keeping extracted directory as fallback" -Severity 2
+            }
+        } catch {
+            Write-DATLog -Message "Warning: Failed to create INF cache - keeping extracted directory: $($_.Exception.Message)" -Severity 2
         }
     }
 
@@ -1140,11 +1175,6 @@ function Invoke-DATSyncSinglePackage {
                 -FolderPath $FolderPath -EnableBDR:$EnableBDR
         }
     }
-
-    # Keep extracted source files (do not delete $OrigExtractDir). When the package is
-    # WIM-compressed, the compressed directory only contains DriverPackage.wim with no INF
-    # files. Future smart-check runs need the extracted directory's INF files to detect
-    # which driver categories are present vs missing, avoiding unnecessary re-downloads.
 
     # Distribute content
     # For NEW packages: only distribute if DPs/DPGs are configured.

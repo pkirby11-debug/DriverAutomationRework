@@ -412,6 +412,121 @@ function Test-DATUrlReachable {
     }
 }
 
+function Compress-DATINFCache {
+    <#
+    .SYNOPSIS
+        Collects only .inf files from an extracted driver pack and compresses them
+        into a small ZIP archive for future smart-check INF scanning.
+    .DESCRIPTION
+        After a driver pack is compressed into a ZIP/WIM for distribution, the full
+        extracted directory is no longer needed for deployment — but its .inf files
+        are required by future sync runs to detect driver categories and versions.
+
+        This function preserves just the .inf files (typically 5-50 MB vs 1-5 GB for
+        the full pack) in an INFCache.zip, allowing the full extracted directory to
+        be safely deleted to reclaim NAS storage.
+    .PARAMETER SourcePath
+        Path to the extracted driver pack directory containing .inf files.
+    .PARAMETER OutputDirectory
+        Directory where INFCache.zip will be created. Defaults to the parent of SourcePath.
+    .OUTPUTS
+        Returns the path to the created INFCache.zip file.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SourcePath,
+
+        [string]$OutputDirectory
+    )
+
+    if (-not (Test-Path $SourcePath)) {
+        throw "Source path not found for INF cache: $SourcePath"
+    }
+
+    if (-not $OutputDirectory) {
+        $OutputDirectory = Split-Path $SourcePath -Parent
+    }
+
+    $InfFiles = @(Get-ChildItem -Path $SourcePath -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+    if ($InfFiles.Count -eq 0) {
+        Write-DATLog -Message "No .inf files found in $SourcePath - skipping INF cache creation" -Severity 2
+        return $null
+    }
+
+    # Stage INF files into a temp directory preserving relative folder structure
+    $TempStaging = Join-Path ([System.IO.Path]::GetTempPath()) "DAT_INFCache_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -Path $TempStaging -ItemType Directory -Force | Out-Null
+
+    try {
+        foreach ($Inf in $InfFiles) {
+            $RelativePath = $Inf.FullName.Substring($SourcePath.TrimEnd('\', '/').Length + 1)
+            $DestFile = Join-Path $TempStaging $RelativePath
+            $DestDir = Split-Path $DestFile -Parent
+            if (-not (Test-Path $DestDir)) {
+                New-Item -Path $DestDir -ItemType Directory -Force | Out-Null
+            }
+            Copy-Item -Path $Inf.FullName -Destination $DestFile -Force
+        }
+
+        $CachePath = Join-Path $OutputDirectory 'INFCache.zip'
+        if (Test-Path $CachePath) {
+            Remove-Item -Path $CachePath -Force
+        }
+
+        Compress-Archive -Path "$TempStaging\*" -DestinationPath $CachePath -CompressionLevel Optimal -Force
+
+        $SizeMB = [math]::Round((Get-Item $CachePath).Length / 1MB, 2)
+        Write-DATLog -Message "INF cache created: $($InfFiles.Count) .inf file(s), $SizeMB MB -> $CachePath" -Severity 1
+        return $CachePath
+    } finally {
+        Remove-Item -Path $TempStaging -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Expand-DATINFCache {
+    <#
+    .SYNOPSIS
+        Extracts an INFCache.zip to a temporary directory for INF scanning.
+    .DESCRIPTION
+        Expands the compressed INF cache created by Compress-DATINFCache into a
+        temporary directory so that Get-DATBasePackCategories can scan the .inf
+        files for category detection and version checking.
+
+        The caller is responsible for cleaning up the returned temp directory
+        after scanning is complete.
+    .PARAMETER CachePath
+        Path to the INFCache.zip file.
+    .OUTPUTS
+        Returns the path to the temporary directory containing the extracted .inf files.
+        Returns $null if the cache file doesn't exist or extraction fails.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$CachePath
+    )
+
+    if (-not (Test-Path $CachePath)) {
+        Write-DATLog -Message "INF cache not found: $CachePath" -Severity 2
+        return $null
+    }
+
+    $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) "DAT_INFScan_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -Path $TempDir -ItemType Directory -Force | Out-Null
+
+    try {
+        Expand-Archive -Path $CachePath -DestinationPath $TempDir -Force
+        $InfCount = @(Get-ChildItem -Path $TempDir -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue).Count
+        Write-DATLog -Message "INF cache expanded: $InfCount .inf file(s) to $TempDir" -Severity 1
+        return $TempDir
+    } catch {
+        Write-DATLog -Message "Failed to expand INF cache: $($_.Exception.Message)" -Severity 2
+        Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+}
+
 function Compress-DATPackage {
     <#
     .SYNOPSIS
