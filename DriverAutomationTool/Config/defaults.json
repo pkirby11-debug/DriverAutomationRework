@@ -23,6 +23,9 @@
         "deploymentPlatform": "ConfigMgr - Standard Pkg",
         "compressPackage": false,
         "compressionType": "ZIP",
+        "wimExcludeFiles": ["*.exe", "*.msi", "*.chm", "*.pdf", "*.htm", "*.html"],
+        "wimExcludeDirs": ["Documentation", "Docs", "Samples", "Sample", "Help", "HelpFiles"],
+        "wimOptimizeExport": true,
         "updateIndividualDrivers": false,
         "verifyDownloadHash": false
     },

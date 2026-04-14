@@ -124,6 +124,10 @@ function Invoke-DATSync {
         [ValidateSet('ZIP', 'WIM')]
         [string]$CompressionType = 'ZIP',
 
+        [string[]]$WimExcludeFiles,
+        [string[]]$WimExcludeDirs,
+        [switch]$WimOptimizeExport,
+
         [switch]$VerifyDownloadHash,
 
         [switch]$ForceRefresh,
@@ -158,6 +162,9 @@ function Invoke-DATSync {
         $CleanDownloads = [switch]$Config.options.cleanDownloads
         $UpdateIndividualDrivers = [switch]$Config.options.updateIndividualDrivers
         $VerifyDownloadHash = [switch]$Config.options.verifyDownloadHash
+        if ($null -ne $Config.options.wimExcludeFiles) { $WimExcludeFiles = @($Config.options.wimExcludeFiles) }
+        if ($null -ne $Config.options.wimExcludeDirs)  { $WimExcludeDirs  = @($Config.options.wimExcludeDirs) }
+        $WimOptimizeExport = [switch]$Config.options.wimOptimizeExport
         $WebhookUrl = $Config.logging.webhookUrl
 
         Write-DATLog -Message "Loaded configuration from $ConfigFile" -Severity 1
@@ -226,6 +233,7 @@ function Invoke-DATSync {
                             -OperatingSystem $OperatingSystem -Architecture $Architecture `
                             -EnableBDR:$EnableBDR -RemoveLegacy:$RemoveLegacy -CleanSource:$CleanSource `
                             -CompressPackage:$CompressPackage -CompressionType $CompressionType `
+                            -WimExcludeFiles $WimExcludeFiles -WimExcludeDirs $WimExcludeDirs -WimOptimizeExport:$WimOptimizeExport `
                             -DeploymentPlatform $DeploymentPlatform `
                             -UpdateIndividualDrivers:$UpdateIndividualDrivers `
                             -VerifyDownloadHash:$VerifyDownloadHash `
@@ -257,6 +265,7 @@ function Invoke-DATSync {
                             -OperatingSystem $OperatingSystem -Architecture $Architecture `
                             -EnableBDR:$EnableBDR -RemoveLegacy:$RemoveLegacy -CleanSource:$CleanSource `
                             -CompressPackage:$CompressPackage -CompressionType $CompressionType `
+                            -WimExcludeFiles $WimExcludeFiles -WimExcludeDirs $WimExcludeDirs -WimOptimizeExport:$WimOptimizeExport `
                             -DeploymentPlatform $DeploymentPlatform `
                             -VerifyDownloadHash:$VerifyDownloadHash `
                             -DistributionPoints $DistributionPoints `
@@ -353,6 +362,10 @@ function Invoke-DATSyncSinglePackage {
 
         [ValidateSet('ZIP', 'WIM')]
         [string]$CompressionType = 'ZIP',
+
+        [string[]]$WimExcludeFiles,
+        [string[]]$WimExcludeDirs,
+        [switch]$WimOptimizeExport,
 
         [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg', 'ConfigMgr - Standard Pkg (Test)', 'ConfigMgr - Driver Pkg (Test)')]
         [string]$DeploymentPlatform = 'ConfigMgr - Standard Pkg',
@@ -1116,8 +1129,18 @@ function Invoke-DATSyncSinglePackage {
             $OrigExtractDir = $PackageSourceDir
             Write-DATLog -Message "Compressing package as $CompressionType..." -Severity 1
             $OsTag = "$OsShort-$Architecture"
-            $CompressedPath = Compress-DATPackage -SourcePath $PackageSourceDir `
-                -CompressionType $CompressionType -PackageName $PackageName -OsTag $OsTag
+            $CompressParams = @{
+                SourcePath      = $PackageSourceDir
+                CompressionType = $CompressionType
+                PackageName     = $PackageName
+                OsTag           = $OsTag
+            }
+            if ($CompressionType -eq 'WIM') {
+                if ($WimExcludeFiles) { $CompressParams['WimExcludeFiles'] = $WimExcludeFiles }
+                if ($WimExcludeDirs)  { $CompressParams['WimExcludeDirs']  = $WimExcludeDirs }
+                if ($WimOptimizeExport) { $CompressParams['WimOptimizeExport'] = $true }
+            }
+            $CompressedPath = Compress-DATPackage @CompressParams
             # Use the compressed output directory as the package source
             $PackageSourceDir = Split-Path $CompressedPath -Parent
 

@@ -542,6 +542,16 @@ function Compress-DATPackage {
     .PARAMETER OsTag
         Optional OS-Architecture tag (e.g. 'Win11-x64') appended to the Compressed
         directory name. Prevents multi-OS packages for the same model from colliding.
+    .PARAMETER WimExcludeFiles
+        WIM only. File-name wildcards (e.g. '*.exe', '*.chm') to drop from the
+        staged content before capture. Reduces WIM size by stripping installers,
+        docs, and other payload not needed for driver injection.
+    .PARAMETER WimExcludeDirs
+        WIM only. Directory-name patterns (e.g. 'Documentation', 'Samples') to
+        drop at any depth before capture.
+    .PARAMETER WimOptimizeExport
+        WIM only. After capture, re-pack the WIM via DISM /Export-Image to shrink
+        it further (typically 5-15%). Adds a few minutes per package.
     .OUTPUTS
         Returns the path to the compressed file.
     #>
@@ -555,7 +565,13 @@ function Compress-DATPackage {
 
         [string]$PackageName = 'DriverPackage',
 
-        [string]$OsTag
+        [string]$OsTag,
+
+        [string[]]$WimExcludeFiles,
+
+        [string[]]$WimExcludeDirs,
+
+        [switch]$WimOptimizeExport
     )
 
     $CompressedDirName = if ($OsTag) { "Compressed-$OsTag" } else { 'Compressed' }
@@ -605,8 +621,32 @@ function Compress-DATPackage {
             New-Item -Path $WimTempSource -ItemType Directory -Force | Out-Null
             New-Item -Path $WimTempOutput -ItemType Directory -Force | Out-Null
 
-            Write-DATLog -Message "Copying drivers to local temp for WIM creation: $WimTempSource" -Severity 1
-            Copy-Item -Path "$SourcePath\*" -Destination $WimTempSource -Recurse -Force
+            $SourceSizeMB = [math]::Round(((Get-ChildItem -Path $SourcePath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB), 2)
+
+            $UseFilter = ($WimExcludeFiles -and $WimExcludeFiles.Count -gt 0) -or ($WimExcludeDirs -and $WimExcludeDirs.Count -gt 0)
+            if ($UseFilter) {
+                Write-DATLog -Message "Staging drivers to local temp with exclusion filter (source: $SourceSizeMB MB): $WimTempSource" -Severity 1
+                if ($WimExcludeFiles.Count -gt 0) { Write-DATLog -Message "  Excluding files: $($WimExcludeFiles -join ', ')" -Severity 1 }
+                if ($WimExcludeDirs.Count -gt 0)  { Write-DATLog -Message "  Excluding dirs:  $($WimExcludeDirs -join ', ')" -Severity 1 }
+
+                # Use robocopy for filtered staging — native /XF /XD support, fast, reliable.
+                # Exit codes 0-7 are success (8+ are real errors); /NFL /NDL /NJH /NJS /NP silences per-file logging.
+                $RoboArgs = @($SourcePath, $WimTempSource, '/E', '/MT:16', '/R:2', '/W:2', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+                if ($WimExcludeFiles.Count -gt 0) { $RoboArgs += '/XF'; $RoboArgs += $WimExcludeFiles }
+                if ($WimExcludeDirs.Count -gt 0)  { $RoboArgs += '/XD'; $RoboArgs += $WimExcludeDirs }
+                $RoboProc = Start-Process -FilePath 'robocopy.exe' -ArgumentList $RoboArgs -Wait -NoNewWindow -PassThru
+                if ($RoboProc.ExitCode -ge 8) {
+                    throw "Robocopy staging failed with exit code $($RoboProc.ExitCode)"
+                }
+
+                $StagedSizeMB = [math]::Round(((Get-ChildItem -Path $WimTempSource -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB), 2)
+                $SavedMB = [math]::Round($SourceSizeMB - $StagedSizeMB, 2)
+                $SavedPct = if ($SourceSizeMB -gt 0) { [math]::Round((($SourceSizeMB - $StagedSizeMB) / $SourceSizeMB) * 100, 1) } else { 0 }
+                Write-DATLog -Message "Slim staging complete: $StagedSizeMB MB (saved $SavedMB MB / $SavedPct%)" -Severity 1
+            } else {
+                Write-DATLog -Message "Copying drivers to local temp for WIM creation (source: $SourceSizeMB MB): $WimTempSource" -Severity 1
+                Copy-Item -Path "$SourcePath\*" -Destination $WimTempSource -Recurse -Force
+            }
 
             # Brief delay after copy to allow AV scanning to complete on newly-copied
             # .sys/.dll files. Corporate AV products lock files during real-time scanning,
@@ -653,6 +693,31 @@ function Compress-DATPackage {
 
             if (-not (Test-Path $LocalWim)) {
                 throw "WIM compression failed - output file not created at $LocalWim"
+            }
+
+            # Optional second pass: DISM /Export-Image re-packs the WIM more efficiently
+            # than /Capture-Image alone — typically shrinks the file another 5-15% by
+            # discarding unreferenced resources and re-running max compression cleanly.
+            if ($WimOptimizeExport) {
+                $PreExportMB = [math]::Round((Get-Item $LocalWim).Length / 1MB, 2)
+                $ExportedWim = Join-Path $WimTempOutput 'DriverPackage.optimized.wim'
+                $ExportArgs = "/Export-Image /SourceImageFile:`"$LocalWim`" /SourceIndex:1 /DestinationImageFile:`"$ExportedWim`" /Compress:max /CheckIntegrity"
+                $ExportLog = Join-Path $WimTempOutput 'DismExport.log'
+                Write-DATLog -Message "Optimizing WIM via DISM /Export-Image (pre-export: $PreExportMB MB)..." -Severity 1
+                $ExportProc = Start-Process -FilePath 'dism.exe' -ArgumentList $ExportArgs -Wait -NoNewWindow -PassThru -RedirectStandardOutput $ExportLog -ErrorAction Stop
+
+                if ($ExportProc.ExitCode -eq 0 -and (Test-Path $ExportedWim)) {
+                    $PostExportMB = [math]::Round((Get-Item $ExportedWim).Length / 1MB, 2)
+                    $ExportSavedMB = [math]::Round($PreExportMB - $PostExportMB, 2)
+                    $ExportSavedPct = if ($PreExportMB -gt 0) { [math]::Round((($PreExportMB - $PostExportMB) / $PreExportMB) * 100, 1) } else { 0 }
+                    Write-DATLog -Message "WIM optimize complete: $PostExportMB MB (saved $ExportSavedMB MB / $ExportSavedPct%)" -Severity 1
+                    Remove-Item $LocalWim -Force
+                    $LocalWim = $ExportedWim
+                } else {
+                    # Non-fatal: keep the original captured WIM and continue.
+                    $ExportLogTail = if (Test-Path $ExportLog) { Get-Content $ExportLog -Tail 15 -ErrorAction SilentlyContinue | Out-String } else { 'No export log' }
+                    Write-DATLog -Message "WIM optimize skipped — /Export-Image exited $($ExportProc.ExitCode). Keeping original captured WIM. Log tail: $ExportLogTail" -Severity 2
+                }
             }
 
             # Copy WIM from local temp back to the UNC output directory
