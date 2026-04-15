@@ -124,9 +124,9 @@ function Invoke-DATSync {
         [ValidateSet('ZIP', 'WIM')]
         [string]$CompressionType = 'ZIP',
 
-        [string[]]$WimExcludeFiles,
-        [string[]]$WimExcludeDirs,
-        [switch]$WimOptimizeExport,
+        [string[]]$WimExcludeFiles = @('*.exe', '*.msi', '*.chm', '*.pdf', '*.htm', '*.html'),
+        [string[]]$WimExcludeDirs  = @('Documentation', 'Docs', 'Samples', 'Sample', 'Help', 'HelpFiles'),
+        [bool]$WimOptimizeExport   = $true,
 
         [switch]$VerifyDownloadHash,
 
