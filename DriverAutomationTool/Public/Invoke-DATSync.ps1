@@ -731,10 +731,53 @@ function Invoke-DATSyncSinglePackage {
     New-Item -Path $PackageSourceDir -ItemType Directory -Force | Out-Null
 
     if ($Type -eq 'BIOS') {
-        # BIOS packages: copy the .exe directly to package source (not an archive to extract)
-        # Dell BIOS .exe files are firmware update utilities, not self-extracting archives
-        Write-DATLog -Message "Copying BIOS file $FileName to $PackageSourceDir" -Severity 1
-        Copy-Item -Path $DownloadDest -Destination $PackageSourceDir -Force
+        if ($Make -eq 'Lenovo') {
+            # Lenovo BIOS .exe is an InnoSetup self-extracting installer. The TS deploy
+            # script expects the extracted firmware payload, not the wrapper. Use the
+            # ExtractCommand from the per-package XML (e.g. "<exe> /SP- /VERYSILENT
+            # /SUPPRESSMSGBOXES /NORESTART /DIR=%PACKAGEPATH%") to extract into
+            # $PackageSourceDir, replacing %PACKAGEPATH% with the real destination.
+            $ExtractCmd = $PackageInfo.ExtractCommand
+            if (-not $ExtractCmd) {
+                $ExtractCmd = "$FileName /SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=%PACKAGEPATH%"
+                Write-DATLog -Message "No ExtractCommand on Lenovo BIOS package - using default InnoSetup args" -Severity 2
+            }
+
+            $ExtractArgs = if ($ExtractCmd.Length -gt $FileName.Length) {
+                $ExtractCmd.Substring($FileName.Length).Trim()
+            } else { '' }
+            $ExtractArgs = $ExtractArgs -replace '%PACKAGEPATH%', "`"$PackageSourceDir`""
+
+            Unblock-File -Path $DownloadDest -ErrorAction SilentlyContinue
+            Write-DATLog -Message "Extracting Lenovo BIOS: $FileName $ExtractArgs" -Severity 1
+
+            $ExtractTimeout = 1800000  # 30 minutes
+            try {
+                $Proc = Start-Process -FilePath $DownloadDest -ArgumentList $ExtractArgs `
+                    -NoNewWindow -PassThru -ErrorAction Stop
+                $Completed = $Proc.WaitForExit($ExtractTimeout)
+                if (-not $Completed) {
+                    Write-DATLog -Message "Lenovo BIOS extraction timed out after 30 minutes - killing process" -Severity 2
+                    $Proc.Kill()
+                } elseif ($Proc.ExitCode -ne 0) {
+                    Write-DATLog -Message "Lenovo BIOS extraction returned exit code $($Proc.ExitCode)" -Severity 2
+                }
+            } catch {
+                Write-DATLog -Message "Lenovo BIOS extraction failed: $($_.Exception.Message)" -Severity 3
+            }
+
+            $ExtractedCount = @(Get-ChildItem $PackageSourceDir -Recurse -File -ErrorAction SilentlyContinue).Count
+            if ($ExtractedCount -eq 0) {
+                Write-DATLog -Message "Lenovo BIOS extraction produced no files - falling back to shipping the .exe (deployment script will need it pre-extracted)" -Severity 3
+                Copy-Item -Path $DownloadDest -Destination $PackageSourceDir -Force
+            } else {
+                Write-DATLog -Message "Lenovo BIOS extracted: $ExtractedCount file(s) in $PackageSourceDir" -Severity 1
+            }
+        } else {
+            # Dell BIOS .exe files are firmware update utilities, not self-extracting archives
+            Write-DATLog -Message "Copying BIOS file $FileName to $PackageSourceDir" -Severity 1
+            Copy-Item -Path $DownloadDest -Destination $PackageSourceDir -Force
+        }
 
         # For Dell BIOS: download Flash64W.exe utility (distributed as a ZIP archive)
         if ($Make -eq 'Dell') {
