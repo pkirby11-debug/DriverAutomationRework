@@ -131,7 +131,7 @@ function Initialize-DATMainForm {
 
             # Auto-select known models if checkbox is checked and SCCM is connected
             if ($Controls['KnownModelsCheckBox'].Checked -and $script:CMConnected -and $ModelCount -gt 0) {
-                $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - querying SCCM for known models..."
+                $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - querying SCCM inventory and existing packages..."
                 try {
                     $Manufacturers = @()
                     if ($Controls['DellCheckBox'].Checked) { $Manufacturers += 'Dell' }
@@ -140,7 +140,7 @@ function Initialize-DATMainForm {
 
                     $KnownModels = Get-DATKnownModels -Manufacturers $Manufacturers
                     $MatchCount = Select-DATKnownModelsInGrid -Grid $Controls['ModelGrid'] -KnownModels $KnownModels
-                    $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - $MatchCount known model(s) selected"
+                    $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - $MatchCount known model(s) selected (inventory + packages)"
                 } catch {
                     Write-DATLog -Message "Known models auto-select failed: $($_.Exception.Message)" -Severity 2
                     $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models (known models query failed)"
@@ -187,7 +187,7 @@ function Initialize-DATMainForm {
             $script:CMConnected) {
 
             $Controls['MainForm'].Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-            $Controls['StatusStripLabel'].Text = 'Querying SCCM for known models...'
+            $Controls['StatusStripLabel'].Text = 'Querying SCCM inventory and existing packages for known models...'
             try {
                 $Manufacturers = @()
                 if ($Controls['DellCheckBox'].Checked) { $Manufacturers += 'Dell' }
@@ -196,7 +196,7 @@ function Initialize-DATMainForm {
 
                 $KnownModels = Get-DATKnownModels -Manufacturers $Manufacturers
                 $MatchCount = Select-DATKnownModelsInGrid -Grid $Controls['ModelGrid'] -KnownModels $KnownModels
-                $Controls['StatusStripLabel'].Text = "Selected $MatchCount known model(s) from SCCM inventory"
+                $Controls['StatusStripLabel'].Text = "Selected $MatchCount known model(s) from SCCM inventory and existing packages"
             } catch {
                 Show-DATFormMessage -Message "Error querying known models: $($_.Exception.Message)" -Type Error
                 $Controls['StatusStripLabel'].Text = 'Error querying known models'

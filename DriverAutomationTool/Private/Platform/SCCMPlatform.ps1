@@ -788,14 +788,19 @@ function Get-DATDistributionPointGroups {
 function Get-DATKnownModels {
     <#
     .SYNOPSIS
-        Queries SCCM WMI for Dell and Lenovo models currently present in the environment.
+        Returns known Dell and Lenovo models from SCCM inventory and existing driver/BIOS packages.
     .DESCRIPTION
-        Queries SMS_G_System_COMPUTER_SYSTEM for known model names and
-        SMS_G_System_MS_SystemInformation for Dell SystemSKU values.
+        Combines two data sources:
+          1. SCCM WMI inventory (SMS_G_System_COMPUTER_SYSTEM / SMS_G_System_MS_SystemInformation)
+             - models and SystemSKUs from machines currently reporting to the site.
+          2. Existing SCCM packages created by this tool - parses the
+             "(Models included:...)" tag in package descriptions and the model name
+             from the package name. Catches models that were previously packaged
+             even if no live systems are in inventory.
     .PARAMETER Manufacturers
         Array of manufacturer names to query. Defaults to @('Dell', 'Lenovo').
     .OUTPUTS
-        PSCustomObject with DellModels, DellSystemSKUs, and LenovoModels arrays.
+        PSCustomObject with DellModels, DellSystemSKUs, and LenovoModels arrays (unioned from both sources).
     #>
     [CmdletBinding()]
     param(
@@ -869,6 +874,94 @@ function Get-DATKnownModels {
         } catch {
             Write-DATLog -Message "Failed to query Lenovo models from SCCM: $($_.Exception.Message)" -Severity 2
         }
+    }
+
+    # --- Harvest models from existing SCCM packages created by this tool ---
+    # Name formats (see Invoke-DATSync.ps1):
+    #   "Drivers - {Make} {Model} - {OS} {Arch}"
+    #   "{Make} {Model} - {OS} {Arch}"
+    #   "BIOS Update - {Make} {Model}"
+    #   Optionally prefixed with "Test - ".
+    # Description embeds "(Models included:{SystemSKU|MachineType(s)|Model})".
+    # Lenovo machine types are ;-separated.
+    $OriginalLocation = Get-Location
+    $LocationChanged = $false
+    try {
+        try {
+            Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
+            $LocationChanged = $true
+        } catch {
+            Write-DATLog -Message "Could not switch to site drive to scan packages: $($_.Exception.Message)" -Severity 2
+            return $Result
+        }
+
+        foreach ($Mfr in $Manufacturers) {
+            Write-DATLog -Message "Scanning existing SCCM packages for known $Mfr models" -Severity 1
+
+            $Packages = @()
+            try {
+                $Packages += @(Get-CMDriverPackage -Name "*$Mfr*" -ErrorAction SilentlyContinue)
+            } catch {
+                Write-DATLog -Message "Failed to enumerate driver packages for ${Mfr}: $($_.Exception.Message)" -Severity 2
+            }
+            try {
+                $Packages += @(Get-CMPackage -Name "*$Mfr*" -Fast -ErrorAction SilentlyContinue)
+            } catch {
+                Write-DATLog -Message "Failed to enumerate packages for ${Mfr}: $($_.Exception.Message)" -Severity 2
+            }
+
+            # Regex captures the model name portion of the package name.
+            # Strips optional "Test - " and optional "Drivers - "/"BIOS Update - " prefixes,
+            # then requires the manufacturer, then captures everything up to the first " - "
+            # (or end of string for BIOS packages).
+            $MfrEscaped = [regex]::Escape($Mfr)
+            $NamePattern = "^(?:Test - )?(?:Drivers - |BIOS Update - )?$MfrEscaped (.+?)(?: - .+)?$"
+
+            $PkgModels = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $PkgIDs    = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+            foreach ($Pkg in $Packages) {
+                if (-not $Pkg) { continue }
+
+                if ($Pkg.Name -match $NamePattern) {
+                    $ModelPart = $matches[1].Trim()
+                    if ($ModelPart) { [void]$PkgModels.Add($ModelPart) }
+                } else {
+                    continue  # Not a tool-created package - skip description parse too
+                }
+
+                if ($Pkg.Description -match '\(Models included:([^)]+)\)') {
+                    foreach ($ID in ($matches[1] -split '[;,\s]+')) {
+                        $ID = $ID.Trim()
+                        if ($ID) { [void]$PkgIDs.Add($ID) }
+                    }
+                }
+            }
+
+            switch ($Mfr) {
+                'Dell' {
+                    if ($PkgIDs.Count -gt 0) {
+                        $Result.DellSystemSKUs = @(@($Result.DellSystemSKUs) + @($PkgIDs)) | Sort-Object -Unique
+                        Write-DATLog -Message "Found $($PkgIDs.Count) Dell SystemSKU/ID value(s) from existing packages" -Severity 1
+                    }
+                    if ($PkgModels.Count -gt 0) {
+                        $Result.DellModels = @(@($Result.DellModels) + @($PkgModels)) | Sort-Object -Unique
+                        Write-DATLog -Message "Found $($PkgModels.Count) Dell model name(s) from existing packages" -Severity 1
+                    }
+                }
+                'Lenovo' {
+                    # Machine types from descriptions are the useful signal - model names
+                    # in package names don't contain machine types and won't match the
+                    # MachineType-based grid rows.
+                    if ($PkgIDs.Count -gt 0) {
+                        $Result.LenovoModels = @(@($Result.LenovoModels) + @($PkgIDs)) | Sort-Object -Unique
+                        Write-DATLog -Message "Found $($PkgIDs.Count) Lenovo machine type(s) from existing packages" -Severity 1
+                    }
+                }
+            }
+        }
+    } finally {
+        if ($LocationChanged) { Set-Location -Path $OriginalLocation }
     }
 
     return $Result
