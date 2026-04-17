@@ -377,20 +377,22 @@ function Get-LenovoBIOSUpdate {
                 continue
             }
 
-            $AllPackages = $CatalogXml.SelectNodes('//Package')
-            $BiosCatalogEntries = @()
-            if ($AllPackages -and $AllPackages.Count -gt 0) {
-                $BiosCatalogEntries = @($AllPackages | Where-Object { $_.Category -match 'BIOS' })
-            }
+            # Lenovo's per-MTM catalog XML uses lowercase <packages>/<package>/<category>/<location>.
+            # XPath is case-sensitive, so SelectNodes('//Package') misses everything. PowerShell's
+            # XML dot-accessor is case-insensitive, so navigate via property access instead.
+            $PackagesRoot = $CatalogXml.packages
+            if (-not $PackagesRoot) { $PackagesRoot = $CatalogXml.DocumentElement }
+            $AllPackages = @($PackagesRoot.package)
+            $BiosCatalogEntries = @($AllPackages | Where-Object { $_ -and ($_.category -match 'BIOS') })
 
             if ($BiosCatalogEntries.Count -eq 0) {
                 Write-DATLog -Message "No BIOS packages in catalog for $Model ($MType) - trying next machine type" -Severity 2
                 continue
             }
 
-            # Match original DAT: pick the latest entry by Location string descending.
-            $LatestEntry = $BiosCatalogEntries | Sort-Object { $_.Location } -Descending | Select-Object -First 1
-            $PackageXmlUrl = $LatestEntry.Location
+            # Match original DAT: pick the latest entry by location string descending.
+            $LatestEntry = $BiosCatalogEntries | Sort-Object { $_.location } -Descending | Select-Object -First 1
+            $PackageXmlUrl = $LatestEntry.location
             if (-not $PackageXmlUrl) {
                 Write-DATLog -Message "Lenovo BIOS catalog entry has no Location URL for $Model ($MType) - trying next type" -Severity 2
                 continue
@@ -412,9 +414,11 @@ function Get-LenovoBIOSUpdate {
                 continue
             }
 
-            $PackageNode = $PackageXml.SelectSingleNode('/Package')
+            # The per-package XML's root element casing varies. Use DocumentElement so we don't
+            # depend on a case-sensitive XPath like '/Package' vs '/package'.
+            $PackageNode = $PackageXml.DocumentElement
             if (-not $PackageNode) {
-                Write-DATLog -Message "Lenovo BIOS package XML missing <Package> root for $Model - trying next type" -Severity 2
+                Write-DATLog -Message "Lenovo BIOS package XML has no root element for $Model - trying next type" -Severity 2
                 continue
             }
 
