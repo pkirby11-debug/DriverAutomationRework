@@ -341,57 +341,77 @@ function Get-LenovoBIOSUpdate {
 
     Write-DATLog -Message "Checking Lenovo BIOS catalog: $BiosXmlUrl" -Severity 1
 
-    # Download BIOS XML for this machine type
+    # Lenovo BIOS lookup is a two-step process:
+    #   1. Download <MachineType>_Win<10|11>.xml. Its <Package> entries have a
+    #      <Category> child and a <Location> child. <Location> is the URL of a
+    #      per-package XML, NOT the BIOS executable.
+    #   2. Download the per-package XML. Its top-level <Package> element carries
+    #      version, ReleaseDate, and ExtractCommand. The first token of
+    #      ExtractCommand is the .exe filename. The actual BIOS download URL is
+    #      the parent of the per-package XML URL combined with that filename.
     $TempDir = Get-DATTempPath -Prefix 'LenovoBios'
     try {
-        $XmlPath = Join-Path $TempDir 'bios.xml'
+        $CatalogPath = Join-Path $TempDir 'catalog.xml'
 
         try {
-            Invoke-DATDownload -Url $BiosXmlUrl -DestinationPath $XmlPath -MaxRetries 2
+            Invoke-DATDownload -Url $BiosXmlUrl -DestinationPath $CatalogPath -MaxRetries 2
         } catch {
             Write-DATLog -Message "Lenovo BIOS XML not available for machine type $MachineType`: $($_.Exception.Message)" -Severity 2
             return $null
         }
 
-        $Xml = Read-DATXml -Path $XmlPath
+        $CatalogXml = Read-DATXml -Path $CatalogPath
+        $AllPackages = $CatalogXml.SelectNodes('//Package')
 
-        # Parse BIOS packages (Lenovo XML can contain firmware, drivers, etc. alongside BIOS)
-        $AllPackages = $Xml.SelectNodes('//Package')
-
-        # Filter to BIOS packages only
-        $BiosPackages = @()
+        $BiosCatalogEntries = @()
         if ($AllPackages -and $AllPackages.Count -gt 0) {
-            $BiosPackages = @($AllPackages | Where-Object {
-                $_.Category -match 'BIOS' -or $_.Title -match 'BIOS' -or $_.Name -match 'BIOS'
-            })
+            $BiosCatalogEntries = @($AllPackages | Where-Object { $_.Category -match 'BIOS' })
         }
 
-        # If category filter yielded nothing, fall back to all packages (some XMLs may not have Category)
-        if ($BiosPackages.Count -eq 0 -and $AllPackages -and $AllPackages.Count -gt 0) {
-            Write-DATLog -Message "No BIOS-categorized packages found; using all packages for Lenovo $Model ($MachineType)" -Severity 2
-            $BiosPackages = @($AllPackages)
-        }
-
-        if ($BiosPackages.Count -eq 0) {
-            Write-DATLog -Message "No BIOS packages found for Lenovo $Model ($MachineType)" -Severity 2
+        if ($BiosCatalogEntries.Count -eq 0) {
+            Write-DATLog -Message "No BIOS packages found in Lenovo catalog for $Model ($MachineType)" -Severity 2
             return $null
         }
 
-        # Get latest by version/date
-        $Latest = $BiosPackages | Sort-Object {
-            if ($_.ReleaseDate) { [datetime]::Parse($_.ReleaseDate) } else { [datetime]::MinValue }
-        } -Descending | Select-Object -First 1
-
-        $DownloadUrl = $Latest.URL
-        if (-not $DownloadUrl) { $DownloadUrl = $Latest.Location }
-
-        if (-not $DownloadUrl) {
-            Write-DATLog -Message "BIOS package found but no download URL for Lenovo $Model" -Severity 2
+        # Match original DAT: pick the latest entry by Location string descending.
+        $LatestEntry = $BiosCatalogEntries | Sort-Object { $_.Location } -Descending | Select-Object -First 1
+        $PackageXmlUrl = $LatestEntry.Location
+        if (-not $PackageXmlUrl) {
+            Write-DATLog -Message "Lenovo BIOS catalog entry has no Location URL for $Model ($MachineType)" -Severity 2
             return $null
         }
 
-        # Get ALL machine types for this model so the BIOS package description
-        # includes every variant for TS script matching (consistent with driver packages)
+        $PackageXmlName = Split-Path $PackageXmlUrl -Leaf
+        $PackageXmlPath = Join-Path $TempDir $PackageXmlName
+        try {
+            Invoke-DATDownload -Url $PackageXmlUrl -DestinationPath $PackageXmlPath -MaxRetries 2
+        } catch {
+            Write-DATLog -Message "Failed to download Lenovo BIOS package XML ($PackageXmlUrl): $($_.Exception.Message)" -Severity 2
+            return $null
+        }
+
+        $PackageXml = Read-DATXml -Path $PackageXmlPath
+        $PackageNode = $PackageXml.SelectSingleNode('/Package')
+        if (-not $PackageNode) {
+            Write-DATLog -Message "Lenovo BIOS package XML missing <Package> root for $Model" -Severity 2
+            return $null
+        }
+
+        $ExtractCommand = $PackageNode.ExtractCommand
+        if (-not $ExtractCommand) {
+            Write-DATLog -Message "Lenovo BIOS package XML missing ExtractCommand for $Model" -Severity 2
+            return $null
+        }
+
+        $BiosFile = ($ExtractCommand -split '\s+')[0]
+        if (-not $BiosFile) {
+            Write-DATLog -Message "Could not parse BIOS executable name from ExtractCommand for Lenovo $Model" -Severity 2
+            return $null
+        }
+
+        $UrlParent = $PackageXmlUrl -replace '/[^/]+$', ''
+        $DownloadUrl = ("$UrlParent/$BiosFile") -replace '\\', '/'
+
         $AllTypes = Find-LenovoMachineType -Model $Model
         $AllMachineTypesStr = if ($AllTypes) { $AllTypes -join ';' } else { $MachineType }
 
@@ -401,10 +421,11 @@ function Get-LenovoBIOSUpdate {
             MachineType     = $MachineType
             AllMachineTypes = $AllMachineTypesStr
             Type            = 'BIOS'
-            Version         = $Latest.version
-            ReleaseDate     = $Latest.ReleaseDate
+            Version         = $PackageNode.version
+            ReleaseDate     = $PackageNode.ReleaseDate
             Url             = $DownloadUrl
-            FileName        = Split-Path $DownloadUrl -Leaf
+            FileName        = $BiosFile
+            ExtractCommand  = $ExtractCommand
         }
 
         Write-DATLog -Message "Found Lenovo BIOS update: v$($Result.Version) ($($Result.ReleaseDate)) for $Model" -Severity 1
