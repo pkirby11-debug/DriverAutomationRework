@@ -1301,7 +1301,7 @@ function Invoke-DATSyncSinglePackage {
     if ($PkgResult -and ($DistributionPoints -or $DistributionPointGroups -or $IsPackageUpdate)) {
         if ($PSCmdlet.ShouldProcess($PkgResult.PackageID, 'Distribute content')) {
             if ($IsApplication) {
-                Distribute-DATApplicationContent -ApplicationID $PkgResult.CI_ID `
+                Distribute-DATApplicationContent -ApplicationName $PkgResult.Name `
                     -DistributionPoints $DistributionPoints `
                     -DistributionPointGroups $DistributionPointGroups `
                     -IsUpdate:$IsPackageUpdate

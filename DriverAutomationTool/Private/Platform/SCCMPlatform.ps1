@@ -1968,13 +1968,15 @@ function New-DATApplicationRequirementRules {
         'Lenovo'    { @('LENOVO') }
         'Microsoft' { @('Microsoft Corporation') }
     }
-    $MfrRule = $Conditions['Manufacturer'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value $MfrValues
+    # New-CMRequirementRuleCommonValue uses -Value1 (and -Value2 for range operators);
+    # there is no -Value parameter for the OneOf/NoneOf operators.
+    $MfrRule = $Conditions['Manufacturer'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value1 $MfrValues
     $Rules.Add($MfrRule)
 
     if ($Manufacturer -eq 'Dell' -and $SystemSKU) {
         $SKUList = @($SystemSKU | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         if ($SKUList.Count -gt 0) {
-            $SKURule = $Conditions['SystemSKU'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value $SKUList
+            $SKURule = $Conditions['SystemSKU'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value1 $SKUList
             $Rules.Add($SKURule)
         }
     }
@@ -1986,14 +1988,14 @@ function New-DATApplicationRequirementRules {
         if ($SystemSKU) {
             $SKUList = @($SystemSKU | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             if ($SKUList.Count -gt 0) {
-                $SKURule = $Conditions['SystemSKU'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value $SKUList
+                $SKURule = $Conditions['SystemSKU'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value1 $SKUList
                 $Rules.Add($SKURule)
             }
         }
         if ($MachineType) {
             $TypeList = @($MachineType | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             if ($TypeList.Count -gt 0) {
-                $TypeRule = $Conditions['ComputerModel'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value $TypeList
+                $TypeRule = $Conditions['ComputerModel'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value1 $TypeList
                 $Rules.Add($TypeRule)
             }
         }
@@ -2231,10 +2233,7 @@ function New-DATConfigMgrApplication {
 
         if ($FolderPath) {
             try {
-                $AppObj = Get-CMApplication -Name $Name -ErrorAction Stop | Select-Object -First 1
-                if ($AppObj) {
-                    Set-DATApplicationFolder -ApplicationID $AppObj.CI_ID -FolderPath $FolderPath
-                }
+                Set-DATApplicationFolder -ApplicationName $Name -FolderPath $FolderPath
             } catch {
                 Write-DATLog -Message "Warning: could not move Application to folder '$FolderPath': $($_.Exception.Message)" -Severity 2
             }
@@ -2266,11 +2265,16 @@ function Set-DATApplicationFolder {
     <#
     .SYNOPSIS
         Moves a ConfigMgr Application into a specific console folder.
+    .DESCRIPTION
+        Move-CMObject for Applications resolves -ObjectId against the ModelName
+        (ScopeId_.../Application_... GUID string), not the numeric CI_ID. This
+        function looks up the Application by name and passes the ModelName to
+        avoid "No object corresponds to the specified parameters" errors.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string]$ApplicationID,
+        [string]$ApplicationName,
 
         [Parameter(Mandatory)]
         [string]$FolderPath
@@ -2292,10 +2296,15 @@ function Set-DATApplicationFolder {
             $CurrentPath = $NextPath
         }
         $TargetFolder = "$RootNode\$FolderPath"
-        Move-CMObject -FolderPath $TargetFolder -ObjectId $ApplicationID -ErrorAction Stop
-        Write-DATLog -Message "Moved Application $ApplicationID to $TargetFolder" -Severity 1
+
+        $App = Get-CMApplication -Name $ApplicationName -Fast -ErrorAction Stop | Select-Object -First 1
+        if (-not $App) {
+            throw "Application '$ApplicationName' not found"
+        }
+        Move-CMObject -FolderPath $TargetFolder -ObjectId $App.ModelName -ErrorAction Stop
+        Write-DATLog -Message "Moved Application '$ApplicationName' to $TargetFolder" -Severity 1
     } catch {
-        Write-DATLog -Message "Failed to set Application folder for $ApplicationID`: $($_.Exception.Message)" -Severity 2
+        Write-DATLog -Message "Failed to set Application folder for '$ApplicationName': $($_.Exception.Message)" -Severity 2
     } finally {
         Set-Location -Path $OriginalLocation
     }
@@ -2406,11 +2415,15 @@ function Distribute-DATApplicationContent {
     <#
     .SYNOPSIS
         Distributes a ConfigMgr Application's content to distribution points / groups.
+    .DESCRIPTION
+        Takes an application name (not CI_ID) - Update-CMDistributionPoint and
+        Start-CMContentDistribution for applications expect -ApplicationName, not
+        -ApplicationId. The numeric CI_ID cannot be used directly.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
-        [string]$ApplicationID,
+        [string]$ApplicationName,
 
         [string[]]$DistributionPoints,
         [string[]]$DistributionPointGroups,
@@ -2426,26 +2439,26 @@ function Distribute-DATApplicationContent {
 
         if ($IsUpdate) {
             try {
-                Write-DATLog -Message "Refreshing application content on existing DPs for $ApplicationID" -Severity 1
-                Update-CMDistributionPoint -ApplicationId $ApplicationID -DeploymentTypeName 'Install' -ErrorAction Stop
-                Write-DATLog -Message "Content refresh queued for Application $ApplicationID" -Severity 1
+                Write-DATLog -Message "Refreshing application content on existing DPs for '$ApplicationName'" -Severity 1
+                Update-CMDistributionPoint -ApplicationName $ApplicationName -DeploymentTypeName 'Install' -ErrorAction Stop
+                Write-DATLog -Message "Content refresh queued for Application '$ApplicationName'" -Severity 1
             } catch {
-                Write-DATLog -Message "Update-CMDistributionPoint failed for Application $ApplicationID`: $($_.Exception.Message)" -Severity 2
+                Write-DATLog -Message "Update-CMDistributionPoint failed for Application '$ApplicationName': $($_.Exception.Message)" -Severity 2
             }
         }
 
         if ($DistributionPointGroups) {
             foreach ($DPG in $DistributionPointGroups) {
-                if ($PSCmdlet.ShouldProcess("$ApplicationID to $DPG", 'Distribute application content')) {
+                if ($PSCmdlet.ShouldProcess("$ApplicationName to $DPG", 'Distribute application content')) {
                     try {
-                        Start-CMContentDistribution -ApplicationId $ApplicationID `
+                        Start-CMContentDistribution -ApplicationName $ApplicationName `
                             -DistributionPointGroupName $DPG -ErrorAction Stop
-                        Write-DATLog -Message "Application content distributed: $ApplicationID -> DPG '$DPG'" -Severity 1
+                        Write-DATLog -Message "Application content distributed: '$ApplicationName' -> DPG '$DPG'" -Severity 1
                     } catch {
                         if ($_.Exception.Message -match 'already been distributed|No content destination') {
                             Write-DATLog -Message "Application content already distributed to DPG '$DPG'" -Severity 1
                         } else {
-                            Write-DATLog -Message "Failed to distribute Application $ApplicationID to DPG '$DPG'`: $($_.Exception.Message)" -Severity 3
+                            Write-DATLog -Message "Failed to distribute Application '$ApplicationName' to DPG '$DPG': $($_.Exception.Message)" -Severity 3
                         }
                     }
                 }
@@ -2454,16 +2467,16 @@ function Distribute-DATApplicationContent {
 
         if ($DistributionPoints) {
             foreach ($DP in $DistributionPoints) {
-                if ($PSCmdlet.ShouldProcess("$ApplicationID to $DP", 'Distribute application content')) {
+                if ($PSCmdlet.ShouldProcess("$ApplicationName to $DP", 'Distribute application content')) {
                     try {
-                        Start-CMContentDistribution -ApplicationId $ApplicationID `
+                        Start-CMContentDistribution -ApplicationName $ApplicationName `
                             -DistributionPointName $DP -ErrorAction Stop
-                        Write-DATLog -Message "Application content distributed: $ApplicationID -> $DP" -Severity 1
+                        Write-DATLog -Message "Application content distributed: '$ApplicationName' -> $DP" -Severity 1
                     } catch {
                         if ($_.Exception.Message -match 'already been distributed|No content destination') {
                             Write-DATLog -Message "Application content already distributed to DP $DP" -Severity 1
                         } else {
-                            Write-DATLog -Message "Failed to distribute Application $ApplicationID to DP $DP`: $($_.Exception.Message)" -Severity 3
+                            Write-DATLog -Message "Failed to distribute Application '$ApplicationName' to DP $DP`: $($_.Exception.Message)" -Severity 3
                         }
                     }
                 }
