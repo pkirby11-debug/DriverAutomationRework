@@ -2160,16 +2160,20 @@ function New-DATConfigMgrApplication {
 
         $DTName = 'Install'
         $SafetyMfr = $Manufacturer
-        $PackageNameEscaped = $Name -replace "'", "''"
-        $VersionEscaped     = $Version -replace "'", "''"
 
+        # Values with spaces (PackageName, BIOSPassword) MUST be wrapped in real
+        # Win32 double quotes - CCMExec invokes the command via CreateProcess,
+        # which only honors double quotes as string delimiters. Single quotes
+        # are treated as literal characters and cause param binding to fail.
+        # Package names and versions produced by this module never contain
+        # double quotes, so we don't do Win32 \" escaping of inner content.
         $InstallArgs = @(
             '-NoProfile'
             '-ExecutionPolicy Bypass'
             '-File ".\Invoke-DATApply.ps1"'
             "-Mode $Mode"
-            "-PackageName '$PackageNameEscaped'"
-            "-Version '$VersionEscaped'"
+            "-PackageName `"$Name`""
+            "-Version `"$Version`""
             "-SafetyManufacturer $SafetyMfr"
         )
         if ($Mode -eq 'BIOS' -and $BIOSPassword) {
@@ -2178,8 +2182,10 @@ function New-DATConfigMgrApplication {
             $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($BIOSPassword)
             try {
                 $PwPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($BSTR)
-                $PwEscaped = $PwPlain -replace "'", "''"
-                $InstallArgs += "-BIOSPassword '$PwEscaped'"
+                if ($PwPlain -match '"') {
+                    throw "BIOSPassword contains a double-quote character, which breaks Win32 command-line quoting. Pick a password without double quotes."
+                }
+                $InstallArgs += "-BIOSPassword `"$PwPlain`""
             } finally {
                 [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
             }
