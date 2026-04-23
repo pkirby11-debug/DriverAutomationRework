@@ -2194,46 +2194,60 @@ function New-DATConfigMgrApplication {
         $DetectionScript = Get-DATDetectionScript -Mode $Mode -ExpectedVersion $Version
 
         if ($PSCmdlet.ShouldProcess($Name, 'Configure deployment type')) {
-            $ExistingDT = Get-CMDeploymentType -ApplicationName $Name -DeploymentTypeName $DTName -ErrorAction SilentlyContinue
-            if ($ExistingDT) {
-                try {
-                    Remove-CMDeploymentType -ApplicationName $Name -DeploymentTypeName $DTName -Force -ErrorAction Stop
-                    Write-DATLog -Message "Removed existing deployment type '$DTName' for rebuild" -Severity 1
-                } catch {
-                    Write-DATLog -Message "Warning: could not remove existing deployment type: $($_.Exception.Message)" -Severity 2
-                }
-            }
-
             $Timeout   = if ($Mode -eq 'Driver') { 60 } else { 30 }
             $Estimated = if ($Mode -eq 'Driver') { 15 } else { 10 }
 
-            Add-CMScriptDeploymentType -ApplicationName $Name `
-                -DeploymentTypeName $DTName `
-                -InstallCommand $InstallCommand `
-                -ContentLocation $SourcePath `
-                -ScriptLanguage PowerShell `
-                -ScriptText $DetectionScript `
-                -InstallationBehaviorType InstallForSystem `
-                -LogonRequirementType WhetherOrNotUserLoggedOn `
-                -UserInteractionMode Hidden `
-                -MaximumRuntimeMins $Timeout `
-                -EstimatedRuntimeMins $Estimated `
-                -RebootBehavior BasedOnExitCode `
-                -ErrorAction Stop | Out-Null
-            Write-DATLog -Message "Deployment type '$DTName' configured for $Name" -Severity 1
+            $ExistingDT = Get-CMDeploymentType -ApplicationName $Name -DeploymentTypeName $DTName -ErrorAction SilentlyContinue
 
-            try {
-                $Rules = New-DATApplicationRequirementRules -Manufacturer $Manufacturer `
-                    -SystemSKU $SystemSKU -MachineType $MachineType
-                if ($Rules.Count -gt 0) {
-                    Set-CMScriptDeploymentType -ApplicationName $Name `
-                        -DeploymentTypeName $DTName `
-                        -AddRequirement $Rules `
-                        -ErrorAction Stop | Out-Null
-                    Write-DATLog -Message "Added $($Rules.Count) requirement rule(s) to $Name\$DTName" -Severity 1
+            # Parameters shared by both the create (Add-CMScriptDeploymentType) and
+            # update (Set-CMScriptDeploymentType) cmdlets.
+            $DTParams = @{
+                ApplicationName          = $Name
+                DeploymentTypeName       = $DTName
+                InstallCommand           = $InstallCommand
+                ContentLocation          = $SourcePath
+                ScriptLanguage           = 'PowerShell'
+                ScriptText               = $DetectionScript
+                InstallationBehaviorType = 'InstallForSystem'
+                LogonRequirementType     = 'WhetherOrNotUserLoggedOn'
+                UserInteractionMode      = 'Hidden'
+                MaximumRuntimeMins       = $Timeout
+                EstimatedRuntimeMins     = $Estimated
+                RebootBehavior           = 'BasedOnExitCode'
+                ErrorAction              = 'Stop'
+            }
+
+            if ($ExistingDT) {
+                # Update in place. Remove+Add is unsafe here because CM's async
+                # replication means the Remove can "complete" while the DT is
+                # still present from Add's perspective, causing
+                # "deployment type ... already exists" on the recreate.
+                # Update-in-place also preserves the DT's internal ID so any
+                # existing deployments keep working, and it keeps attached
+                # requirement rules intact (no re-attach churn).
+                Write-DATLog -Message "Updating deployment type '$DTName' for $Name in place" -Severity 1
+                Set-CMScriptDeploymentType @DTParams | Out-Null
+                Write-DATLog -Message "Deployment type '$DTName' updated (install command, content, detection script refreshed; existing requirement rules preserved)" -Severity 1
+            } else {
+                Write-DATLog -Message "Creating new deployment type '$DTName' for $Name" -Severity 1
+                Add-CMScriptDeploymentType @DTParams | Out-Null
+                Write-DATLog -Message "Deployment type '$DTName' created" -Severity 1
+
+                # Attach requirement rules only on fresh creation. Updates
+                # preserve whatever rules were attached at creation time.
+                try {
+                    $Rules = New-DATApplicationRequirementRules -Manufacturer $Manufacturer `
+                        -SystemSKU $SystemSKU -MachineType $MachineType
+                    if ($Rules.Count -gt 0) {
+                        Set-CMScriptDeploymentType -ApplicationName $Name `
+                            -DeploymentTypeName $DTName `
+                            -AddRequirement $Rules `
+                            -ErrorAction Stop | Out-Null
+                        Write-DATLog -Message "Added $($Rules.Count) requirement rule(s) to $Name\$DTName" -Severity 1
+                    }
+                } catch {
+                    Write-DATLog -Message "Warning: requirement rule attach failed: $($_.Exception.Message)" -Severity 2
                 }
-            } catch {
-                Write-DATLog -Message "Warning: requirement rule attach failed: $($_.Exception.Message)" -Severity 2
             }
         }
 
@@ -2260,7 +2274,7 @@ function New-DATConfigMgrApplication {
             Kind         = 'Application'
         }
     } catch {
-        Write-DATLog -Message "Failed to create Application '$Name': $($_.Exception.Message)" -Severity 3
+        Write-DATLog -Message "Failed while configuring Application '$Name': $($_.Exception.Message)" -Severity 3
         throw
     } finally {
         Set-Location -Path $OriginalLocation

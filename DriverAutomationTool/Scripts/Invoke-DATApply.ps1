@@ -162,6 +162,58 @@ function Get-DeviceManufacturer {
 }
 
 # -------------------------------------------------------------------------
+# BIOS version check
+# -------------------------------------------------------------------------
+function Get-CurrentBIOSVersion {
+    try {
+        return (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SMBIOSBIOSVersion
+    } catch {
+        Write-Log "Could not query Win32_BIOS: $($_.Exception.Message)" -Severity 2
+        return $null
+    }
+}
+
+function Compare-BIOSVersion {
+    <#
+        Returns one of: 'equal', 'lower', 'higher', 'unknown'.
+        BIOS version strings vary by vendor - some semver-like (1.23.0), some
+        letter-prefixed (A09), some with trailing tags. Falls back through:
+          1. exact string equality
+          2. [System.Version] parse on raw strings
+          3. [System.Version] parse on the first numeric-dotted substring
+        If nothing parses, returns 'unknown' so the caller defaults to flashing.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Current,
+        [Parameter(Mandatory)][string]$Target
+    )
+
+    if ($Current -eq $Target) { return 'equal' }
+
+    $cv = $null
+    $tv = $null
+    if ([System.Version]::TryParse($Current, [ref]$cv) -and [System.Version]::TryParse($Target, [ref]$tv)) {
+        $cmp = $cv.CompareTo($tv)
+        if ($cmp -lt 0) { return 'lower' }
+        if ($cmp -gt 0) { return 'higher' }
+        return 'equal'
+    }
+
+    $cn = [regex]::Match($Current, '\d+(?:\.\d+)+').Value
+    $tn = [regex]::Match($Target,  '\d+(?:\.\d+)+').Value
+    if ($cn -and $tn -and
+        [System.Version]::TryParse($cn, [ref]$cv) -and
+        [System.Version]::TryParse($tn, [ref]$tv)) {
+        $cmp = $cv.CompareTo($tv)
+        if ($cmp -lt 0) { return 'lower' }
+        if ($cmp -gt 0) { return 'higher' }
+        return 'equal'
+    }
+
+    return 'unknown'
+}
+
+# -------------------------------------------------------------------------
 # Driver install
 # -------------------------------------------------------------------------
 function Install-DriverContent {
@@ -376,6 +428,38 @@ try {
     if ($Mode -eq 'Driver') {
         $ExitCode = Install-DriverContent -Path $ContentPath
     } else {
+        # Compare current vs target BIOS version before flashing. Skipping here
+        # saves a reboot cycle on devices already at or past the target version,
+        # and prevents accidental downgrades.
+        $CurrentBIOS = Get-CurrentBIOSVersion
+        Write-Log "Current BIOS version: $CurrentBIOS"
+        Write-Log "Target BIOS version:  $Version"
+
+        if (-not $CurrentBIOS) {
+            Write-Log 'Current BIOS version unavailable - proceeding with flash' -Severity 2
+        } else {
+            $VersionState = Compare-BIOSVersion -Current $CurrentBIOS -Target $Version
+            Write-Log "BIOS version state: $VersionState"
+            switch ($VersionState) {
+                'equal' {
+                    Write-Log 'Device is already at the target BIOS version - nothing to flash'
+                    Write-DetectionMarker -Status 'Installed'
+                    exit 0
+                }
+                'higher' {
+                    Write-Log "Device BIOS ($CurrentBIOS) is newer than target ($Version) - refusing to downgrade" -Severity 2
+                    Write-DetectionMarker -Status 'Installed'
+                    exit 0
+                }
+                'lower' {
+                    Write-Log 'Device BIOS is older than target - proceeding with flash'
+                }
+                'unknown' {
+                    Write-Log 'Could not compare BIOS versions numerically - proceeding with flash' -Severity 2
+                }
+            }
+        }
+
         Suspend-BitLockerForFlash
         switch ($DeviceMfr) {
             'Dell'   { $ExitCode = Invoke-DellBIOSFlash   -Path $ContentPath }
