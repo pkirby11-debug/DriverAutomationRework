@@ -76,7 +76,10 @@ param(
     [Parameter(Mandatory)]
     [string]$Version,
 
-    [string]$ContentPath = $PSScriptRoot,
+    # Default is resolved in the body (see below). $PSScriptRoot as a param
+    # default has been observed to be empty when the script is launched by
+    # CCMExec via `-File ".\..."` from a service context.
+    [string]$ContentPath,
 
     [string]$BIOSPassword,
 
@@ -332,7 +335,30 @@ function Invoke-LenovoBIOSFlash {
 try {
     Write-Log '==================================================================='
     Write-Log "DATApply starting - Mode=$Mode, Package='$PackageName', Version=$Version"
-    Write-Log "ContentPath=$ContentPath"
+
+    # Resolve ContentPath with a fallback chain. $PSScriptRoot as a param default
+    # has been seen to be empty under CCMExec when the script is launched with
+    # -File and a relative path from a service context, so resolve in the body.
+    if (-not $ContentPath) {
+        $ContentPathSource = 'unknown'
+        if ($PSScriptRoot) {
+            $ContentPath = $PSScriptRoot
+            $ContentPathSource = '$PSScriptRoot'
+        } elseif ($PSCommandPath) {
+            $ContentPath = Split-Path $PSCommandPath -Parent
+            $ContentPathSource = 'Split-Path $PSCommandPath'
+        } elseif ($MyInvocation -and $MyInvocation.MyCommand -and $MyInvocation.MyCommand.Path) {
+            $ContentPath = Split-Path $MyInvocation.MyCommand.Path -Parent
+            $ContentPathSource = '$MyInvocation.MyCommand.Path'
+        } else {
+            $ContentPath = (Get-Location).Path
+            $ContentPathSource = 'Get-Location'
+        }
+        Write-Log "ContentPath not provided - resolved to '$ContentPath' via $ContentPathSource"
+    } else {
+        Write-Log "ContentPath=$ContentPath (from -ContentPath parameter)"
+    }
+
     Write-Log "ComputerName=$env:COMPUTERNAME"
 
     if (-not (Test-Path $ContentPath)) {
