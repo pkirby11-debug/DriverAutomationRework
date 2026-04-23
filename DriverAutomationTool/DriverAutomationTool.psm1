@@ -11,6 +11,7 @@ $PrivatePaths = @(
     'Private\OEM\LenovoAdapter.ps1'
     'Private\OEM\SurfaceAdapter.ps1'
     'Private\Platform\SCCMPlatform.ps1'
+    'Private\Platform\IntunePlatform.ps1'
 )
 
 foreach ($Path in $PrivatePaths) {

@@ -9,6 +9,16 @@
         "distributionPoints": [],
         "distributionPointGroups": []
     },
+    "intune": {
+        "tenantId": "",
+        "authMode": "DeviceCode",
+        "clientId": "",
+        "assignmentGroups": [],
+        "assignmentIntent": "Available",
+        "retentionCount": 2,
+        "uploadChunkSizeMB": 50,
+        "parallelUploads": 1
+    },
     "paths": {
         "download": "",
         "package": ""

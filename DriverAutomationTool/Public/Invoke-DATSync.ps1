@@ -60,6 +60,13 @@ function Invoke-DATSync {
     .EXAMPLE
         Invoke-DATSync -Manufacturer Dell -Models "OptiPlex 7090" -OperatingSystem "Windows 11 24H2" `
             -SiteServer "CM01" -SiteCode "PS1" -DownloadPath "\\server\Drivers$" -PackagePath "\\server\Packages$"
+    .EXAMPLE
+        # Application mode - deploys drivers outside Task Sequences so maintenance
+        # windows work regardless of whether users are logged in.
+        Invoke-DATSync -Manufacturer Dell -Models "OptiPlex 7090" -OperatingSystem "Windows 11 24H2" `
+            -SiteServer "CM01" -SiteCode "PS1" -DownloadPath "\\server\Drivers$" -PackagePath "\\server\Packages$" `
+            -DeploymentPlatform "ConfigMgr - Application" -IncludeDrivers $true -IncludeBIOS $true `
+            -DistributionPointGroups "Production DPs" -RemoveLegacy
     .NOTES
         Version history:
         1.0.0 - Initial release
@@ -116,7 +123,7 @@ function Invoke-DATSync {
         [switch]$CleanDownloads,
         [switch]$UpdateIndividualDrivers,
 
-        [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg', 'ConfigMgr - Standard Pkg (Test)', 'ConfigMgr - Driver Pkg (Test)')]
+        [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg', 'ConfigMgr - Application', 'ConfigMgr - Standard Pkg (Test)', 'ConfigMgr - Driver Pkg (Test)', 'ConfigMgr - Application (Test)')]
         [string]$DeploymentPlatform = 'ConfigMgr - Standard Pkg',
 
         [switch]$CompressPackage,
@@ -129,6 +136,12 @@ function Invoke-DATSync {
         [bool]$WimOptimizeExport   = $true,
 
         [switch]$VerifyDownloadHash,
+
+        # Only used when DeploymentPlatform = 'ConfigMgr - Application'. BIOS-only.
+        # WARNING: gets decrypted and baked into the Application's install command,
+        # which ConfigMgr stores plaintext in the database and in client policy.
+        # Omit if fleet has no BIOS password.
+        [SecureString]$BIOSPassword,
 
         [switch]$ForceRefresh,
         [string]$WebhookUrl
@@ -268,6 +281,7 @@ function Invoke-DATSync {
                             -WimExcludeFiles $WimExcludeFiles -WimExcludeDirs $WimExcludeDirs -WimOptimizeExport:$WimOptimizeExport `
                             -DeploymentPlatform $DeploymentPlatform `
                             -VerifyDownloadHash:$VerifyDownloadHash `
+                            -BIOSPassword $BIOSPassword `
                             -DistributionPoints $DistributionPoints `
                             -DistributionPointGroups $DistributionPointGroups
 
@@ -367,10 +381,12 @@ function Invoke-DATSyncSinglePackage {
         [string[]]$WimExcludeDirs,
         [switch]$WimOptimizeExport,
 
-        [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg', 'ConfigMgr - Standard Pkg (Test)', 'ConfigMgr - Driver Pkg (Test)')]
+        [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg', 'ConfigMgr - Application', 'ConfigMgr - Standard Pkg (Test)', 'ConfigMgr - Driver Pkg (Test)', 'ConfigMgr - Application (Test)')]
         [string]$DeploymentPlatform = 'ConfigMgr - Standard Pkg',
 
         [switch]$VerifyDownloadHash,
+
+        [SecureString]$BIOSPassword,
 
         [string[]]$DistributionPoints,
         [string[]]$DistributionPointGroups
@@ -390,9 +406,10 @@ function Invoke-DATSyncSinglePackage {
     # Strip a leading manufacturer prefix from ModelName to avoid "Drivers - Lenovo Lenovo V15..."
     $DisplayModelName = if ($ModelName -like "$Make *") { $ModelName.Substring($Make.Length).TrimStart() } else { $ModelName }
     $IsTestPackage = $DeploymentPlatform -like '*(Test)'
+    $IsApplication = $DeploymentPlatform -like 'ConfigMgr - Application*'
     if ($Type -eq 'BIOS') {
         $PackageName = "BIOS Update - $Make $DisplayModelName"
-    } elseif ($DeploymentPlatform -like 'ConfigMgr - Standard Pkg*') {
+    } elseif ($DeploymentPlatform -like 'ConfigMgr - Standard Pkg*' -or $IsApplication) {
         $PackageName = "Drivers - $Make $DisplayModelName - $OperatingSystem $Architecture"
     } else {
         $PackageName = "$Make $DisplayModelName - $OperatingSystem $Architecture"
@@ -415,7 +432,10 @@ function Invoke-DATSyncSinglePackage {
     $IsDriverPkg = ($DeploymentPlatform -like 'ConfigMgr - Driver Pkg*')
 
     # Find ALL existing packages for this model/type (any version) - used for duplicate prevention
-    $AllExisting = if ($IsDriverPkg) {
+    $AllExisting = if ($IsApplication) {
+        Find-DATExistingApplications -Manufacturer $Make -Model $ModelName -Type $Type |
+            Where-Object { $_.Name -eq $PackageName }
+    } elseif ($IsDriverPkg) {
         Find-DATExistingDriverPackages -Manufacturer $Make -Model $ModelName -Type $Type |
             Where-Object { $_.Name -eq $PackageName }
     } else {
@@ -1215,7 +1235,10 @@ function Invoke-DATSyncSinglePackage {
     #        "Drivers - Dell OptiPlex 7070 - Windows 10 x64"
     $LegacyPackages = @()
     if ($RemoveLegacy) {
-        $LegacyPackages = if ($IsDriverPkg) {
+        $LegacyPackages = if ($IsApplication) {
+            Find-DATExistingApplications -Manufacturer $Make -Model $ModelName -Type $Type |
+                Where-Object { $_.Version -ne $Version -and $_.Name -eq $PackageName }
+        } elseif ($IsDriverPkg) {
             Find-DATExistingDriverPackages -Manufacturer $Make -Model $ModelName -Type $Type |
                 Where-Object { $_.Version -ne $Version -and $_.Name -eq $PackageName }
         } else {
@@ -1224,12 +1247,40 @@ function Invoke-DATSyncSinglePackage {
         }
     }
 
-    # Create/update ConfigMgr package
-    $FolderPath = if ($Type -eq 'BIOS') { "BIOS Packages\$Make" } else { "Driver Packages\$Make" }
+    # Create/update ConfigMgr package or application
+    # Applications use a dedicated folder hierarchy so they're easy to spot in the console.
+    $FolderPath = if ($IsApplication) {
+        if ($Type -eq 'BIOS') { "Driver Automation\BIOS\$Make" } else { "Driver Automation\Drivers\$Make" }
+    } elseif ($Type -eq 'BIOS') { "BIOS Packages\$Make" } else { "Driver Packages\$Make" }
 
     $PkgResult = $null
-    if ($PSCmdlet.ShouldProcess($PackageName, 'Create ConfigMgr package')) {
-        if ($IsDriverPkg) {
+    if ($PSCmdlet.ShouldProcess($PackageName, 'Create ConfigMgr package/application')) {
+        if ($IsApplication) {
+            # Marshal identifier arrays for requirement rules.
+            # Dell catalog returns semicolon-delimited SystemIDs like "0D03;0D04".
+            # Lenovo catalog puts all known machine types in AllMachineTypes.
+            $AppSystemSKU  = @()
+            $AppMachineType = @()
+            if ($PackageInfo.SystemID)        { $AppSystemSKU  += ($PackageInfo.SystemID        -split ';' | Where-Object { $_ }) }
+            if ($PackageInfo.AllMachineTypes) { $AppMachineType += ($PackageInfo.AllMachineTypes -split ';' | Where-Object { $_ }) }
+            if ($PackageInfo.MachineType)     { $AppMachineType += ($PackageInfo.MachineType    -split ';' | Where-Object { $_ }) }
+            $AppMachineType = @($AppMachineType | Select-Object -Unique)
+
+            $AppParams = @{
+                Name         = $PackageName
+                SourcePath   = $PackageSourceDir
+                Mode         = if ($Type -eq 'BIOS') { 'BIOS' } else { 'Driver' }
+                Manufacturer = $Make
+                Model        = $ModelName
+                Version      = $Version
+                FolderPath   = $FolderPath
+            }
+            if ($AppSystemSKU.Count -gt 0)   { $AppParams['SystemSKU']   = $AppSystemSKU }
+            if ($AppMachineType.Count -gt 0) { $AppParams['MachineType'] = $AppMachineType }
+            if ($Type -eq 'BIOS' -and $BIOSPassword) { $AppParams['BIOSPassword'] = $BIOSPassword }
+
+            $PkgResult = New-DATConfigMgrApplication @AppParams
+        } elseif ($IsDriverPkg) {
             $PkgResult = New-DATCMDriverPackage -Name $PackageName -SourcePath $PackageSourceDir `
                 -Manufacturer $Make -Model $ModelName -Version $Version `
                 -Description $PackageDescription `
@@ -1244,37 +1295,66 @@ function Invoke-DATSyncSinglePackage {
 
     # Distribute content
     # For NEW packages: only distribute if DPs/DPGs are configured.
-    # For UPDATED packages: always call Distribute-DATContent so that
-    # Update-CMDistributionPoint refreshes content on DPs that already have it,
-    # even when no explicit DP/DPG parameters were provided.
+    # For UPDATED packages: always refresh content on existing DPs so they pick up
+    # the new source, even when no explicit DP/DPG parameters were provided.
     $IsPackageUpdate = $PkgResult -and (-not $PkgResult.IsNew)
     if ($PkgResult -and ($DistributionPoints -or $DistributionPointGroups -or $IsPackageUpdate)) {
         if ($PSCmdlet.ShouldProcess($PkgResult.PackageID, 'Distribute content')) {
-            Distribute-DATContent -PackageID $PkgResult.PackageID `
-                -DistributionPoints $DistributionPoints `
-                -DistributionPointGroups $DistributionPointGroups `
-                -IsUpdate:$IsPackageUpdate
+            if ($IsApplication) {
+                Distribute-DATApplicationContent -ApplicationID $PkgResult.CI_ID `
+                    -DistributionPoints $DistributionPoints `
+                    -DistributionPointGroups $DistributionPointGroups `
+                    -IsUpdate:$IsPackageUpdate
+            } else {
+                Distribute-DATContent -PackageID $PkgResult.PackageID `
+                    -DistributionPoints $DistributionPoints `
+                    -DistributionPointGroups $DistributionPointGroups `
+                    -IsUpdate:$IsPackageUpdate
+            }
         }
     }
 
-    # Remove duplicate packages (same name, different PackageID) - prevents accumulation
+    # Wire supersedence so the new version auto-supersedes older ones of the same
+    # application family. Best-effort - failures are logged but non-fatal.
+    if ($IsApplication -and $PkgResult -and $PkgResult.IsNew -and $LegacyPackages) {
+        $Predecessors = @($LegacyPackages | Select-Object -ExpandProperty Name -Unique)
+        if ($Predecessors.Count -gt 0) {
+            try {
+                Add-DATApplicationSupersedence -NewApplicationName $PackageName -OldApplicationName $Predecessors
+            } catch {
+                Write-DATLog -Message "Supersedence wiring failed: $($_.Exception.Message)" -Severity 2
+            }
+        }
+    }
+
+    # Remove duplicate packages/apps (same name, different ID) - prevents accumulation
     if ($PkgResult -and $AllExisting) {
-        $Duplicates = @($AllExisting | Where-Object { $_.PackageID -ne $PkgResult.PackageID })
+        $KeepID = if ($IsApplication) { $PkgResult.CI_ID } else { $PkgResult.PackageID }
+        $Duplicates = @($AllExisting | Where-Object { $_.PackageID -ne $KeepID })
         foreach ($Dup in $Duplicates) {
-            Write-DATLog -Message "Removing duplicate package: $($Dup.Name) v$($Dup.Version) (ID: $($Dup.PackageID)) - keeping $($PkgResult.PackageID)" -Severity 2
-            Remove-DATLegacyPackage -PackageID $Dup.PackageID -CleanSource:$CleanSource
+            Write-DATLog -Message "Removing duplicate: $($Dup.Name) v$($Dup.Version) (ID: $($Dup.PackageID)) - keeping $KeepID" -Severity 2
+            if ($IsApplication) {
+                Remove-DATLegacyApplication -ApplicationID $Dup.PackageID -CleanSource:$CleanSource
+            } else {
+                Remove-DATLegacyPackage -PackageID $Dup.PackageID -CleanSource:$CleanSource
+            }
         }
     }
 
-    # Remove legacy packages (exclude the package we just created/updated)
+    # Remove legacy packages/apps (exclude the one we just created/updated)
     if ($RemoveLegacy -and $LegacyPackages -and $PkgResult) {
+        $KeepID = if ($IsApplication) { $PkgResult.CI_ID } else { $PkgResult.PackageID }
         foreach ($Legacy in $LegacyPackages) {
-            if ($Legacy.PackageID -eq $PkgResult.PackageID) {
-                Write-DATLog -Message "Skipping legacy removal of $($Legacy.Name) v$($Legacy.Version) - same package was just updated to v$Version" -Severity 1
+            if ($Legacy.PackageID -eq $KeepID) {
+                Write-DATLog -Message "Skipping legacy removal of $($Legacy.Name) v$($Legacy.Version) - same item was just updated to v$Version" -Severity 1
                 continue
             }
-            Write-DATLog -Message "Removing legacy package: $($Legacy.Name) v$($Legacy.Version)" -Severity 1
-            Remove-DATLegacyPackage -PackageID $Legacy.PackageID -CleanSource:$CleanSource
+            Write-DATLog -Message "Removing legacy: $($Legacy.Name) v$($Legacy.Version)" -Severity 1
+            if ($IsApplication) {
+                Remove-DATLegacyApplication -ApplicationID $Legacy.PackageID -CleanSource:$CleanSource
+            } else {
+                Remove-DATLegacyPackage -PackageID $Legacy.PackageID -CleanSource:$CleanSource
+            }
         }
     }
 

@@ -409,7 +409,7 @@ function New-DATMainForm {
     $DeployPlatformCombo.Location = New-Object System.Drawing.Point(160, 101)
     $DeployPlatformCombo.Width = 220
     $DeployPlatformCombo.DropDownStyle = 'DropDownList'
-    $DeployPlatformCombo.Items.AddRange(@('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg', 'ConfigMgr - Standard Pkg (Test)', 'ConfigMgr - Driver Pkg (Test)'))
+    $DeployPlatformCombo.Items.AddRange(@('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg', 'ConfigMgr - Application', 'ConfigMgr - Standard Pkg (Test)', 'ConfigMgr - Driver Pkg (Test)', 'ConfigMgr - Application (Test)'))
     $DeployPlatformCombo.SelectedIndex = 0
     $OptionsGroup.Controls.Add($DeployPlatformCombo)
     $Controls['DeployPlatformCombo'] = $DeployPlatformCombo

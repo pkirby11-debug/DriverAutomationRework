@@ -1855,3 +1855,671 @@ function Invoke-DATPatchPackage {
         Set-Location -Path $OriginalLocation
     }
 }
+
+# =============================================================================
+# ConfigMgr Application support
+# =============================================================================
+# Creates CM Applications (not Packages) with script deployment types,
+# requirement rules bound to Global Conditions, and registry-based detection.
+# Applications run under CCMExec on a schedule regardless of logged-in users,
+# which avoids the Task Sequence "multiple users" limitation for maintenance
+# window driver/BIOS updates. (v1.7.0 - 2026-04-22)
+# =============================================================================
+
+function Get-DATGlobalCondition {
+    <#
+    .SYNOPSIS
+        Gets a ConfigMgr Global Condition by name, creating it if missing.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$Namespace,
+
+        [Parameter(Mandatory)]
+        [string]$Class,
+
+        [Parameter(Mandatory)]
+        [string]$Property,
+
+        [ValidateSet('String', 'Boolean', 'DateTime', 'FloatingPoint', 'Integer', 'Version')]
+        [string]$DataType = 'String'
+    )
+
+    Assert-DATConfigMgrConnected
+
+    $OriginalLocation = Get-Location
+    try {
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
+
+        $Existing = Get-CMGlobalCondition -Name $Name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($Existing) {
+            return $Existing
+        }
+
+        Write-DATLog -Message "Creating Global Condition '$Name' (WMI $Namespace\$Class.$Property)" -Severity 1
+        $GC = New-CMGlobalConditionWqlQuery -Name $Name `
+            -Namespace $Namespace -Class $Class -Property $Property `
+            -DataType $DataType `
+            -Description "Created by DriverAutomationTool for Application requirement rules."
+        return $GC
+    } catch {
+        Write-DATLog -Message "Failed to get/create Global Condition '$Name': $($_.Exception.Message)" -Severity 3
+        throw
+    } finally {
+        Set-Location -Path $OriginalLocation
+    }
+}
+
+function Initialize-DATGlobalConditions {
+    <#
+    .SYNOPSIS
+        Ensures the DAT Global Conditions used by Application requirement rules exist.
+    .DESCRIPTION
+        Idempotent - safe to call on every sync. Returns a hashtable mapping
+        condition key (SystemSKU, Manufacturer, ComputerModel) to the GC object.
+
+        SystemSKU uses root\wmi\MS_SystemInformation which exposes the SKU for
+        both Dell (matches Dell SystemID from the catalog) and newer Lenovo
+        models. Lenovo machine types historically live in
+        Win32_ComputerSystemProduct.Version, so ComputerModel is queried there.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Assert-DATConfigMgrConnected
+
+    $Conditions = @{}
+    $Conditions['SystemSKU']    = Get-DATGlobalCondition -Name 'DAT - Computer SystemSKU'    -Namespace 'root\wmi'   -Class 'MS_SystemInformation'        -Property 'SystemSKU'    -DataType String
+    $Conditions['Manufacturer'] = Get-DATGlobalCondition -Name 'DAT - Computer Manufacturer' -Namespace 'root\cimv2' -Class 'Win32_ComputerSystem'        -Property 'Manufacturer' -DataType String
+    $Conditions['ComputerModel']= Get-DATGlobalCondition -Name 'DAT - Computer Model'        -Namespace 'root\cimv2' -Class 'Win32_ComputerSystemProduct' -Property 'Version'      -DataType String
+    return $Conditions
+}
+
+function New-DATApplicationRequirementRules {
+    <#
+    .SYNOPSIS
+        Builds a collection of requirement rules from manufacturer and system identifier.
+    .DESCRIPTION
+        Always includes a Manufacturer rule. For Dell, adds a SystemSKU rule with
+        one-or-more SKU values (Dell SystemID). For Lenovo, adds a ComputerModel
+        rule matching the machine type(s). CCMExec enforces the intersection,
+        so the Application never runs on a device that doesn't match.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Dell', 'Lenovo', 'Microsoft')]
+        [string]$Manufacturer,
+
+        [string[]]$SystemSKU,
+
+        [string[]]$MachineType
+    )
+
+    $Conditions = Initialize-DATGlobalConditions
+    $Rules = [System.Collections.Generic.List[object]]::new()
+
+    $MfrValues = switch ($Manufacturer) {
+        'Dell'      { @('Dell Inc.') }
+        'Lenovo'    { @('LENOVO') }
+        'Microsoft' { @('Microsoft Corporation') }
+    }
+    $MfrRule = $Conditions['Manufacturer'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value $MfrValues
+    $Rules.Add($MfrRule)
+
+    if ($Manufacturer -eq 'Dell' -and $SystemSKU) {
+        $SKUList = @($SystemSKU | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($SKUList.Count -gt 0) {
+            $SKURule = $Conditions['SystemSKU'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value $SKUList
+            $Rules.Add($SKURule)
+        }
+    }
+
+    # Lenovo: Win32_ComputerSystemProduct.Version reports the friendly model name.
+    # Machine types (e.g. "21HD") sometimes appear in SystemSKU on modern
+    # firmware, sometimes not - include both rules when available.
+    if ($Manufacturer -eq 'Lenovo') {
+        if ($SystemSKU) {
+            $SKUList = @($SystemSKU | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($SKUList.Count -gt 0) {
+                $SKURule = $Conditions['SystemSKU'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value $SKUList
+                $Rules.Add($SKURule)
+            }
+        }
+        if ($MachineType) {
+            $TypeList = @($MachineType | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($TypeList.Count -gt 0) {
+                $TypeRule = $Conditions['ComputerModel'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value $TypeList
+                $Rules.Add($TypeRule)
+            }
+        }
+    }
+
+    return $Rules
+}
+
+function Get-DATDetectionScript {
+    <#
+    .SYNOPSIS
+        Returns the PowerShell detection script text for a DAT-managed Application.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Driver', 'BIOS')]
+        [string]$Mode,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedVersion
+    )
+
+    $SubKey = if ($Mode -eq 'Driver') { 'Drivers' } else { 'BIOS' }
+    $EscapedVersion = $ExpectedVersion -replace "'", "''"
+
+    return @"
+`$Path = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation\$SubKey'
+if (-not (Test-Path `$Path)) { return }
+`$Installed = (Get-ItemProperty -Path `$Path -Name 'Version' -ErrorAction SilentlyContinue).Version
+`$Status    = (Get-ItemProperty -Path `$Path -Name 'Status'  -ErrorAction SilentlyContinue).Status
+if (`$Installed -eq '$EscapedVersion' -and `$Status -eq 'Installed') {
+    Write-Output `$Installed
+}
+"@
+}
+
+function Copy-DATApplyScript {
+    <#
+    .SYNOPSIS
+        Copies Invoke-DATApply.ps1 into an Application's content source directory.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DestinationPath
+    )
+
+    $SourceScript = Join-Path $script:ModuleRoot 'Scripts\Invoke-DATApply.ps1'
+    if (-not (Test-Path $SourceScript)) {
+        throw "Invoke-DATApply.ps1 not found at $SourceScript - module installation is incomplete."
+    }
+    if (-not (Test-Path $DestinationPath)) {
+        throw "Content destination does not exist: $DestinationPath"
+    }
+    Copy-Item -Path $SourceScript -Destination (Join-Path $DestinationPath 'Invoke-DATApply.ps1') -Force
+    Write-DATLog -Message "Staged Invoke-DATApply.ps1 into $DestinationPath" -Severity 1
+}
+
+function New-DATConfigMgrApplication {
+    <#
+    .SYNOPSIS
+        Creates or updates a ConfigMgr Application that installs a driver pack or BIOS update.
+    .DESCRIPTION
+        Replaces the package+task-sequence model for maintenance-window deployments.
+        Each call produces an Application with a single PowerShell script
+        deployment type that runs under SYSTEM, detection via registry marker,
+        and requirement rules that gate the Application to matching hardware.
+
+        Safe to call repeatedly - existing Applications are updated in place
+        (deployment type rebuilt, content refreshed). Callers populate the
+        content source directory with driver/BIOS files; this function stages
+        Invoke-DATApply.ps1 into that directory automatically.
+    .PARAMETER BIOSPassword
+        Optional. WARNING: embedded in the install command, which ConfigMgr
+        stores plaintext. Omit if your fleet has no BIOS password.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$SourcePath,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Driver', 'BIOS')]
+        [string]$Mode,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Dell', 'Lenovo', 'Microsoft')]
+        [string]$Manufacturer,
+
+        [Parameter(Mandatory)]
+        [string]$Model,
+
+        [Parameter(Mandatory)]
+        [string]$Version,
+
+        [string[]]$SystemSKU,
+
+        [string[]]$MachineType,
+
+        [SecureString]$BIOSPassword,
+
+        [string]$FolderPath,
+
+        [string]$Description
+    )
+
+    Assert-DATConfigMgrConnected
+
+    if (-not $Description) {
+        $Description = if ($Mode -eq 'Driver') {
+            "Driver Pack - $Manufacturer $Model - Version $Version"
+        } else {
+            "BIOS Update - $Manufacturer $Model - Version $Version"
+        }
+    }
+
+    Copy-DATApplyScript -DestinationPath $SourcePath
+
+    $OriginalLocation = Get-Location
+    try {
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
+
+        $ExistingAll = @(Get-CMApplication -Name $Name -ErrorAction SilentlyContinue)
+        $App = $null
+        if ($ExistingAll.Count -gt 1) {
+            Write-DATLog -Message "WARNING: Found $($ExistingAll.Count) applications named '$Name' - using first" -Severity 2
+            $App = $ExistingAll[0]
+        } elseif ($ExistingAll.Count -eq 1) {
+            $App = $ExistingAll[0]
+        }
+
+        $IsNew = -not $App
+
+        if ($PSCmdlet.ShouldProcess($Name, 'Create/update ConfigMgr Application')) {
+            if ($IsNew) {
+                Write-DATLog -Message "Creating new Application: $Name" -Severity 1
+                $App = New-CMApplication -Name $Name `
+                    -Description $Description `
+                    -Publisher $Manufacturer `
+                    -SoftwareVersion $Version `
+                    -LocalizedApplicationName $Name `
+                    -LocalizedDescription $Description `
+                    -ErrorAction Stop
+            } else {
+                Write-DATLog -Message "Updating existing Application: $Name" -Severity 1
+                try {
+                    Set-CMApplication -Name $Name `
+                        -Description $Description `
+                        -SoftwareVersion $Version `
+                        -LocalizedApplicationName $Name `
+                        -LocalizedDescription $Description `
+                        -ErrorAction Stop
+                } catch {
+                    Write-DATLog -Message "Warning: could not update Application properties: $($_.Exception.Message)" -Severity 2
+                }
+            }
+        }
+
+        $DTName = 'Install'
+        $SafetyMfr = $Manufacturer
+        $PackageNameEscaped = $Name -replace "'", "''"
+        $VersionEscaped     = $Version -replace "'", "''"
+
+        $InstallArgs = @(
+            '-NoProfile'
+            '-ExecutionPolicy Bypass'
+            '-File ".\Invoke-DATApply.ps1"'
+            "-Mode $Mode"
+            "-PackageName '$PackageNameEscaped'"
+            "-Version '$VersionEscaped'"
+            "-SafetyManufacturer $SafetyMfr"
+        )
+        if ($Mode -eq 'BIOS' -and $BIOSPassword) {
+            # Decrypt SecureString to plaintext only here - it is immediately
+            # consumed by the install-command string that CM persists.
+            $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($BIOSPassword)
+            try {
+                $PwPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($BSTR)
+                $PwEscaped = $PwPlain -replace "'", "''"
+                $InstallArgs += "-BIOSPassword '$PwEscaped'"
+            } finally {
+                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+            }
+        }
+        $InstallCommand = 'powershell.exe {0}' -f ($InstallArgs -join ' ')
+        $DetectionScript = Get-DATDetectionScript -Mode $Mode -ExpectedVersion $Version
+
+        if ($PSCmdlet.ShouldProcess($Name, 'Configure deployment type')) {
+            $ExistingDT = Get-CMDeploymentType -ApplicationName $Name -DeploymentTypeName $DTName -ErrorAction SilentlyContinue
+            if ($ExistingDT) {
+                try {
+                    Remove-CMDeploymentType -ApplicationName $Name -DeploymentTypeName $DTName -Force -ErrorAction Stop
+                    Write-DATLog -Message "Removed existing deployment type '$DTName' for rebuild" -Severity 1
+                } catch {
+                    Write-DATLog -Message "Warning: could not remove existing deployment type: $($_.Exception.Message)" -Severity 2
+                }
+            }
+
+            $Timeout   = if ($Mode -eq 'Driver') { 60 } else { 30 }
+            $Estimated = if ($Mode -eq 'Driver') { 15 } else { 10 }
+
+            Add-CMScriptDeploymentType -ApplicationName $Name `
+                -DeploymentTypeName $DTName `
+                -InstallCommand $InstallCommand `
+                -ContentLocation $SourcePath `
+                -ScriptLanguage PowerShell `
+                -ScriptText $DetectionScript `
+                -InstallationBehaviorType InstallForSystem `
+                -LogonRequirementType WhetherOrNotUserLoggedOn `
+                -UserInteractionMode Hidden `
+                -MaximumRuntimeMins $Timeout `
+                -EstimatedRuntimeMins $Estimated `
+                -RebootBehavior BasedOnExitCode `
+                -ErrorAction Stop | Out-Null
+            Write-DATLog -Message "Deployment type '$DTName' configured for $Name" -Severity 1
+
+            try {
+                $Rules = New-DATApplicationRequirementRules -Manufacturer $Manufacturer `
+                    -SystemSKU $SystemSKU -MachineType $MachineType
+                if ($Rules.Count -gt 0) {
+                    Set-CMScriptDeploymentType -ApplicationName $Name `
+                        -DeploymentTypeName $DTName `
+                        -AddRequirement $Rules `
+                        -ErrorAction Stop | Out-Null
+                    Write-DATLog -Message "Added $($Rules.Count) requirement rule(s) to $Name\$DTName" -Severity 1
+                }
+            } catch {
+                Write-DATLog -Message "Warning: requirement rule attach failed: $($_.Exception.Message)" -Severity 2
+            }
+        }
+
+        if ($FolderPath) {
+            try {
+                $AppObj = Get-CMApplication -Name $Name -ErrorAction Stop | Select-Object -First 1
+                if ($AppObj) {
+                    Set-DATApplicationFolder -ApplicationID $AppObj.CI_ID -FolderPath $FolderPath
+                }
+            } catch {
+                Write-DATLog -Message "Warning: could not move Application to folder '$FolderPath': $($_.Exception.Message)" -Severity 2
+            }
+        }
+
+        $AppObj = Get-CMApplication -Name $Name -ErrorAction Stop | Select-Object -First 1
+        Write-DATLog -Message "Application ready: $Name (CI_ID: $($AppObj.CI_ID), ModelName: $($AppObj.ModelName))" -Severity 1
+
+        return [PSCustomObject]@{
+            PackageID    = [string]$AppObj.CI_ID
+            CI_ID        = [string]$AppObj.CI_ID
+            ModelName    = [string]$AppObj.ModelName
+            Name         = $Name
+            Version      = $Version
+            Manufacturer = $Manufacturer
+            SourcePath   = $SourcePath
+            IsNew        = $IsNew
+            Kind         = 'Application'
+        }
+    } catch {
+        Write-DATLog -Message "Failed to create Application '$Name': $($_.Exception.Message)" -Severity 3
+        throw
+    } finally {
+        Set-Location -Path $OriginalLocation
+    }
+}
+
+function Set-DATApplicationFolder {
+    <#
+    .SYNOPSIS
+        Moves a ConfigMgr Application into a specific console folder.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ApplicationID,
+
+        [Parameter(Mandatory)]
+        [string]$FolderPath
+    )
+
+    $OriginalLocation = Get-Location
+    try {
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
+        $RootNode = "$($script:CMSiteCode):\Application"
+
+        $Parts = $FolderPath.Split('\') | Where-Object { $_ }
+        $CurrentPath = $RootNode
+        foreach ($Part in $Parts) {
+            $NextPath = Join-Path $CurrentPath $Part
+            if (-not (Test-Path $NextPath)) {
+                New-Item -Path $NextPath -ItemType Directory -ErrorAction Stop | Out-Null
+                Write-DATLog -Message "Created console folder: $NextPath" -Severity 1
+            }
+            $CurrentPath = $NextPath
+        }
+        $TargetFolder = "$RootNode\$FolderPath"
+        Move-CMObject -FolderPath $TargetFolder -ObjectId $ApplicationID -ErrorAction Stop
+        Write-DATLog -Message "Moved Application $ApplicationID to $TargetFolder" -Severity 1
+    } catch {
+        Write-DATLog -Message "Failed to set Application folder for $ApplicationID`: $($_.Exception.Message)" -Severity 2
+    } finally {
+        Set-Location -Path $OriginalLocation
+    }
+}
+
+function Find-DATExistingApplications {
+    <#
+    .SYNOPSIS
+        Finds DAT-managed Applications filtered by manufacturer/model/type.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Manufacturer,
+        [string]$Model,
+
+        [ValidateSet('Drivers', 'BIOS', 'All')]
+        [string]$Type = 'All'
+    )
+
+    Assert-DATConfigMgrConnected
+
+    $OriginalLocation = Get-Location
+    try {
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
+
+        $Filter = '*'
+        if ($Model) { $Filter = "*$Model*" }
+        $Apps = @(Get-CMApplication -Name $Filter -Fast -ErrorAction SilentlyContinue)
+        if ($Manufacturer) {
+            $Apps = $Apps | Where-Object { $_.Manufacturer -eq $Manufacturer -or $_.Name -like "*$Manufacturer*" }
+        }
+        if ($Type -eq 'Drivers') {
+            $Apps = $Apps | Where-Object { $_.Name -like 'Drivers - *' -or $_.Name -like 'Test - Drivers - *' }
+        } elseif ($Type -eq 'BIOS') {
+            $Apps = $Apps | Where-Object { $_.Name -like 'BIOS Update - *' -or $_.Name -like 'Test - BIOS Update - *' }
+        }
+
+        return $Apps | Select-Object @{N='PackageID';E={[string]$_.CI_ID}},
+            @{N='CI_ID';E={[string]$_.CI_ID}},
+            Name,
+            @{N='Version';E={$_.SoftwareVersion}},
+            @{N='Manufacturer';E={$_.Manufacturer}},
+            @{N='Description';E={$_.LocalizedDescription}},
+            @{N='LastModified';E={$_.DateLastModified}},
+            @{N='Kind';E={'Application'}}
+    } finally {
+        Set-Location -Path $OriginalLocation
+    }
+}
+
+function Remove-DATLegacyApplication {
+    <#
+    .SYNOPSIS
+        Removes a DAT-managed ConfigMgr Application, optionally cleaning its content source.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ApplicationID,
+
+        [switch]$CleanSource
+    )
+
+    Assert-DATConfigMgrConnected
+
+    $OriginalLocation = Get-Location
+    try {
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
+
+        $App = Get-CMApplication -Id $ApplicationID -Fast -ErrorAction SilentlyContinue
+        if (-not $App) {
+            Write-DATLog -Message "Application $ApplicationID not found - skipping removal" -Severity 2
+            return
+        }
+
+        $SourcePath = $null
+        if ($CleanSource) {
+            try {
+                $DT = Get-CMDeploymentType -ApplicationName $App.LocalizedDisplayName -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($DT) {
+                    $XmlContent = [xml]$DT.SDMPackageXML
+                    $SourcePath = ($XmlContent.AppMgmtDigest.DeploymentType.Installer.Contents.Content.Location | Select-Object -First 1)
+                }
+            } catch {
+                Write-DATLog -Message "Could not inspect deployment type content location for $ApplicationID" -Severity 2
+            }
+        }
+
+        if ($PSCmdlet.ShouldProcess($App.LocalizedDisplayName, 'Remove Application')) {
+            Remove-CMApplication -Id $ApplicationID -Force -ErrorAction Stop
+            Write-DATLog -Message "Removed Application: $($App.LocalizedDisplayName) ($ApplicationID)" -Severity 1
+        }
+
+        if ($CleanSource -and $SourcePath -and (Test-Path $SourcePath)) {
+            try {
+                Remove-Item -Path $SourcePath -Recurse -Force -ErrorAction Stop
+                Write-DATLog -Message "Removed content source: $SourcePath" -Severity 1
+            } catch {
+                Write-DATLog -Message "Could not remove content source $SourcePath`: $($_.Exception.Message)" -Severity 2
+            }
+        }
+    } finally {
+        Set-Location -Path $OriginalLocation
+    }
+}
+
+function Distribute-DATApplicationContent {
+    <#
+    .SYNOPSIS
+        Distributes a ConfigMgr Application's content to distribution points / groups.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ApplicationID,
+
+        [string[]]$DistributionPoints,
+        [string[]]$DistributionPointGroups,
+
+        [switch]$IsUpdate
+    )
+
+    Assert-DATConfigMgrConnected
+
+    $OriginalLocation = Get-Location
+    try {
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
+
+        if ($IsUpdate) {
+            try {
+                Write-DATLog -Message "Refreshing application content on existing DPs for $ApplicationID" -Severity 1
+                Update-CMDistributionPoint -ApplicationId $ApplicationID -DeploymentTypeName 'Install' -ErrorAction Stop
+                Write-DATLog -Message "Content refresh queued for Application $ApplicationID" -Severity 1
+            } catch {
+                Write-DATLog -Message "Update-CMDistributionPoint failed for Application $ApplicationID`: $($_.Exception.Message)" -Severity 2
+            }
+        }
+
+        if ($DistributionPointGroups) {
+            foreach ($DPG in $DistributionPointGroups) {
+                if ($PSCmdlet.ShouldProcess("$ApplicationID to $DPG", 'Distribute application content')) {
+                    try {
+                        Start-CMContentDistribution -ApplicationId $ApplicationID `
+                            -DistributionPointGroupName $DPG -ErrorAction Stop
+                        Write-DATLog -Message "Application content distributed: $ApplicationID -> DPG '$DPG'" -Severity 1
+                    } catch {
+                        if ($_.Exception.Message -match 'already been distributed|No content destination') {
+                            Write-DATLog -Message "Application content already distributed to DPG '$DPG'" -Severity 1
+                        } else {
+                            Write-DATLog -Message "Failed to distribute Application $ApplicationID to DPG '$DPG'`: $($_.Exception.Message)" -Severity 3
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($DistributionPoints) {
+            foreach ($DP in $DistributionPoints) {
+                if ($PSCmdlet.ShouldProcess("$ApplicationID to $DP", 'Distribute application content')) {
+                    try {
+                        Start-CMContentDistribution -ApplicationId $ApplicationID `
+                            -DistributionPointName $DP -ErrorAction Stop
+                        Write-DATLog -Message "Application content distributed: $ApplicationID -> $DP" -Severity 1
+                    } catch {
+                        if ($_.Exception.Message -match 'already been distributed|No content destination') {
+                            Write-DATLog -Message "Application content already distributed to DP $DP" -Severity 1
+                        } else {
+                            Write-DATLog -Message "Failed to distribute Application $ApplicationID to DP $DP`: $($_.Exception.Message)" -Severity 3
+                        }
+                    }
+                }
+            }
+        }
+    } finally {
+        Set-Location -Path $OriginalLocation
+    }
+}
+
+function Add-DATApplicationSupersedence {
+    <#
+    .SYNOPSIS
+        Wires supersedence: the new Application supersedes one or more old ones.
+    .DESCRIPTION
+        Best-effort. Failures are logged but non-fatal.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$NewApplicationName,
+
+        [Parameter(Mandatory)]
+        [string[]]$OldApplicationName
+    )
+
+    Assert-DATConfigMgrConnected
+
+    $OriginalLocation = Get-Location
+    try {
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
+
+        $NewDT = Get-CMDeploymentType -ApplicationName $NewApplicationName -DeploymentTypeName 'Install' -ErrorAction SilentlyContinue
+        if (-not $NewDT) {
+            Write-DATLog -Message "Cannot set supersedence: new deployment type for '$NewApplicationName' not found" -Severity 2
+            return
+        }
+
+        foreach ($OldName in $OldApplicationName) {
+            if ($OldName -eq $NewApplicationName) { continue }
+            try {
+                $OldDT = Get-CMDeploymentType -ApplicationName $OldName -DeploymentTypeName 'Install' -ErrorAction SilentlyContinue
+                if (-not $OldDT) {
+                    Write-DATLog -Message "Supersedence target '$OldName' has no 'Install' deployment type - skipping" -Severity 2
+                    continue
+                }
+                if ($PSCmdlet.ShouldProcess("$NewApplicationName supersedes $OldName", 'Set supersedence')) {
+                    Add-CMDeploymentTypeSupersedence -SupersedingDeploymentType $NewDT `
+                        -SupersededDeploymentType $OldDT -ErrorAction Stop
+                    Write-DATLog -Message "Supersedence set: '$NewApplicationName' -> '$OldName'" -Severity 1
+                }
+            } catch {
+                Write-DATLog -Message "Supersedence wiring failed for '$OldName': $($_.Exception.Message)" -Severity 2
+            }
+        }
+    } finally {
+        Set-Location -Path $OriginalLocation
+    }
+}
