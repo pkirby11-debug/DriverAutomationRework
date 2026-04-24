@@ -687,6 +687,61 @@ function Invoke-DATSyncSinglePackage {
         if (-not $IntegrityOk) {
             Write-DATLog -Message "INTEGRITY CHECK FAILED for $PackageName v$Version`: $IntegrityReason - forcing re-download" -Severity 2
             # Fall through to download instead of returning Skipped
+        } elseif ($IsApplication) {
+            # Application mode: even when the catalog version is unchanged, the
+            # embedded Invoke-DATApply.ps1 may have been updated in the module
+            # (bug fixes, new features). A plain skip would leave stale apply
+            # scripts on the DP and on every client's CCM cache. Instead, do a
+            # lightweight refresh: restage the apply script into the existing
+            # package source, update the DT in place (same content path - CM
+            # detects the file hash change and bumps the DT revision), and
+            # trigger DP redistribution. No driver re-download needed.
+            Write-DATLog -Message "Application at v$Version exists - refreshing apply script and deployment type (no driver re-download)" -Severity 1
+
+            $AppSystemSKU   = @()
+            $AppMachineType = @()
+            if ($PackageInfo.SystemID)        { $AppSystemSKU  += ($PackageInfo.SystemID        -split ';' | Where-Object { $_ }) }
+            if ($PackageInfo.AllMachineTypes) { $AppMachineType += ($PackageInfo.AllMachineTypes -split ';' | Where-Object { $_ }) }
+            if ($PackageInfo.MachineType)     { $AppMachineType += ($PackageInfo.MachineType    -split ';' | Where-Object { $_ }) }
+            $AppMachineType = @($AppMachineType | Select-Object -Unique)
+
+            $FolderPath = if ($Type -eq 'BIOS') { "Driver Automation\BIOS\$Make" } else { "Driver Automation\Drivers\$Make" }
+
+            $AppParams = @{
+                Name         = $PackageName
+                SourcePath   = $ExistingPkg.SourcePath
+                Mode         = if ($Type -eq 'BIOS') { 'BIOS' } else { 'Driver' }
+                Manufacturer = $Make
+                Model        = $ModelName
+                Version      = $Version
+                FolderPath   = $FolderPath
+            }
+            if ($AppSystemSKU.Count -gt 0)   { $AppParams['SystemSKU']   = $AppSystemSKU }
+            if ($AppMachineType.Count -gt 0) { $AppParams['MachineType'] = $AppMachineType }
+            if ($Type -eq 'BIOS' -and $BIOSPassword) { $AppParams['BIOSPassword'] = $BIOSPassword }
+
+            try {
+                $PkgResult = New-DATConfigMgrApplication @AppParams
+                Distribute-DATApplicationContent -ApplicationName $PackageName `
+                    -DistributionPoints $DistributionPoints `
+                    -DistributionPointGroups $DistributionPointGroups `
+                    -IsUpdate
+                Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
+                    -Version $Version -PackageID $PkgResult.PackageID -Status 'Success'
+
+                return [PSCustomObject]@{
+                    Manufacturer = $Make
+                    Model        = $ModelName
+                    Type         = $Type
+                    Version      = $Version
+                    PackageID    = $PkgResult.PackageID
+                    Status       = 'Success'
+                    Message      = 'Apply script and deployment type refreshed'
+                }
+            } catch {
+                Write-DATLog -Message "Application refresh failed: $($_.Exception.Message) - falling through to full re-download" -Severity 2
+                # Fall through to the full download path as recovery
+            }
         } else {
             Write-DATLog -Message "Package already exists at version $Version`: $PackageName - Skipping" -Severity 1
 
