@@ -253,12 +253,17 @@ function Compare-BIOSVersion {
 # -------------------------------------------------------------------------
 # Driver install
 # -------------------------------------------------------------------------
-function Install-DriverContent {
-    param([string]$Path)
+function Install-InfTree {
+    <#
+        Runs pnputil against a directory tree of .inf files. Returns 0 on success,
+        propagates pnputil's exit code on failure, sets $script:RebootRequired if
+        pnputil reports a restart is needed.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
 
     $InfFiles = @(Get-ChildItem -Path $Path -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
     if ($InfFiles.Count -eq 0) {
-        throw "No .inf files found under $Path - package content may be missing or corrupt."
+        throw "No .inf files found under $Path after extraction. Content is missing or corrupt."
     }
     Write-Log "Found $($InfFiles.Count) .inf file(s) under $Path"
 
@@ -272,22 +277,132 @@ function Install-DriverContent {
         throw "pnputil.exe not found at $PnpUtil"
     }
 
-    # Single recursive invocation covers every .inf under $Path and is faster
-    # than looping. /subdirs walks subdirectories; /install runs the install
-    # portion so drivers are actually staged and bound to devices.
+    # Single recursive invocation covers every .inf under $Path. /subdirs walks
+    # subdirectories; /install stages and binds drivers to devices.
     Write-Log "Running: pnputil.exe /add-driver `"$Path\*.inf`" /subdirs /install"
     $PnpArgs = @('/add-driver', "$Path\*.inf", '/subdirs', '/install')
     $Proc = Start-Process -FilePath $PnpUtil -ArgumentList $PnpArgs -Wait -PassThru -NoNewWindow
     $ExitCode = $Proc.ExitCode
     Write-Log "pnputil exit code: $ExitCode"
 
-    # pnputil returns 3010 (ERROR_SUCCESS_REBOOT_REQUIRED) or 259 when a restart
-    # is required. Both are success signals, not failures.
+    # pnputil returns 3010 / 259 when a restart is required - both are success.
     if ($ExitCode -eq 3010 -or $ExitCode -eq 259) {
         $script:RebootRequired = $true
         return 0
     }
     return $ExitCode
+}
+
+function Install-DriverContent {
+    <#
+        Driver install entry point. Handles three possible content layouts:
+          1. Loose .inf tree (uncompressed sync output) - install directly
+          2. Single .wim file (WIM-compressed sync output) - DISM mount then install
+          3. Single .zip file (ZIP-compressed sync output) - expand then install
+        Logs a summary of ContentPath contents before deciding, so diagnostics
+        make it into the log even when content is missing or unexpected.
+    #>
+    param([string]$Path)
+
+    # Diagnostic: what's actually in the content path?
+    $AllFiles = @(Get-ChildItem -Path $Path -File -Recurse -ErrorAction SilentlyContinue)
+    $TotalMB  = [math]::Round((($AllFiles | Measure-Object -Property Length -Sum).Sum) / 1MB, 2)
+    $TopLevel = @(Get-ChildItem -Path $Path -ErrorAction SilentlyContinue | Select-Object -First 15 -ExpandProperty Name)
+    Write-Log "ContentPath summary: $($AllFiles.Count) file(s), $TotalMB MB"
+    Write-Log "Top-level entries: $($TopLevel -join ', ')"
+
+    if ($AllFiles.Count -eq 0) {
+        throw "ContentPath '$Path' is empty. Likely a CM client cache-size problem: bump Client Settings > Client Cache > Maximum cache size to 20 GB+ (default 5 GB is too small for modern driver packs)."
+    }
+
+    # WIM-compressed content
+    $WimFile = Get-ChildItem -Path $Path -Filter '*.wim' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($WimFile) {
+        Write-Log "Detected WIM-compressed content: $($WimFile.Name) ($([math]::Round($WimFile.Length / 1MB, 2)) MB)"
+        return Install-DriverContentFromWim -WimPath $WimFile.FullName
+    }
+
+    # ZIP-compressed content
+    $ZipFile = Get-ChildItem -Path $Path -Filter '*.zip' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($ZipFile) {
+        Write-Log "Detected ZIP-compressed content: $($ZipFile.Name) ($([math]::Round($ZipFile.Length / 1MB, 2)) MB)"
+        return Install-DriverContentFromZip -ZipPath $ZipFile.FullName
+    }
+
+    # Loose .inf tree
+    return Install-InfTree -Path $Path
+}
+
+function Install-DriverContentFromWim {
+    <#
+        Mounts a DAT-produced WIM driver pack, copies contents to a plain
+        directory, runs Install-InfTree against the copy, then dismounts and
+        cleans up. Mirrors the proven flow from the legacy apply script
+        (mount + copy-out + install + dismount + cleanup). Staging under
+        ProgramData rather than %TEMP% avoids AV on-access scan noise.
+
+        The copy step looks redundant but is what the legacy script did and
+        what the Dell/Lenovo community apply scripts do - pnputil running
+        against a mounted WIM works in most cases but occasionally mis-handles
+        driver packs with INFs referencing relative paths (e.g. CopyFiles
+        directives pointing to sibling subdirectories). Installing from a
+        plain filesystem copy sidesteps that whole class of issues.
+    #>
+    param([Parameter(Mandatory)][string]$WimPath)
+
+    $StageRoot  = Join-Path $env:ProgramData ("DriverAutomationTool\Driver_{0}" -f $PID)
+    $MountPoint = Join-Path $StageRoot 'Mount'
+    $CopyPoint  = Join-Path $StageRoot 'Content'
+
+    if (Test-Path $StageRoot) { Remove-Item -Path $StageRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -Path $MountPoint -ItemType Directory -Force | Out-Null
+    New-Item -Path $CopyPoint  -ItemType Directory -Force | Out-Null
+
+    $Mounted = $false
+    try {
+        Write-Log "Mounting WIM (read-only): $WimPath -> $MountPoint"
+        Mount-WindowsImage -ImagePath $WimPath -Path $MountPoint -Index 1 -ReadOnly -ErrorAction Stop | Out-Null
+        $Mounted = $true
+        Write-Log 'WIM mounted successfully'
+
+        Write-Log "Copying mounted WIM contents to staging: $CopyPoint"
+        Get-ChildItem -Path $MountPoint | Copy-Item -Destination $CopyPoint -Recurse -Container -Force -ErrorAction Stop
+        $CopiedFiles = @(Get-ChildItem -Path $CopyPoint -Recurse -File -ErrorAction SilentlyContinue)
+        Write-Log "Staged $($CopiedFiles.Count) file(s) from WIM"
+
+        return Install-InfTree -Path $CopyPoint
+    } finally {
+        if ($Mounted) {
+            Write-Log "Dismounting WIM: $MountPoint"
+            try {
+                Dismount-WindowsImage -Path $MountPoint -Discard -ErrorAction Stop | Out-Null
+                Write-Log 'WIM dismounted'
+            } catch {
+                Write-Log "Dismount failed (may leave a stale mount): $($_.Exception.Message)" -Severity 2
+            }
+        }
+        Remove-Item -Path $StageRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Install-DriverContentFromZip {
+    <#
+        Extracts a ZIP-compressed driver pack to a ProgramData temp dir and
+        installs from there. Requires ~package-size free disk space (unlike WIM
+        mount which doesn't copy).
+    #>
+    param([Parameter(Mandatory)][string]$ZipPath)
+
+    $ExtractDir = Join-Path $env:ProgramData ("DriverAutomationTool\DriverExtract_{0}" -f $PID)
+    if (Test-Path $ExtractDir) { Remove-Item -Path $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -Path $ExtractDir -ItemType Directory -Force | Out-Null
+    try {
+        Write-Log "Extracting ZIP: $ZipPath -> $ExtractDir"
+        Expand-Archive -Path $ZipPath -DestinationPath $ExtractDir -Force
+        return Install-InfTree -Path $ExtractDir
+    } finally {
+        Remove-Item -Path $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # -------------------------------------------------------------------------
