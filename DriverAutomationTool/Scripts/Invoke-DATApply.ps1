@@ -61,9 +61,6 @@
     OSD / bare-metal driver injection is still handled by ConfigMgr's Auto Apply
     Drivers step or the legacy apply scripts in a task sequence.
 #>
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
-    'PSAvoidUsingPlainTextForPassword', 'BIOSPassword',
-    Justification='CCMExec invokes this script with a plaintext command line; vendor flash utilities (Flash64W, SRSETUP64) require plaintext on their own command lines.')]
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
@@ -81,6 +78,13 @@ param(
     # CCMExec via `-File ".\..."` from a service context.
     [string]$ContentPath,
 
+    # Plaintext is required here - CCMExec invokes the script with a literal
+    # command line, and the vendor flash utilities (Flash64W, SRSETUP64) read
+    # the password as plaintext from their own command lines. SecureString is
+    # not useful at this boundary.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'BIOSPassword',
+        Justification='See comment above - plaintext is unavoidable at the CCMExec boundary.')]
     [string]$BIOSPassword,
 
     [ValidateSet('Dell', 'Lenovo', 'Microsoft')]
@@ -91,8 +95,41 @@ param(
     [switch]$DebugMode
 )
 
+# -------------------------------------------------------------------------
+# Last-resort logging path (available to trap + startup marker)
+# -------------------------------------------------------------------------
+$script:FailsafeLogPath = if (Test-Path (Join-Path $env:SystemRoot 'CCM\Logs')) {
+    Join-Path $env:SystemRoot 'CCM\Logs\DATApply.log'
+} else {
+    Join-Path $env:SystemRoot 'Temp\DATApply.log'
+}
+
+# Trap anything that escapes the main try/catch - this guarantees at least one
+# line gets logged no matter where initialization fails. Without this, a
+# terminating error during function definition or variable setup would produce
+# "exit code 1, no log" with no clue what happened.
+trap {
+    try {
+        $TrapLine = '[{0}] [TRAP] {1} | at {2} | {3}' -f `
+            (Get-Date -Format 'HH:mm:ss.fff'),
+            $_.Exception.Message,
+            $_.InvocationInfo.PositionMessage.Trim(),
+            $_.ScriptStackTrace
+        Add-Content -Path $script:FailsafeLogPath -Value $TrapLine -ErrorAction SilentlyContinue
+    } catch { }
+    exit 1
+}
+
 $ErrorActionPreference = 'Stop'
 $script:RebootRequired = $false
+
+# Startup marker - writes before any other logic runs so we can confirm the
+# script survived param binding and attribute processing.
+try {
+    $StartupLine = '[{0}] [START] PID={1} PS={2} Mode={3} Version={4} Package=''{5}''' -f `
+        (Get-Date -Format 'HH:mm:ss.fff'), $PID, $PSVersionTable.PSVersion, $Mode, $Version, $PackageName
+    Add-Content -Path $script:FailsafeLogPath -Value $StartupLine -ErrorAction SilentlyContinue
+} catch { }
 
 # -------------------------------------------------------------------------
 # Logging

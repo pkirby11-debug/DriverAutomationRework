@@ -1788,7 +1788,10 @@ function Invoke-DATPatchPackage {
             # WIM package: mount, copy, dismount
             Write-DATLog -Message "Detected WIM package format: $($WimFile.Name)" -Severity 1
 
-            $MountDir = Join-Path $env:TEMP "DAT_WimMount_$PackageID"
+            # Under ProgramData (not %TEMP%) to avoid AV on-access scans while
+            # DISM has the WIM mounted. Consistent with the rest of DAT's temp
+            # strategy - see Get-DATTempPath.
+            $MountDir = Join-Path $env:ProgramData "DriverAutomationTool\WimMount\$PackageID"
             if (Test-Path $MountDir) { Remove-Item -Path $MountDir -Recurse -Force }
             New-Item -Path $MountDir -ItemType Directory -Force | Out-Null
 

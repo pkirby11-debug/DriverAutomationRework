@@ -111,6 +111,13 @@ function Get-DATTempPath {
     <#
     .SYNOPSIS
         Returns a unique temporary directory for the current operation.
+    .DESCRIPTION
+        Returns a path under $env:ProgramData\DriverAutomationTool\Temp rather than
+        %TEMP% / %LOCALAPPDATA%\Temp. Self-extracting driver .exe files written
+        under %TEMP% consistently trigger Defender's on-access scanner (it treats
+        that path as a malware-staging hotspot); staging under ProgramData avoids
+        those false positives and is writable by any context DAT runs in
+        (user, service account, SYSTEM during OSD).
     .PARAMETER Prefix
         Prefix for the temp directory name.
     #>
@@ -119,7 +126,7 @@ function Get-DATTempPath {
         [string]$Prefix = 'DAT'
     )
 
-    $TempBase = Join-Path $env:TEMP 'DriverAutomationTool'
+    $TempBase = Join-Path $env:ProgramData 'DriverAutomationTool\Temp'
     if (-not (Test-Path $TempBase)) {
         New-Item -Path $TempBase -ItemType Directory -Force | Out-Null
     }
@@ -141,6 +148,8 @@ function Remove-DATTempPath {
         [string]$Path
     )
 
+    # Safety check on the path marker accepts either the new ProgramData location
+    # (primary) or any legacy %TEMP% leftovers from pre-1.7.1 sync runs.
     if ((Test-Path $Path) -and $Path -like "*DriverAutomationTool*") {
         Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
     }
