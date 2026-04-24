@@ -431,6 +431,72 @@ function Invoke-DATSyncSinglePackage {
     # Check if this version already exists (use correct lookup based on deployment platform)
     $IsDriverPkg = ($DeploymentPlatform -like 'ConfigMgr - Driver Pkg*')
 
+    # Shared refresh scriptblock for Application mode. Any skip path that decides
+    # "content already at the right version" MUST route through this first when
+    # deploying as an Application, otherwise edits to the embedded apply script
+    # (Invoke-DATApply.ps1 in the DAT module) never reach the DP or client.
+    # Returns a result object when a refresh ran; returns $null on failure (caller
+    # should fall through to full sync) or when this isn't Application mode.
+    $TryApplicationRefresh = {
+        param(
+            [Parameter(Mandatory)][PSCustomObject]$ExistingPkg,
+            [Parameter(Mandatory)][string]$UseVersion
+        )
+
+        if (-not $IsApplication) { return $null }
+        if (-not $ExistingPkg.SourcePath -or -not (Test-Path $ExistingPkg.SourcePath)) {
+            Write-DATLog -Message "Application refresh not possible - existing source path missing: $($ExistingPkg.SourcePath)" -Severity 2
+            return $null
+        }
+
+        Write-DATLog -Message "Application at v$UseVersion exists - refreshing apply script and deployment type (no driver re-download)" -Severity 1
+
+        $AppSystemSKU   = @()
+        $AppMachineType = @()
+        if ($PackageInfo.SystemID)        { $AppSystemSKU  += ($PackageInfo.SystemID        -split ';' | Where-Object { $_ }) }
+        if ($PackageInfo.AllMachineTypes) { $AppMachineType += ($PackageInfo.AllMachineTypes -split ';' | Where-Object { $_ }) }
+        if ($PackageInfo.MachineType)     { $AppMachineType += ($PackageInfo.MachineType    -split ';' | Where-Object { $_ }) }
+        $AppMachineType = @($AppMachineType | Select-Object -Unique)
+
+        $FolderPath = if ($Type -eq 'BIOS') { "Driver Automation\BIOS\$Make" } else { "Driver Automation\Drivers\$Make" }
+
+        $AppParams = @{
+            Name         = $PackageName
+            SourcePath   = $ExistingPkg.SourcePath
+            Mode         = if ($Type -eq 'BIOS') { 'BIOS' } else { 'Driver' }
+            Manufacturer = $Make
+            Model        = $ModelName
+            Version      = $UseVersion
+            FolderPath   = $FolderPath
+        }
+        if ($AppSystemSKU.Count -gt 0)   { $AppParams['SystemSKU']   = $AppSystemSKU }
+        if ($AppMachineType.Count -gt 0) { $AppParams['MachineType'] = $AppMachineType }
+        if ($Type -eq 'BIOS' -and $BIOSPassword) { $AppParams['BIOSPassword'] = $BIOSPassword }
+
+        try {
+            $PkgResult = New-DATConfigMgrApplication @AppParams
+            Distribute-DATApplicationContent -ApplicationName $PackageName `
+                -DistributionPoints $DistributionPoints `
+                -DistributionPointGroups $DistributionPointGroups `
+                -IsUpdate
+            Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
+                -Version $UseVersion -PackageID $PkgResult.PackageID -Status 'Success'
+
+            return [PSCustomObject]@{
+                Manufacturer = $Make
+                Model        = $ModelName
+                Type         = $Type
+                Version      = $UseVersion
+                PackageID    = $PkgResult.PackageID
+                Status       = 'Success'
+                Message      = 'Apply script and deployment type refreshed'
+            }
+        } catch {
+            Write-DATLog -Message "Application refresh failed: $($_.Exception.Message) - caller will fall through" -Severity 2
+            return $null
+        }
+    }
+
     # Find ALL existing packages for this model/type (any version) - used for duplicate prevention
     $AllExisting = if ($IsApplication) {
         Find-DATExistingApplications -Manufacturer $Make -Model $ModelName -Type $Type |
@@ -570,9 +636,12 @@ function Invoke-DATSyncSinglePackage {
                 } else { $null }
 
                 if ($ExistingToCheck -and $ExistingToCheck.Version -like "*OVL.$OverlayFingerprint") {
-                    Write-DATLog -Message "Package already contains latest individual drivers (v$($ExistingToCheck.Version)) - Skipping" -Severity 1
+                    Write-DATLog -Message "Package already contains latest individual drivers (v$($ExistingToCheck.Version))" -Severity 1
 
+                    $Refresh = & $TryApplicationRefresh $ExistingToCheck $ExistingToCheck.Version
+                    if ($Refresh) { return $Refresh }
 
+                    Write-DATLog -Message "Skipping $PackageName" -Severity 1
                     Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
                         -Version $ExistingToCheck.Version -PackageID $ExistingToCheck.PackageID -Status 'Skipped'
 
@@ -597,9 +666,13 @@ function Invoke-DATSyncSinglePackage {
                 # download - extract - scan path.
                 if ($SourceScanComplete) {
                     if ($Existing) {
-                        Write-DATLog -Message "No newer individual drivers found and base package exists at v$Version - Skipping" -Severity 1
+                        Write-DATLog -Message "No newer individual drivers found and base package exists at v$Version" -Severity 1
                         $ExistingPkg = if ($Existing -is [array]) { $Existing[0] } else { $Existing }
 
+                        $Refresh = & $TryApplicationRefresh $ExistingPkg $Version
+                        if ($Refresh) { return $Refresh }
+
+                        Write-DATLog -Message "Skipping $PackageName" -Severity 1
                         Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
                             -Version $Version -PackageID $ExistingPkg.PackageID -Status 'Skipped'
 
@@ -615,8 +688,12 @@ function Invoke-DATSyncSinglePackage {
                     }
                     if ($OverlayExisting) {
                         $OvlPkg = if ($OverlayExisting -is [array]) { $OverlayExisting[0] } else { $OverlayExisting }
-                        Write-DATLog -Message "No newer individual drivers found - package at v$($OvlPkg.Version) is current - Skipping" -Severity 1
+                        Write-DATLog -Message "No newer individual drivers found - package at v$($OvlPkg.Version) is current" -Severity 1
 
+                        $Refresh = & $TryApplicationRefresh $OvlPkg $OvlPkg.Version
+                        if ($Refresh) { return $Refresh }
+
+                        Write-DATLog -Message "Skipping $PackageName" -Severity 1
                         Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
                             -Version $OvlPkg.Version -PackageID $OvlPkg.PackageID -Status 'Skipped'
 
@@ -687,62 +764,10 @@ function Invoke-DATSyncSinglePackage {
         if (-not $IntegrityOk) {
             Write-DATLog -Message "INTEGRITY CHECK FAILED for $PackageName v$Version`: $IntegrityReason - forcing re-download" -Severity 2
             # Fall through to download instead of returning Skipped
-        } elseif ($IsApplication) {
-            # Application mode: even when the catalog version is unchanged, the
-            # embedded Invoke-DATApply.ps1 may have been updated in the module
-            # (bug fixes, new features). A plain skip would leave stale apply
-            # scripts on the DP and on every client's CCM cache. Instead, do a
-            # lightweight refresh: restage the apply script into the existing
-            # package source, update the DT in place (same content path - CM
-            # detects the file hash change and bumps the DT revision), and
-            # trigger DP redistribution. No driver re-download needed.
-            Write-DATLog -Message "Application at v$Version exists - refreshing apply script and deployment type (no driver re-download)" -Severity 1
-
-            $AppSystemSKU   = @()
-            $AppMachineType = @()
-            if ($PackageInfo.SystemID)        { $AppSystemSKU  += ($PackageInfo.SystemID        -split ';' | Where-Object { $_ }) }
-            if ($PackageInfo.AllMachineTypes) { $AppMachineType += ($PackageInfo.AllMachineTypes -split ';' | Where-Object { $_ }) }
-            if ($PackageInfo.MachineType)     { $AppMachineType += ($PackageInfo.MachineType    -split ';' | Where-Object { $_ }) }
-            $AppMachineType = @($AppMachineType | Select-Object -Unique)
-
-            $FolderPath = if ($Type -eq 'BIOS') { "Driver Automation\BIOS\$Make" } else { "Driver Automation\Drivers\$Make" }
-
-            $AppParams = @{
-                Name         = $PackageName
-                SourcePath   = $ExistingPkg.SourcePath
-                Mode         = if ($Type -eq 'BIOS') { 'BIOS' } else { 'Driver' }
-                Manufacturer = $Make
-                Model        = $ModelName
-                Version      = $Version
-                FolderPath   = $FolderPath
-            }
-            if ($AppSystemSKU.Count -gt 0)   { $AppParams['SystemSKU']   = $AppSystemSKU }
-            if ($AppMachineType.Count -gt 0) { $AppParams['MachineType'] = $AppMachineType }
-            if ($Type -eq 'BIOS' -and $BIOSPassword) { $AppParams['BIOSPassword'] = $BIOSPassword }
-
-            try {
-                $PkgResult = New-DATConfigMgrApplication @AppParams
-                Distribute-DATApplicationContent -ApplicationName $PackageName `
-                    -DistributionPoints $DistributionPoints `
-                    -DistributionPointGroups $DistributionPointGroups `
-                    -IsUpdate
-                Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
-                    -Version $Version -PackageID $PkgResult.PackageID -Status 'Success'
-
-                return [PSCustomObject]@{
-                    Manufacturer = $Make
-                    Model        = $ModelName
-                    Type         = $Type
-                    Version      = $Version
-                    PackageID    = $PkgResult.PackageID
-                    Status       = 'Success'
-                    Message      = 'Apply script and deployment type refreshed'
-                }
-            } catch {
-                Write-DATLog -Message "Application refresh failed: $($_.Exception.Message) - falling through to full re-download" -Severity 2
-                # Fall through to the full download path as recovery
-            }
         } else {
+            $Refresh = & $TryApplicationRefresh $ExistingPkg $Version
+            if ($Refresh) { return $Refresh }
+
             Write-DATLog -Message "Package already exists at version $Version`: $PackageName - Skipping" -Severity 1
 
             Write-DATJobSummary -Manufacturer $Make -Model $ModelName -Type $Type `
