@@ -303,7 +303,10 @@ function Install-InfTree {
 
     # Per-driver counters from pnputil text. Multiple phrasings cover language
     # / build differences in pnputil output across Windows builds.
+    # Cast both to [string] explicitly - Get-Content -Raw on an empty file
+    # returns $null (not "") which would make later .Trim() calls throw.
     $StdOut = [string]$StdOut
+    $StdErr = [string]$StdErr
     $Successes = ([regex]::Matches($StdOut, '(?im)(Driver package added successfully|Successfully installed)')).Count
     $Failures  = ([regex]::Matches($StdOut, '(?im)(Failed to (?:install|add) (?:driver )?package)')).Count
     $Attempts  = ([regex]::Matches($StdOut, '(?im)(Adding driver package|Processing driver package)')).Count
@@ -396,28 +399,21 @@ function Install-DriverContent {
 
 function Install-DriverContentFromWim {
     <#
-        Mounts a DAT-produced WIM driver pack, copies contents to a plain
-        directory, runs Install-InfTree against the copy, then dismounts and
-        cleans up. Mirrors the proven flow from the legacy apply script
-        (mount + copy-out + install + dismount + cleanup). Staging under
-        ProgramData rather than %TEMP% avoids AV on-access scan noise.
-
-        The copy step looks redundant but is what the legacy script did and
-        what the Dell/Lenovo community apply scripts do - pnputil running
-        against a mounted WIM works in most cases but occasionally mis-handles
-        driver packs with INFs referencing relative paths (e.g. CopyFiles
-        directives pointing to sibling subdirectories). Installing from a
-        plain filesystem copy sidesteps that whole class of issues.
+        Mounts a DAT-produced WIM driver pack read-only and runs Install-InfTree
+        directly against the mount point. No copy-out step - we previously tried
+        the mount + copy-out + install pattern from the legacy script, but in
+        the online-install context Copy-Item -Recurse from a WIM mount has been
+        seen to silently miss some referenced files (CAT files in particular),
+        which then makes pnputil fail with "The system cannot find the file
+        specified" when it tries to read those files during driver-store import.
+        Reading INFs and their referenced files directly from the WIM mount
+        lets the WIM filesystem driver handle path resolution natively.
     #>
     param([Parameter(Mandatory)][string]$WimPath)
 
-    $StageRoot  = Join-Path $env:ProgramData ("DriverAutomationTool\Driver_{0}" -f $PID)
-    $MountPoint = Join-Path $StageRoot 'Mount'
-    $CopyPoint  = Join-Path $StageRoot 'Content'
-
-    if (Test-Path $StageRoot) { Remove-Item -Path $StageRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    $MountPoint = Join-Path $env:ProgramData ("DriverAutomationTool\DriverMount_{0}" -f $PID)
+    if (Test-Path $MountPoint) { Remove-Item -Path $MountPoint -Recurse -Force -ErrorAction SilentlyContinue }
     New-Item -Path $MountPoint -ItemType Directory -Force | Out-Null
-    New-Item -Path $CopyPoint  -ItemType Directory -Force | Out-Null
 
     $Mounted = $false
     try {
@@ -426,12 +422,10 @@ function Install-DriverContentFromWim {
         $Mounted = $true
         Write-Log 'WIM mounted successfully'
 
-        Write-Log "Copying mounted WIM contents to staging: $CopyPoint"
-        Get-ChildItem -Path $MountPoint | Copy-Item -Destination $CopyPoint -Recurse -Container -Force -ErrorAction Stop
-        $CopiedFiles = @(Get-ChildItem -Path $CopyPoint -Recurse -File -ErrorAction SilentlyContinue)
-        Write-Log "Staged $($CopiedFiles.Count) file(s) from WIM"
+        $MountInfFiles = @(Get-ChildItem -Path $MountPoint -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+        Write-Log "WIM mount surfaces $($MountInfFiles.Count) .inf file(s)"
 
-        return Install-InfTree -Path $CopyPoint
+        return Install-InfTree -Path $MountPoint
     } finally {
         if ($Mounted) {
             Write-Log "Dismounting WIM: $MountPoint"
@@ -442,7 +436,7 @@ function Install-DriverContentFromWim {
                 Write-Log "Dismount failed (may leave a stale mount): $($_.Exception.Message)" -Severity 2
             }
         }
-        Remove-Item -Path $StageRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $MountPoint -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
