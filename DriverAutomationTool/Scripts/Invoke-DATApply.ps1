@@ -255,9 +255,13 @@ function Compare-BIOSVersion {
 # -------------------------------------------------------------------------
 function Install-InfTree {
     <#
-        Runs pnputil against a directory tree of .inf files. Returns 0 on success,
-        propagates pnputil's exit code on failure, sets $script:RebootRequired if
-        pnputil reports a restart is needed.
+        Runs pnputil against a directory tree of .inf files. Captures pnputil's
+        stdout / stderr (without which the apply script has no visibility into
+        per-driver outcomes) and applies a lenient exit-code policy: pnputil's
+        overall exit code reflects only the last driver in the batch, so a 270/271
+        success run still reports the failing driver's code. We treat the run as
+        success when at least some drivers landed and the failure ratio is small.
+        Returns 0 on success, propagates pnputil's exit code on real failure.
     #>
     param([Parameter(Mandatory)][string]$Path)
 
@@ -277,19 +281,76 @@ function Install-InfTree {
         throw "pnputil.exe not found at $PnpUtil"
     }
 
-    # Single recursive invocation covers every .inf under $Path. /subdirs walks
-    # subdirectories; /install stages and binds drivers to devices.
+    $StdOutFile = Join-Path $env:ProgramData ("DriverAutomationTool\pnputil_{0}.out" -f $PID)
+    $StdErrFile = Join-Path $env:ProgramData ("DriverAutomationTool\pnputil_{0}.err" -f $PID)
+    foreach ($f in @($StdOutFile, $StdErrFile)) {
+        $dir = Split-Path $f -Parent
+        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+    }
+
     Write-Log "Running: pnputil.exe /add-driver `"$Path\*.inf`" /subdirs /install"
     $PnpArgs = @('/add-driver', "$Path\*.inf", '/subdirs', '/install')
-    $Proc = Start-Process -FilePath $PnpUtil -ArgumentList $PnpArgs -Wait -PassThru -NoNewWindow
+    $Proc = Start-Process -FilePath $PnpUtil -ArgumentList $PnpArgs `
+        -Wait -PassThru -NoNewWindow `
+        -RedirectStandardOutput $StdOutFile `
+        -RedirectStandardError  $StdErrFile
     $ExitCode = $Proc.ExitCode
-    Write-Log "pnputil exit code: $ExitCode"
 
-    # pnputil returns 3010 / 259 when a restart is required - both are success.
-    if ($ExitCode -eq 3010 -or $ExitCode -eq 259) {
+    $StdOut = if (Test-Path $StdOutFile) { Get-Content -Path $StdOutFile -Raw -ErrorAction SilentlyContinue } else { '' }
+    $StdErr = if (Test-Path $StdErrFile) { Get-Content -Path $StdErrFile -Raw -ErrorAction SilentlyContinue } else { '' }
+    Remove-Item -Path $StdOutFile, $StdErrFile -Force -ErrorAction SilentlyContinue
+
+    # Per-driver counters from pnputil text. Multiple phrasings cover language
+    # / build differences in pnputil output across Windows builds.
+    $StdOut = [string]$StdOut
+    $Successes = ([regex]::Matches($StdOut, '(?im)(Driver package added successfully|Successfully installed)')).Count
+    $Failures  = ([regex]::Matches($StdOut, '(?im)(Failed to (?:install|add) (?:driver )?package)')).Count
+    $Attempts  = ([regex]::Matches($StdOut, '(?im)(Adding driver package|Processing driver package)')).Count
+
+    # End-of-run summary (newer pnputil versions emit this).
+    $SummaryAdded = if ($StdOut -match 'Added driver packages?:\s+(\d+)') { [int]$Matches[1] } else { 0 }
+    $SummaryTotal = if ($StdOut -match 'Total driver packages?:\s+(\d+)') { [int]$Matches[1] } else { 0 }
+
+    Write-Log "pnputil exit code: $ExitCode"
+    Write-Log "pnputil summary: attempts=$Attempts succeeded=$Successes failed=$Failures (summary line: added=$SummaryAdded/total=$SummaryTotal)"
+
+    # Log full output for diagnostic value. Long but worth the noise during the
+    # current shakedown phase.
+    if ($StdOut.Trim()) {
+        $OutLines = @($StdOut -split "`r?`n" | Where-Object { $_.Trim() })
+        Write-Log "pnputil stdout ($($OutLines.Count) line(s) follow):"
+        foreach ($L in $OutLines) { Write-Log "  $L" }
+    }
+    if ($StdErr.Trim()) {
+        $ErrLines = @($StdErr -split "`r?`n" | Where-Object { $_.Trim() })
+        Write-Log "pnputil stderr ($($ErrLines.Count) line(s) follow):" -Severity 2
+        foreach ($L in $ErrLines) { Write-Log "  $L" -Severity 2 }
+    }
+
+    # Reboot signaling - pnputil returns 3010 / 259 when restart is required,
+    # and some builds put it in stdout text instead of the exit code.
+    $RebootSignaled = ($ExitCode -eq 3010 -or $ExitCode -eq 259) -or
+                      ($StdOut -match '(?i)restart (?:is )?required|reboot (?:is )?required')
+
+    # Decide pass/fail. Prefer the summary line if pnputil emitted one.
+    $EffectiveAdded = if ($SummaryAdded -gt 0) { $SummaryAdded } else { $Successes }
+    $EffectiveTotal = if ($SummaryTotal -gt 0) { $SummaryTotal } else { $Attempts }
+
+    if ($EffectiveAdded -gt 0 -and ($Failures -eq 0 -or ($EffectiveTotal -gt 0 -and ($Failures / $EffectiveTotal) -le 0.10))) {
+        if ($ExitCode -ne 0 -and $ExitCode -ne 3010 -and $ExitCode -ne 259) {
+            Write-Log "Treating pnputil exit code $ExitCode as success - $EffectiveAdded driver package(s) added, $Failures failure(s)" -Severity 2
+        }
+        if ($RebootSignaled) { $script:RebootRequired = $true }
+        return 0
+    }
+
+    if ($RebootSignaled -and $EffectiveAdded -gt 0) {
         $script:RebootRequired = $true
         return 0
     }
+
+    # Real failure path
     return $ExitCode
 }
 
