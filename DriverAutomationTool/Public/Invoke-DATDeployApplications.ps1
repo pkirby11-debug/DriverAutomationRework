@@ -87,20 +87,27 @@ function Invoke-DATDeployApplications {
                     continue
                 }
 
+                # -TimeBaseOn qualifies AvailableDateTime/DeadlineDateTime/SoftDeadlineDateTime;
+                # passing it without any of those throws InvalidOperationException, which
+                # surfaces as the unhelpful "Invalid operation" error. Omit it - the
+                # cmdlet defaults to local time when DateTime parameters are absent.
                 New-CMApplicationDeployment `
                     -Name $AppName `
                     -CollectionName $CollectionName `
                     -DeployAction $DeployAction `
                     -DeployPurpose $DeployPurpose `
                     -UserNotification $UserNotification `
-                    -TimeBaseOn LocalTime `
                     -ErrorAction Stop | Out-Null
 
                 Write-DATLog -Message "Deployed '$AppName' to '$CollectionName' ($DeployPurpose / $DeployAction)" -Severity 1
                 $Results.Add(@{ Name = $AppName; Status = 'Created' })
             } catch {
-                Write-DATLog -Message "Failed to deploy '$AppName' to '$CollectionName': $($_.Exception.Message)" -Severity 3
-                $Results.Add(@{ Name = $AppName; Status = 'Failed'; Error = $_.Exception.Message })
+                # Surface the underlying exception type so generic SCCM messages
+                # like "Invalid operation" can be tied back to a specific failure.
+                $ErrType = $_.Exception.GetType().FullName
+                $ErrMsg  = "$ErrType - $($_.Exception.Message)"
+                Write-DATLog -Message "Failed to deploy '$AppName' to '$CollectionName': $ErrMsg" -Severity 3
+                $Results.Add(@{ Name = $AppName; Status = 'Failed'; Error = $ErrMsg })
             }
         }
     } finally {
