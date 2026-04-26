@@ -2379,21 +2379,35 @@ function Find-DATExistingApplications {
     try {
         Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
 
-        $Filter = '*'
-        if ($Model) { $Filter = "*$Model*" }
-        $Apps = @(Get-CMApplication -Name $Filter -Fast -ErrorAction SilentlyContinue)
+        # Get-CMApplication's -Name parameter is unreliable with the literal '*'
+        # wildcard across module versions (some return zero results). Omit -Name
+        # entirely when no model filter is specified to enumerate all apps,
+        # then filter by LocalizedDisplayName (the actual user-visible title;
+        # the .Name property on the IResultObject can be empty).
+        if ($Model) {
+            $Apps = @(Get-CMApplication -Name "*$Model*" -Fast -ErrorAction SilentlyContinue)
+        } else {
+            $Apps = @(Get-CMApplication -Fast -ErrorAction SilentlyContinue)
+        }
+
         if ($Manufacturer) {
-            $Apps = $Apps | Where-Object { $_.Manufacturer -eq $Manufacturer -or $_.Name -like "*$Manufacturer*" }
+            $Apps = $Apps | Where-Object {
+                $_.Manufacturer -eq $Manufacturer -or $_.LocalizedDisplayName -like "*$Manufacturer*"
+            }
         }
         if ($Type -eq 'Drivers') {
-            $Apps = $Apps | Where-Object { $_.Name -like 'Drivers - *' -or $_.Name -like 'Test - Drivers - *' }
+            $Apps = $Apps | Where-Object {
+                $_.LocalizedDisplayName -like 'Drivers - *' -or $_.LocalizedDisplayName -like 'Test - Drivers - *'
+            }
         } elseif ($Type -eq 'BIOS') {
-            $Apps = $Apps | Where-Object { $_.Name -like 'BIOS Update - *' -or $_.Name -like 'Test - BIOS Update - *' }
+            $Apps = $Apps | Where-Object {
+                $_.LocalizedDisplayName -like 'BIOS Update - *' -or $_.LocalizedDisplayName -like 'Test - BIOS Update - *'
+            }
         }
 
         return $Apps | Select-Object @{N='PackageID';E={[string]$_.CI_ID}},
             @{N='CI_ID';E={[string]$_.CI_ID}},
-            Name,
+            @{N='Name';E={$_.LocalizedDisplayName}},
             @{N='Version';E={$_.SoftwareVersion}},
             @{N='Manufacturer';E={$_.Manufacturer}},
             @{N='Description';E={$_.LocalizedDescription}},
