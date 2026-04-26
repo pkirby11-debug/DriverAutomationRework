@@ -690,6 +690,271 @@ function New-DATMainForm {
     $PkgMgmtTab.Controls.Add($PkgGrid)
     $PkgMgmtTab.Controls.Add($PkgFilterPanel)
 
+    # --- Tab 5: Deploy Applications ---
+    $DeployTab = New-Object System.Windows.Forms.TabPage
+    $DeployTab.Text = 'Deploy Applications'
+    $DeployTab.Padding = New-Object System.Windows.Forms.Padding(10)
+    $TabControl.TabPages.Add($DeployTab)
+
+    # Top filter / options panel (added to tab later for correct dock order)
+    $DeployTopPanel = New-Object System.Windows.Forms.Panel
+    $DeployTopPanel.Dock = 'Top'
+    $DeployTopPanel.Height = 215
+
+    # --- Application type filter (which kind of apps to list) ---
+    $DeployTypeGroup = New-Object System.Windows.Forms.GroupBox
+    $DeployTypeGroup.Text = 'Application Type'
+    $DeployTypeGroup.Location = New-Object System.Drawing.Point(10, 5)
+    $DeployTypeGroup.Size = New-Object System.Drawing.Size(220, 95)
+    $DeployTopPanel.Controls.Add($DeployTypeGroup)
+
+    $DeployDriverCheckBox = New-Object System.Windows.Forms.CheckBox
+    $DeployDriverCheckBox.Text = 'Driver Applications'
+    $DeployDriverCheckBox.Location = New-Object System.Drawing.Point(15, 22)
+    $DeployDriverCheckBox.Checked = $true
+    $DeployDriverCheckBox.AutoSize = $true
+    $DeployTypeGroup.Controls.Add($DeployDriverCheckBox)
+    $Controls['DeployDriverCheckBox'] = $DeployDriverCheckBox
+
+    $DeployBIOSCheckBox = New-Object System.Windows.Forms.CheckBox
+    $DeployBIOSCheckBox.Text = 'BIOS Applications'
+    $DeployBIOSCheckBox.Location = New-Object System.Drawing.Point(15, 45)
+    $DeployBIOSCheckBox.AutoSize = $true
+    $DeployTypeGroup.Controls.Add($DeployBIOSCheckBox)
+    $Controls['DeployBIOSCheckBox'] = $DeployBIOSCheckBox
+
+    $DeployIncludeTestCheckBox = New-Object System.Windows.Forms.CheckBox
+    $DeployIncludeTestCheckBox.Text = "Include 'Test - ' apps"
+    $DeployIncludeTestCheckBox.Location = New-Object System.Drawing.Point(15, 68)
+    $DeployIncludeTestCheckBox.AutoSize = $true
+    $DeployTypeGroup.Controls.Add($DeployIncludeTestCheckBox)
+    $Controls['DeployIncludeTestCheckBox'] = $DeployIncludeTestCheckBox
+
+    # --- Manufacturer filter ---
+    $DeployMfrGroup = New-Object System.Windows.Forms.GroupBox
+    $DeployMfrGroup.Text = 'Manufacturer Filter'
+    $DeployMfrGroup.Location = New-Object System.Drawing.Point(240, 5)
+    $DeployMfrGroup.Size = New-Object System.Drawing.Size(220, 95)
+    $DeployTopPanel.Controls.Add($DeployMfrGroup)
+
+    $DeployDellCheckBox = New-Object System.Windows.Forms.CheckBox
+    $DeployDellCheckBox.Text = 'Dell'
+    $DeployDellCheckBox.Location = New-Object System.Drawing.Point(15, 22)
+    $DeployDellCheckBox.Checked = $true
+    $DeployDellCheckBox.AutoSize = $true
+    $DeployMfrGroup.Controls.Add($DeployDellCheckBox)
+    $Controls['DeployDellCheckBox'] = $DeployDellCheckBox
+
+    $DeployLenovoCheckBox = New-Object System.Windows.Forms.CheckBox
+    $DeployLenovoCheckBox.Text = 'Lenovo'
+    $DeployLenovoCheckBox.Location = New-Object System.Drawing.Point(80, 22)
+    $DeployLenovoCheckBox.Checked = $true
+    $DeployLenovoCheckBox.AutoSize = $true
+    $DeployMfrGroup.Controls.Add($DeployLenovoCheckBox)
+    $Controls['DeployLenovoCheckBox'] = $DeployLenovoCheckBox
+
+    $DeployMicrosoftCheckBox = New-Object System.Windows.Forms.CheckBox
+    $DeployMicrosoftCheckBox.Text = 'Microsoft'
+    $DeployMicrosoftCheckBox.Location = New-Object System.Drawing.Point(155, 22)
+    $DeployMicrosoftCheckBox.Checked = $true
+    $DeployMicrosoftCheckBox.AutoSize = $true
+    $DeployMfrGroup.Controls.Add($DeployMicrosoftCheckBox)
+    $Controls['DeployMicrosoftCheckBox'] = $DeployMicrosoftCheckBox
+
+    $DeployModelLabel = New-Object System.Windows.Forms.Label
+    $DeployModelLabel.Text = 'Model contains:'
+    $DeployModelLabel.Location = New-Object System.Drawing.Point(15, 52)
+    $DeployModelLabel.AutoSize = $true
+    $DeployMfrGroup.Controls.Add($DeployModelLabel)
+
+    $DeployModelInput = New-Object System.Windows.Forms.TextBox
+    $DeployModelInput.Location = New-Object System.Drawing.Point(15, 70)
+    $DeployModelInput.Width = 190
+    $DeployMfrGroup.Controls.Add($DeployModelInput)
+    $Controls['DeployModelInput'] = $DeployModelInput
+
+    # --- Deployment options ---
+    $DeployOptGroup = New-Object System.Windows.Forms.GroupBox
+    $DeployOptGroup.Text = 'Deployment Options'
+    $DeployOptGroup.Location = New-Object System.Drawing.Point(470, 5)
+    $DeployOptGroup.Size = New-Object System.Drawing.Size(540, 95)
+    $DeployOptGroup.Anchor = 'Top,Left,Right'
+    $DeployTopPanel.Controls.Add($DeployOptGroup)
+
+    $DeployPurposeLabel = New-Object System.Windows.Forms.Label
+    $DeployPurposeLabel.Text = 'Purpose:'
+    $DeployPurposeLabel.Location = New-Object System.Drawing.Point(15, 25)
+    $DeployPurposeLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployPurposeLabel)
+
+    $DeployPurposeAvailableRadio = New-Object System.Windows.Forms.RadioButton
+    $DeployPurposeAvailableRadio.Text = 'Available'
+    $DeployPurposeAvailableRadio.Location = New-Object System.Drawing.Point(80, 23)
+    $DeployPurposeAvailableRadio.Checked = $true
+    $DeployPurposeAvailableRadio.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployPurposeAvailableRadio)
+    $Controls['DeployPurposeAvailableRadio'] = $DeployPurposeAvailableRadio
+
+    $DeployPurposeRequiredRadio = New-Object System.Windows.Forms.RadioButton
+    $DeployPurposeRequiredRadio.Text = 'Required'
+    $DeployPurposeRequiredRadio.Location = New-Object System.Drawing.Point(170, 23)
+    $DeployPurposeRequiredRadio.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployPurposeRequiredRadio)
+    $Controls['DeployPurposeRequiredRadio'] = $DeployPurposeRequiredRadio
+
+    $DeployActionLabel = New-Object System.Windows.Forms.Label
+    $DeployActionLabel.Text = 'Action:'
+    $DeployActionLabel.Location = New-Object System.Drawing.Point(260, 25)
+    $DeployActionLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployActionLabel)
+
+    $DeployActionInstallRadio = New-Object System.Windows.Forms.RadioButton
+    $DeployActionInstallRadio.Text = 'Install'
+    $DeployActionInstallRadio.Location = New-Object System.Drawing.Point(310, 23)
+    $DeployActionInstallRadio.Checked = $true
+    $DeployActionInstallRadio.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployActionInstallRadio)
+    $Controls['DeployActionInstallRadio'] = $DeployActionInstallRadio
+
+    $DeployActionUninstallRadio = New-Object System.Windows.Forms.RadioButton
+    $DeployActionUninstallRadio.Text = 'Uninstall'
+    $DeployActionUninstallRadio.Location = New-Object System.Drawing.Point(385, 23)
+    $DeployActionUninstallRadio.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployActionUninstallRadio)
+    $Controls['DeployActionUninstallRadio'] = $DeployActionUninstallRadio
+
+    $DeployUserNotifLabel = New-Object System.Windows.Forms.Label
+    $DeployUserNotifLabel.Text = 'User notification:'
+    $DeployUserNotifLabel.Location = New-Object System.Drawing.Point(15, 60)
+    $DeployUserNotifLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployUserNotifLabel)
+
+    $DeployUserNotifCombo = New-Object System.Windows.Forms.ComboBox
+    $DeployUserNotifCombo.Location = New-Object System.Drawing.Point(120, 57)
+    $DeployUserNotifCombo.Width = 200
+    $DeployUserNotifCombo.DropDownStyle = 'DropDownList'
+    $DeployUserNotifCombo.Items.AddRange(@('DisplayAll', 'DisplaySoftwareCenterOnly', 'HideAll'))
+    $DeployUserNotifCombo.SelectedIndex = 0
+    $DeployOptGroup.Controls.Add($DeployUserNotifCombo)
+    $Controls['DeployUserNotifCombo'] = $DeployUserNotifCombo
+
+    # --- Collection picker + action row ---
+    $DeployCollectionLabel = New-Object System.Windows.Forms.Label
+    $DeployCollectionLabel.Text = 'Target Collection:'
+    $DeployCollectionLabel.Location = New-Object System.Drawing.Point(10, 115)
+    $DeployCollectionLabel.AutoSize = $true
+    $DeployTopPanel.Controls.Add($DeployCollectionLabel)
+
+    $DeployCollectionCombo = New-Object System.Windows.Forms.ComboBox
+    $DeployCollectionCombo.Location = New-Object System.Drawing.Point(125, 112)
+    $DeployCollectionCombo.Width = 500
+    $DeployCollectionCombo.DropDownStyle = 'DropDown'  # editable so users can type/filter
+    $DeployCollectionCombo.AutoCompleteMode = 'SuggestAppend'
+    $DeployCollectionCombo.AutoCompleteSource = 'ListItems'
+    $DeployCollectionCombo.Anchor = 'Top,Left,Right'
+    $DeployTopPanel.Controls.Add($DeployCollectionCombo)
+    $Controls['DeployCollectionCombo'] = $DeployCollectionCombo
+
+    $DeployRefreshCollectionsButton = New-Object System.Windows.Forms.Button
+    $DeployRefreshCollectionsButton.Text = 'Refresh Collections'
+    $DeployRefreshCollectionsButton.Location = New-Object System.Drawing.Point(635, 110)
+    $DeployRefreshCollectionsButton.Width = 140
+    $DeployRefreshCollectionsButton.Anchor = 'Top,Right'
+    $DeployTopPanel.Controls.Add($DeployRefreshCollectionsButton)
+    $Controls['DeployRefreshCollectionsButton'] = $DeployRefreshCollectionsButton
+
+    # --- App-list action row ---
+    $DeployRefreshAppsButton = New-Object System.Windows.Forms.Button
+    $DeployRefreshAppsButton.Text = 'Refresh Applications'
+    $DeployRefreshAppsButton.Location = New-Object System.Drawing.Point(10, 150)
+    $DeployRefreshAppsButton.Width = 150
+    $DeployTopPanel.Controls.Add($DeployRefreshAppsButton)
+    $Controls['DeployRefreshAppsButton'] = $DeployRefreshAppsButton
+
+    $DeploySelectAllButton = New-Object System.Windows.Forms.Button
+    $DeploySelectAllButton.Text = 'Select All'
+    $DeploySelectAllButton.Location = New-Object System.Drawing.Point(170, 150)
+    $DeploySelectAllButton.Width = 90
+    $DeployTopPanel.Controls.Add($DeploySelectAllButton)
+    $Controls['DeploySelectAllButton'] = $DeploySelectAllButton
+
+    $DeploySelectNoneButton = New-Object System.Windows.Forms.Button
+    $DeploySelectNoneButton.Text = 'Select None'
+    $DeploySelectNoneButton.Location = New-Object System.Drawing.Point(265, 150)
+    $DeploySelectNoneButton.Width = 90
+    $DeployTopPanel.Controls.Add($DeploySelectNoneButton)
+    $Controls['DeploySelectNoneButton'] = $DeploySelectNoneButton
+
+    $DeployAppsSearchLabel = New-Object System.Windows.Forms.Label
+    $DeployAppsSearchLabel.Text = 'Search:'
+    $DeployAppsSearchLabel.Location = New-Object System.Drawing.Point(370, 154)
+    $DeployAppsSearchLabel.AutoSize = $true
+    $DeployTopPanel.Controls.Add($DeployAppsSearchLabel)
+
+    $DeployAppsSearchBox = New-Object System.Windows.Forms.TextBox
+    $DeployAppsSearchBox.Location = New-Object System.Drawing.Point(420, 151)
+    $DeployAppsSearchBox.Width = 300
+    $DeployTopPanel.Controls.Add($DeployAppsSearchBox)
+    $Controls['DeployAppsSearchBox'] = $DeployAppsSearchBox
+
+    $DeployButton = New-Object System.Windows.Forms.Button
+    $DeployButton.Text = 'Deploy Selected'
+    $DeployButton.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $DeployButton.Location = New-Object System.Drawing.Point(10, 185)
+    $DeployButton.Size = New-Object System.Drawing.Size(160, 26)
+    $DeployButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    $DeployButton.ForeColor = [System.Drawing.Color]::White
+    $DeployButton.FlatStyle = 'Flat'
+    $DeployTopPanel.Controls.Add($DeployButton)
+    $Controls['DeployButton'] = $DeployButton
+
+    $DeployStatusLabel = New-Object System.Windows.Forms.Label
+    $DeployStatusLabel.Text = 'Connect to ConfigMgr to populate collections, then click Refresh Applications.'
+    $DeployStatusLabel.ForeColor = [System.Drawing.Color]::Gray
+    $DeployStatusLabel.Location = New-Object System.Drawing.Point(180, 191)
+    $DeployStatusLabel.AutoSize = $true
+    $DeployTopPanel.Controls.Add($DeployStatusLabel)
+    $Controls['DeployStatusLabel'] = $DeployStatusLabel
+
+    # --- Application grid ---
+    $DeployAppsGrid = New-Object System.Windows.Forms.DataGridView
+    $DeployAppsGrid.Dock = 'Fill'
+    $DeployAppsGrid.AllowUserToAddRows = $false
+    $DeployAppsGrid.AllowUserToDeleteRows = $false
+    $DeployAppsGrid.RowHeadersVisible = $false
+    $DeployAppsGrid.SelectionMode = 'FullRowSelect'
+    $DeployAppsGrid.BackgroundColor = [System.Drawing.Color]::White
+    $DeployAppsGrid.AutoSizeColumnsMode = 'Fill'
+
+    foreach ($Col in @(
+        @{ Name = 'Selected'; Type = 'CheckBox'; Width = 30 }
+        @{ Name = 'Name'; Type = 'Text'; FillWeight = 55 }
+        @{ Name = 'Version'; Type = 'Text'; Width = 90 }
+        @{ Name = 'Manufacturer'; Type = 'Text'; Width = 110 }
+        @{ Name = 'Kind'; Type = 'Text'; Width = 90 }
+        @{ Name = 'LastModified'; Type = 'Text'; FillWeight = 25 }
+    )) {
+        if ($Col.Type -eq 'CheckBox') {
+            $GridCol = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+        } else {
+            $GridCol = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+            $GridCol.ReadOnly = $true
+        }
+        $GridCol.Name = $Col.Name
+        $GridCol.HeaderText = $Col.Name
+        if ($Col.Width) {
+            $GridCol.Width = $Col.Width
+            $GridCol.AutoSizeMode = 'None'
+        }
+        if ($Col.FillWeight) { $GridCol.FillWeight = $Col.FillWeight }
+        $DeployAppsGrid.Columns.Add($GridCol) | Out-Null
+    }
+    $Controls['DeployAppsGrid'] = $DeployAppsGrid
+
+    # Add to tab in correct dock order: Fill first, Top last
+    $DeployTab.Controls.Add($DeployAppsGrid)
+    $DeployTab.Controls.Add($DeployTopPanel)
+
     # === BOTTOM STATUS BAR === (StatusStrip auto-docks to bottom)
     $StatusStrip = New-Object System.Windows.Forms.StatusStrip
 

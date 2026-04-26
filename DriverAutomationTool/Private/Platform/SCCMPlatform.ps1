@@ -785,6 +785,32 @@ function Get-DATDistributionPointGroups {
     return $DPGs
 }
 
+function Get-DATDeviceCollections {
+    <#
+    .SYNOPSIS
+        Returns all device collections from ConfigMgr, sorted by name.
+    .DESCRIPTION
+        Used by the Deploy Applications GUI tab to populate the target collection
+        picker. Filters to device collections (CollectionType=2) since DAT-managed
+        Applications target devices, not users.
+    .OUTPUTS
+        Array of strings (collection names).
+    #>
+    [CmdletBinding()]
+    param()
+
+    Assert-DATConfigMgrConnected
+
+    # SMS_Collection.CollectionType: 1 = User, 2 = Device, 0 = Other (root only)
+    $Names = Get-WmiObject -ComputerName $script:CMSiteServer `
+        -Namespace "Root\SMS\Site_$($script:CMSiteCode)" `
+        -Query "SELECT Name FROM SMS_Collection WHERE CollectionType = 2" -ErrorAction Stop |
+        Select-Object -ExpandProperty Name |
+        Sort-Object
+
+    return @($Names)
+}
+
 function Get-DATKnownModels {
     <#
     .SYNOPSIS

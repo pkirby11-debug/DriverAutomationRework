@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '1.7.0'
+    ModuleVersion     = '1.8.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = 'Automates downloading, packaging, and distributing Dell and Lenovo drivers and BIOS updates for SCCM/ConfigMgr environments. 1.7 adds ConfigMgr Application support so drivers/BIOS can be deployed outside Task Sequences.'
+    Description       = 'Automates downloading, packaging, and distributing Dell and Lenovo drivers and BIOS updates for SCCM/ConfigMgr environments. 1.8 adds a Deploy Applications GUI tab for bulk-creating deployments of DAT-managed Apps against a target collection.'
     PowerShellVersion = '5.1'
     FunctionsToExport = @(
         'Get-DATDriverPack'
@@ -15,6 +15,7 @@
         'Export-DATReport'
         'Register-DATQueueLogSubscriber'
         'Invoke-DATRemovePackages'
+        'Invoke-DATDeployApplications'
         'Connect-DATIntune'
         'Disconnect-DATIntune'
         'Test-DATIntuneConnection'

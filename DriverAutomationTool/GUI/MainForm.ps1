@@ -248,6 +248,16 @@ function Initialize-DATMainForm {
                 $Controls['DPGGrid'].Rows.Add($false, $DPG)
             }
 
+            # Populate the Deploy Applications collection picker. Failure here is
+            # non-fatal - the user can hit Refresh Collections from the tab itself.
+            try {
+                $Collections = @(Get-DATDeviceCollections)
+                $Controls['DeployCollectionCombo'].Items.Clear()
+                foreach ($C in $Collections) { $Controls['DeployCollectionCombo'].Items.Add($C) | Out-Null }
+            } catch {
+                Write-DATLog -Message "Could not preload device collections: $($_.Exception.Message)" -Severity 2
+            }
+
             $Controls['StatusStripLabel'].Text = "Connected to $Server - $($DPs.Count) DPs, $($DPGs.Count) DPGs"
         } catch {
             $Controls['ConnStatusLabel'].Text = 'Connection Failed'
@@ -863,6 +873,280 @@ function Initialize-DATMainForm {
         $Controls['PkgRefreshButton'].PerformClick()
     })
 
+    # --- Deploy Applications - Refresh Collections ---
+    $Controls['DeployRefreshCollectionsButton'].Add_Click({
+        if (-not $script:CMConnected) {
+            Show-DATFormMessage -Message 'Connect to ConfigMgr first.' -Type Warning
+            return
+        }
+        $Controls['MainForm'].Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        try {
+            $Current = $Controls['DeployCollectionCombo'].Text
+            $Collections = @(Get-DATDeviceCollections)
+            $Controls['DeployCollectionCombo'].Items.Clear()
+            foreach ($C in $Collections) { $Controls['DeployCollectionCombo'].Items.Add($C) | Out-Null }
+            if ($Current -and $Controls['DeployCollectionCombo'].Items.Contains($Current)) {
+                $Controls['DeployCollectionCombo'].SelectedItem = $Current
+            }
+            $Controls['DeployStatusLabel'].Text = "Loaded $($Collections.Count) device collection(s)."
+            $Controls['DeployStatusLabel'].ForeColor = [System.Drawing.Color]::Gray
+        } catch {
+            Show-DATFormMessage -Message "Error loading collections: $($_.Exception.Message)" -Type Error
+        } finally {
+            $Controls['MainForm'].Cursor = [System.Windows.Forms.Cursors]::Default
+        }
+    })
+
+    # --- Deploy Applications - Refresh Apps ---
+    $Controls['DeployRefreshAppsButton'].Add_Click({
+        if (-not $script:CMConnected) {
+            Show-DATFormMessage -Message 'Connect to ConfigMgr first.' -Type Warning
+            return
+        }
+        if (-not ($Controls['DeployDriverCheckBox'].Checked -or $Controls['DeployBIOSCheckBox'].Checked)) {
+            Show-DATFormMessage -Message 'Select at least one Application Type (Driver or BIOS).' -Type Warning
+            return
+        }
+
+        $Controls['DeployAppsGrid'].Rows.Clear()
+        $Controls['MainForm'].Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+
+        try {
+            $Model = $Controls['DeployModelInput'].Text
+            $IncludeTest = $Controls['DeployIncludeTestCheckBox'].Checked
+            $WantedMfrs = @()
+            if ($Controls['DeployDellCheckBox'].Checked)      { $WantedMfrs += 'Dell' }
+            if ($Controls['DeployLenovoCheckBox'].Checked)    { $WantedMfrs += 'Lenovo' }
+            if ($Controls['DeployMicrosoftCheckBox'].Checked) { $WantedMfrs += 'Microsoft' }
+
+            $Types = @()
+            if ($Controls['DeployDriverCheckBox'].Checked) { $Types += 'Drivers' }
+            if ($Controls['DeployBIOSCheckBox'].Checked)   { $Types += 'BIOS' }
+
+            $Found = @()
+            foreach ($T in $Types) {
+                $Params = @{ Type = $T }
+                if ($Model) { $Params['Model'] = $Model }
+                $Found += Find-DATExistingApplications @Params
+            }
+
+            # Filter by manufacturer (default Find returns all manufacturers; allow narrowing).
+            # Microsoft Surface apps in the catalog can have Manufacturer='Microsoft Corporation',
+            # so match by the manufacturer name appearing in the app name as well.
+            if ($WantedMfrs.Count -gt 0 -and $WantedMfrs.Count -lt 3) {
+                $Found = $Found | Where-Object {
+                    $App = $_
+                    $WantedMfrs | Where-Object {
+                        $App.Manufacturer -eq $_ -or $App.Name -like "*$_*"
+                    }
+                }
+            }
+
+            # Excluding test apps when not requested - Find-DATExistingApplications
+            # always includes them since they share the 'Drivers - ' / 'BIOS Update - '
+            # prefix with a 'Test - ' qualifier in front.
+            if (-not $IncludeTest) {
+                $Found = $Found | Where-Object { $_.Name -notlike 'Test - *' }
+            }
+
+            $Found = @($Found | Sort-Object Name -Unique:$false)
+
+            foreach ($App in $Found) {
+                $LastMod = if ($App.LastModified) { ([datetime]$App.LastModified).ToString('yyyy-MM-dd HH:mm') } else { '' }
+                $Controls['DeployAppsGrid'].Rows.Add(
+                    $false,
+                    $App.Name,
+                    $App.Version,
+                    $App.Manufacturer,
+                    $App.Kind,
+                    $LastMod
+                ) | Out-Null
+            }
+
+            $Controls['DeployStatusLabel'].Text = "Found $($Found.Count) application(s) matching the filter."
+            $Controls['DeployStatusLabel'].ForeColor = [System.Drawing.Color]::Gray
+            $Controls['StatusStripLabel'].Text = "Found $($Found.Count) deployable application(s)"
+        } catch {
+            Show-DATFormMessage -Message "Error loading applications: $($_.Exception.Message)" -Type Error
+        } finally {
+            $Controls['MainForm'].Cursor = [System.Windows.Forms.Cursors]::Default
+        }
+    })
+
+    # --- Deploy Applications - Select All / None ---
+    $Controls['DeploySelectAllButton'].Add_Click({
+        foreach ($Row in $Controls['DeployAppsGrid'].Rows) {
+            if ($Row.Visible) { $Row.Cells[0].Value = $true }
+        }
+    })
+
+    $Controls['DeploySelectNoneButton'].Add_Click({
+        foreach ($Row in $Controls['DeployAppsGrid'].Rows) {
+            $Row.Cells[0].Value = $false
+        }
+    })
+
+    # --- Deploy Applications - Search filter ---
+    $Controls['DeployAppsSearchBox'].Add_TextChanged({
+        $SearchText = $Controls['DeployAppsSearchBox'].Text
+        foreach ($Row in $Controls['DeployAppsGrid'].Rows) {
+            if ([string]::IsNullOrEmpty($SearchText)) {
+                $Row.Visible = $true
+            } else {
+                $Name = $Row.Cells['Name'].Value
+                $Mfr  = $Row.Cells['Manufacturer'].Value
+                $Row.Visible = (($Name -and $Name -like "*$SearchText*") -or
+                                ($Mfr  -and $Mfr  -like "*$SearchText*"))
+            }
+        }
+    })
+
+    # --- Deploy Applications - Deploy Selected (background runspace) ---
+    $Controls['DeployButton'].Add_Click({
+        if (-not $script:CMConnected) {
+            Show-DATFormMessage -Message 'Connect to ConfigMgr first.' -Type Warning
+            return
+        }
+
+        $CollectionName = $Controls['DeployCollectionCombo'].Text
+        if ([string]::IsNullOrWhiteSpace($CollectionName)) {
+            Show-DATFormMessage -Message 'Choose a target collection.' -Type Warning
+            return
+        }
+
+        $SelectedRows = @($Controls['DeployAppsGrid'].Rows | Where-Object { $_.Cells[0].Value -eq $true })
+        if ($SelectedRows.Count -eq 0) {
+            Show-DATFormMessage -Message 'Select at least one application to deploy.' -Type Warning
+            return
+        }
+
+        $AppNames = @($SelectedRows | ForEach-Object { $_.Cells['Name'].Value })
+
+        $DeployPurpose = if ($Controls['DeployPurposeRequiredRadio'].Checked) { 'Required' } else { 'Available' }
+        $DeployAction  = if ($Controls['DeployActionUninstallRadio'].Checked) { 'Uninstall' } else { 'Install' }
+        $UserNotif     = $Controls['DeployUserNotifCombo'].Text
+
+        $Confirm = Show-DATFormMessage `
+            -Message ("Create {0} deployment(s) on '{1}'?`n`nPurpose: {2}`nAction: {3}`nNotification: {4}" -f `
+                $AppNames.Count, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif) `
+            -Type Question
+        if ($Confirm -ne 'Yes') { return }
+
+        # Capture connection params before going background
+        $ConnParams = @{ SiteServer = $Controls['SiteServerInput'].Text; SiteCode = $Controls['SiteCodeInput'].Text }
+        if ($Controls['UseSSLCheckBox'].Checked) { $ConnParams['UseSSL'] = $true }
+        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+
+        # Disable the action buttons while the deployment runs
+        $Controls['DeployButton'].Enabled                  = $false
+        $Controls['DeployRefreshAppsButton'].Enabled       = $false
+        $Controls['DeployRefreshCollectionsButton'].Enabled = $false
+        $Controls['StatusStripLabel'].Text = "Deploying $($AppNames.Count) application(s) to '$CollectionName'..."
+        $Controls['DeployStatusLabel'].Text = "Deploying $($AppNames.Count) application(s)..."
+        $Controls['DeployStatusLabel'].ForeColor = [System.Drawing.Color]::Orange
+
+        # Switch to Progress tab so logs are visible while it runs
+        $Controls['TabControl'].SelectedIndex = 2
+        $Controls['LogListBox'].Items.Clear()
+
+        $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+        $DeployScript = {
+            param($ModulePath, $ConnParams, $AppNames, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $LogQueue)
+
+            Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+            Register-DATQueueLogSubscriber -LogQueue $LogQueue
+
+            return Invoke-DATDeployApplications @ConnParams `
+                -Applications     $AppNames `
+                -CollectionName   $CollectionName `
+                -DeployPurpose    $DeployPurpose `
+                -DeployAction     $DeployAction `
+                -UserNotification $UserNotif
+        }
+
+        $script:DeployRunspace = [System.Management.Automation.PowerShell]::Create()
+        $script:DeployRunspace.AddScript($DeployScript).
+            AddArgument($ModulePath).
+            AddArgument($ConnParams).
+            AddArgument($AppNames).
+            AddArgument($CollectionName).
+            AddArgument($DeployPurpose).
+            AddArgument($DeployAction).
+            AddArgument($UserNotif).
+            AddArgument($script:LogQueue) | Out-Null
+        $script:DeployHandle = $script:DeployRunspace.BeginInvoke()
+
+        $script:TimerControls = $Controls
+
+        if ($script:DeployTimer) { $script:DeployTimer.Stop(); $script:DeployTimer.Dispose() }
+        $script:DeployTimer = New-Object System.Windows.Forms.Timer
+        $script:DeployTimer.Interval = 500
+
+        $script:DeployTimer.Add_Tick({
+            # Drain log queue to the Progress tab
+            if ($script:LogQueue) {
+                $LogMsg = $null
+                while ($script:LogQueue.TryDequeue([ref]$LogMsg)) {
+                    $script:TimerControls['LogListBox'].Items.Add($LogMsg)
+                }
+                if ($script:TimerControls['LogListBox'].Items.Count -gt 0) {
+                    $script:TimerControls['LogListBox'].TopIndex = $script:TimerControls['LogListBox'].Items.Count - 1
+                }
+            }
+
+            if ($null -eq $script:DeployHandle -or -not $script:DeployHandle.IsCompleted) { return }
+            $script:DeployTimer.Stop()
+
+            # Final log drain
+            if ($script:LogQueue) {
+                $LogMsg = $null
+                while ($script:LogQueue.TryDequeue([ref]$LogMsg)) {
+                    $script:TimerControls['LogListBox'].Items.Add($LogMsg)
+                }
+                if ($script:TimerControls['LogListBox'].Items.Count -gt 0) {
+                    $script:TimerControls['LogListBox'].TopIndex = $script:TimerControls['LogListBox'].Items.Count - 1
+                }
+            }
+
+            # Re-enable buttons
+            $script:TimerControls['DeployButton'].Enabled                  = $true
+            $script:TimerControls['DeployRefreshAppsButton'].Enabled       = $true
+            $script:TimerControls['DeployRefreshCollectionsButton'].Enabled = $true
+
+            try {
+                $Results = $script:DeployRunspace.EndInvoke($script:DeployHandle)
+                $script:DeployRunspace.Dispose()
+
+                $Created = @($Results | Where-Object { $_.Status -eq 'Created' })
+                $Skipped = @($Results | Where-Object { $_.Status -eq 'Skipped' })
+                $Failed  = @($Results | Where-Object { $_.Status -eq 'Failed'  })
+
+                $Summary = "Created: $($Created.Count), Skipped: $($Skipped.Count), Failed: $($Failed.Count)"
+                $script:TimerControls['StatusStripLabel'].Text = "Deploy complete - $Summary"
+                $script:TimerControls['DeployStatusLabel'].Text = "Last deploy: $Summary"
+                $script:TimerControls['DeployStatusLabel'].ForeColor = [System.Drawing.Color]::Gray
+
+                if ($Failed.Count -eq 0) {
+                    Show-DATFormMessage -Message "Deployment complete.`n`n$Summary" -Type Information
+                } else {
+                    $FailList = ($Failed | ForEach-Object { "$($_.Name): $($_.Error)" }) -join "`n"
+                    Show-DATFormMessage -Message "Deployment finished with errors.`n`n$Summary`n`nFailed:`n$FailList" -Type Warning
+                }
+            } catch {
+                $script:TimerControls['StatusStripLabel'].Text = 'Deploy failed'
+                $script:TimerControls['DeployStatusLabel'].Text = "Deploy failed: $($_.Exception.Message)"
+                $script:TimerControls['DeployStatusLabel'].ForeColor = [System.Drawing.Color]::Red
+                Show-DATFormMessage -Message "Deployment failed: $($_.Exception.Message)" -Type Error
+            } finally {
+                $script:DeployHandle = $null
+                $script:LogQueue = $null
+            }
+        })
+
+        $script:DeployTimer.Start()
+    })
+
     # --- Load saved settings on form load ---
     $Form.Add_Load({
         try {
@@ -971,6 +1255,15 @@ function Initialize-DATMainForm {
                                     $Row.Cells['Selected'].Value = $true
                                 }
                             }
+                        }
+
+                        # Pre-populate the Deploy Applications collection picker
+                        try {
+                            $Collections = @(Get-DATDeviceCollections)
+                            $Controls['DeployCollectionCombo'].Items.Clear()
+                            foreach ($C in $Collections) { $Controls['DeployCollectionCombo'].Items.Add($C) | Out-Null }
+                        } catch {
+                            # Non-fatal - user can use Refresh Collections on the Deploy tab
                         }
 
                         $Controls['StatusStripLabel'].Text = "Auto-connected to $($Controls['SiteServerInput'].Text) - Select manufacturers and click Refresh Models"
