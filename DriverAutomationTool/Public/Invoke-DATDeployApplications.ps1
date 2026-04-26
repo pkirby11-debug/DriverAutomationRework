@@ -78,6 +78,14 @@ function Invoke-DATDeployApplications {
 
         Write-DATLog -Message "Deploying $($Applications.Count) application(s) to collection '$CollectionName' as $DeployPurpose / $DeployAction" -Severity 1
 
+        # The SMS provider throws WqlQueryException ("Invalid operation") when a
+        # Required deployment is created without a DeadlineDateTime, even though
+        # the cmdlet help marks it optional. Default to "now" so deployments are
+        # required immediately - users can edit the deadline in the console later.
+        # AvailableDateTime is set to the same instant so the schedule object is
+        # internally consistent.
+        $Now = Get-Date
+
         foreach ($AppName in $Applications) {
             try {
                 $Existing = Get-CMApplicationDeployment -Name $AppName -CollectionName $CollectionName -ErrorAction SilentlyContinue
@@ -87,17 +95,29 @@ function Invoke-DATDeployApplications {
                     continue
                 }
 
-                # -TimeBaseOn qualifies AvailableDateTime/DeadlineDateTime/SoftDeadlineDateTime;
-                # passing it without any of those throws InvalidOperationException, which
-                # surfaces as the unhelpful "Invalid operation" error. Omit it - the
-                # cmdlet defaults to local time when DateTime parameters are absent.
-                New-CMApplicationDeployment `
-                    -Name $AppName `
-                    -CollectionName $CollectionName `
-                    -DeployAction $DeployAction `
-                    -DeployPurpose $DeployPurpose `
-                    -UserNotification $UserNotification `
-                    -ErrorAction Stop | Out-Null
+                # Pass the application as -InputObject rather than -Name so the
+                # cmdlet skips its internal WQL lookup. Reduces the chance of
+                # WqlQueryException on names with characters the provider's
+                # query escaping mishandles.
+                $App = Get-CMApplication -Name $AppName -Fast -ErrorAction Stop | Select-Object -First 1
+                if (-not $App) {
+                    throw "Application '$AppName' not found on site $($script:CMSiteCode)."
+                }
+
+                $DeployParams = @{
+                    InputObject       = $App
+                    CollectionName    = $CollectionName
+                    DeployAction      = $DeployAction
+                    DeployPurpose     = $DeployPurpose
+                    UserNotification  = $UserNotification
+                    AvailableDateTime = $Now
+                    ErrorAction       = 'Stop'
+                }
+                if ($DeployPurpose -eq 'Required') {
+                    $DeployParams['DeadlineDateTime'] = $Now
+                }
+
+                New-CMApplicationDeployment @DeployParams | Out-Null
 
                 Write-DATLog -Message "Deployed '$AppName' to '$CollectionName' ($DeployPurpose / $DeployAction)" -Severity 1
                 $Results.Add(@{ Name = $AppName; Status = 'Created' })
