@@ -303,10 +303,11 @@ function Install-InfTree {
 
     # Per-driver counters from pnputil text. Multiple phrasings cover language
     # / build differences in pnputil output across Windows builds.
-    # Cast both to [string] explicitly - Get-Content -Raw on an empty file
-    # returns $null (not "") which would make later .Trim() calls throw.
-    $StdOut = [string]$StdOut
-    $StdErr = [string]$StdErr
+    # Defensively normalize to a non-null string. Get-Content -Raw on an empty
+    # / missing file returns $null and the [string] cast has been seen to keep
+    # null in some SYSTEM-context edge cases, which would crash .Trim() below.
+    if ($null -eq $StdOut) { $StdOut = '' }
+    if ($null -eq $StdErr) { $StdErr = '' }
     $Successes = ([regex]::Matches($StdOut, '(?im)(Driver package added successfully|Successfully installed)')).Count
     $Failures  = ([regex]::Matches($StdOut, '(?im)(Failed to (?:install|add) (?:driver )?package)')).Count
     $Attempts  = ([regex]::Matches($StdOut, '(?im)(Adding driver package|Processing driver package)')).Count
@@ -319,14 +320,14 @@ function Install-InfTree {
     Write-Log "pnputil summary: attempts=$Attempts succeeded=$Successes failed=$Failures (summary line: added=$SummaryAdded/total=$SummaryTotal)"
 
     # Log full output for diagnostic value. Long but worth the noise during the
-    # current shakedown phase.
-    if ($StdOut.Trim()) {
-        $OutLines = @($StdOut -split "`r?`n" | Where-Object { $_.Trim() })
+    # current shakedown phase. IsNullOrWhiteSpace is null-safe; .Trim() is not.
+    if (-not [string]::IsNullOrWhiteSpace($StdOut)) {
+        $OutLines = @($StdOut -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         Write-Log "pnputil stdout ($($OutLines.Count) line(s) follow):"
         foreach ($L in $OutLines) { Write-Log "  $L" }
     }
-    if ($StdErr.Trim()) {
-        $ErrLines = @($StdErr -split "`r?`n" | Where-Object { $_.Trim() })
+    if (-not [string]::IsNullOrWhiteSpace($StdErr)) {
+        $ErrLines = @($StdErr -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         Write-Log "pnputil stderr ($($ErrLines.Count) line(s) follow):" -Severity 2
         foreach ($L in $ErrLines) { Write-Log "  $L" -Severity 2 }
     }
