@@ -571,7 +571,16 @@ function Get-DellIndividualDrivers {
 
         [string]$OperatingSystem,
 
-        [string[]]$MissingCategories
+        [string[]]$MissingCategories,
+
+        # Skip Dell SSD/HDD firmware update DUPs. The Dell per-model catalog ships
+        # firmware DUPs for every drive vendor that ever shipped with the model
+        # (Adata, Kioxia, Micron, Samsung, SK Hynix, SSSTC, SanDisk, WD, ...) -
+        # ~25 DUPs at 25-40 MB each that all self-skip at apply time on any single
+        # device. Excluding them shrinks DriverUpdates packages noticeably without
+        # losing functionality, since the matching firmware also ships in the
+        # base driver pack when it's actually relevant.
+        [switch]$ExcludeStorageFirmware
     )
 
     # Try per-model catalogs first (CatalogIndexPC chain - more current than legacy CatalogPC).
@@ -672,6 +681,12 @@ function Get-DellIndividualDrivers {
     # firmware components (e.g., "Intel Thunderbolt Controller Firmware").
     $ExcludePattern = '\bBIOS\b|SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Digital Delivery|\bApplication\b|\bUtility\b'
 
+    # Storage firmware exclusion (opt-in via -ExcludeStorageFirmware).
+    # Matches DUP display names like "Kioxia BG5 Solid State Drive Firmware Update"
+    # or "WDC WD20EZBX Hard Drive Firmware Update". The "Firmware Update" anchor
+    # keeps this from catching legitimate drive controller drivers like Intel RST.
+    $StorageFirmwarePattern = '(Solid State Drive|\bSSD\b|Hard Drive|\bHDD\b)\s+Firmware\s+Update'
+
     # Scan all catalog(s) and collect matching drivers.
     # When multiple catalogs are available (multi-SystemID models), each catalog is
     # scanned independently and results are merged. Deduplication happens at the end.
@@ -749,6 +764,17 @@ function Get-DellIndividualDrivers {
             # packages that bundle companion apps (e.g., "Intel Graphics Driver and Intel
             # Graphics Software Application" should NOT be excluded despite containing "Application").
             if ($DisplayName -match $ExcludePattern -and $DisplayName -notmatch '\bDriver\b') {
+                $SkippedExcluded++
+                continue
+            }
+
+            # Storage firmware exclusion: drop the parade of Adata/Kioxia/Micron/Samsung/
+            # SK Hynix/SSSTC/SanDisk/WD SSD firmware DUPs and HDD firmware DUPs that the
+            # Dell catalog ships for every drive ever offered with this model. Each only
+            # applies to one drive vendor/model so most exit code 5 (not applicable) at
+            # apply time, and they collectively account for a meaningful share of the
+            # DriverUpdates package size.
+            if ($ExcludeStorageFirmware -and $DisplayName -match $StorageFirmwarePattern) {
                 $SkippedExcluded++
                 continue
             }

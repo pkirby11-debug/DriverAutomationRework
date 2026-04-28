@@ -522,12 +522,16 @@ function Install-DriverUpdates {
         Write-Log "$DriverLabel - running $($Drv.FileName)"
         $DupStart = Get-Date
 
-        # /s = silent, /r=0 = no install-time reboot. The DUP still returns code
-        # 2 when it would have rebooted; we aggregate those into a single 3010
-        # at the end so SCCM handles the reboot prompt.
+        # /s alone is the documented silent switch for modern Dell driver DUPs.
+        # /r=0 is BIOS-DUP syntax and driver DUPs reject it (instant exit) - do NOT pass it.
+        # If a DUP returns code 2 we map it to 3010 at the end so SCCM handles reboot.
         try {
-            $Proc = Start-Process -FilePath $DriverExe -ArgumentList '/s', '/r=0' `
+            $Proc = Start-Process -FilePath $DriverExe -ArgumentList '/s' `
                 -NoNewWindow -PassThru -ErrorAction Stop
+            # Touching .Handle forces PS 5.1's Start-Process to retain the OS handle.
+            # Without this, $Proc.ExitCode reads as $null after WaitForExit on PS 5.1
+            # and every DUP looks like a failure even when it succeeded.
+            $null = $Proc.Handle
             $Completed = $Proc.WaitForExit($PerDupTimeoutMs)
             if (-not $Completed) {
                 Write-Log "$DriverLabel - timed out after 15 minutes - killing" -Severity 2

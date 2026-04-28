@@ -677,6 +677,12 @@ function Invoke-DATSyncSinglePackage {
             if ($SmartCheckMissing.Count -gt 0) {
                 $GetDriverParams['MissingCategories'] = $SmartCheckMissing
             }
+            # Smart-check fingerprint must use the same filter set the post-download
+            # path will use, otherwise an unchanged package looks "changed" when we
+            # later re-resolve drivers without the storage firmware DUPs.
+            if ($Type -eq 'DriverUpdates') {
+                $GetDriverParams['ExcludeStorageFirmware'] = $true
+            }
             $CachedIndividualDrivers = Get-DellIndividualDrivers @GetDriverParams
 
             if ($CachedIndividualDrivers -and $CachedIndividualDrivers.Count -gt 0) {
@@ -1140,6 +1146,11 @@ function Invoke-DATSyncSinglePackage {
                     }
                     if ($MissingCats.Count -gt 0) {
                         $GetDriverParams['MissingCategories'] = $MissingCats
+                    }
+                    # DriverUpdates packages: drop SSD/HDD firmware DUPs to keep package
+                    # size manageable. Base 'Drivers' overlay keeps current behavior.
+                    if ($Type -eq 'DriverUpdates') {
+                        $GetDriverParams['ExcludeStorageFirmware'] = $true
                     }
                     $IndividualDrivers = Get-DellIndividualDrivers @GetDriverParams
                 }
