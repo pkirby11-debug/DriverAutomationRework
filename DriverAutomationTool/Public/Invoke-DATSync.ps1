@@ -116,6 +116,9 @@ function Invoke-DATSync {
 
         [bool]$IncludeDrivers = $true,
         [bool]$IncludeBIOS = $false,
+        # Catalog-only "Driver Updates" application: skips the OEM base pack and builds a
+        # package containing only Dell catalog DUPs (the same feed DCU consumes). Dell-only.
+        [bool]$IncludeDriverUpdates = $false,
         [switch]$RemoveLegacy,
         [switch]$CleanSource,
         [switch]$EnableBDR,
@@ -168,6 +171,7 @@ function Invoke-DATSync {
         $DistributionPointGroups = $Config.sccm.distributionPointGroups
         $IncludeDrivers = if ($null -ne $Config.options.includeDrivers) { $Config.options.includeDrivers } else { $true }
         $IncludeBIOS = if ($null -ne $Config.options.includeBIOS) { $Config.options.includeBIOS } else { $false }
+        $IncludeDriverUpdates = if ($null -ne $Config.options.includeDriverUpdates) { $Config.options.includeDriverUpdates } else { $false }
         $RemoveLegacy = [switch]$Config.options.removeLegacy
         $CleanSource = [switch]$Config.options.cleanSource
         $EnableBDR = [switch]$Config.options.enableBDR
@@ -260,6 +264,60 @@ function Invoke-DATSync {
                 } catch {
                     $ErrorCount++
                     Write-DATLog -Message "Error processing drivers for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
+                }
+            }
+
+            # --- DRIVER UPDATES (catalog-only, Dell only) ---
+            # Builds a package from the Dell per-model catalog DUPs without touching
+            # the OEM base driver pack. Used when the base pack's complex DCH driver
+            # INFs (Intel iigd_dch, NVIDIA nvdd, Storage VMD, etc.) fail to import via
+            # pnputil but the standalone catalog DUPs install cleanly.
+            if ($IncludeDriverUpdates) {
+                if ($Make -ne 'Dell') {
+                    Write-DATLog -Message "Driver Updates (catalog-only) is currently Dell-only - skipping $Make $ModelName" -Severity 2
+                } else {
+                    try {
+                        # Reuse Get-DellDriverPack purely to derive SystemID/MachineType for
+                        # the catalog lookup - we won't actually download the pack file.
+                        $DriverPackInfo = Get-DellDriverPack -Model $ModelName -OperatingSystem $OperatingSystem -Architecture $Architecture
+                        if (-not $DriverPackInfo) {
+                            Write-DATLog -Message "No Dell driver pack metadata found for $ModelName / $OperatingSystem - cannot derive SystemID for catalog-only updates" -Severity 2
+                        } else {
+                            $UpdatesInfo = [PSCustomObject]@{
+                                Manufacturer    = $DriverPackInfo.Manufacturer
+                                Model           = $DriverPackInfo.Model
+                                # Placeholder; gets replaced with "Cat.<fingerprint>" after catalog scan.
+                                Version         = 'Catalog'
+                                # Old baseline so the catalog scan returns every applicable component.
+                                ReleaseDate     = '1970-01-01T00:00:00'
+                                SystemID        = $DriverPackInfo.SystemID
+                                MachineType     = $DriverPackInfo.MachineType
+                                AllMachineTypes = $DriverPackInfo.AllMachineTypes
+                                OS              = $DriverPackInfo.OS
+                                Url             = $null
+                                FileName        = $null
+                                Size            = 0
+                                HashMD5         = $null
+                            }
+
+                            $UpdResult = Invoke-DATSyncSinglePackage -PackageInfo $UpdatesInfo `
+                                -Type 'DriverUpdates' -DownloadPath $DownloadPath -PackagePath $PackagePath `
+                                -OperatingSystem $OperatingSystem -Architecture $Architecture `
+                                -EnableBDR:$EnableBDR -RemoveLegacy:$RemoveLegacy -CleanSource:$CleanSource `
+                                -CompressPackage:$CompressPackage -CompressionType $CompressionType `
+                                -WimExcludeFiles $WimExcludeFiles -WimExcludeDirs $WimExcludeDirs -WimOptimizeExport:$WimOptimizeExport `
+                                -DeploymentPlatform $DeploymentPlatform `
+                                -UpdateIndividualDrivers `
+                                -VerifyDownloadHash:$VerifyDownloadHash `
+                                -DistributionPoints $DistributionPoints `
+                                -DistributionPointGroups $DistributionPointGroups
+
+                            $SyncResults.Add($UpdResult)
+                        }
+                    } catch {
+                        $ErrorCount++
+                        Write-DATLog -Message "Error processing driver updates for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
+                    }
                 }
             }
 
@@ -361,7 +419,7 @@ function Invoke-DATSyncSinglePackage {
         [Parameter(Mandatory)]
         [PSCustomObject]$PackageInfo,
 
-        [ValidateSet('Drivers', 'BIOS')]
+        [ValidateSet('Drivers', 'BIOS', 'DriverUpdates')]
         [string]$Type = 'Drivers',
 
         [string]$DownloadPath,
@@ -409,6 +467,8 @@ function Invoke-DATSyncSinglePackage {
     $IsApplication = $DeploymentPlatform -like 'ConfigMgr - Application*'
     if ($Type -eq 'BIOS') {
         $PackageName = "BIOS Update - $Make $DisplayModelName"
+    } elseif ($Type -eq 'DriverUpdates') {
+        $PackageName = "Driver Updates - $Make $DisplayModelName - $OperatingSystem $Architecture"
     } elseif ($DeploymentPlatform -like 'ConfigMgr - Standard Pkg*' -or $IsApplication) {
         $PackageName = "Drivers - $Make $DisplayModelName - $OperatingSystem $Architecture"
     } else {
@@ -458,7 +518,9 @@ function Invoke-DATSyncSinglePackage {
         if ($PackageInfo.MachineType)     { $AppMachineType += ($PackageInfo.MachineType    -split ';' | Where-Object { $_ }) }
         $AppMachineType = @($AppMachineType | Select-Object -Unique)
 
-        $FolderPath = if ($Type -eq 'BIOS') { "Driver Automation\BIOS\$Make" } else { "Driver Automation\Drivers\$Make" }
+        $FolderPath = if ($Type -eq 'BIOS') { "Driver Automation\BIOS\$Make" }
+                      elseif ($Type -eq 'DriverUpdates') { "Driver Automation\Driver Updates\$Make" }
+                      else { "Driver Automation\Drivers\$Make" }
 
         $AppParams = @{
             Name         = $PackageName
@@ -716,7 +778,9 @@ function Invoke-DATSyncSinglePackage {
         }
     }
 
-    if ($Existing -and -not ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers')) {
+    # DriverUpdates always rebuilds (no fixed base version to skip on); the catalog-driven
+    # fingerprint determines content currency in the overlay block.
+    if ($Existing -and $Type -ne 'DriverUpdates' -and -not ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers')) {
         # If multiple packages exist with the same name, use the first one
         $ExistingPkg = if ($Existing -is [array]) { $Existing[0] } else { $Existing }
 
@@ -789,32 +853,39 @@ function Invoke-DATSyncSinglePackage {
         Write-DATLog -Message "Individual drivers have changed - proceeding with overlay update" -Severity 1
     }
 
-    # Download
-    Write-DATLog -Message "Downloading $Type for $Make $ModelName v$Version" -Severity 1
-    $DownloadDir = Join-Path $DownloadPath "$Make\$ModelName\$Type"
-    if (-not (Test-Path $DownloadDir)) {
-        New-Item -Path $DownloadDir -ItemType Directory -Force | Out-Null
-    }
-
-    $FileName = $PackageInfo.FileName
-    $DownloadDest = Join-Path $DownloadDir $FileName
-
+    # Download (skipped for DriverUpdates: catalog DUPs are downloaded individually
+    # in the overlay block; there's no OEM base pack to fetch)
+    $FileName = $null
+    $DownloadDest = $null
     $StopWatch = [System.Diagnostics.Stopwatch]::StartNew()
-    if ($PSCmdlet.ShouldProcess($DownloadUrl, 'Download')) {
-        $DownloadParams = @{
-            Url             = $DownloadUrl
-            DestinationPath = $DownloadDest
+    if ($Type -ne 'DriverUpdates') {
+        Write-DATLog -Message "Downloading $Type for $Make $ModelName v$Version" -Severity 1
+        $DownloadDir = Join-Path $DownloadPath "$Make\$ModelName\$Type"
+        if (-not (Test-Path $DownloadDir)) {
+            New-Item -Path $DownloadDir -ItemType Directory -Force | Out-Null
         }
-        # Size verification (always, when catalog provides it)
-        if ($PackageInfo.Size) {
-            $DownloadParams['ExpectedSize'] = [long]$PackageInfo.Size
+
+        $FileName = $PackageInfo.FileName
+        $DownloadDest = Join-Path $DownloadDir $FileName
+
+        if ($PSCmdlet.ShouldProcess($DownloadUrl, 'Download')) {
+            $DownloadParams = @{
+                Url             = $DownloadUrl
+                DestinationPath = $DownloadDest
+            }
+            # Size verification (always, when catalog provides it)
+            if ($PackageInfo.Size) {
+                $DownloadParams['ExpectedSize'] = [long]$PackageInfo.Size
+            }
+            # Hash verification (optional, controlled by config)
+            if ($VerifyDownloadHash -and $PackageInfo.HashMD5) {
+                $DownloadParams['ExpectedHash'] = $PackageInfo.HashMD5
+                $DownloadParams['HashAlgorithm'] = 'MD5'
+            }
+            Invoke-DATDownload @DownloadParams
         }
-        # Hash verification (optional, controlled by config)
-        if ($VerifyDownloadHash -and $PackageInfo.HashMD5) {
-            $DownloadParams['ExpectedHash'] = $PackageInfo.HashMD5
-            $DownloadParams['HashAlgorithm'] = 'MD5'
-        }
-        Invoke-DATDownload @DownloadParams
+    } else {
+        Write-DATLog -Message "Building catalog-only Driver Updates package for $Make $ModelName (no base pack download)" -Severity 1
     }
     $StopWatch.Stop()
 
@@ -920,7 +991,9 @@ function Invoke-DATSyncSinglePackage {
         $BiosFiles = @(Get-ChildItem $PackageSourceDir -File -ErrorAction SilentlyContinue)
         Write-DATLog -Message "BIOS package source ready: $($BiosFiles.Count) file(s) in $PackageSourceDir" -Severity 1
     } else {
-        # Driver packs: extract archive content
+        # Drivers and DriverUpdates: extract archive content (skipped for DriverUpdates -
+        # there is no OEM base pack; the catalog overlay block populates the package source).
+        if ($Type -ne 'DriverUpdates') {
         Write-DATLog -Message "Extracting $FileName to $PackageSourceDir" -Severity 1
 
         if ($PSCmdlet.ShouldProcess($DownloadDest, 'Extract')) {
@@ -1015,6 +1088,7 @@ function Invoke-DATSyncSinglePackage {
             throw "Extraction produced no files for $Make $ModelName from $FileName. The archive may be corrupt or the extraction method unsupported."
         }
         Write-DATLog -Message "Extraction complete: $($ExtractedFiles.Count) files in $PackageSourceDir" -Severity 1
+        }  # end "if ($Type -ne 'DriverUpdates')"
 
         # --- Individual driver overlay (Dell only) ---
         # After extracting the base driver pack, check Dell's component catalog
@@ -1022,8 +1096,12 @@ function Invoke-DATSyncSinglePackage {
         # Also scans the extracted pack's INF files to detect which driver categories
         # are absent and fetches the latest available driver for those categories.
         # Reuse $CachedIndividualDrivers if the smart check already queried them.
-        if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers') {
-            Write-DATLog -Message "Checking for individual Dell drivers for $ModelName..." -Severity 1
+        if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -in @('Drivers', 'DriverUpdates')) {
+            if ($Type -eq 'DriverUpdates') {
+                Write-DATLog -Message "Resolving Dell catalog drivers for $ModelName (catalog-only Driver Updates)..." -Severity 1
+            } else {
+                Write-DATLog -Message "Checking for individual Dell drivers for $ModelName..." -Severity 1
+            }
             try {
                 # Detect missing categories and per-category DriverVer dates by scanning
                 # INF files in the extracted base pack. Per-category dates are used as
@@ -1036,7 +1114,9 @@ function Invoke-DATSyncSinglePackage {
                 $PackCategoryDates = $InfScanResult.CategoryDates
                 $MissingCats = @($AllCategories | Where-Object { $_ -notin $PresentCategories })
                 $StandardMissing = @($MissingCats | Where-Object { $_ -ne 'Other' })
-                if ($StandardMissing.Count -gt 0) {
+                if ($Type -eq 'DriverUpdates') {
+                    Write-DATLog -Message "Catalog-only mode: pulling latest driver in every category from Dell per-model catalog" -Severity 1
+                } elseif ($StandardMissing.Count -gt 0) {
                     Write-DATLog -Message "Base pack is missing standard driver categories: $($StandardMissing -join ', ')" -Severity 2
                 } else {
                     Write-DATLog -Message "Base pack covers all standard driver categories (also checking 'Other' for unclassified drivers)" -Severity 1
@@ -1249,19 +1329,34 @@ function Invoke-DATSyncSinglePackage {
                             $OverlayFingerprint = ($FpBytes | ForEach-Object { $_.ToString('x2') }) -join ''
                             $OverlayFingerprint = $OverlayFingerprint.Substring(0, 8)
                         }
-                        $Version = '{0}.OVL.{1}' -f $Version, $OverlayFingerprint
-                        Write-DATLog -Message "Package version updated to $Version (includes individual driver overlay)" -Severity 1
+                        if ($Type -eq 'DriverUpdates') {
+                            $Version = 'Cat.{0}' -f $OverlayFingerprint
+                            Write-DATLog -Message "Driver Updates package version: $Version" -Severity 1
+                        } else {
+                            $Version = '{0}.OVL.{1}' -f $Version, $OverlayFingerprint
+                            Write-DATLog -Message "Package version updated to $Version (includes individual driver overlay)" -Severity 1
+                        }
                     } finally {
                         Remove-DATTempPath -Path $OverlayTempDir
                     }
                 } else {
-                    if ($MissingCats.Count -gt 0) {
+                    if ($Type -eq 'DriverUpdates') {
+                        # No drivers means an empty catalog-only package - that's a hard failure,
+                        # not a "fall back to base pack" situation (there is no base pack here).
+                        throw "No catalog drivers resolved for $ModelName - cannot build catalog-only Driver Updates package"
+                    } elseif ($MissingCats.Count -gt 0) {
                         Write-DATLog -Message "No individual drivers found in catalog for $ModelName (checked missing: $($MissingCats -join ', '))" -Severity 2
                     } else {
                         Write-DATLog -Message "No newer individual drivers found for $ModelName - driver pack is up to date" -Severity 1
                     }
                 }
             } catch {
+                if ($Type -eq 'DriverUpdates') {
+                    # For catalog-only mode the overlay IS the package - any failure means
+                    # the package can't be produced. Re-throw so the caller logs an error
+                    # and skips compression/distribution.
+                    throw
+                }
                 Write-DATLog -Message "Individual driver overlay failed: $($_.Exception.Message) - continuing with base driver pack" -Severity 2
             }
         }
@@ -1330,8 +1425,12 @@ function Invoke-DATSyncSinglePackage {
     # Create/update ConfigMgr package or application
     # Applications use a dedicated folder hierarchy so they're easy to spot in the console.
     $FolderPath = if ($IsApplication) {
-        if ($Type -eq 'BIOS') { "Driver Automation\BIOS\$Make" } else { "Driver Automation\Drivers\$Make" }
-    } elseif ($Type -eq 'BIOS') { "BIOS Packages\$Make" } else { "Driver Packages\$Make" }
+        if ($Type -eq 'BIOS') { "Driver Automation\BIOS\$Make" }
+        elseif ($Type -eq 'DriverUpdates') { "Driver Automation\Driver Updates\$Make" }
+        else { "Driver Automation\Drivers\$Make" }
+    } elseif ($Type -eq 'BIOS') { "BIOS Packages\$Make" }
+    elseif ($Type -eq 'DriverUpdates') { "Driver Update Packages\$Make" }
+    else { "Driver Packages\$Make" }
 
     $PkgResult = $null
     if ($PSCmdlet.ShouldProcess($PackageName, 'Create ConfigMgr package/application')) {

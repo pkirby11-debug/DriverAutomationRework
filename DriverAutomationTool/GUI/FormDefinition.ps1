@@ -135,9 +135,9 @@ function New-DATMainForm {
 
     $TypeCombo = New-Object System.Windows.Forms.ComboBox
     $TypeCombo.Location = New-Object System.Drawing.Point(630, 37)
-    $TypeCombo.Width = 150
+    $TypeCombo.Width = 220
     $TypeCombo.DropDownStyle = 'DropDownList'
-    $TypeCombo.Items.AddRange(@('Drivers', 'BIOS Updates', 'Drivers + BIOS'))
+    $TypeCombo.Items.AddRange(@('Drivers', 'BIOS Updates', 'Drivers + BIOS', 'Driver Updates (Catalog Only)'))
     $TypeCombo.SelectedIndex = 0
     $ModelsTopPanel.Controls.Add($TypeCombo)
     $Controls['TypeCombo'] = $TypeCombo

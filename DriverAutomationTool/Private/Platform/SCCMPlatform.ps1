@@ -581,7 +581,7 @@ function Find-DATExistingDriverPackages {
         [string]$Manufacturer,
         [string]$Model,
 
-        [ValidateSet('Drivers', 'BIOS', 'All')]
+        [ValidateSet('Drivers', 'BIOS', 'DriverUpdates', 'All')]
         [string]$Type = 'All'
     )
 
@@ -597,7 +597,11 @@ function Find-DATExistingDriverPackages {
 
         $Packages = Get-CMDriverPackage -Name $Filter -ErrorAction SilentlyContinue
 
-        if ($Type -ne 'All') {
+        if ($Type -eq 'DriverUpdates') {
+            $Packages = $Packages | Where-Object {
+                $_.Name -like 'Driver Updates - *' -or $_.Name -like 'Test - Driver Updates - *'
+            }
+        } elseif ($Type -ne 'All') {
             $Packages = $Packages | Where-Object {
                 $_.Description -match $Type -or $_.Name -match $Type
             }
@@ -1424,7 +1428,7 @@ function Find-DATExistingPackages {
         [string]$Manufacturer,
         [string]$Model,
 
-        [ValidateSet('Drivers', 'BIOS', 'All')]
+        [ValidateSet('Drivers', 'BIOS', 'DriverUpdates', 'All')]
         [string]$Type = 'All',
 
         [switch]$IncludeDriverPackages
@@ -1443,7 +1447,11 @@ function Find-DATExistingPackages {
         # Query standard packages
         $StdPackages = @(Get-CMPackage -Name $Filter -Fast -ErrorAction SilentlyContinue)
 
-        if ($Type -ne 'All') {
+        if ($Type -eq 'DriverUpdates') {
+            $StdPackages = @($StdPackages | Where-Object {
+                $_.Name -like 'Driver Updates - *' -or $_.Name -like 'Test - Driver Updates - *'
+            })
+        } elseif ($Type -ne 'All') {
             $StdPackages = @($StdPackages | Where-Object {
                 $_.Description -match $Type -or $_.Name -match $Type
             })
@@ -2369,7 +2377,7 @@ function Find-DATExistingApplications {
         [string]$Manufacturer,
         [string]$Model,
 
-        [ValidateSet('Drivers', 'BIOS', 'All')]
+        [ValidateSet('Drivers', 'BIOS', 'DriverUpdates', 'All')]
         [string]$Type = 'All'
     )
 
@@ -2402,6 +2410,10 @@ function Find-DATExistingApplications {
         } elseif ($Type -eq 'BIOS') {
             $Apps = $Apps | Where-Object {
                 $_.LocalizedDisplayName -like 'BIOS Update - *' -or $_.LocalizedDisplayName -like 'Test - BIOS Update - *'
+            }
+        } elseif ($Type -eq 'DriverUpdates') {
+            $Apps = $Apps | Where-Object {
+                $_.LocalizedDisplayName -like 'Driver Updates - *' -or $_.LocalizedDisplayName -like 'Test - Driver Updates - *'
             }
         }
 

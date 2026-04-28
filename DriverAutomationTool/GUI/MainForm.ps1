@@ -340,6 +340,7 @@ function Initialize-DATMainForm {
         $TypeSelection = $Controls['TypeCombo'].Text
         $IncludeDrivers = $TypeSelection -in @('Drivers', 'Drivers + BIOS')
         $IncludeBIOS = $TypeSelection -in @('BIOS Updates', 'Drivers + BIOS')
+        $IncludeDriverUpdates = $TypeSelection -eq 'Driver Updates (Catalog Only)'
 
         $DPs = Get-DATFormSelectedDPs -Grid $Controls['DPGrid']
         $DPGs = Get-DATFormSelectedDPs -Grid $Controls['DPGGrid']
@@ -355,6 +356,7 @@ function Initialize-DATMainForm {
             PackagePath              = $Controls['PackagePathInput'].Text
             IncludeDrivers           = $IncludeDrivers
             IncludeBIOS              = $IncludeBIOS
+            IncludeDriverUpdates     = $IncludeDriverUpdates
             RemoveLegacy             = $Controls['RemoveLegacyCheckBox'].Checked
             CleanSource              = $Controls['CleanSourceCheckBox'].Checked
             EnableBDR                = $Controls['EnableBDRCheckBox'].Checked
