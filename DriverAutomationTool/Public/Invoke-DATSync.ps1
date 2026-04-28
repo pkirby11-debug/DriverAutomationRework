@@ -1156,6 +1156,11 @@ function Invoke-DATSyncSinglePackage {
                     }
                     Write-DATLog -Message $OverlayMsg -Severity 1
                     $OverlayTempDir = Get-DATTempPath -Prefix 'DellOverlay'
+                    # DriverUpdates manifest: rows describing each staged DUP. Written
+                    # to $PackageSourceDir\manifest.json after the loop and consumed by
+                    # Invoke-DATApply.ps1 in DriverUpdates mode to drive the per-DUP
+                    # silent installer (vendor-tested install path, no pnputil).
+                    $ManifestEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
                     try {
                         foreach ($IndvDriver in $IndividualDrivers) {
                             $OverlayTag = if ($IndvDriver.IsMissing) { '[MISSING]' } else { '[UPDATE]' }
@@ -1187,6 +1192,26 @@ function Invoke-DATSyncSinglePackage {
                                 # Remove Mark of the Web so Windows doesn't block execution
                                 # (WebRequest downloads get Zone.Identifier ADS from internet zone)
                                 Unblock-File -Path $DriverExePath -ErrorAction SilentlyContinue
+
+                                # DriverUpdates: keep the DUP intact and stage it flat in the package
+                                # source. Apply-side invokes each DUP's own silent installer (the
+                                # vendor-tested install path that DCU uses) instead of trying to
+                                # feed extracted INFs through pnputil.
+                                if ($Type -eq 'DriverUpdates') {
+                                    $StagedExe = Join-Path $PackageSourceDir $IndvDriver.FileName
+                                    Copy-Item -Path $DriverExePath -Destination $StagedExe -Force
+                                    $StagedSize = (Get-Item $StagedExe -ErrorAction SilentlyContinue).Length
+                                    $ManifestEntries.Add([PSCustomObject]@{
+                                        FileName    = $IndvDriver.FileName
+                                        Name        = $IndvDriver.Name
+                                        Version     = $IndvDriver.Version
+                                        Category    = $IndvDriver.Category
+                                        ReleaseDate = $IndvDriver.ReleaseDate
+                                        Size        = $StagedSize
+                                    })
+                                    Write-DATLog -Message "  Staged DUP: $($IndvDriver.FileName) ($([math]::Round($StagedSize / 1MB, 2)) MB)" -Severity 1
+                                    continue
+                                }
 
                                 # Create category subdirectory in package source
                                 $OverlayTargetDir = Join-Path $PackageSourceDir $IndvDriver.Category
@@ -1314,6 +1339,26 @@ function Invoke-DATSyncSinglePackage {
                         $TotalFiles = @(Get-ChildItem $PackageSourceDir -Recurse -File -ErrorAction SilentlyContinue)
                         Write-DATLog -Message "Individual driver overlay complete. Total files in package: $($TotalFiles.Count)" -Severity 1
 
+                        # DriverUpdates: write the manifest the apply script consumes. Drivers
+                        # mode skips this (its content is INFs, not DUPs).
+                        if ($Type -eq 'DriverUpdates') {
+                            if ($ManifestEntries.Count -eq 0) {
+                                throw "No DUPs were successfully staged for $ModelName - cannot build catalog-only Driver Updates package"
+                            }
+                            $ManifestPath = Join-Path $PackageSourceDir 'manifest.json'
+                            $ManifestObj = [PSCustomObject]@{
+                                schemaVersion = 1
+                                manufacturer  = $Make
+                                model         = $ModelName
+                                operatingSystem = $OperatingSystem
+                                architecture  = $Architecture
+                                generatedAt   = (Get-Date).ToUniversalTime().ToString('o')
+                                drivers       = @($ManifestEntries)
+                            }
+                            $ManifestObj | ConvertTo-Json -Depth 4 | Set-Content -Path $ManifestPath -Encoding UTF8
+                            Write-DATLog -Message "Wrote DriverUpdates manifest: $($ManifestEntries.Count) DUP(s) -> $ManifestPath" -Severity 1
+                        }
+
                         # Bump the package version to reflect the overlay so the TS apply
                         # script (Test-DriverPackageUpToDate) detects the content change.
                         # Format: "BaseVersion.OVL.fingerprint" e.g. "A01.OVL.3f8a12bc"
@@ -1361,9 +1406,11 @@ function Invoke-DATSyncSinglePackage {
             }
         }
 
-        # Compress driver package if requested (BIOS packages are never compressed)
+        # Compress driver package if requested (BIOS packages are never compressed,
+        # and DriverUpdates skips it: DUPs are already vendor-compressed and the
+        # apply script needs them as standalone .exe files, not WIM-mounted).
         $OrigExtractDir = $null
-        if ($CompressPackage) {
+        if ($CompressPackage -and $Type -ne 'DriverUpdates') {
             $OrigExtractDir = $PackageSourceDir
             Write-DATLog -Message "Compressing package as $CompressionType..." -Severity 1
             $OsTag = "$OsShort-$Architecture"
@@ -1448,7 +1495,11 @@ function Invoke-DATSyncSinglePackage {
             $AppParams = @{
                 Name         = $PackageName
                 SourcePath   = $PackageSourceDir
-                Mode         = if ($Type -eq 'BIOS') { 'BIOS' } else { 'Driver' }
+                Mode         = switch ($Type) {
+                                    'BIOS'           { 'BIOS' }
+                                    'DriverUpdates'  { 'DriverUpdates' }
+                                    default          { 'Driver' }
+                                }
                 Manufacturer = $Make
                 Model        = $ModelName
                 Version      = $Version

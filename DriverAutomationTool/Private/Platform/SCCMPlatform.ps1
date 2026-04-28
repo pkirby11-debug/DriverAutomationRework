@@ -2049,14 +2049,19 @@ function Get-DATDetectionScript {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Driver', 'BIOS')]
+        [ValidateSet('Driver', 'BIOS', 'DriverUpdates')]
         [string]$Mode,
 
         [Parameter(Mandatory)]
         [string]$ExpectedVersion
     )
 
-    $SubKey = if ($Mode -eq 'Driver') { 'Drivers' } else { 'BIOS' }
+    $SubKey = switch ($Mode) {
+        'Driver'        { 'Drivers' }
+        'DriverUpdates' { 'DriverUpdates' }
+        'BIOS'          { 'BIOS' }
+        default         { 'Drivers' }
+    }
     $EscapedVersion = $ExpectedVersion -replace "'", "''"
 
     return @"
@@ -2119,7 +2124,7 @@ function New-DATConfigMgrApplication {
         [string]$SourcePath,
 
         [Parameter(Mandatory)]
-        [ValidateSet('Driver', 'BIOS')]
+        [ValidateSet('Driver', 'BIOS', 'DriverUpdates')]
         [string]$Mode,
 
         [Parameter(Mandatory)]
@@ -2231,8 +2236,16 @@ function New-DATConfigMgrApplication {
         $DetectionScript = Get-DATDetectionScript -Mode $Mode -ExpectedVersion $Version
 
         if ($PSCmdlet.ShouldProcess($Name, 'Configure deployment type')) {
-            $Timeout   = if ($Mode -eq 'Driver') { 60 } else { 30 }
-            $Estimated = if ($Mode -eq 'Driver') { 15 } else { 10 }
+            $Timeout   = switch ($Mode) {
+                'BIOS'          { 30 }
+                'DriverUpdates' { 90 }   # Each DUP can take 30-180s; 30+ DUPs need headroom
+                default         { 60 }   # 'Driver'
+            }
+            $Estimated = switch ($Mode) {
+                'BIOS'          { 10 }
+                'DriverUpdates' { 25 }
+                default         { 15 }   # 'Driver'
+            }
 
             $ExistingDT = Get-CMDeploymentType -ApplicationName $Name -DeploymentTypeName $DTName -ErrorAction SilentlyContinue
 

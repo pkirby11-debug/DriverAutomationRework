@@ -64,7 +64,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Driver', 'BIOS')]
+    [ValidateSet('Driver', 'BIOS', 'DriverUpdates')]
     [string]$Mode,
 
     [Parameter(Mandatory)]
@@ -166,7 +166,12 @@ function Write-Log {
 # Detection marker
 # -------------------------------------------------------------------------
 $MarkerRoot = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation'
-$MarkerSubKey = if ($Mode -eq 'Driver') { 'Drivers' } else { 'BIOS' }
+$MarkerSubKey = switch ($Mode) {
+    'Driver'        { 'Drivers' }
+    'DriverUpdates' { 'DriverUpdates' }
+    'BIOS'          { 'BIOS' }
+    default         { 'Drivers' }
+}
 $MarkerPath = Join-Path $MarkerRoot $MarkerSubKey
 
 function Write-DetectionMarker {
@@ -441,6 +446,139 @@ function Install-DriverContentFromWim {
     }
 }
 
+function Install-DriverUpdates {
+    <#
+        Catalog-only Driver Updates apply path. The package source is a flat folder
+        of Dell DUP .exe files plus a manifest.json describing each one. We run each
+        DUP's silent installer (the vendor-tested install path that DCU uses) and
+        aggregate exit codes per Dell's published convention. This bypasses pnputil
+        entirely - the failures we saw with WIM-mounted INF imports of complex DCH
+        drivers (Intel iigd_dch, NVIDIA nvdd, Storage VMD, etc.) don't apply here
+        because we're delegating to each DUP's own installer.
+
+        Dell DUP exit codes (per Dell DUP Reference Guide):
+          0  = SUCCESS
+          1  = ERROR (install failed)
+          2  = REBOOT_REQUIRED (success, system reboot needed)
+          3  = DEP_SOFT_ERROR  (driver dependency not satisfied; not applicable)
+          4  = DEP_HARD_ERROR  (hardware/qualification mismatch; not applicable)
+          5  = QUAL_HARD_ERROR (qualification mismatch; not applicable)
+          6  = REBOOTING_SYSTEM (success, system already rebooting)
+          Other = treat as failure but continue (per-DUP failure is not fatal)
+
+        Aggregate behavior:
+          - All DUPs success/N-A    -> exit 0  (Status=Installed)
+          - Any DUP returned 2 or 6 -> exit 3010 (Status=Installed, reboot required)
+          - One or more DUP failed  -> exit non-zero (Status=Failed)
+            (we still try every DUP - one bad SSD firmware shouldn't block the
+            graphics driver install)
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $ManifestPath = Join-Path $Path 'manifest.json'
+    if (-not (Test-Path $ManifestPath)) {
+        throw "DriverUpdates package missing manifest.json at '$ManifestPath' - was this package built with V1 sync? Re-sync the model with the current GUI to produce a V2 catalog-only package."
+    }
+
+    try {
+        $Manifest = Get-Content -Path $ManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "Failed to parse manifest.json: $($_.Exception.Message)"
+    }
+
+    $Drivers = @($Manifest.drivers)
+    if ($Drivers.Count -eq 0) {
+        throw "manifest.json contains no drivers - nothing to install"
+    }
+
+    Write-Log "DriverUpdates manifest: $($Drivers.Count) DUP(s) for $($Manifest.manufacturer) $($Manifest.model) ($($Manifest.operatingSystem))"
+    if ($Manifest.generatedAt) { Write-Log "  Manifest generated: $($Manifest.generatedAt)" }
+
+    # Dell DUP success/not-applicable codes (these never count as failure).
+    $SuccessCodes    = @(0, 2, 6)
+    $NotApplicable   = @(3, 4, 5)
+    $RebootCodes     = @(2, 6)
+    $PerDupTimeoutMs = 900000  # 15 minutes per DUP
+
+    $Successful = 0
+    $NotApply   = 0
+    $Failed     = 0
+    $Rebooted   = $false
+    $FailureLines = [System.Collections.Generic.List[string]]::new()
+
+    $Index = 0
+    foreach ($Drv in $Drivers) {
+        $Index++
+        $DriverExe = Join-Path $Path $Drv.FileName
+        $DriverLabel = "[$Index/$($Drivers.Count)] $($Drv.Category) - $($Drv.Name) v$($Drv.Version)"
+
+        if (-not (Test-Path $DriverExe)) {
+            Write-Log "$DriverLabel - DUP not found at $DriverExe - SKIPPED" -Severity 2
+            $Failed++
+            $FailureLines.Add(("{0} (missing file)" -f $Drv.FileName))
+            continue
+        }
+
+        Write-Log "$DriverLabel - running $($Drv.FileName)"
+        $DupStart = Get-Date
+
+        # /s = silent, /r=0 = no install-time reboot. The DUP still returns code
+        # 2 when it would have rebooted; we aggregate those into a single 3010
+        # at the end so SCCM handles the reboot prompt.
+        try {
+            $Proc = Start-Process -FilePath $DriverExe -ArgumentList '/s', '/r=0' `
+                -NoNewWindow -PassThru -ErrorAction Stop
+            $Completed = $Proc.WaitForExit($PerDupTimeoutMs)
+            if (-not $Completed) {
+                Write-Log "$DriverLabel - timed out after 15 minutes - killing" -Severity 2
+                try { $Proc.Kill() } catch { }
+                $Failed++
+                $FailureLines.Add(("{0} (timeout)" -f $Drv.FileName))
+                continue
+            }
+            $DupCode = $Proc.ExitCode
+        } catch {
+            Write-Log "$DriverLabel - launch failed: $($_.Exception.Message)" -Severity 2
+            $Failed++
+            $FailureLines.Add(("{0} (launch error: {1})" -f $Drv.FileName, $_.Exception.Message))
+            continue
+        }
+
+        $Elapsed = [math]::Round(((Get-Date) - $DupStart).TotalSeconds, 1)
+
+        if ($DupCode -in $SuccessCodes) {
+            $Successful++
+            if ($DupCode -in $RebootCodes) { $Rebooted = $true }
+            $RebootTag = if ($DupCode -in $RebootCodes) { ' (reboot required)' } else { '' }
+            Write-Log "$DriverLabel - exit $DupCode (success$RebootTag) in ${Elapsed}s"
+        } elseif ($DupCode -in $NotApplicable) {
+            # Dell catalog returns drivers for the model regardless of installed
+            # hardware (e.g., Adata SSD firmware on a system with a Samsung SSD).
+            # The DUP self-detects and exits cleanly without doing anything.
+            $NotApply++
+            Write-Log "$DriverLabel - exit $DupCode (not applicable to this device) in ${Elapsed}s"
+        } else {
+            $Failed++
+            $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
+            Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s" -Severity 2
+        }
+    }
+
+    Write-Log "DriverUpdates summary: $Successful succeeded, $NotApply not-applicable, $Failed failed"
+    if ($Failed -gt 0) {
+        Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
+    }
+
+    if ($Rebooted) {
+        $script:RebootRequired = $true
+    }
+
+    # Any non-success/non-N-A failure -> non-zero return so the SCCM "Installed"
+    # state isn't claimed when graphics drivers actually didn't install.
+    if ($Failed -gt 0) { return 1 }
+    return 0
+}
+
 function Install-DriverContentFromZip {
     <#
         Extracts a ZIP-compressed driver pack to a ProgramData temp dir and
@@ -635,6 +773,8 @@ try {
     $ExitCode = 0
     if ($Mode -eq 'Driver') {
         $ExitCode = Install-DriverContent -Path $ContentPath
+    } elseif ($Mode -eq 'DriverUpdates') {
+        $ExitCode = Install-DriverUpdates -Path $ContentPath
     } else {
         # Compare current vs target BIOS version before flashing. Skipping here
         # saves a reboot cycle on devices already at or past the target version,
