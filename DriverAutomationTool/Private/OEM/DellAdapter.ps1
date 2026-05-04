@@ -908,17 +908,75 @@ function Get-DellIndividualDrivers {
         return $null
     }
 
-    # Deduplicate: keep only the latest version of each distinct driver component.
-    # Dell catalog display names often include the Dell revision suffix in the name
-    # itself (e.g., "ASMedia USB Extended Host Controller Driver, A04" and the same
-    # driver as "...Driver, A10"). Stripping the trailing ", Axx" or ",Axx" before
-    # grouping ensures these are recognized as the same driver so only the newest is kept.
-    $RevisionSuffix = ',?\s*A\d{2,3}$'
-    $LatestPerDriver = $MatchedDrivers |
-        Group-Object { ($_.Name -replace $RevisionSuffix, '').Trim() } |
-        ForEach-Object {
-            $_.Group | Sort-Object ParsedDate -Descending | Select-Object -First 1
+    # Deduplicate: keep only the latest version of each distinct driver "family".
+    #
+    # The naive approach of grouping by (name minus ", Axx" Dell revision suffix)
+    # leaves a lot of fat on the bone because Dell ships the same underlying driver
+    # under different display names depending on the bundled UWP app or chip-coverage
+    # rev. Two concrete examples from a Precision 3660 catalog:
+    #
+    #   - "Intel UHD Graphics Driver and Intel Graphics Command Center Application"
+    #     and
+    #     "Intel UHD Graphics Driver and Intel Graphics Software Application"
+    #     are the same iGPU driver; only the bundled UWP app changes.
+    #
+    #   - "Intel AX211/AX210/AX200/AX201/9260/9560/9462 Wi-Fi UWD Driver" (22.130)
+    #     and
+    #     "Intel BE2xx/AX4xx/AX2xx/9xxx Wi-Fi Driver" (23.160)
+    #     are successive versions of the unified Intel Wi-Fi driver - the chip-list
+    #     in the name is purely descriptive coverage, not a different SKU.
+    #
+    # We build a normalized "family key" that strips the Dell revision, parenthesized
+    # text, slash- and dash-separated chip/SKU lists, and the bundled-app suffix that
+    # follows "Driver and ... Application". Drivers that share the resulting key are
+    # treated as the same product line, and we keep the one with the newest release
+    # date. Drivers that target genuinely different products keep distinct keys (e.g.
+    # "Intel I225 NIC Driver" stays separate from "Intel X710 Ethernet Controller
+    # Driver" because the chip codes I225/X710 are not slash-separated lists).
+    $GetFamilyKey = {
+        param([string]$RawName)
+        $k = $RawName
+        # Trailing Dell revision (",Axx" or ", Axx")
+        $k = $k -replace ',?\s*A\d{2,3}$', ''
+        # "Driver and <bundled UWP app> Application" -> "Driver"
+        $k = $k -replace '\s+Driver\s+and\s+.+\s+Application$', ' Driver'
+        # "and NVIDIA Control Panel Application" tail
+        $k = $k -replace '\s+and\s+NVIDIA\s+Control\s+Panel\s+Application$', ''
+        # Parenthesized text
+        $k = $k -replace '\s*\([^)]*\)', ''
+        # Slash-separated chip/SKU lists (2+ tokens):
+        # "AX211/AX210/AX200/AX201/9260/9560/9462", "Pxx0/Pxx00/GV1xx", "I210/X550/X710"
+        $k = $k -replace '\b[A-Za-z0-9][A-Za-z0-9\-]*(?:/[A-Za-z0-9][A-Za-z0-9\-]*)+\b', ''
+        # Hyphen-separated chip lists ("BE2xx-AX4xx-AX2xx-9xxx")
+        $k = $k -replace '\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+){3,}\b', ''
+        # Bundle/style suffix tokens that vary across releases of the same driver
+        # (UWD = legacy bundle name, DCH = new bundle, Desktop = workstation marker)
+        $k = $k -replace '\b(UWD|DCH|Desktop|Bundle)\b', ''
+        # Standalone series labels left over after chip-list strips ("GT", "GTX", "RTX"...)
+        $k = $k -replace '\b(?:GT|GTX|RTX|RX|GS|GE|TI|XT|XTX|Super)\b', ''
+        # Loose chip codes left dangling after the list strip ("AX211", "Axx00", "x000")
+        $k = $k -replace '\b[A-Za-z]?[0-9x]{3,5}\b', ''
+        # Collapse whitespace, trim, lowercase
+        ($k -replace '\s+', ' ').Trim().ToLowerInvariant()
+    }
+
+    # Group by (Category, FamilyKey). Including Category prevents a (rare) name
+    # collision across unrelated categories (e.g. an "X Driver" classified as Audio
+    # vs another classified as Other) from being collapsed.
+    $Grouped = $MatchedDrivers | Group-Object { '{0}|{1}' -f $_.Category, (& $GetFamilyKey $_.Name) }
+    $LatestPerDriver = foreach ($G in $Grouped) {
+        $Sorted = $G.Group | Sort-Object ParsedDate -Descending
+        $Winner = $Sorted | Select-Object -First 1
+        if ($G.Count -gt 1) {
+            $Dropped = $Sorted | Select-Object -Skip 1
+            foreach ($D in $Dropped) {
+                Write-DATLog -Message ("  Dedup: kept '{0}' v{1} ({2:yyyy-MM-dd}); dropped '{3}' v{4} ({5:yyyy-MM-dd}) [same family]" -f `
+                    $Winner.Name, $Winner.Version, $Winner.ParsedDate,
+                    $D.Name, $D.Version, $D.ParsedDate) -Severity 1
+            }
         }
+        $Winner
+    }
 
     # Log summary split by updated vs missing
     $UpdatedCount = @($LatestPerDriver | Where-Object { -not $_.IsMissing }).Count
