@@ -614,8 +614,8 @@ function Suspend-BitLockerForFlash {
                 Write-Log "DebugMode - would suspend BitLocker on $($env:SystemDrive)"
                 return
             }
-            Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 1 -ErrorAction Stop | Out-Null
-            Write-Log "BitLocker suspended on $($env:SystemDrive) for one reboot"
+            Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 2 -ErrorAction Stop | Out-Null
+            Write-Log "BitLocker suspended on $($env:SystemDrive) for two reboots"
         } else {
             Write-Log "BitLocker is not active on $($env:SystemDrive) - no suspension needed"
         }
