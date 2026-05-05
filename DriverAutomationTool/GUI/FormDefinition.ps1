@@ -717,7 +717,7 @@ function New-DATMainForm {
     $DeployTypeGroup = New-Object System.Windows.Forms.GroupBox
     $DeployTypeGroup.Text = 'Application Type'
     $DeployTypeGroup.Location = New-Object System.Drawing.Point(10, 5)
-    $DeployTypeGroup.Size = New-Object System.Drawing.Size(220, 95)
+    $DeployTypeGroup.Size = New-Object System.Drawing.Size(220, 115)
     $DeployTopPanel.Controls.Add($DeployTypeGroup)
 
     $DeployDriverCheckBox = New-Object System.Windows.Forms.CheckBox
@@ -728,16 +728,24 @@ function New-DATMainForm {
     $DeployTypeGroup.Controls.Add($DeployDriverCheckBox)
     $Controls['DeployDriverCheckBox'] = $DeployDriverCheckBox
 
+    $DeployDriverUpdatesCheckBox = New-Object System.Windows.Forms.CheckBox
+    $DeployDriverUpdatesCheckBox.Text = 'Driver Update Applications'
+    $DeployDriverUpdatesCheckBox.Location = New-Object System.Drawing.Point(15, 45)
+    $DeployDriverUpdatesCheckBox.Checked = $true
+    $DeployDriverUpdatesCheckBox.AutoSize = $true
+    $DeployTypeGroup.Controls.Add($DeployDriverUpdatesCheckBox)
+    $Controls['DeployDriverUpdatesCheckBox'] = $DeployDriverUpdatesCheckBox
+
     $DeployBIOSCheckBox = New-Object System.Windows.Forms.CheckBox
     $DeployBIOSCheckBox.Text = 'BIOS Applications'
-    $DeployBIOSCheckBox.Location = New-Object System.Drawing.Point(15, 45)
+    $DeployBIOSCheckBox.Location = New-Object System.Drawing.Point(15, 68)
     $DeployBIOSCheckBox.AutoSize = $true
     $DeployTypeGroup.Controls.Add($DeployBIOSCheckBox)
     $Controls['DeployBIOSCheckBox'] = $DeployBIOSCheckBox
 
     $DeployIncludeTestCheckBox = New-Object System.Windows.Forms.CheckBox
     $DeployIncludeTestCheckBox.Text = "Include 'Test - ' apps"
-    $DeployIncludeTestCheckBox.Location = New-Object System.Drawing.Point(15, 68)
+    $DeployIncludeTestCheckBox.Location = New-Object System.Drawing.Point(15, 91)
     $DeployIncludeTestCheckBox.AutoSize = $true
     $DeployTypeGroup.Controls.Add($DeployIncludeTestCheckBox)
     $Controls['DeployIncludeTestCheckBox'] = $DeployIncludeTestCheckBox
@@ -746,7 +754,7 @@ function New-DATMainForm {
     $DeployMfrGroup = New-Object System.Windows.Forms.GroupBox
     $DeployMfrGroup.Text = 'Manufacturer Filter'
     $DeployMfrGroup.Location = New-Object System.Drawing.Point(240, 5)
-    $DeployMfrGroup.Size = New-Object System.Drawing.Size(220, 95)
+    $DeployMfrGroup.Size = New-Object System.Drawing.Size(220, 115)
     $DeployTopPanel.Controls.Add($DeployMfrGroup)
 
     $DeployDellCheckBox = New-Object System.Windows.Forms.CheckBox

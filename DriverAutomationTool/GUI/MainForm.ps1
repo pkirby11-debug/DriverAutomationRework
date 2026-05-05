@@ -1073,8 +1073,10 @@ function Initialize-DATMainForm {
             Show-DATFormMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
         }
-        if (-not ($Controls['DeployDriverCheckBox'].Checked -or $Controls['DeployBIOSCheckBox'].Checked)) {
-            Show-DATFormMessage -Message 'Select at least one Application Type (Driver or BIOS).' -Type Warning
+        if (-not ($Controls['DeployDriverCheckBox'].Checked -or
+                  $Controls['DeployDriverUpdatesCheckBox'].Checked -or
+                  $Controls['DeployBIOSCheckBox'].Checked)) {
+            Show-DATFormMessage -Message 'Select at least one Application Type (Driver, Driver Updates, or BIOS).' -Type Warning
             return
         }
 
@@ -1090,8 +1092,9 @@ function Initialize-DATMainForm {
             if ($Controls['DeployMicrosoftCheckBox'].Checked) { $WantedMfrs += 'Microsoft' }
 
             $Types = @()
-            if ($Controls['DeployDriverCheckBox'].Checked) { $Types += 'Drivers' }
-            if ($Controls['DeployBIOSCheckBox'].Checked)   { $Types += 'BIOS' }
+            if ($Controls['DeployDriverCheckBox'].Checked)        { $Types += 'Drivers' }
+            if ($Controls['DeployDriverUpdatesCheckBox'].Checked) { $Types += 'DriverUpdates' }
+            if ($Controls['DeployBIOSCheckBox'].Checked)          { $Types += 'BIOS' }
 
             $Found = @()
             foreach ($T in $Types) {
