@@ -780,6 +780,174 @@ function Initialize-DATMainForm {
         $script:DeleteTimer.Start()
     })
 
+    # --- Cleanup Overlay TS Packages -----------------------------------------
+    # Two-phase: phase 1 runs Invoke-DATCleanupOverlayPackages -DiscoveryOnly to
+    # populate a candidate list, then a confirm dialog asks the user. Phase 2
+    # runs the same function with -Force only on confirmed candidates. Both
+    # phases use background runspaces with a tick-timer for log drain so the
+    # UI stays responsive on big sites.
+    $Controls['PkgCleanupOverlayButton'].Add_Click({
+        if (-not $script:CMConnected) {
+            Show-DATFormMessage -Message 'Connect to ConfigMgr first (SCCM Settings tab).' -Type Warning
+            return
+        }
+
+        $ConnParams = @{ SiteServer = $Controls['SiteServerInput'].Text; SiteCode = $Controls['SiteCodeInput'].Text }
+        if ($Controls['UseSSLCheckBox'].Checked) { $ConnParams['UseSSL'] = $true }
+        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+
+        $Controls['PkgCleanupOverlayButton'].Enabled = $false
+        $Controls['PkgDeleteButton'].Enabled         = $false
+        $Controls['PkgRefreshButton'].Enabled        = $false
+        $Controls['PkgApplyButton'].Enabled          = $false
+        $Controls['StatusStripLabel'].Text = 'Scanning for legacy overlay TS packages...'
+
+        $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+        $DiscoveryScript = {
+            param($ModulePath, $ConnParams, $LogQueue)
+            Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+            Register-DATQueueLogSubscriber -LogQueue $LogQueue
+            return Invoke-DATCleanupOverlayPackages @ConnParams -DiscoveryOnly
+        }
+
+        $script:OverlayDiscoveryRunspace = [System.Management.Automation.PowerShell]::Create()
+        $script:OverlayDiscoveryRunspace.AddScript($DiscoveryScript).
+            AddArgument($ModulePath).AddArgument($ConnParams).AddArgument($script:LogQueue) | Out-Null
+        $script:OverlayDiscoveryHandle = $script:OverlayDiscoveryRunspace.BeginInvoke()
+
+        $script:TimerControls = $Controls
+        if ($script:OverlayDiscoveryTimer) { $script:OverlayDiscoveryTimer.Stop(); $script:OverlayDiscoveryTimer.Dispose() }
+        $script:OverlayDiscoveryTimer = New-Object System.Windows.Forms.Timer
+        $script:OverlayDiscoveryTimer.Interval = 500
+        $script:OverlayDiscoveryTimer.Add_Tick({
+            if ($script:LogQueue) {
+                $LogMsg = $null
+                while ($script:LogQueue.TryDequeue([ref]$LogMsg)) {
+                    $script:TimerControls['LogListBox'].Items.Add($LogMsg)
+                }
+                if ($script:TimerControls['LogListBox'].Items.Count -gt 0) {
+                    $script:TimerControls['LogListBox'].TopIndex = $script:TimerControls['LogListBox'].Items.Count - 1
+                }
+            }
+            if ($null -eq $script:OverlayDiscoveryHandle -or -not $script:OverlayDiscoveryHandle.IsCompleted) { return }
+            $script:OverlayDiscoveryTimer.Stop()
+
+            $ReEnable = {
+                $script:TimerControls['PkgCleanupOverlayButton'].Enabled = $true
+                $script:TimerControls['PkgDeleteButton'].Enabled         = $true
+                $script:TimerControls['PkgRefreshButton'].Enabled        = $true
+                $script:TimerControls['PkgApplyButton'].Enabled          = $true
+            }
+
+            try {
+                $Candidates = @($script:OverlayDiscoveryRunspace.EndInvoke($script:OverlayDiscoveryHandle))
+                $script:OverlayDiscoveryRunspace.Dispose()
+                $script:OverlayDiscoveryHandle = $null
+
+                if ($Candidates.Count -eq 0) {
+                    & $ReEnable
+                    $script:TimerControls['StatusStripLabel'].Text = 'No overlay TS packages found.'
+                    Show-DATFormMessage -Message 'No legacy overlay TS packages were found - nothing to clean up.' -Type Information
+                    return
+                }
+
+                # Build a readable list for the confirm dialog (cap to 25 lines so the
+                # message box stays useable on big fleets).
+                $ListPreview = ($Candidates | Select-Object -First 25 | ForEach-Object {
+                    "  - $($_.Name) v$($_.Version) ($($_.PackageID))"
+                }) -join "`n"
+                if ($Candidates.Count -gt 25) {
+                    $ListPreview += "`n  ... and $($Candidates.Count - 25) more (full list in Progress log)"
+                }
+
+                $CleanSource = $script:TimerControls['CleanSourceCheckBox'].Checked
+                $SourceNote = if ($CleanSource) {
+                    "`nThe 'Also remove source' checkbox is ON - source folders WILL be deleted."
+                } else {
+                    "`nThe 'Also remove source' checkbox is OFF - SCCM packages will be removed but source folders kept."
+                }
+
+                $Confirm = Show-DATFormMessage `
+                    -Message ("Found {0} legacy overlay TS package(s):`n`n{1}`n{2}`n`nRemove all of them?" -f `
+                        $Candidates.Count, $ListPreview, $SourceNote) `
+                    -Type Question
+                if ($Confirm -ne 'Yes') {
+                    & $ReEnable
+                    $script:TimerControls['StatusStripLabel'].Text = "Cleanup cancelled ($($Candidates.Count) candidate(s) found)."
+                    return
+                }
+
+                # Phase 2: actually remove. Disable controls again and kick a fresh runspace.
+                $script:TimerControls['StatusStripLabel'].Text = "Removing $($Candidates.Count) overlay TS package(s)..."
+
+                $RemovalScript = {
+                    param($ModulePath, $ConnParams, $CleanSource, $LogQueue)
+                    Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+                    Register-DATQueueLogSubscriber -LogQueue $LogQueue
+                    return Invoke-DATCleanupOverlayPackages @ConnParams -CleanSource:$CleanSource -Force -Confirm:$false
+                }
+
+                $script:OverlayRemoveRunspace = [System.Management.Automation.PowerShell]::Create()
+                $script:OverlayRemoveRunspace.AddScript($RemovalScript).
+                    AddArgument($ModulePath).AddArgument($ConnParams).AddArgument($CleanSource).AddArgument($script:LogQueue) | Out-Null
+                $script:OverlayRemoveHandle = $script:OverlayRemoveRunspace.BeginInvoke()
+
+                if ($script:OverlayRemoveTimer) { $script:OverlayRemoveTimer.Stop(); $script:OverlayRemoveTimer.Dispose() }
+                $script:OverlayRemoveTimer = New-Object System.Windows.Forms.Timer
+                $script:OverlayRemoveTimer.Interval = 500
+                $script:OverlayRemoveTimer.Add_Tick({
+                    if ($script:LogQueue) {
+                        $LogMsg = $null
+                        while ($script:LogQueue.TryDequeue([ref]$LogMsg)) {
+                            $script:TimerControls['LogListBox'].Items.Add($LogMsg)
+                        }
+                        if ($script:TimerControls['LogListBox'].Items.Count -gt 0) {
+                            $script:TimerControls['LogListBox'].TopIndex = $script:TimerControls['LogListBox'].Items.Count - 1
+                        }
+                    }
+                    if ($null -eq $script:OverlayRemoveHandle -or -not $script:OverlayRemoveHandle.IsCompleted) { return }
+                    $script:OverlayRemoveTimer.Stop()
+
+                    $script:TimerControls['PkgCleanupOverlayButton'].Enabled = $true
+                    $script:TimerControls['PkgDeleteButton'].Enabled         = $true
+                    $script:TimerControls['PkgRefreshButton'].Enabled        = $true
+                    $script:TimerControls['PkgApplyButton'].Enabled          = $true
+
+                    try {
+                        $Results = @($script:OverlayRemoveRunspace.EndInvoke($script:OverlayRemoveHandle))
+                        $script:OverlayRemoveRunspace.Dispose()
+                        $script:OverlayRemoveHandle = $null
+
+                        $Removed = @($Results | Where-Object { $_.Status -eq 'Removed' }).Count
+                        $Failed  = @($Results | Where-Object { $_.Status -eq 'Failed'  })
+
+                        # Refresh the package grid so the deleted ones disappear.
+                        $script:TimerControls['PkgRefreshButton'].PerformClick()
+
+                        if ($Failed.Count -eq 0) {
+                            $script:TimerControls['StatusStripLabel'].Text = "Cleanup complete - $Removed package(s) removed."
+                            Show-DATFormMessage -Message "Cleanup complete.`n`nRemoved: $Removed package(s)" -Type Information
+                        } else {
+                            $FailList = ($Failed | ForEach-Object { "$($_.PackageID) ($($_.Name)): $($_.Error)" }) -join "`n"
+                            $script:TimerControls['StatusStripLabel'].Text = "Cleanup finished with $($Failed.Count) failure(s)."
+                            Show-DATFormMessage -Message "Cleanup finished.`n`nRemoved: $Removed`nFailed: $($Failed.Count)`n`n$FailList" -Type Warning
+                        }
+                    } catch {
+                        $script:TimerControls['StatusStripLabel'].Text = 'Cleanup failed'
+                        Show-DATFormMessage -Message "Cleanup failed: $($_.Exception.Message)" -Type Error
+                    }
+                })
+                $script:OverlayRemoveTimer.Start()
+            } catch {
+                & $ReEnable
+                $script:TimerControls['StatusStripLabel'].Text = 'Discovery failed'
+                Show-DATFormMessage -Message "Overlay package discovery failed: $($_.Exception.Message)" -Type Error
+            }
+        })
+        $script:OverlayDiscoveryTimer.Start()
+    })
+
     # --- Package Management - Apply Action ---
     $Controls['PkgApplyButton'].Add_Click({
         if (-not $script:CMConnected) {
@@ -1028,9 +1196,27 @@ function Initialize-DATMainForm {
         $DeployAction  = if ($Controls['DeployActionUninstallRadio'].Checked) { 'Uninstall' } else { 'Install' }
         $UserNotif     = $Controls['DeployUserNotifCombo'].Text
 
+        # Read schedule. When the checkbox is off, leave $AvailableAt/$DeadlineAt as $null
+        # and Invoke-DATDeployApplications keeps its current "now" behavior.
+        $AvailableAt = $null
+        $DeadlineAt  = $null
+        if ($Controls['DeployScheduleCheck'].Checked) {
+            $AvailableAt = $Controls['DeployAvailablePicker'].Value
+            $DeadlineAt  = $Controls['DeployDeadlinePicker'].Value
+            if ($DeployPurpose -eq 'Required' -and $DeadlineAt -le $AvailableAt) {
+                Show-DATFormMessage -Message 'Deadline must be after the Available date for Required deployments.' -Type Warning
+                return
+            }
+        }
+
+        $ScheduleSummary = if ($AvailableAt) {
+            "Available: {0:yyyy-MM-dd HH:mm}{1}" -f $AvailableAt, $(
+                if ($DeployPurpose -eq 'Required') { "`nDeadline: $($DeadlineAt.ToString('yyyy-MM-dd HH:mm'))" } else { '' })
+        } else { 'Available immediately' }
+
         $Confirm = Show-DATFormMessage `
-            -Message ("Create {0} deployment(s) on '{1}'?`n`nPurpose: {2}`nAction: {3}`nNotification: {4}" -f `
-                $AppNames.Count, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif) `
+            -Message ("Create {0} deployment(s) on '{1}'?`n`nPurpose: {2}`nAction: {3}`nNotification: {4}`n{5}" -f `
+                $AppNames.Count, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $ScheduleSummary) `
             -Type Question
         if ($Confirm -ne 'Yes') { return }
 
@@ -1054,17 +1240,22 @@ function Initialize-DATMainForm {
         $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
         $DeployScript = {
-            param($ModulePath, $ConnParams, $AppNames, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $LogQueue)
+            param($ModulePath, $ConnParams, $AppNames, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $AvailableAt, $DeadlineAt, $LogQueue)
 
             Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
             Register-DATQueueLogSubscriber -LogQueue $LogQueue
 
-            return Invoke-DATDeployApplications @ConnParams `
-                -Applications     $AppNames `
-                -CollectionName   $CollectionName `
-                -DeployPurpose    $DeployPurpose `
-                -DeployAction     $DeployAction `
-                -UserNotification $UserNotif
+            $DeployArgs = @{
+                Applications     = $AppNames
+                CollectionName   = $CollectionName
+                DeployPurpose    = $DeployPurpose
+                DeployAction     = $DeployAction
+                UserNotification = $UserNotif
+            }
+            if ($AvailableAt) { $DeployArgs['AvailableDateTime'] = $AvailableAt }
+            if ($DeadlineAt)  { $DeployArgs['DeadlineDateTime']  = $DeadlineAt  }
+
+            return Invoke-DATDeployApplications @ConnParams @DeployArgs
         }
 
         $script:DeployRunspace = [System.Management.Automation.PowerShell]::Create()
@@ -1076,6 +1267,8 @@ function Initialize-DATMainForm {
             AddArgument($DeployPurpose).
             AddArgument($DeployAction).
             AddArgument($UserNotif).
+            AddArgument($AvailableAt).
+            AddArgument($DeadlineAt).
             AddArgument($script:LogQueue) | Out-Null
         $script:DeployHandle = $script:DeployRunspace.BeginInvoke()
 

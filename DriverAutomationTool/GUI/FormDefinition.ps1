@@ -588,6 +588,18 @@ function New-DATMainForm {
     $PkgFilterPanel.Controls.Add($PkgIncludeDriverPkgsCheckBox)
     $Controls['PkgIncludeDriverPkgsCheckBox'] = $PkgIncludeDriverPkgsCheckBox
 
+    # Cleanup helper: surfaces TS-targeted Standard/Driver packages that still carry
+    # a per-model catalog overlay (".OVL." in the version) - leftovers from before
+    # we moved the catalog overlay to DriverUpdates Apps only. Click runs discovery
+    # in a runspace and shows a confirm dialog with the candidate list.
+    $PkgCleanupOverlayButton = New-Object System.Windows.Forms.Button
+    $PkgCleanupOverlayButton.Text = 'Cleanup Overlay TS Packages...'
+    $PkgCleanupOverlayButton.Location = New-Object System.Drawing.Point(660, 10)
+    $PkgCleanupOverlayButton.Width = 200
+    $PkgCleanupOverlayButton.ForeColor = [System.Drawing.Color]::DarkRed
+    $PkgFilterPanel.Controls.Add($PkgCleanupOverlayButton)
+    $Controls['PkgCleanupOverlayButton'] = $PkgCleanupOverlayButton
+
     # Action row (second row in filter panel)
     $PkgActionLabel = New-Object System.Windows.Forms.Label
     $PkgActionLabel.Text = 'Action:'
@@ -699,7 +711,7 @@ function New-DATMainForm {
     # Top filter / options panel (added to tab later for correct dock order)
     $DeployTopPanel = New-Object System.Windows.Forms.Panel
     $DeployTopPanel.Dock = 'Top'
-    $DeployTopPanel.Height = 215
+    $DeployTopPanel.Height = 255
 
     # --- Application type filter (which kind of apps to list) ---
     $DeployTypeGroup = New-Object System.Windows.Forms.GroupBox
@@ -777,7 +789,7 @@ function New-DATMainForm {
     $DeployOptGroup = New-Object System.Windows.Forms.GroupBox
     $DeployOptGroup.Text = 'Deployment Options'
     $DeployOptGroup.Location = New-Object System.Drawing.Point(470, 5)
-    $DeployOptGroup.Size = New-Object System.Drawing.Size(540, 95)
+    $DeployOptGroup.Size = New-Object System.Drawing.Size(540, 130)
     $DeployOptGroup.Anchor = 'Top,Left,Right'
     $DeployTopPanel.Controls.Add($DeployOptGroup)
 
@@ -838,15 +850,65 @@ function New-DATMainForm {
     $DeployOptGroup.Controls.Add($DeployUserNotifCombo)
     $Controls['DeployUserNotifCombo'] = $DeployUserNotifCombo
 
+    # --- Scheduling row: when unchecked, the deploy uses "now" (current behavior).
+    # When checked, the two DateTimePickers drive AvailableDateTime / DeadlineDateTime
+    # on the SCCM deployment so admins can stage Required deployments for off-hours.
+    $DeployScheduleCheck = New-Object System.Windows.Forms.CheckBox
+    $DeployScheduleCheck.Text = 'Schedule:'
+    $DeployScheduleCheck.Location = New-Object System.Drawing.Point(15, 92)
+    $DeployScheduleCheck.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployScheduleCheck)
+    $Controls['DeployScheduleCheck'] = $DeployScheduleCheck
+
+    $DeployAvailableLabel = New-Object System.Windows.Forms.Label
+    $DeployAvailableLabel.Text = 'Available:'
+    $DeployAvailableLabel.Location = New-Object System.Drawing.Point(85, 95)
+    $DeployAvailableLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployAvailableLabel)
+
+    $DeployAvailablePicker = New-Object System.Windows.Forms.DateTimePicker
+    $DeployAvailablePicker.Location = New-Object System.Drawing.Point(150, 90)
+    $DeployAvailablePicker.Width = 150
+    $DeployAvailablePicker.Format = 'Custom'
+    $DeployAvailablePicker.CustomFormat = 'yyyy-MM-dd HH:mm'
+    $DeployAvailablePicker.ShowUpDown = $false
+    $DeployAvailablePicker.Enabled = $false
+    $DeployOptGroup.Controls.Add($DeployAvailablePicker)
+    $Controls['DeployAvailablePicker'] = $DeployAvailablePicker
+
+    $DeployDeadlineLabel = New-Object System.Windows.Forms.Label
+    $DeployDeadlineLabel.Text = 'Deadline:'
+    $DeployDeadlineLabel.Location = New-Object System.Drawing.Point(310, 95)
+    $DeployDeadlineLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployDeadlineLabel)
+
+    $DeployDeadlinePicker = New-Object System.Windows.Forms.DateTimePicker
+    $DeployDeadlinePicker.Location = New-Object System.Drawing.Point(370, 90)
+    $DeployDeadlinePicker.Width = 150
+    $DeployDeadlinePicker.Format = 'Custom'
+    $DeployDeadlinePicker.CustomFormat = 'yyyy-MM-dd HH:mm'
+    $DeployDeadlinePicker.ShowUpDown = $false
+    $DeployDeadlinePicker.Enabled = $false
+    # Default deadline 24h after now so a freshly-checked schedule is immediately valid.
+    $DeployDeadlinePicker.Value = (Get-Date).AddHours(24)
+    $DeployOptGroup.Controls.Add($DeployDeadlinePicker)
+    $Controls['DeployDeadlinePicker'] = $DeployDeadlinePicker
+
+    # Wire the checkbox to enable/disable the pickers as a single block.
+    $DeployScheduleCheck.Add_CheckedChanged({
+        $DeployAvailablePicker.Enabled = $DeployScheduleCheck.Checked
+        $DeployDeadlinePicker.Enabled  = $DeployScheduleCheck.Checked
+    }.GetNewClosure())
+
     # --- Collection picker + action row ---
     $DeployCollectionLabel = New-Object System.Windows.Forms.Label
     $DeployCollectionLabel.Text = 'Target Collection:'
-    $DeployCollectionLabel.Location = New-Object System.Drawing.Point(10, 115)
+    $DeployCollectionLabel.Location = New-Object System.Drawing.Point(10, 155)
     $DeployCollectionLabel.AutoSize = $true
     $DeployTopPanel.Controls.Add($DeployCollectionLabel)
 
     $DeployCollectionCombo = New-Object System.Windows.Forms.ComboBox
-    $DeployCollectionCombo.Location = New-Object System.Drawing.Point(125, 112)
+    $DeployCollectionCombo.Location = New-Object System.Drawing.Point(125, 152)
     $DeployCollectionCombo.Width = 500
     $DeployCollectionCombo.DropDownStyle = 'DropDown'  # editable so users can type/filter
     $DeployCollectionCombo.AutoCompleteMode = 'SuggestAppend'
@@ -857,7 +919,7 @@ function New-DATMainForm {
 
     $DeployRefreshCollectionsButton = New-Object System.Windows.Forms.Button
     $DeployRefreshCollectionsButton.Text = 'Refresh Collections'
-    $DeployRefreshCollectionsButton.Location = New-Object System.Drawing.Point(635, 110)
+    $DeployRefreshCollectionsButton.Location = New-Object System.Drawing.Point(635, 150)
     $DeployRefreshCollectionsButton.Width = 140
     $DeployRefreshCollectionsButton.Anchor = 'Top,Right'
     $DeployTopPanel.Controls.Add($DeployRefreshCollectionsButton)
@@ -866,33 +928,33 @@ function New-DATMainForm {
     # --- App-list action row ---
     $DeployRefreshAppsButton = New-Object System.Windows.Forms.Button
     $DeployRefreshAppsButton.Text = 'Refresh Applications'
-    $DeployRefreshAppsButton.Location = New-Object System.Drawing.Point(10, 150)
+    $DeployRefreshAppsButton.Location = New-Object System.Drawing.Point(10, 190)
     $DeployRefreshAppsButton.Width = 150
     $DeployTopPanel.Controls.Add($DeployRefreshAppsButton)
     $Controls['DeployRefreshAppsButton'] = $DeployRefreshAppsButton
 
     $DeploySelectAllButton = New-Object System.Windows.Forms.Button
     $DeploySelectAllButton.Text = 'Select All'
-    $DeploySelectAllButton.Location = New-Object System.Drawing.Point(170, 150)
+    $DeploySelectAllButton.Location = New-Object System.Drawing.Point(170, 190)
     $DeploySelectAllButton.Width = 90
     $DeployTopPanel.Controls.Add($DeploySelectAllButton)
     $Controls['DeploySelectAllButton'] = $DeploySelectAllButton
 
     $DeploySelectNoneButton = New-Object System.Windows.Forms.Button
     $DeploySelectNoneButton.Text = 'Select None'
-    $DeploySelectNoneButton.Location = New-Object System.Drawing.Point(265, 150)
+    $DeploySelectNoneButton.Location = New-Object System.Drawing.Point(265, 190)
     $DeploySelectNoneButton.Width = 90
     $DeployTopPanel.Controls.Add($DeploySelectNoneButton)
     $Controls['DeploySelectNoneButton'] = $DeploySelectNoneButton
 
     $DeployAppsSearchLabel = New-Object System.Windows.Forms.Label
     $DeployAppsSearchLabel.Text = 'Search:'
-    $DeployAppsSearchLabel.Location = New-Object System.Drawing.Point(370, 154)
+    $DeployAppsSearchLabel.Location = New-Object System.Drawing.Point(370, 194)
     $DeployAppsSearchLabel.AutoSize = $true
     $DeployTopPanel.Controls.Add($DeployAppsSearchLabel)
 
     $DeployAppsSearchBox = New-Object System.Windows.Forms.TextBox
-    $DeployAppsSearchBox.Location = New-Object System.Drawing.Point(420, 151)
+    $DeployAppsSearchBox.Location = New-Object System.Drawing.Point(420, 191)
     $DeployAppsSearchBox.Width = 300
     $DeployTopPanel.Controls.Add($DeployAppsSearchBox)
     $Controls['DeployAppsSearchBox'] = $DeployAppsSearchBox
@@ -900,7 +962,7 @@ function New-DATMainForm {
     $DeployButton = New-Object System.Windows.Forms.Button
     $DeployButton.Text = 'Deploy Selected'
     $DeployButton.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-    $DeployButton.Location = New-Object System.Drawing.Point(10, 185)
+    $DeployButton.Location = New-Object System.Drawing.Point(10, 225)
     $DeployButton.Size = New-Object System.Drawing.Size(160, 26)
     $DeployButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
     $DeployButton.ForeColor = [System.Drawing.Color]::White
@@ -911,7 +973,7 @@ function New-DATMainForm {
     $DeployStatusLabel = New-Object System.Windows.Forms.Label
     $DeployStatusLabel.Text = 'Connect to ConfigMgr to populate collections, then click Refresh Applications.'
     $DeployStatusLabel.ForeColor = [System.Drawing.Color]::Gray
-    $DeployStatusLabel.Location = New-Object System.Drawing.Point(180, 191)
+    $DeployStatusLabel.Location = New-Object System.Drawing.Point(180, 231)
     $DeployStatusLabel.AutoSize = $true
     $DeployTopPanel.Controls.Add($DeployStatusLabel)
     $Controls['DeployStatusLabel'] = $DeployStatusLabel

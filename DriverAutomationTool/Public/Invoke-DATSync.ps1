@@ -575,10 +575,32 @@ function Invoke-DATSyncSinglePackage {
     $Existing = $AllExisting | Where-Object { $_.Version -eq $Version }
 
     # For individual driver overlay, also match packages whose version starts with the
+    # The catalog driver overlay only applies to SCCM Applications and DriverUpdates,
+    # NOT to TS-targeted Standard/Driver Packages - those ship the OEM base pack alone
+    # so we don't double up on storage on the SCCM source share. This gate is the
+    # single source of truth used by the smart-check skip and the overlay-apply block
+    # below; both must agree on which packages are eligible.
+    $OverlayApplies = (
+        ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers' -and $IsApplication) -or
+        ($Make -eq 'Dell' -and $Type -eq 'DriverUpdates')
+    )
+
     # base version (e.g. "A01.OVL.abc123" starts with "A01") - these are previous overlay runs
     $OverlayExisting = $null
-    if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers' -and -not $Existing) {
+    if ($OverlayApplies -and $Type -eq 'Drivers' -and -not $Existing) {
         $OverlayExisting = $AllExisting | Where-Object { $_.Version -like "$Version.OVL.*" -or $_.Version -like "$Version.*" }
+    }
+    # DriverUpdates packages versioned as "Cat.<fingerprint>" (no base pack involved).
+    # The previous deployment's version IS the overlay fingerprint, so we treat any
+    # existing DriverUpdates package as the candidate to fingerprint-compare against.
+    if ($Make -eq 'Dell' -and $Type -eq 'DriverUpdates' -and -not $Existing) {
+        $OverlayExisting = $AllExisting | Where-Object { $_.Version -like 'Cat.*' }
+    }
+
+    # Log the deliberate TS skip so it's not a silent behavior change for anyone
+    # who had overlay packages on the SCCM share before this update.
+    if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers' -and -not $IsApplication) {
+        Write-DATLog -Message "Skipping per-model catalog overlay for TS-targeted package '$PackageName' (use a 'Driver Updates' Application to deliver catalog drivers)" -Severity 1
     }
 
     # --- Smart overlay skip: check if individual drivers have changed before re-building ---
@@ -591,7 +613,8 @@ function Invoke-DATSyncSinglePackage {
     $OverlayFingerprint = $null
     $CachedIndividualDrivers = $null
     $CachedMissingCategories = $null
-    if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers' -and ($Existing -or $OverlayExisting)) {
+    $SmartCheckEnabled = ($OverlayApplies -and ($Existing -or $OverlayExisting))
+    if ($SmartCheckEnabled) {
         try {
             Write-DATLog -Message "Checking if individual Dell drivers have changed for $ModelName..." -Severity 1
 
@@ -703,7 +726,9 @@ function Invoke-DATSyncSinglePackage {
                     if ($Existing -is [array]) { $Existing[0] } else { $Existing }
                 } else { $null }
 
-                if ($ExistingToCheck -and $ExistingToCheck.Version -like "*OVL.$OverlayFingerprint") {
+                # Match either "<base>.OVL.<fp>" (Drivers overlay) or "Cat.<fp>" (DriverUpdates).
+                $FpMatchPattern = if ($Type -eq 'DriverUpdates') { "Cat.$OverlayFingerprint" } else { "*OVL.$OverlayFingerprint" }
+                if ($ExistingToCheck -and $ExistingToCheck.Version -like $FpMatchPattern) {
                     Write-DATLog -Message "Package already contains latest individual drivers (v$($ExistingToCheck.Version))" -Severity 1
 
                     $Refresh = & $TryApplicationRefresh $ExistingToCheck $ExistingToCheck.Version
@@ -786,7 +811,11 @@ function Invoke-DATSyncSinglePackage {
 
     # DriverUpdates always rebuilds (no fixed base version to skip on); the catalog-driven
     # fingerprint determines content currency in the overlay block.
-    if ($Existing -and $Type -ne 'DriverUpdates' -and -not ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers')) {
+    # When the catalog overlay applies (App Drivers or DriverUpdates), the smart-check
+    # block above is the right place to skip - this base-version skip would short-circuit
+    # past the overlay refresh. TS-targeted Drivers packages don't get an overlay, so
+    # for them this base-version skip IS the correct fast path.
+    if ($Existing -and -not $OverlayApplies) {
         # If multiple packages exist with the same name, use the first one
         $ExistingPkg = if ($Existing -is [array]) { $Existing[0] } else { $Existing }
 
@@ -855,7 +884,7 @@ function Invoke-DATSyncSinglePackage {
         }
     }
 
-    if (($Existing -or $OverlayExisting) -and $UpdateIndividualDrivers) {
+    if (($Existing -or $OverlayExisting) -and $OverlayApplies) {
         Write-DATLog -Message "Individual drivers have changed - proceeding with overlay update" -Severity 1
     }
 
@@ -1102,7 +1131,9 @@ function Invoke-DATSyncSinglePackage {
         # Also scans the extracted pack's INF files to detect which driver categories
         # are absent and fetches the latest available driver for those categories.
         # Reuse $CachedIndividualDrivers if the smart check already queried them.
-        if ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -in @('Drivers', 'DriverUpdates')) {
+        # $OverlayApplies is the single gate (computed near the top of this function)
+        # that excludes TS-targeted Standard/Driver Packages so they ship base-pack-only.
+        if ($OverlayApplies) {
             if ($Type -eq 'DriverUpdates') {
                 Write-DATLog -Message "Resolving Dell catalog drivers for $ModelName (catalog-only Driver Updates)..." -Severity 1
             } else {

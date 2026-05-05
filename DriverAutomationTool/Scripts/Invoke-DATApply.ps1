@@ -500,17 +500,69 @@ function Install-DriverUpdates {
     $RebootCodes     = @(2, 6)
     $PerDupTimeoutMs = 900000  # 15 minutes per DUP
 
-    $Successful = 0
-    $NotApply   = 0
-    $Failed     = 0
-    $Rebooted   = $false
+    $Successful   = 0
+    $NotApply     = 0
+    $Failed       = 0
+    $AlreadyInst  = 0
+    $Rebooted     = $false
     $FailureLines = [System.Collections.Generic.List[string]]::new()
+
+    # Per-DUP version-skip support. After a successful run we record
+    #   HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation\DriverUpdates\Components\<sanitized FileName>
+    # so the next deployment cycle can skip DUPs whose installed version already
+    # equals or exceeds what's in the manifest. This is the in-application
+    # idempotency guarantee on top of the SCCM detection marker, which only
+    # tracks the package-level Cat.<fingerprint>.
+    $ComponentsRoot = Join-Path $MarkerPath 'Components'
+    if (-not (Test-Path $ComponentsRoot)) {
+        try { New-Item -Path $ComponentsRoot -ItemType Directory -Force | Out-Null } catch {
+            Write-Log "Could not create components marker root: $($_.Exception.Message)" -Severity 2
+        }
+    }
+    $SanitizeKey = {
+        param([string]$FileName)
+        # Registry keys allow most chars but `*?:\/` etc. are awkward; collapse to safe set.
+        ($FileName -replace '[^A-Za-z0-9._\-]', '_')
+    }
+    $CompareVersion = {
+        param([string]$Installed, [string]$Target)
+        if ([string]::IsNullOrWhiteSpace($Installed) -or [string]::IsNullOrWhiteSpace($Target)) { return $null }
+        # Try [version] first - works for typical Dell DUP versions like "32.0.101.7077".
+        try {
+            $vi = [version]$Installed
+            $vt = [version]$Target
+            return $vi.CompareTo($vt)  # -1 / 0 / +1
+        } catch { }
+        # Fall back to Dell's "A05" / "1.1.4.38" style mix - normalize and string-compare.
+        $ni = ($Installed -replace '[^A-Za-z0-9.]', '').ToUpperInvariant()
+        $nt = ($Target    -replace '[^A-Za-z0-9.]', '').ToUpperInvariant()
+        if ($ni -eq $nt) { return 0 }
+        return $null  # unknown ordering - caller should treat as "needs install"
+    }
 
     $Index = 0
     foreach ($Drv in $Drivers) {
         $Index++
         $DriverExe = Join-Path $Path $Drv.FileName
         $DriverLabel = "[$Index/$($Drivers.Count)] $($Drv.Category) - $($Drv.Name) v$($Drv.Version)"
+        $CompKey = & $SanitizeKey $Drv.FileName
+        $CompKeyPath = Join-Path $ComponentsRoot $CompKey
+
+        # Per-DUP version skip: if we already installed this exact DUP at >= the
+        # manifest version, don't re-run it. Saves the bulk of the deploy time on
+        # repeat passes and stops Dell DUPs from churning their own re-install
+        # logic for drivers that haven't changed.
+        if (Test-Path $CompKeyPath) {
+            try {
+                $ExistingVer = (Get-ItemProperty -Path $CompKeyPath -Name 'Version' -ErrorAction Stop).Version
+                $Cmp = & $CompareVersion $ExistingVer $Drv.Version
+                if ($null -ne $Cmp -and $Cmp -ge 0) {
+                    Write-Log "$DriverLabel - already installed (marker v$ExistingVer) - skipping"
+                    $AlreadyInst++
+                    continue
+                }
+            } catch { }
+        }
 
         if (-not (Test-Path $DriverExe)) {
             Write-Log "$DriverLabel - DUP not found at $DriverExe - SKIPPED" -Severity 2
@@ -555,6 +607,23 @@ function Install-DriverUpdates {
             if ($DupCode -in $RebootCodes) { $Rebooted = $true }
             $RebootTag = if ($DupCode -in $RebootCodes) { ' (reboot required)' } else { '' }
             Write-Log "$DriverLabel - exit $DupCode (success$RebootTag) in ${Elapsed}s"
+
+            # Record per-DUP version so subsequent deployments can skip this DUP
+            # if its version hasn't moved. We deliberately only mark on success
+            # codes (0/2/6) - not on N-A (3/4/5) - so that if hardware later
+            # changes (e.g., new GPU), the DUP gets a chance to run.
+            try {
+                if (-not (Test-Path $CompKeyPath)) {
+                    New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null
+                }
+                New-ItemProperty -Path $CompKeyPath -Name 'Version'    -Value $Drv.Version -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'Category'   -Value $Drv.Category -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'Name'       -Value $Drv.Name    -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'InstalledOn' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'ExitCode'   -Value $DupCode     -PropertyType DWord -Force | Out-Null
+            } catch {
+                Write-Log "  Failed to write component marker for $($Drv.FileName): $($_.Exception.Message)" -Severity 2
+            }
         } elseif ($DupCode -in $NotApplicable) {
             # Dell catalog returns drivers for the model regardless of installed
             # hardware (e.g., Adata SSD firmware on a system with a Samsung SSD).
@@ -568,7 +637,36 @@ function Install-DriverUpdates {
         }
     }
 
-    Write-Log "DriverUpdates summary: $Successful succeeded, $NotApply not-applicable, $Failed failed"
+    # Marker GC: Dell renames DUP filenames between catalog refreshes (e.g. when
+    # a chip-coverage list grows or a bundled UWP app changes), which leaves
+    # orphan keys under Components\ that no longer correspond to anything in the
+    # current manifest. Sweep them on every successful run so the registry stays
+    # in sync with what's actually deployable.
+    try {
+        $ExpectedKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($Drv in $Drivers) {
+            [void]$ExpectedKeys.Add((& $SanitizeKey $Drv.FileName))
+        }
+        $Removed = 0
+        if (Test-Path $ComponentsRoot) {
+            Get-ChildItem -Path $ComponentsRoot -ErrorAction SilentlyContinue |
+                Where-Object { -not $ExpectedKeys.Contains($_.PSChildName) } |
+                ForEach-Object {
+                    try {
+                        Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction Stop
+                        Write-Log "  GC: removed stale component marker '$($_.PSChildName)' (no longer in manifest)" -Severity 1
+                        $Removed++
+                    } catch {
+                        Write-Log "  GC: could not remove '$($_.PSChildName)': $($_.Exception.Message)" -Severity 2
+                    }
+                }
+        }
+        if ($Removed -gt 0) { Write-Log "Component marker GC: $Removed stale entries removed" }
+    } catch {
+        Write-Log "Component marker GC failed: $($_.Exception.Message)" -Severity 2
+    }
+
+    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $NotApply not-applicable, $Failed failed"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
     }

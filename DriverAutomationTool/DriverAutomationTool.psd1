@@ -15,6 +15,7 @@
         'Export-DATReport'
         'Register-DATQueueLogSubscriber'
         'Invoke-DATRemovePackages'
+        'Invoke-DATCleanupOverlayPackages'
         'Invoke-DATDeployApplications'
         'Connect-DATIntune'
         'Disconnect-DATIntune'

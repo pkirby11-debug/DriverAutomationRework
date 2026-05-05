@@ -51,7 +51,15 @@ function Invoke-DATDeployApplications {
         [string]$DeployAction = 'Install',
 
         [ValidateSet('DisplayAll', 'DisplaySoftwareCenterOnly', 'HideAll')]
-        [string]$UserNotification = 'DisplayAll'
+        [string]$UserNotification = 'DisplayAll',
+
+        # Optional schedule. When omitted (default) the deployment is available now
+        # and - for Required deployments - the deadline is also "now", matching the
+        # original behavior. When supplied, both values flow through to
+        # New-CMApplicationDeployment so admins can stage off-hours installs.
+        [Nullable[datetime]]$AvailableDateTime,
+
+        [Nullable[datetime]]$DeadlineDateTime
     )
 
     $ConnectParams = @{ SiteServer = $SiteServer }
@@ -85,6 +93,12 @@ function Invoke-DATDeployApplications {
         # AvailableDateTime is set to the same instant so the schedule object is
         # internally consistent.
         $Now = Get-Date
+        $EffectiveAvailable = if ($AvailableDateTime) { $AvailableDateTime } else { $Now }
+        $EffectiveDeadline  = if ($DeadlineDateTime)  { $DeadlineDateTime  } else { $EffectiveAvailable }
+        if ($AvailableDateTime -or $DeadlineDateTime) {
+            Write-DATLog -Message ("  Schedule: Available={0:yyyy-MM-dd HH:mm}{1}" -f $EffectiveAvailable,
+                $(if ($DeployPurpose -eq 'Required') { ", Deadline=$($EffectiveDeadline.ToString('yyyy-MM-dd HH:mm'))" } else { '' })) -Severity 1
+        }
 
         foreach ($AppName in $Applications) {
             try {
@@ -110,11 +124,11 @@ function Invoke-DATDeployApplications {
                     DeployAction      = $DeployAction
                     DeployPurpose     = $DeployPurpose
                     UserNotification  = $UserNotification
-                    AvailableDateTime = $Now
+                    AvailableDateTime = $EffectiveAvailable
                     ErrorAction       = 'Stop'
                 }
                 if ($DeployPurpose -eq 'Required') {
-                    $DeployParams['DeadlineDateTime'] = $Now
+                    $DeployParams['DeadlineDateTime'] = $EffectiveDeadline
                 }
 
                 New-CMApplicationDeployment @DeployParams | Out-Null
