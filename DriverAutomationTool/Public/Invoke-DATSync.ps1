@@ -522,10 +522,22 @@ function Invoke-DATSyncSinglePackage {
                       elseif ($Type -eq 'DriverUpdates') { "Driver Automation\Driver Updates\$Make" }
                       else { "Driver Automation\Drivers\$Make" }
 
+        # Map sync-side $Type (Drivers/BIOS/DriverUpdates) to app-side Mode
+        # (Driver/BIOS/DriverUpdates). The previous mapping collapsed
+        # DriverUpdates into 'Driver', which on the refresh path rebuilt the
+        # deployment type with the wrong install command (-Mode Driver against
+        # a folder of DUPs), wrote the detection marker to the Drivers subkey
+        # instead of DriverUpdates, and bypassed the DriverUpdates-only
+        # RebootBehavior=ForceReboot in New-DATConfigMgrApplication.
+        $AppMode = switch ($Type) {
+            'BIOS'          { 'BIOS' }
+            'DriverUpdates' { 'DriverUpdates' }
+            default         { 'Driver' }   # 'Drivers'
+        }
         $AppParams = @{
             Name         = $PackageName
             SourcePath   = $ExistingPkg.SourcePath
-            Mode         = if ($Type -eq 'BIOS') { 'BIOS' } else { 'Driver' }
+            Mode         = $AppMode
             Manufacturer = $Make
             Model        = $ModelName
             Version      = $UseVersion

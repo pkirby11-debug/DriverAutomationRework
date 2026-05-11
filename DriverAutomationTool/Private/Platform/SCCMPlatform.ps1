@@ -2249,6 +2249,15 @@ function New-DATConfigMgrApplication {
 
             $ExistingDT = Get-CMDeploymentType -ApplicationName $Name -DeploymentTypeName $DTName -ErrorAction SilentlyContinue
 
+            # DriverUpdates apps target already-built devices where the new drivers
+            # don't take effect until the OS reloads them, so always force a restart
+            # after a successful install. SCCM honors the deployment's UserNotification
+            # setting (default DisplayAll) and displays the standard restart countdown
+            # to the logged-on user. Driver/BIOS modes stay on BasedOnExitCode - those
+            # paths already signal 3010 from the install script when truly needed and
+            # have their own pre-reboot handling (e.g., BitLocker suspension).
+            $RebootBehavior = if ($Mode -eq 'DriverUpdates') { 'ForceReboot' } else { 'BasedOnExitCode' }
+
             # Parameters shared by both the create (Add-CMScriptDeploymentType) and
             # update (Set-CMScriptDeploymentType) cmdlets.
             $DTParams = @{
@@ -2263,7 +2272,7 @@ function New-DATConfigMgrApplication {
                 UserInteractionMode      = 'Hidden'
                 MaximumRuntimeMins       = $Timeout
                 EstimatedRuntimeMins     = $Estimated
-                RebootBehavior           = 'BasedOnExitCode'
+                RebootBehavior           = $RebootBehavior
                 ErrorAction              = 'Stop'
             }
 
@@ -2275,11 +2284,11 @@ function New-DATConfigMgrApplication {
                 # Update-in-place also preserves the DT's internal ID so any
                 # existing deployments keep working, and it keeps attached
                 # requirement rules intact (no re-attach churn).
-                Write-DATLog -Message "Updating deployment type '$DTName' for $Name in place" -Severity 1
+                Write-DATLog -Message "Updating deployment type '$DTName' for $Name in place (RebootBehavior=$RebootBehavior)" -Severity 1
                 Set-CMScriptDeploymentType @DTParams | Out-Null
                 Write-DATLog -Message "Deployment type '$DTName' updated (install command, content, detection script refreshed; existing requirement rules preserved)" -Severity 1
             } else {
-                Write-DATLog -Message "Creating new deployment type '$DTName' for $Name" -Severity 1
+                Write-DATLog -Message "Creating new deployment type '$DTName' for $Name (RebootBehavior=$RebootBehavior)" -Severity 1
                 Add-CMScriptDeploymentType @DTParams | Out-Null
                 Write-DATLog -Message "Deployment type '$DTName' created" -Severity 1
 
