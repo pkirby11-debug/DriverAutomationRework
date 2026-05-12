@@ -571,9 +571,13 @@ function Invoke-DATSyncSinglePackage {
         }
     }
 
-    # Find ALL existing packages for this model/type (any version) - used for duplicate prevention
+    # Find ALL existing packages for this model/type (any version) - used for duplicate prevention.
+    # -IncludeSourcePath is required here because $TryApplicationRefresh needs
+    # the on-disk content location to re-stage Invoke-DATApply.ps1 and rebuild
+    # the deployment type. Without it, the refresh aborts with "existing source
+    # path missing" and the latest apply script never reaches the DP/client.
     $AllExisting = if ($IsApplication) {
-        Find-DATExistingApplications -Manufacturer $Make -Model $ModelName -Type $Type |
+        Find-DATExistingApplications -Manufacturer $Make -Model $ModelName -Type $Type -IncludeSourcePath |
             Where-Object { $_.Name -eq $PackageName }
     } elseif ($IsDriverPkg) {
         Find-DATExistingDriverPackages -Manufacturer $Make -Model $ModelName -Type $Type |

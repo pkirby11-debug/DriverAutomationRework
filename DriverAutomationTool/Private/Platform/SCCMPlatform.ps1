@@ -2393,6 +2393,12 @@ function Find-DATExistingApplications {
     <#
     .SYNOPSIS
         Finds DAT-managed Applications filtered by manufacturer/model/type.
+    .PARAMETER IncludeSourcePath
+        Resolve each app's deployment type content location and project it as
+        SourcePath on the output. Costs one Get-CMDeploymentType + SDMPackageXML
+        parse per match - opt in only when the caller actually needs the path
+        (e.g. Invoke-DATSync's $TryApplicationRefresh). The GUI Deploy tab,
+        which can enumerate hundreds of apps, leaves this off.
     #>
     [CmdletBinding()]
     param(
@@ -2400,7 +2406,9 @@ function Find-DATExistingApplications {
         [string]$Model,
 
         [ValidateSet('Drivers', 'BIOS', 'DriverUpdates', 'All')]
-        [string]$Type = 'All'
+        [string]$Type = 'All',
+
+        [switch]$IncludeSourcePath
     )
 
     Assert-DATConfigMgrConnected
@@ -2439,14 +2447,40 @@ function Find-DATExistingApplications {
             }
         }
 
-        return $Apps | Select-Object @{N='PackageID';E={[string]$_.CI_ID}},
-            @{N='CI_ID';E={[string]$_.CI_ID}},
-            @{N='Name';E={$_.LocalizedDisplayName}},
-            @{N='Version';E={$_.SoftwareVersion}},
-            @{N='Manufacturer';E={$_.Manufacturer}},
-            @{N='Description';E={$_.LocalizedDescription}},
-            @{N='LastModified';E={$_.DateLastModified}},
-            @{N='Kind';E={'Application'}}
+        return $Apps | ForEach-Object {
+            $App = $_
+
+            # SourcePath isn't exposed on the Application object itself - it
+            # lives on the deployment type. We extract it the same way the
+            # Remove-DATLegacyApplication CleanSource path does (line ~2495):
+            # parse SDMPackageXML and pull Installer.Contents.Content.Location.
+            $SourcePath = $null
+            if ($IncludeSourcePath) {
+                try {
+                    $DT = Get-CMDeploymentType -ApplicationName $App.LocalizedDisplayName -ErrorAction SilentlyContinue |
+                        Select-Object -First 1
+                    if ($DT -and $DT.SDMPackageXML) {
+                        $XmlContent = [xml]$DT.SDMPackageXML
+                        $SourcePath = ($XmlContent.AppMgmtDigest.DeploymentType.Installer.Contents.Content.Location |
+                            Select-Object -First 1)
+                    }
+                } catch {
+                    Write-DATLog -Message "Could not resolve SourcePath for application '$($App.LocalizedDisplayName)': $($_.Exception.Message)" -Severity 2
+                }
+            }
+
+            [PSCustomObject]@{
+                PackageID    = [string]$App.CI_ID
+                CI_ID        = [string]$App.CI_ID
+                Name         = $App.LocalizedDisplayName
+                Version      = $App.SoftwareVersion
+                Manufacturer = $App.Manufacturer
+                Description  = $App.LocalizedDescription
+                LastModified = $App.DateLastModified
+                SourcePath   = $SourcePath
+                Kind         = 'Application'
+            }
+        }
     } finally {
         Set-Location -Path $OriginalLocation
     }
