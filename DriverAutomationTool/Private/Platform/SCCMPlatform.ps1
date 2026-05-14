@@ -2075,6 +2075,71 @@ if (`$Installed -eq '$EscapedVersion' -and `$Status -eq 'Installed') {
 "@
 }
 
+function Get-DATInstallCommand {
+    <#
+    .SYNOPSIS
+        Builds the powershell.exe install command line for a DAT-managed deployment type.
+    .DESCRIPTION
+        Centralizes the quoting / argument-construction logic shared by
+        New-DATConfigMgrApplication and Update-DATApplicationCommands. Values
+        with spaces (PackageName, BIOSPassword) MUST be wrapped in real
+        Win32 double quotes - CCMExec invokes the command via CreateProcess,
+        which only honors double quotes as string delimiters. Single quotes
+        are treated as literal characters and cause param binding to fail
+        (the bug that produces "exit code 2 / Unmatched exit code is
+        considered an execution failure" in AppEnforce.log with no DATApply
+        lines preceding it).
+
+        Package names and versions produced by this module never contain
+        double quotes, so we don't do Win32 \" escaping of inner content;
+        BIOS passwords are validated to be quote-free up front.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Driver', 'BIOS', 'DriverUpdates')]
+        [string]$Mode,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$Version,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Dell', 'Lenovo', 'Microsoft')]
+        [string]$SafetyManufacturer,
+
+        [SecureString]$BIOSPassword
+    )
+
+    $InstallArgs = [System.Collections.Generic.List[string]]::new()
+    [void]$InstallArgs.Add('-NoProfile')
+    [void]$InstallArgs.Add('-ExecutionPolicy Bypass')
+    [void]$InstallArgs.Add('-File ".\Invoke-DATApply.ps1"')
+    [void]$InstallArgs.Add("-Mode $Mode")
+    [void]$InstallArgs.Add("-PackageName `"$Name`"")
+    [void]$InstallArgs.Add("-Version `"$Version`"")
+    [void]$InstallArgs.Add("-SafetyManufacturer $SafetyManufacturer")
+
+    if ($Mode -eq 'BIOS' -and $BIOSPassword) {
+        # Decrypt SecureString to plaintext only here - it is immediately
+        # consumed by the install-command string that CM persists.
+        $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($BIOSPassword)
+        try {
+            $PwPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($BSTR)
+            if ($PwPlain -match '"') {
+                throw "BIOSPassword contains a double-quote character, which breaks Win32 command-line quoting. Pick a password without double quotes."
+            }
+            [void]$InstallArgs.Add("-BIOSPassword `"$PwPlain`"")
+        } finally {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+        }
+    }
+
+    return 'powershell.exe {0}' -f ($InstallArgs -join ' ')
+}
+
 function Copy-DATApplyScript {
     <#
     .SYNOPSIS
@@ -2095,6 +2160,112 @@ function Copy-DATApplyScript {
     }
     Copy-Item -Path $SourceScript -Destination (Join-Path $DestinationPath 'Invoke-DATApply.ps1') -Force
     Write-DATLog -Message "Staged Invoke-DATApply.ps1 into $DestinationPath" -Severity 1
+}
+
+# Vendor exit-code map used by DAT-managed deployment types. Each entry becomes
+# a CustomReturnCode on the script DT so SCCM stops treating vendor-native
+# "reboot required" / "not applicable" codes as execution failures.
+#
+# Dell Flash64W / Dell BIOS DUP / Dell driver DUP (per Dell DUP Reference Guide):
+#   0 SUCCESS, 1 ERROR, 2 REBOOT_REQUIRED, 3 DEP_SOFT_ERROR (N/A),
+#   4 DEP_HARD_ERROR (N/A), 5 QUAL_HARD_ERROR (N/A), 6 REBOOTING_SYSTEM.
+# Lenovo SRSETUP also uses 256 for reboot-required; we surface it here too.
+$script:DATCustomReturnCodes = @(
+    @{ Code =     2; Class = 'SoftReboot'; Name = 'Reboot required (Dell Flash64W / DUP)' }
+    @{ Code =     3; Class = 'Success';    Name = 'Dependency soft error (not applicable)' }
+    @{ Code =     4; Class = 'Success';    Name = 'Dependency hard error (not applicable)' }
+    @{ Code =     5; Class = 'Success';    Name = 'Qualification mismatch (not applicable)' }
+    @{ Code =     6; Class = 'SoftReboot'; Name = 'Rebooting system' }
+    @{ Code =   256; Class = 'SoftReboot'; Name = 'Reboot required (Lenovo SRSETUP)' }
+)
+
+function Set-DATDeploymentTypeReturnCodes {
+    <#
+    .SYNOPSIS
+        Adds DAT-standard CustomReturnCodes to a script deployment type.
+    .DESCRIPTION
+        The SCCM script-DT cmdlets don't expose a parameter for custom return
+        codes, so we go through SDMPackageXML: deserialize the application
+        definition, mutate Installer.CustomReturnCodes on the matching DT,
+        re-serialize, and Put() back. Without this, vendor exit codes like
+        Dell Flash64W's "2" (reboot required) and Dell DUP's "3/4/5" (not
+        applicable) hit SCCM's "Unmatched exit code is considered an
+        execution failure" path even though the install actually succeeded.
+
+        Idempotent - existing codes with the same numeric value are updated
+        in place rather than duplicated.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ApplicationName,
+
+        [Parameter(Mandatory)]
+        [string]$DeploymentTypeName
+    )
+
+    Assert-DATConfigMgrConnected
+
+    try {
+        $App = Get-CMApplication -Name $ApplicationName -ErrorAction Stop | Select-Object -First 1
+        if (-not $App) {
+            throw "Application '$ApplicationName' not found"
+        }
+
+        $Xml = $App.SDMPackageXML
+        if ([string]::IsNullOrWhiteSpace($Xml)) {
+            throw "Application '$ApplicationName' has no SDMPackageXML to modify"
+        }
+
+        # SccmSerializer / CustomError types live in the
+        # Microsoft.ConfigurationManagement.ApplicationManagement assembly that
+        # the ConfigurationManager module loads when imported. The CM PSDrive
+        # call up the stack guarantees the module is loaded by the time we
+        # reach here.
+        $AppDef = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::DeserializeFromString($Xml, $true)
+        $DT = $AppDef.DeploymentTypes | Where-Object { $_.Title -eq $DeploymentTypeName } | Select-Object -First 1
+        if (-not $DT) {
+            throw "Deployment type '$DeploymentTypeName' not found on application '$ApplicationName'"
+        }
+
+        $Installer = $DT.Installer
+        $ReturnCodes = $Installer.CustomReturnCodes
+        $Added = 0
+        $Updated = 0
+        foreach ($Def in $script:DATCustomReturnCodes) {
+            $ClassEnum = [Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass]::($Def.Class)
+            $Existing = $ReturnCodes | Where-Object { $_.Code -eq [int]$Def.Code } | Select-Object -First 1
+            if ($Existing) {
+                if ($Existing.Class -ne $ClassEnum -or $Existing.Name -ne $Def.Name) {
+                    $Existing.Class = $ClassEnum
+                    $Existing.Name = $Def.Name
+                    $Updated++
+                }
+            } else {
+                $NewErr = New-Object Microsoft.ConfigurationManagement.ApplicationManagement.CustomError
+                $NewErr.Code = [int]$Def.Code
+                $NewErr.Class = $ClassEnum
+                $NewErr.Name = $Def.Name
+                [void]$ReturnCodes.Add($NewErr)
+                $Added++
+            }
+        }
+
+        if ($Added -eq 0 -and $Updated -eq 0) {
+            Write-DATLog -Message "Return codes already current on $ApplicationName\$DeploymentTypeName - no change" -Severity 1
+            return
+        }
+
+        $NewXml = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::SerializeToString($AppDef, $true)
+        $App.SetPropertyValue('SDMPackageXML', $NewXml)
+        $App.Put() | Out-Null
+        Write-DATLog -Message "Updated return codes on $ApplicationName\$DeploymentTypeName (added=$Added, updated=$Updated)" -Severity 1
+    } catch {
+        # Non-fatal: the application + DT itself were created/updated before
+        # this call. Return-code mapping is an enhancement, not a hard
+        # requirement for the deployment to function.
+        Write-DATLog -Message "Could not set custom return codes on '$ApplicationName\$DeploymentTypeName': $($_.Exception.Message)" -Severity 2
+    }
 }
 
 function New-DATConfigMgrApplication {
@@ -2201,38 +2372,8 @@ function New-DATConfigMgrApplication {
         }
 
         $DTName = 'Install'
-        $SafetyMfr = $Manufacturer
-
-        # Values with spaces (PackageName, BIOSPassword) MUST be wrapped in real
-        # Win32 double quotes - CCMExec invokes the command via CreateProcess,
-        # which only honors double quotes as string delimiters. Single quotes
-        # are treated as literal characters and cause param binding to fail.
-        # Package names and versions produced by this module never contain
-        # double quotes, so we don't do Win32 \" escaping of inner content.
-        $InstallArgs = @(
-            '-NoProfile'
-            '-ExecutionPolicy Bypass'
-            '-File ".\Invoke-DATApply.ps1"'
-            "-Mode $Mode"
-            "-PackageName `"$Name`""
-            "-Version `"$Version`""
-            "-SafetyManufacturer $SafetyMfr"
-        )
-        if ($Mode -eq 'BIOS' -and $BIOSPassword) {
-            # Decrypt SecureString to plaintext only here - it is immediately
-            # consumed by the install-command string that CM persists.
-            $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($BIOSPassword)
-            try {
-                $PwPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($BSTR)
-                if ($PwPlain -match '"') {
-                    throw "BIOSPassword contains a double-quote character, which breaks Win32 command-line quoting. Pick a password without double quotes."
-                }
-                $InstallArgs += "-BIOSPassword `"$PwPlain`""
-            } finally {
-                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
-            }
-        }
-        $InstallCommand = 'powershell.exe {0}' -f ($InstallArgs -join ' ')
+        $InstallCommand = Get-DATInstallCommand -Mode $Mode -Name $Name -Version $Version `
+            -SafetyManufacturer $Manufacturer -BIOSPassword $BIOSPassword
         $DetectionScript = Get-DATDetectionScript -Mode $Mode -ExpectedVersion $Version
 
         if ($PSCmdlet.ShouldProcess($Name, 'Configure deployment type')) {
@@ -2308,6 +2449,11 @@ function New-DATConfigMgrApplication {
                     Write-DATLog -Message "Warning: requirement rule attach failed: $($_.Exception.Message)" -Severity 2
                 }
             }
+
+            # Ensure the DAT-standard custom return codes (Dell DUP / Flash64W /
+            # Lenovo SRSETUP) are attached to the DT. Idempotent - safe on both
+            # the create and update branches above.
+            Set-DATDeploymentTypeReturnCodes -ApplicationName $Name -DeploymentTypeName $DTName
         }
 
         if ($FolderPath) {
