@@ -454,16 +454,16 @@ function Compress-DATINFCache {
         return $null
     }
 
-    # Stage INF files into a temp directory preserving relative folder structure.
-    # Use ProgramData rather than user temp — user profile temp dirs may not exist
-    # on servers running under service/domain admin accounts with incomplete profiles.
-    $TempStaging = Join-Path $env:ProgramData "DriverAutomationTool\DAT_INFCache_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    New-Item -Path $TempStaging -ItemType Directory -Force | Out-Null
+    # Stage INF files into a per-user staging directory preserving relative folder
+    # structure. See Get-DATStagingRoot for why this lives under Documents rather
+    # than $env:ProgramData or %TEMP%.
+    $INFCacheStaging = Join-Path (Get-DATStagingRoot) "INFCache_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -Path $INFCacheStaging -ItemType Directory -Force | Out-Null
 
     try {
         foreach ($Inf in $InfFiles) {
             $RelativePath = $Inf.FullName.Substring($SourcePath.TrimEnd('\', '/').Length + 1)
-            $DestFile = Join-Path $TempStaging $RelativePath
+            $DestFile = Join-Path $INFCacheStaging $RelativePath
             $DestDir = Split-Path $DestFile -Parent
             if (-not (Test-Path $DestDir)) {
                 New-Item -Path $DestDir -ItemType Directory -Force | Out-Null
@@ -476,13 +476,13 @@ function Compress-DATINFCache {
             Remove-Item -Path $CachePath -Force
         }
 
-        Compress-Archive -Path "$TempStaging\*" -DestinationPath $CachePath -CompressionLevel Optimal -Force
+        Compress-Archive -Path "$INFCacheStaging\*" -DestinationPath $CachePath -CompressionLevel Optimal -Force
 
         $SizeMB = [math]::Round((Get-Item $CachePath).Length / 1MB, 2)
         Write-DATLog -Message "INF cache created: $($InfFiles.Count) .inf file(s), $SizeMB MB -> $CachePath" -Severity 1
         return $CachePath
     } finally {
-        Remove-Item -Path $TempStaging -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $INFCacheStaging -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -514,17 +514,17 @@ function Expand-DATINFCache {
         return $null
     }
 
-    $TempDir = Join-Path $env:ProgramData "DriverAutomationTool\DAT_INFScan_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    New-Item -Path $TempDir -ItemType Directory -Force | Out-Null
+    $ScanDir = Join-Path (Get-DATStagingRoot) "INFScan_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -Path $ScanDir -ItemType Directory -Force | Out-Null
 
     try {
-        Expand-Archive -Path $CachePath -DestinationPath $TempDir -Force
-        $InfCount = @(Get-ChildItem -Path $TempDir -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue).Count
-        Write-DATLog -Message "INF cache expanded: $InfCount .inf file(s) to $TempDir" -Severity 1
-        return $TempDir
+        Expand-Archive -Path $CachePath -DestinationPath $ScanDir -Force
+        $InfCount = @(Get-ChildItem -Path $ScanDir -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue).Count
+        Write-DATLog -Message "INF cache expanded: $InfCount .inf file(s) to $ScanDir" -Severity 1
+        return $ScanDir
     } catch {
         Write-DATLog -Message "Failed to expand INF cache: $($_.Exception.Message)" -Severity 2
-        Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $ScanDir -Recurse -Force -ErrorAction SilentlyContinue
         return $null
     }
 }
@@ -605,45 +605,45 @@ function Compress-DATPackage {
                 Write-DATLog -Message "Warning: DISM /Capture-Image typically requires administrator privileges. If compression fails, run the DAT Tool as Administrator." -Severity 2
             }
 
-            # DISM does NOT support UNC paths - must use local directory.
-            # Use ProgramData instead of %TEMP% or user Documents to avoid two issues:
-            #   1. AV products aggressively scan %TEMP% (common malware staging location)
-            #   2. User profile folders (Documents) may not exist on servers where the tool
-            #      runs under service accounts or domain admin accounts with incomplete profiles
-            # ProgramData (C:\ProgramData) is always present on any Windows machine.
-            # IMPORTANT: The WIM output file must be in a SEPARATE directory from the
-            # capture source, otherwise DISM gets exit code 5 (Access Denied) because it
-            # locks the output file while also trying to read the same directory as source.
-            $WimTempBase = Join-Path $env:ProgramData 'DriverAutomationTool\DAT_WimTemp'
-            $WimTempSource = Join-Path $WimTempBase 'Source'
-            $WimTempOutput = Join-Path $WimTempBase 'Output'
-            if (Test-Path $WimTempBase) { Remove-Item -Path $WimTempBase -Recurse -Force }
-            New-Item -Path $WimTempSource -ItemType Directory -Force | Out-Null
-            New-Item -Path $WimTempOutput -ItemType Directory -Force | Out-Null
+            # DISM does NOT support UNC paths - must use a local directory. Stage
+            # the capture under the per-user staging root rather than %TEMP%
+            # (Defender treats %TEMP% as a malware-staging hotspot) and rather
+            # than $env:ProgramData (enterprise AV / EDR rules flag bulk writes
+            # there). See Get-DATStagingRoot.
+            # IMPORTANT: The WIM output file must be in a SEPARATE directory from
+            # the capture source, otherwise DISM gets exit code 5 (Access Denied)
+            # because it locks the output file while also reading the same
+            # directory as source.
+            $WimStagingBase = Join-Path (Get-DATStagingRoot) 'WimBuild'
+            $WimStagingSource = Join-Path $WimStagingBase 'Source'
+            $WimStagingOutput = Join-Path $WimStagingBase 'Output'
+            if (Test-Path $WimStagingBase) { Remove-Item -Path $WimStagingBase -Recurse -Force }
+            New-Item -Path $WimStagingSource -ItemType Directory -Force | Out-Null
+            New-Item -Path $WimStagingOutput -ItemType Directory -Force | Out-Null
 
-            Write-DATLog -Message "Copying drivers to local temp for WIM creation: $WimTempSource" -Severity 1
-            Copy-Item -Path "$SourcePath\*" -Destination $WimTempSource -Recurse -Force
+            Write-DATLog -Message "Copying drivers to local staging for WIM creation: $WimStagingSource" -Severity 1
+            Copy-Item -Path "$SourcePath\*" -Destination $WimStagingSource -Recurse -Force
 
             # Slim the local staging copy by removing excluded files and directories.
             # This runs AFTER the copy so it never touches the UNC source and avoids
             # robocopy UNC/MT compatibility issues on domain NAS shares.
             $UseFilter = ($WimExcludeFiles -and $WimExcludeFiles.Count -gt 0) -or ($WimExcludeDirs -and $WimExcludeDirs.Count -gt 0)
             if ($UseFilter) {
-                $PreSlimMB = [math]::Round(((Get-ChildItem -Path $WimTempSource -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB), 2)
+                $PreSlimMB = [math]::Round(((Get-ChildItem -Path $WimStagingSource -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB), 2)
                 if ($WimExcludeFiles.Count -gt 0) { Write-DATLog -Message "  Excluding files: $($WimExcludeFiles -join ', ')" -Severity 1 }
                 if ($WimExcludeDirs.Count -gt 0)  { Write-DATLog -Message "  Excluding dirs:  $($WimExcludeDirs -join ', ')" -Severity 1 }
 
                 foreach ($Pattern in $WimExcludeFiles) {
-                    Get-ChildItem -Path $WimTempSource -Filter $Pattern -Recurse -File -ErrorAction SilentlyContinue |
+                    Get-ChildItem -Path $WimStagingSource -Filter $Pattern -Recurse -File -ErrorAction SilentlyContinue |
                         Remove-Item -Force -ErrorAction SilentlyContinue
                 }
                 foreach ($DirName in $WimExcludeDirs) {
-                    Get-ChildItem -Path $WimTempSource -Directory -Recurse -ErrorAction SilentlyContinue |
+                    Get-ChildItem -Path $WimStagingSource -Directory -Recurse -ErrorAction SilentlyContinue |
                         Where-Object { $_.Name -eq $DirName } |
                         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
                 }
 
-                $PostSlimMB = [math]::Round(((Get-ChildItem -Path $WimTempSource -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB), 2)
+                $PostSlimMB = [math]::Round(((Get-ChildItem -Path $WimStagingSource -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB), 2)
                 $SavedMB = [math]::Round($PreSlimMB - $PostSlimMB, 2)
                 $SavedPct = if ($PreSlimMB -gt 0) { [math]::Round((($PreSlimMB - $PostSlimMB) / $PreSlimMB) * 100, 1) } else { 0 }
                 Write-DATLog -Message "Slim staging complete: $PostSlimMB MB (removed $SavedMB MB / $SavedPct%)" -Severity 1
@@ -656,15 +656,15 @@ function Compress-DATPackage {
             Write-DATLog -Message "Waiting 10 seconds for AV scanning to complete before WIM capture..." -Severity 1
             Start-Sleep -Seconds 10
 
-            $LocalWim = Join-Path $WimTempOutput 'DriverPackage.wim'
-            $DismArgs = "/Capture-Image /ImageFile:`"$LocalWim`" /CaptureDir:`"$WimTempSource`" /Name:`"$PackageName`" /Compress:max"
+            $LocalWim = Join-Path $WimStagingOutput 'DriverPackage.wim'
+            $DismArgs = "/Capture-Image /ImageFile:`"$LocalWim`" /CaptureDir:`"$WimStagingSource`" /Name:`"$PackageName`" /Compress:max"
             Write-DATLog -Message "DISM args: $DismArgs" -Severity 1
 
             # Retry DISM capture up to 3 times with increasing delay to handle AV file locks
             $MaxDismRetries = 3
             $DismSuccess = $false
             for ($DismAttempt = 1; $DismAttempt -le $MaxDismRetries; $DismAttempt++) {
-                $DismLog = Join-Path $WimTempOutput "DismAction_attempt${DismAttempt}.log"
+                $DismLog = Join-Path $WimStagingOutput "DismAction_attempt${DismAttempt}.log"
                 $Proc = Start-Process -FilePath 'dism.exe' -ArgumentList $DismArgs -Wait -NoNewWindow -PassThru -RedirectStandardOutput $DismLog -ErrorAction Stop
 
                 if ($Proc.ExitCode -eq 0) {
@@ -701,9 +701,9 @@ function Compress-DATPackage {
             # discarding unreferenced resources and re-running max compression cleanly.
             if ($WimOptimizeExport) {
                 $PreExportMB = [math]::Round((Get-Item $LocalWim).Length / 1MB, 2)
-                $ExportedWim = Join-Path $WimTempOutput 'DriverPackage.optimized.wim'
+                $ExportedWim = Join-Path $WimStagingOutput 'DriverPackage.optimized.wim'
                 $ExportArgs = "/Export-Image /SourceImageFile:`"$LocalWim`" /SourceIndex:1 /DestinationImageFile:`"$ExportedWim`" /Compress:max /CheckIntegrity"
-                $ExportLog = Join-Path $WimTempOutput 'DismExport.log'
+                $ExportLog = Join-Path $WimStagingOutput 'DismExport.log'
                 Write-DATLog -Message "Optimizing WIM via DISM /Export-Image (pre-export: $PreExportMB MB)..." -Severity 1
                 $ExportProc = Start-Process -FilePath 'dism.exe' -ArgumentList $ExportArgs -Wait -NoNewWindow -PassThru -RedirectStandardOutput $ExportLog -ErrorAction Stop
 
@@ -721,12 +721,12 @@ function Compress-DATPackage {
                 }
             }
 
-            # Copy WIM from local temp back to the UNC output directory
+            # Copy WIM from local staging back to the UNC output directory
             Write-DATLog -Message "Copying WIM to package destination: $WimPath" -Severity 1
             Copy-Item -Path $LocalWim -Destination $WimPath -Force
 
-            # Clean up local temp
-            Remove-Item -Path $WimTempBase -Recurse -Force -ErrorAction SilentlyContinue
+            # Clean up local staging
+            Remove-Item -Path $WimStagingBase -Recurse -Force -ErrorAction SilentlyContinue
 
             $SizeMB = [math]::Round((Get-Item $WimPath).Length / 1MB, 2)
             Write-DATLog -Message "WIM compression complete: $SizeMB MB" -Severity 1

@@ -1822,10 +1822,11 @@ function Invoke-DATPatchPackage {
             # WIM package: mount, copy, dismount
             Write-DATLog -Message "Detected WIM package format: $($WimFile.Name)" -Severity 1
 
-            # Under ProgramData (not %TEMP%) to avoid AV on-access scans while
-            # DISM has the WIM mounted. Consistent with the rest of DAT's temp
-            # strategy - see Get-DATTempPath.
-            $MountDir = Join-Path $env:ProgramData "DriverAutomationTool\WimMount\$PackageID"
+            # Under the per-user staging root (not %TEMP%) to avoid AV on-access
+            # scans while DISM has the WIM mounted, and not $env:ProgramData so
+            # corporate AV / EDR doesn't flag bulk writes there. Consistent with
+            # the rest of DAT's staging strategy - see Get-DATStagingRoot.
+            $MountDir = Join-Path (Get-DATStagingRoot) "WimMount\$PackageID"
             if (Test-Path $MountDir) { Remove-Item -Path $MountDir -Recurse -Force }
             New-Item -Path $MountDir -ItemType Directory -Force | Out-Null
 
