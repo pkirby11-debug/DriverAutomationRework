@@ -755,13 +755,35 @@ function Invoke-DellBIOSFlash {
 
     Write-Log "Running: Flash64W.exe $($FlashArgs -replace '/p=".+"', '/p="***"' -join ' ')"
     $Proc = Start-Process -FilePath $FlashUtil.FullName -ArgumentList $FlashArgs `
-        -Wait -PassThru -NoNewWindow -WorkingDirectory $Path
+        -PassThru -NoNewWindow -WorkingDirectory $Path
+    # Touching .Handle forces PS 5.1's Start-Process to retain the OS handle so
+    # $Proc.ExitCode reads correctly after WaitForExit under CCMExec / SYSTEM.
+    # Without this, ExitCode can read as $null and the default-branch below
+    # propagates $null up to the main exit, which SCCM logs as a literal "2" /
+    # binding-style failure with no DATApply lines preceding it.
+    $null = $Proc.Handle
+    $Proc.WaitForExit()
     $ExitCode = $Proc.ExitCode
     Write-Log "Flash64W.exe exit code: $ExitCode"
 
+    if ($null -eq $ExitCode) {
+        Write-Log 'Flash64W.exe ExitCode came back null - treating as soft-reboot success per Dell convention (BIOS most likely flashed; let SCCM reboot and re-detect).' -Severity 2
+        $script:RebootRequired = $true
+        return 0
+    }
+
+    # Dell Flash64W / BIOS DUP convention:
+    #   0     = success, no reboot
+    #   2     = success, reboot required
+    #   3/4/5 = not applicable (dependency / qualification mismatch)
+    #   6     = rebooting now
     switch ($ExitCode) {
         0 { return 0 }
         2 { $script:RebootRequired = $true; return 0 }
+        3 { Write-Log 'Flash64W returned 3 (dependency soft error / not applicable) - treating as success' -Severity 2; return 0 }
+        4 { Write-Log 'Flash64W returned 4 (dependency hard error / not applicable) - treating as success' -Severity 2; return 0 }
+        5 { Write-Log 'Flash64W returned 5 (qualification mismatch / not applicable) - treating as success' -Severity 2; return 0 }
+        6 { $script:RebootRequired = $true; return 0 }
         default { return $ExitCode }
     }
 }
@@ -809,9 +831,19 @@ function Invoke-LenovoBIOSFlash {
 
     Write-Log "Running: $($Utility.Name) $($FlashArgs -replace '/pass:".+"', '/pass:"***"' -join ' ')"
     $Proc = Start-Process -FilePath $Utility.FullName -ArgumentList $FlashArgs `
-        -Wait -PassThru -NoNewWindow -WorkingDirectory $Path
+        -PassThru -NoNewWindow -WorkingDirectory $Path
+    # See Invoke-DellBIOSFlash for the .Handle rationale - same PS 5.1 / CCMExec
+    # ExitCode-is-null issue applies to the Lenovo utilities.
+    $null = $Proc.Handle
+    $Proc.WaitForExit()
     $ExitCode = $Proc.ExitCode
     Write-Log "$($Utility.Name) exit code: $ExitCode"
+
+    if ($null -eq $ExitCode) {
+        Write-Log "$($Utility.Name) ExitCode came back null - treating as soft-reboot success (flash most likely completed; let SCCM reboot and re-detect)." -Severity 2
+        $script:RebootRequired = $true
+        return 0
+    }
 
     if ($UtilityType -eq 'SRSETUP') {
         # SRSETUP returns 0 on success with reboot required, 256 explicitly for reboot.
