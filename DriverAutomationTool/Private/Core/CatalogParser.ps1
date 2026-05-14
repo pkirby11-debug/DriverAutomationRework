@@ -107,40 +107,71 @@ function Read-DATXml {
     }
 }
 
+function Get-DATStagingRoot {
+    <#
+    .SYNOPSIS
+        Returns the per-user staging root used for all pack extract / compress work.
+    .DESCRIPTION
+        Resolves to "<Documents>\DriverAutomationTool\Staging" and creates the
+        directory if it does not exist. Uses [Environment]::GetFolderPath so that
+        Group Policy folder redirection and OneDrive's Known Folder Move are
+        honored — the path tracks wherever the user's Documents actually live.
+
+        Staging lives under the user profile (not $env:ProgramData) so that
+        enterprise AV / EDR products that watch ProgramData for bulk file churn
+        stop flagging DAT's normal extract activity, and so the tool no longer
+        needs write access to a machine-wide directory.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $Documents = [Environment]::GetFolderPath('MyDocuments')
+    if ([string]::IsNullOrWhiteSpace($Documents)) {
+        # GetFolderPath returns empty for some service / SYSTEM contexts that have
+        # no loaded user profile. Fall back to the literal profile Documents path.
+        $Documents = Join-Path $env:USERPROFILE 'Documents'
+    }
+
+    $Root = Join-Path $Documents 'DriverAutomationTool\Staging'
+    if (-not (Test-Path $Root)) {
+        New-Item -Path $Root -ItemType Directory -Force | Out-Null
+    }
+    return $Root
+}
+
 function Get-DATTempPath {
     <#
     .SYNOPSIS
-        Returns a unique temporary directory for the current operation.
+        Returns a unique staging directory for the current operation.
     .DESCRIPTION
-        Returns a path under $env:ProgramData\DriverAutomationTool\Temp rather than
-        %TEMP% / %LOCALAPPDATA%\Temp. Self-extracting driver .exe files written
-        under %TEMP% consistently trigger Defender's on-access scanner (it treats
-        that path as a malware-staging hotspot); staging under ProgramData avoids
-        those false positives and is writable by any context DAT runs in
-        (user, service account, SYSTEM during OSD).
+        Returns a path under "<Documents>\DriverAutomationTool\Staging". Self-
+        extracting driver .exe files written under %TEMP% consistently trigger
+        Defender's on-access scanner (it treats that path as a malware-staging
+        hotspot), and staging under $env:ProgramData has been observed to trip
+        enterprise AV / EDR rules that watch ProgramData for bulk file writes.
+
+        The function name is retained for backward compatibility with the many
+        callers in DellAdapter / LenovoAdapter / SurfaceAdapter / Invoke-DATSync;
+        only the underlying location has moved.
     .PARAMETER Prefix
-        Prefix for the temp directory name.
+        Prefix for the staging directory name.
     #>
     [CmdletBinding()]
     param(
         [string]$Prefix = 'DAT'
     )
 
-    $TempBase = Join-Path $env:ProgramData 'DriverAutomationTool\Temp'
-    if (-not (Test-Path $TempBase)) {
-        New-Item -Path $TempBase -ItemType Directory -Force | Out-Null
-    }
+    $StagingRoot = Get-DATStagingRoot
+    $StagingDir = Join-Path $StagingRoot ('{0}_{1}' -f $Prefix, [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -Path $StagingDir -ItemType Directory -Force | Out-Null
 
-    $TempDir = Join-Path $TempBase ('{0}_{1}' -f $Prefix, [guid]::NewGuid().ToString('N').Substring(0, 8))
-    New-Item -Path $TempDir -ItemType Directory -Force | Out-Null
-
-    return $TempDir
+    return $StagingDir
 }
 
 function Remove-DATTempPath {
     <#
     .SYNOPSIS
-        Removes a temporary directory created by Get-DATTempPath.
+        Removes a staging directory created by Get-DATTempPath.
     #>
     [CmdletBinding()]
     param(
@@ -148,8 +179,9 @@ function Remove-DATTempPath {
         [string]$Path
     )
 
-    # Safety check on the path marker accepts either the new ProgramData location
-    # (primary) or any legacy %TEMP% leftovers from pre-1.7.1 sync runs.
+    # The path marker accepts either the current Documents\DriverAutomationTool
+    # location or any leftover $env:ProgramData\DriverAutomationTool folders from
+    # builds prior to the staging-root move, so cleanup works across upgrades.
     if ((Test-Path $Path) -and $Path -like "*DriverAutomationTool*") {
         Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
     }
