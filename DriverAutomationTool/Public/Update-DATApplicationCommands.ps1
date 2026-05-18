@@ -18,14 +18,16 @@ function Update-DATApplicationCommands {
           3. Re-stages Invoke-DATApply.ps1 into the app's content source folder so
              the running copy includes the BIOS-flash ExitCode capture fix and the
              expanded Dell DUP exit-code handling.
-          4. Rebuilds the install command via Get-DATInstallCommand (double-quote
-             form) and writes it back with Set-CMScriptDeploymentType.
-          5. Applies the DAT-standard CustomReturnCodes (2/3/4/5/6/256) via
-             Set-DATDeploymentTypeReturnCodes so vendor "reboot required" /
-             "not applicable" codes stop tripping SCCM's failure path.
+          4. Rebuilds the install command (double-quote form) and stages the
+             DAT-standard CustomReturnCodes (2/3/4/5/6/256) on the same in-memory
+             SDM object, then commits both changes with a single $App.Put() so the
+             whole DT update rides one revision bump. Two consecutive bumps caused
+             the 0x87D00314 ("CI Version Info timed out") cascade seen during the
+             1.9.0 retrofit - clients had to reconcile through the intermediate
+             revision while the MP was still delivering the second.
 
-        Idempotent - apps whose install command already matches the current
-        builder are skipped with Status='Skipped'.
+        Idempotent - apps whose install command and return codes already match
+        are skipped with Status='Skipped' (no Put(), no revision bump).
     .PARAMETER SiteServer
         ConfigMgr site server FQDN.
     .PARAMETER SiteCode
@@ -153,6 +155,11 @@ function Update-DATApplicationCommands {
                 # Pull existing install command + source path via SccmSerializer.
                 # Avoids hard-coding XML layout, which has shifted between
                 # CM versions (CustomData.InstallCommandLine vs Args.Arg).
+                # The same deserialized object is mutated below and saved with
+                # one Put(), so install-command and return-code changes ride a
+                # single revision bump - halves the CI-metadata churn that
+                # showed up as 0x87D00314 (CI Version Info timed out) on the
+                # fleet after the first run.
                 $CmApp = Get-CMApplication -Name $AppName -ErrorAction Stop | Select-Object -First 1
                 $AppDef = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::DeserializeFromString($CmApp.SDMPackageXML, $true)
                 $DT = $AppDef.DeploymentTypes | Where-Object { $_.Title -eq 'Install' } | Select-Object -First 1
@@ -184,8 +191,36 @@ function Update-DATApplicationCommands {
                 $NewCmd = Get-DATInstallCommand -Mode $Mode -Name $AppName -Version $Version `
                     -SafetyManufacturer $Mfr -BIOSPassword $BIOSPasswordSecure
 
-                if ($NewCmd -eq $ExistingCmd) {
-                    Write-DATLog -Message "[$AppName] install command already current ($Mode) - skipping" -Severity 1
+                $InstallCmdNeedsUpdate = ($NewCmd -ne $ExistingCmd)
+
+                # Stage return-code mutations on the same in-memory $DT so the
+                # eventual Put() carries both changes in one revision bump.
+                $RcAdded = 0
+                $RcUpdated = 0
+                if (-not $SkipReturnCodes) {
+                    $ReturnCodes = $DT.Installer.CustomReturnCodes
+                    foreach ($Def in $script:DATCustomReturnCodes) {
+                        $ClassEnum = [Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass]::($Def.Class)
+                        $Existing = $ReturnCodes | Where-Object { $_.Code -eq [int]$Def.Code } | Select-Object -First 1
+                        if ($Existing) {
+                            if ($Existing.Class -ne $ClassEnum -or $Existing.Name -ne $Def.Name) {
+                                $Existing.Class = $ClassEnum
+                                $Existing.Name = $Def.Name
+                                $RcUpdated++
+                            }
+                        } else {
+                            $NewErr = New-Object Microsoft.ConfigurationManagement.ApplicationManagement.CustomError
+                            $NewErr.Code = [int]$Def.Code
+                            $NewErr.Class = $ClassEnum
+                            $NewErr.Name = $Def.Name
+                            [void]$ReturnCodes.Add($NewErr)
+                            $RcAdded++
+                        }
+                    }
+                }
+
+                if (-not $InstallCmdNeedsUpdate -and $RcAdded -eq 0 -and $RcUpdated -eq 0) {
+                    Write-DATLog -Message "[$AppName] install command and return codes already current ($Mode) - skipping" -Severity 1
                     $Results.Add([PSCustomObject]@{
                         Name   = $AppName
                         Mode   = $Mode
@@ -194,7 +229,8 @@ function Update-DATApplicationCommands {
                     continue
                 }
 
-                if (-not $PSCmdlet.ShouldProcess($AppName, "Rebuild install command ($Mode)")) {
+                $WhatIfMessage = "Rebuild DT ($Mode): install-cmd=$InstallCmdNeedsUpdate, return-codes added=$RcAdded updated=$RcUpdated"
+                if (-not $PSCmdlet.ShouldProcess($AppName, $WhatIfMessage)) {
                     $Results.Add([PSCustomObject]@{
                         Name   = $AppName
                         Mode   = $Mode
@@ -215,15 +251,16 @@ function Update-DATApplicationCommands {
                     }
                 }
 
-                Set-CMScriptDeploymentType -ApplicationName $AppName `
-                    -DeploymentTypeName 'Install' `
-                    -InstallCommand $NewCmd `
-                    -ErrorAction Stop | Out-Null
-                Write-DATLog -Message "[$AppName] install command rebuilt (Mode=$Mode)" -Severity 1
-
-                if (-not $SkipReturnCodes) {
-                    Set-DATDeploymentTypeReturnCodes -ApplicationName $AppName -DeploymentTypeName 'Install'
+                # Apply install command change in-memory; return-code mutations
+                # were already applied above. One Put() commits everything.
+                if ($InstallCmdNeedsUpdate) {
+                    $DT.Installer.InstallCommandLine = $NewCmd
                 }
+
+                $NewXml = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::SerializeToString($AppDef, $true)
+                $CmApp.SetPropertyValue('SDMPackageXML', $NewXml)
+                $CmApp.Put() | Out-Null
+                Write-DATLog -Message "[$AppName] DT rebuilt in one revision (Mode=$Mode, install-cmd=$InstallCmdNeedsUpdate, return-codes added=$RcAdded updated=$RcUpdated)" -Severity 1
 
                 $Results.Add([PSCustomObject]@{
                     Name   = $AppName
