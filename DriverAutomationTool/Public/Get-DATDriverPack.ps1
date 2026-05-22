@@ -49,7 +49,7 @@ function Get-DATDriverPack {
 
                 if ($Model) {
                     foreach ($M in $Model) {
-                        $Pack = Get-DellDriverPack -Model $M -OperatingSystem $OperatingSystem -Architecture $Architecture
+                        $Pack = Get-DellDriverPack -Model $M -OperatingSystem $OperatingSystem -Architecture $Architecture -ForceRefresh:$ForceRefresh
                         if ($Pack) { $Results.Add($Pack) }
                     }
                 } else {
