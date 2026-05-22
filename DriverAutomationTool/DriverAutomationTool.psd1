@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '1.11.2'
+    ModuleVersion     = '1.11.3'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = 'Automates downloading, packaging, and distributing Dell and Lenovo drivers and BIOS updates for SCCM/ConfigMgr environments. 1.11.2 fixes "Could not set custom return codes ... Unable to find type [Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass]" by explicitly Add-Type''ing the ConfigMgr ApplicationManagement SDK assembly (the CM module loads it lazily inside cmdlet binaries, but our static [Type]::Member references need it in the AppDomain), and adds a Dell catalog diagnostic that logs when a newer SoftwareComponent revision exists for a driver family but was filtered out (e.g. picking A03 when A05 exists), showing the rejected revision''s SystemIDs and OS codes so the operator can immediately see whether the filter dropped it on SystemID or OS-code mismatch.'
+    Description       = 'Automates downloading, packaging, and distributing Dell and Lenovo drivers and BIOS updates for SCCM/ConfigMgr environments. 1.11.3 widens the Dell individual-driver OS filter to accept Dell''s newer year-based osCode format (W21H4 / W21P4, observed on the late-2026 Intel Arc A06 driver). DCU treats these as Win11-applicable, so without the wider match the tool was silently keeping older revisions like A03 instead of picking up A06. Pattern W2[0-9]* covers W21*-W29* so future builds don''t need another code change.'
     PowerShellVersion = '5.1'
     FunctionsToExport = @(
         'Get-DATDriverPack'

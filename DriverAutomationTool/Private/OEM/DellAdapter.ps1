@@ -652,10 +652,23 @@ function Get-DellIndividualDrivers {
     # Build compatible OS code patterns for filtering.
     # Dell uses TWO different OS code formats across their catalogs:
     #   DriverPackCatalog.xml: "Windows10", "Windows11" (long format)
-    #   CatalogPC.xml:         "W10H4" (Win10 Home x64), "W10P4" (Win10 Pro x64),
-    #                          "W11P4" (Win11 Pro x64), "W21P4", "IOT01", etc.
-    # We use wildcard patterns that match both formats.
-    # Windows 10/11 share the same driver model, so accept both.
+    #   CatalogPC.xml + per-model catalogs: short codes:
+    #     W10H4 / W10P4 / W10E4  - Win10 Home/Pro/Ent x64
+    #     W11H4 / W11P4 / W11E4  - Win11 Home/Pro/Ent x64
+    #     W21H4 / W21P4          - newer Dell year-based codes for Win11 (observed
+    #                              on the late-2026 Intel Arc driver A06 on Dell
+    #                              Pro Max - DCU treats them as Win11-applicable,
+    #                              so Dell is using W2x as a parallel taxonomy
+    #                              to W11). We include W2[0-9]* so future
+    #                              W22*/W23* codes are covered without another
+    #                              code change.
+    #     IOT01..04, IOTL3..L4   - Win10/11 IoT Enterprise variants (NOT included
+    #                              by default - IoT-tagged drivers can technically
+    #                              run on desktop Windows but Dell ships separate
+    #                              entries for the desktop SKUs, so accepting IOT*
+    #                              would just pull in duplicate variants).
+    # Patterns below match both formats. Windows 10/11 share the same driver model
+    # so we accept both regardless of which is the user's target.
     $CompatibleOsPatterns = $null
     if ($OperatingSystem) {
         $TargetOsCode = ConvertTo-DellOSCode -OperatingSystem $OperatingSystem
@@ -665,6 +678,7 @@ function Get-DellIndividualDrivers {
                 '*Windows11*'   # DriverPackCatalog long format
                 'W10*'          # CatalogPC short format (Win10 Home/Pro/Ent, any arch)
                 'W11*'          # CatalogPC short format (Win11 Home/Pro/Ent, any arch)
+                'W2[0-9]*'      # Dell year-based Win11 codes (W21H4/W21P4 ...)
             )
             Write-DATLog -Message "Filtering individual drivers to OS patterns: $($CompatibleOsPatterns -join ', ') (from '$OperatingSystem')" -Severity 1
         } else {
