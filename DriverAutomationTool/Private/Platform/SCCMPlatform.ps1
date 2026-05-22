@@ -2180,6 +2180,54 @@ $script:DATCustomReturnCodes = @(
     @{ Code =   256; Class = 'SoftReboot'; Name = 'Reboot required (Lenovo SRSETUP)' }
 )
 
+function Initialize-DATConfigMgrSDKTypes {
+    <#
+    .SYNOPSIS
+        Eagerly loads the ConfigMgr ApplicationManagement SDK assembly so our
+        explicit type references resolve.
+    .DESCRIPTION
+        Functions that mutate Application SDMPackageXML by hand (e.g.
+        Set-DATDeploymentTypeReturnCodes, Update-DATApplicationCommands)
+        reference types like
+        [Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass]
+        and
+        [Microsoft.ConfigurationManagement.ApplicationManagement.CustomError]
+        directly. Importing the ConfigurationManager module loads its cmdlets,
+        but the SDK DLL that contains those types is loaded LAZILY - only when
+        a CM cmdlet binary internally instantiates one - so PowerShell's
+        own type resolver can't see them yet. The first call to
+        [Type]::Member then throws "Unable to find type [...]" even though
+        the ConfigurationManager module is loaded and the CM cmdlets work.
+
+        Add-Type'ing the DLL up front into our AppDomain makes the static
+        type references resolve. Idempotent and safe to call repeatedly -
+        skips the load if the marker type is already known.
+    #>
+    [CmdletBinding()]
+    param()
+
+    # Already loaded? Nothing to do.
+    if ('Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass' -as [Type]) {
+        return
+    }
+
+    $CmModule = Get-Module ConfigurationManager
+    if (-not $CmModule) {
+        throw "ConfigurationManager module is not loaded - cannot locate the SCCM SDK assemblies. Run Connect-DATConfigMgr first."
+    }
+
+    # The SDK DLL ships alongside ConfigurationManager.psd1 in <console>\bin\
+    $BinDir = Split-Path $CmModule.Path -Parent
+    $SDKAssembly = Join-Path $BinDir 'Microsoft.ConfigurationManagement.ApplicationManagement.dll'
+
+    if (-not (Test-Path $SDKAssembly)) {
+        throw "SCCM ApplicationManagement SDK assembly not found at $SDKAssembly"
+    }
+
+    Add-Type -Path $SDKAssembly -ErrorAction Stop
+    Write-DATLog -Message "Loaded SCCM ApplicationManagement SDK: $SDKAssembly" -Severity 1
+}
+
 function Set-DATDeploymentTypeReturnCodes {
     <#
     .SYNOPSIS
@@ -2206,6 +2254,7 @@ function Set-DATDeploymentTypeReturnCodes {
     )
 
     Assert-DATConfigMgrConnected
+    Initialize-DATConfigMgrSDKTypes
 
     try {
         $App = Get-CMApplication -Name $ApplicationName -ErrorAction Stop | Select-Object -First 1
@@ -2218,11 +2267,13 @@ function Set-DATDeploymentTypeReturnCodes {
             throw "Application '$ApplicationName' has no SDMPackageXML to modify"
         }
 
-        # SccmSerializer / CustomError types live in the
-        # Microsoft.ConfigurationManagement.ApplicationManagement assembly that
-        # the ConfigurationManager module loads when imported. The CM PSDrive
-        # call up the stack guarantees the module is loaded by the time we
-        # reach here.
+        # SccmSerializer / CustomError / ErrorClass live in
+        # Microsoft.ConfigurationManagement.ApplicationManagement.dll, which
+        # Initialize-DATConfigMgrSDKTypes loaded explicitly above. The CM
+        # module's lazy-load can't be relied on to make these resolvable to
+        # PowerShell's static type lookup - we hit
+        # "Unable to find type [Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass]"
+        # otherwise.
         $AppDef = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::DeserializeFromString($Xml, $true)
         $DT = $AppDef.DeploymentTypes | Where-Object { $_.Title -eq $DeploymentTypeName } | Select-Object -First 1
         if (-not $DT) {

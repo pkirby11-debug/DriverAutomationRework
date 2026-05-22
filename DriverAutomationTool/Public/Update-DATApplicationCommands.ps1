@@ -88,6 +88,7 @@ function Update-DATApplicationCommands {
     if ($UseSSL)   { $ConnectParams['UseSSL']   = $true }
 
     Connect-DATConfigMgr @ConnectParams
+    Initialize-DATConfigMgrSDKTypes
 
     $OriginalLocation = Get-Location
     $Results = [System.Collections.Generic.List[object]]::new()
