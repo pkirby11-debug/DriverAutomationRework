@@ -103,7 +103,12 @@ function Update-DellModelCatalog {
     .PARAMETER ForceRefresh
         Forces re-download even if cache is valid.
     .PARAMETER CacheTTLHours
-        Cache time-to-live in hours. Default: 24.
+        Cache time-to-live in hours. Default: 6. Per-model catalogs are kept
+        on a shorter TTL than the top-level DriverPackCatalog/CatalogIndex
+        because Dell publishes new SoftwareComponent entries here (Intel Arc,
+        chipset, NPU, etc.) at any point during the day, and a 24h TTL would
+        cause a sync run that lands shortly after a fresh release to keep
+        serving the previous version until the next day.
     .OUTPUTS
         Array of paths to cached per-model XML files, or $null if not available.
         Returns multiple paths when SystemIDs span different GroupManifests (catalog groups).
@@ -114,7 +119,7 @@ function Update-DellModelCatalog {
         [string]$SystemID,
 
         [switch]$ForceRefresh,
-        [int]$CacheTTLHours = 24
+        [int]$CacheTTLHours = 6
     )
 
     $Sources = Get-DATOEMSources
@@ -321,6 +326,10 @@ function Get-DellDriverPack {
         Target OS (e.g., 'Windows 11 24H2').
     .PARAMETER Architecture
         Target architecture. Default: 'x64'.
+    .PARAMETER ForceRefresh
+        Force re-download of the Dell DriverPackCatalog before searching, so a
+        sync started shortly after a fresh Dell release picks up the new pack
+        instead of hitting the 24h-cached XML.
     .OUTPUTS
         PSCustomObject with Url, Version, ReleaseDate, Hash, FileName, or $null if not found.
     #>
@@ -332,9 +341,14 @@ function Get-DellDriverPack {
         [Parameter(Mandatory)]
         [string]$OperatingSystem,
 
-        [string]$Architecture = 'x64'
+        [string]$Architecture = 'x64',
+
+        [switch]$ForceRefresh
     )
 
+    if ($ForceRefresh) {
+        Update-DellCatalogCache -ForceRefresh
+    }
     $CatalogPath = Get-DATCachedItem -Key 'Dell_DriverPackCatalog.xml'
     if (-not $CatalogPath) {
         Update-DellCatalogCache
@@ -411,6 +425,10 @@ function Get-DellBIOSUpdate {
         The Dell model name.
     .PARAMETER SystemID
         The Dell SystemID (SKU). If not provided, looks it up from the driver catalog.
+    .PARAMETER ForceRefresh
+        Force re-download of both the top-level driver catalog and the per-model
+        catalog before searching. Without this the per-model XML can be up to
+        6h stale, so a BIOS released earlier in the same day may not appear.
     .OUTPUTS
         PSCustomObject with Url, Version, ReleaseDate, FileName, or $null if not found.
     #>
@@ -419,7 +437,9 @@ function Get-DellBIOSUpdate {
         [Parameter(Mandatory)]
         [string]$Model,
 
-        [string]$SystemID
+        [string]$SystemID,
+
+        [switch]$ForceRefresh
     )
 
     $Sources = Get-DATOEMSources
@@ -448,7 +468,7 @@ function Get-DellBIOSUpdate {
     $SystemIDs = $SystemID.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 
     # Get per-model catalogs from CatalogIndexPC (same source used for driver packages)
-    $ModelCatalogPaths = Update-DellModelCatalog -SystemID $SystemID
+    $ModelCatalogPaths = Update-DellModelCatalog -SystemID $SystemID -ForceRefresh:$ForceRefresh
     if (-not $ModelCatalogPaths) {
         Write-DATLog -Message "No per-model catalog available for Dell $Model (SystemID: $SystemID)" -Severity 2
         return $null
@@ -580,7 +600,14 @@ function Get-DellIndividualDrivers {
         # device. Excluding them shrinks DriverUpdates packages noticeably without
         # losing functionality, since the matching firmware also ships in the
         # base driver pack when it's actually relevant.
-        [switch]$ExcludeStorageFirmware
+        [switch]$ExcludeStorageFirmware,
+
+        # Force re-download of the per-model catalog before scanning. Without
+        # this, the cached XML from up to 6h ago is used and any
+        # SoftwareComponent Dell published since then (e.g. an A05 graphics
+        # driver that replaced the A03 currently in cache) won't be visible
+        # and the dedup step will pick the older revision.
+        [switch]$ForceRefresh
     )
 
     # Try per-model catalogs first (CatalogIndexPC chain - more current than legacy CatalogPC).
@@ -592,7 +619,7 @@ function Get-DellIndividualDrivers {
     $UsingModelCatalog = $false
     $CatalogPaths = @()
     try {
-        $ModelCatalogPaths = @(Update-DellModelCatalog -SystemID $SystemID)
+        $ModelCatalogPaths = @(Update-DellModelCatalog -SystemID $SystemID -ForceRefresh:$ForceRefresh)
         if ($ModelCatalogPaths -and $ModelCatalogPaths.Count -gt 0) {
             $CatalogPaths = $ModelCatalogPaths
             $UsingModelCatalog = $true

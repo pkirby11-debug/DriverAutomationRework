@@ -239,7 +239,7 @@ function Invoke-DATSync {
             if ($IncludeDrivers) {
                 try {
                     $DriverPack = switch ($Make) {
-                        'Dell'      { Get-DellDriverPack -Model $ModelName -OperatingSystem $OperatingSystem -Architecture $Architecture }
+                        'Dell'      { Get-DellDriverPack -Model $ModelName -OperatingSystem $OperatingSystem -Architecture $Architecture -ForceRefresh:$ForceRefresh }
                         'Lenovo'    { Get-LenovoDriverPack -Model $ModelName -OperatingSystem $OperatingSystem }
                         'Microsoft' { Get-SurfaceDriverPack -Model $ModelName -OperatingSystem $OperatingSystem -Architecture $Architecture }
                     }
@@ -255,7 +255,8 @@ function Invoke-DATSync {
                             -UpdateIndividualDrivers:$UpdateIndividualDrivers `
                             -VerifyDownloadHash:$VerifyDownloadHash `
                             -DistributionPoints $DistributionPoints `
-                            -DistributionPointGroups $DistributionPointGroups
+                            -DistributionPointGroups $DistributionPointGroups `
+                            -ForceRefresh:$ForceRefresh
 
                         $SyncResults.Add($DriverResult)
                     } else {
@@ -279,7 +280,7 @@ function Invoke-DATSync {
                     try {
                         # Reuse Get-DellDriverPack purely to derive SystemID/MachineType for
                         # the catalog lookup - we won't actually download the pack file.
-                        $DriverPackInfo = Get-DellDriverPack -Model $ModelName -OperatingSystem $OperatingSystem -Architecture $Architecture
+                        $DriverPackInfo = Get-DellDriverPack -Model $ModelName -OperatingSystem $OperatingSystem -Architecture $Architecture -ForceRefresh:$ForceRefresh
                         if (-not $DriverPackInfo) {
                             Write-DATLog -Message "No Dell driver pack metadata found for $ModelName / $OperatingSystem - cannot derive SystemID for catalog-only updates" -Severity 2
                         } else {
@@ -310,7 +311,8 @@ function Invoke-DATSync {
                                 -UpdateIndividualDrivers `
                                 -VerifyDownloadHash:$VerifyDownloadHash `
                                 -DistributionPoints $DistributionPoints `
-                                -DistributionPointGroups $DistributionPointGroups
+                                -DistributionPointGroups $DistributionPointGroups `
+                                -ForceRefresh:$ForceRefresh
 
                             $SyncResults.Add($UpdResult)
                         }
@@ -325,7 +327,7 @@ function Invoke-DATSync {
             if ($IncludeBIOS) {
                 try {
                     $BiosUpdate = switch ($Make) {
-                        'Dell'      { Get-DellBIOSUpdate -Model $ModelName }
+                        'Dell'      { Get-DellBIOSUpdate -Model $ModelName -ForceRefresh:$ForceRefresh }
                         'Lenovo'    { Get-LenovoBIOSUpdate -Model $ModelName -OperatingSystem $OperatingSystem }
                         'Microsoft' { Get-SurfaceBIOSUpdate -Model $ModelName -OperatingSystem $OperatingSystem }
                     }
@@ -341,7 +343,8 @@ function Invoke-DATSync {
                             -VerifyDownloadHash:$VerifyDownloadHash `
                             -BIOSPassword $BIOSPassword `
                             -DistributionPoints $DistributionPoints `
-                            -DistributionPointGroups $DistributionPointGroups
+                            -DistributionPointGroups $DistributionPointGroups `
+                            -ForceRefresh:$ForceRefresh
 
                         $SyncResults.Add($BiosResult)
                     } else {
@@ -447,7 +450,13 @@ function Invoke-DATSyncSinglePackage {
         [SecureString]$BIOSPassword,
 
         [string[]]$DistributionPoints,
-        [string[]]$DistributionPointGroups
+        [string[]]$DistributionPointGroups,
+
+        # Forces the per-model Dell catalog to be re-downloaded before the
+        # individual-driver scan. Without this, a sync run that happens to land
+        # while the per-model XML is still inside its TTL would resolve drivers
+        # against a stale snapshot and miss the same-day Dell publishes.
+        [switch]$ForceRefresh
     )
 
     $Make = $PackageInfo.Manufacturer
@@ -721,6 +730,14 @@ function Invoke-DATSyncSinglePackage {
             # later re-resolve drivers without the storage firmware DUPs.
             if ($Type -eq 'DriverUpdates') {
                 $GetDriverParams['ExcludeStorageFirmware'] = $true
+            }
+            # Propagate ForceRefresh so the per-model catalog is re-pulled and the
+            # fingerprint is computed against the SAME catalog the post-download
+            # phase will use - otherwise the smart-check could match a stale
+            # cached fingerprint and skip pulling a newer driver Dell published
+            # since the per-model XML was last fetched.
+            if ($ForceRefresh) {
+                $GetDriverParams['ForceRefresh'] = $true
             }
             $CachedIndividualDrivers = Get-DellIndividualDrivers @GetDriverParams
 
@@ -1199,6 +1216,9 @@ function Invoke-DATSyncSinglePackage {
                     if ($Type -eq 'DriverUpdates') {
                         $GetDriverParams['ExcludeStorageFirmware'] = $true
                     }
+                    if ($ForceRefresh) {
+                        $GetDriverParams['ForceRefresh'] = $true
+                    }
                     $IndividualDrivers = Get-DellIndividualDrivers @GetDriverParams
                 }
 
@@ -1362,6 +1382,22 @@ function Invoke-DATSyncSinglePackage {
                     $DlFailed    = $DownloadResults.Count - $DlSucceeded
                     Write-DATLog -Message "Pre-download complete: $DlSucceeded succeeded, $DlFailed failed" -Severity 1
 
+                    # When every DUP failed, the individual per-DUP warnings get drowned by
+                    # the cascade of "Skipping ..." lines that follow. Group failures by
+                    # error message and surface the top reasons up front so the operator
+                    # can immediately see whether it's a uniform BITS/network/proxy
+                    # problem vs. per-DUP-specific failures.
+                    if ($DlFailed -gt 0) {
+                        $FailedResults = @($DownloadResults | Where-Object { $_.Status -ne 'Success' })
+                        $ErrorGroups = $FailedResults |
+                            Group-Object { if ($_.Error) { $_.Error } else { '(no error message)' } } |
+                            Sort-Object Count -Descending |
+                            Select-Object -First 3
+                        foreach ($Grp in $ErrorGroups) {
+                            Write-DATLog -Message ("  Failure reason ({0}/{1}): {2}" -f $Grp.Count, $DlFailed, $Grp.Name) -Severity 2
+                        }
+                    }
+
                     # === Phase 2: sequential extraction/staging using the pre-downloaded files ===
                         foreach ($IndvDriver in $IndividualDrivers) {
                             $OverlayTag = if ($IndvDriver.IsMissing) { '[MISSING]' } else { '[UPDATE]' }
@@ -1370,11 +1406,21 @@ function Invoke-DATSyncSinglePackage {
 
                             try {
                                 # Pull the pre-downloaded file path from the parallel phase above.
-                                # Skip cleanly if the download failed - the per-DUP error was already
-                                # logged during the pre-download phase.
+                                # Skip cleanly if the download failed - the per-DUP warning was already
+                                # logged during the pre-download phase, but we also surface the reason
+                                # here so the log line that explains WHY this DUP got skipped sits
+                                # right next to the "Overlaying:" line for that DUP, instead of being
+                                # buried hundreds of lines back in the parallel-phase log dump.
                                 $DlEntry = $DownloadMap[$IndvDriver.FileName]
                                 if (-not $DlEntry -or $DlEntry.Status -ne 'Success') {
-                                    Write-DATLog -Message "  Skipping $($IndvDriver.Name) - pre-download did not produce a usable file" -Severity 2
+                                    $SkipReason = if (-not $DlEntry) {
+                                        'no download result returned (parallel job may have crashed before emitting an entry)'
+                                    } elseif ($DlEntry.Error) {
+                                        "download failed: $($DlEntry.Error)"
+                                    } else {
+                                        'pre-download did not produce a usable file'
+                                    }
+                                    Write-DATLog -Message "  Skipping $($IndvDriver.Name) - $SkipReason" -Severity 2
                                     continue
                                 }
                                 $DriverExePath = $DlEntry.Path

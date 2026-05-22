@@ -39,7 +39,7 @@ function Get-DATBIOSUpdate {
             switch ($Make) {
                 'Dell' {
                     if ($ForceRefresh) { Update-DellCatalogCache -ForceRefresh }
-                    $Update = Get-DellBIOSUpdate -Model $M
+                    $Update = Get-DellBIOSUpdate -Model $M -ForceRefresh:$ForceRefresh
                     if ($Update) { $Results.Add($Update) }
                 }
                 'Lenovo' {
