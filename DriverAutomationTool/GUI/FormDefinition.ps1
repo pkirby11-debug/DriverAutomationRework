@@ -711,7 +711,8 @@ function New-DATMainForm {
     # Top filter / options panel (added to tab later for correct dock order)
     $DeployTopPanel = New-Object System.Windows.Forms.Panel
     $DeployTopPanel.Dock = 'Top'
-    $DeployTopPanel.Height = 255
+    # Height grew (255 -> 275) to fit the maintenance-window checkboxes added in 1.10.0.
+    $DeployTopPanel.Height = 275
 
     # --- Application type filter (which kind of apps to list) ---
     $DeployTypeGroup = New-Object System.Windows.Forms.GroupBox
@@ -797,7 +798,8 @@ function New-DATMainForm {
     $DeployOptGroup = New-Object System.Windows.Forms.GroupBox
     $DeployOptGroup.Text = 'Deployment Options'
     $DeployOptGroup.Location = New-Object System.Drawing.Point(470, 5)
-    $DeployOptGroup.Size = New-Object System.Drawing.Size(540, 130)
+    # Grew 130 -> 150 to fit the MW checkboxes at y=125.
+    $DeployOptGroup.Size = New-Object System.Drawing.Size(540, 150)
     $DeployOptGroup.Anchor = 'Top,Left,Right'
     $DeployTopPanel.Controls.Add($DeployOptGroup)
 
@@ -908,15 +910,33 @@ function New-DATMainForm {
         $DeployDeadlinePicker.Enabled  = $DeployScheduleCheck.Checked
     }.GetNewClosure())
 
+    # --- Maintenance window behavior ---
+    # Default (both unchecked) keeps installs AND restarts confined to the collection's
+    # maintenance windows - which is what lets DriverUpdates (ForceReboot) restart silently
+    # overnight without prompting users during the day. Admins can opt out per-deployment.
+    $DeployOverrideSWCheck = New-Object System.Windows.Forms.CheckBox
+    $DeployOverrideSWCheck.Text = 'Install outside maintenance window'
+    $DeployOverrideSWCheck.Location = New-Object System.Drawing.Point(15, 125)
+    $DeployOverrideSWCheck.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployOverrideSWCheck)
+    $Controls['DeployOverrideSWCheck'] = $DeployOverrideSWCheck
+
+    $DeployRebootOutsideSWCheck = New-Object System.Windows.Forms.CheckBox
+    $DeployRebootOutsideSWCheck.Text = 'Restart outside maintenance window'
+    $DeployRebootOutsideSWCheck.Location = New-Object System.Drawing.Point(275, 125)
+    $DeployRebootOutsideSWCheck.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployRebootOutsideSWCheck)
+    $Controls['DeployRebootOutsideSWCheck'] = $DeployRebootOutsideSWCheck
+
     # --- Collection picker + action row ---
     $DeployCollectionLabel = New-Object System.Windows.Forms.Label
     $DeployCollectionLabel.Text = 'Target Collection:'
-    $DeployCollectionLabel.Location = New-Object System.Drawing.Point(10, 155)
+    $DeployCollectionLabel.Location = New-Object System.Drawing.Point(10, 175)
     $DeployCollectionLabel.AutoSize = $true
     $DeployTopPanel.Controls.Add($DeployCollectionLabel)
 
     $DeployCollectionCombo = New-Object System.Windows.Forms.ComboBox
-    $DeployCollectionCombo.Location = New-Object System.Drawing.Point(125, 152)
+    $DeployCollectionCombo.Location = New-Object System.Drawing.Point(125, 172)
     $DeployCollectionCombo.Width = 500
     $DeployCollectionCombo.DropDownStyle = 'DropDown'  # editable so users can type/filter
     $DeployCollectionCombo.AutoCompleteMode = 'SuggestAppend'
@@ -927,7 +947,7 @@ function New-DATMainForm {
 
     $DeployRefreshCollectionsButton = New-Object System.Windows.Forms.Button
     $DeployRefreshCollectionsButton.Text = 'Refresh Collections'
-    $DeployRefreshCollectionsButton.Location = New-Object System.Drawing.Point(635, 150)
+    $DeployRefreshCollectionsButton.Location = New-Object System.Drawing.Point(635, 170)
     $DeployRefreshCollectionsButton.Width = 140
     $DeployRefreshCollectionsButton.Anchor = 'Top,Right'
     $DeployTopPanel.Controls.Add($DeployRefreshCollectionsButton)
@@ -936,33 +956,33 @@ function New-DATMainForm {
     # --- App-list action row ---
     $DeployRefreshAppsButton = New-Object System.Windows.Forms.Button
     $DeployRefreshAppsButton.Text = 'Refresh Applications'
-    $DeployRefreshAppsButton.Location = New-Object System.Drawing.Point(10, 190)
+    $DeployRefreshAppsButton.Location = New-Object System.Drawing.Point(10, 210)
     $DeployRefreshAppsButton.Width = 150
     $DeployTopPanel.Controls.Add($DeployRefreshAppsButton)
     $Controls['DeployRefreshAppsButton'] = $DeployRefreshAppsButton
 
     $DeploySelectAllButton = New-Object System.Windows.Forms.Button
     $DeploySelectAllButton.Text = 'Select All'
-    $DeploySelectAllButton.Location = New-Object System.Drawing.Point(170, 190)
+    $DeploySelectAllButton.Location = New-Object System.Drawing.Point(170, 210)
     $DeploySelectAllButton.Width = 90
     $DeployTopPanel.Controls.Add($DeploySelectAllButton)
     $Controls['DeploySelectAllButton'] = $DeploySelectAllButton
 
     $DeploySelectNoneButton = New-Object System.Windows.Forms.Button
     $DeploySelectNoneButton.Text = 'Select None'
-    $DeploySelectNoneButton.Location = New-Object System.Drawing.Point(265, 190)
+    $DeploySelectNoneButton.Location = New-Object System.Drawing.Point(265, 210)
     $DeploySelectNoneButton.Width = 90
     $DeployTopPanel.Controls.Add($DeploySelectNoneButton)
     $Controls['DeploySelectNoneButton'] = $DeploySelectNoneButton
 
     $DeployAppsSearchLabel = New-Object System.Windows.Forms.Label
     $DeployAppsSearchLabel.Text = 'Search:'
-    $DeployAppsSearchLabel.Location = New-Object System.Drawing.Point(370, 194)
+    $DeployAppsSearchLabel.Location = New-Object System.Drawing.Point(370, 214)
     $DeployAppsSearchLabel.AutoSize = $true
     $DeployTopPanel.Controls.Add($DeployAppsSearchLabel)
 
     $DeployAppsSearchBox = New-Object System.Windows.Forms.TextBox
-    $DeployAppsSearchBox.Location = New-Object System.Drawing.Point(420, 191)
+    $DeployAppsSearchBox.Location = New-Object System.Drawing.Point(420, 211)
     $DeployAppsSearchBox.Width = 300
     $DeployTopPanel.Controls.Add($DeployAppsSearchBox)
     $Controls['DeployAppsSearchBox'] = $DeployAppsSearchBox
@@ -970,7 +990,7 @@ function New-DATMainForm {
     $DeployButton = New-Object System.Windows.Forms.Button
     $DeployButton.Text = 'Deploy Selected'
     $DeployButton.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-    $DeployButton.Location = New-Object System.Drawing.Point(10, 225)
+    $DeployButton.Location = New-Object System.Drawing.Point(10, 245)
     $DeployButton.Size = New-Object System.Drawing.Size(160, 26)
     $DeployButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
     $DeployButton.ForeColor = [System.Drawing.Color]::White
@@ -981,7 +1001,7 @@ function New-DATMainForm {
     $DeployStatusLabel = New-Object System.Windows.Forms.Label
     $DeployStatusLabel.Text = 'Connect to ConfigMgr to populate collections, then click Refresh Applications.'
     $DeployStatusLabel.ForeColor = [System.Drawing.Color]::Gray
-    $DeployStatusLabel.Location = New-Object System.Drawing.Point(180, 231)
+    $DeployStatusLabel.Location = New-Object System.Drawing.Point(180, 251)
     $DeployStatusLabel.AutoSize = $true
     $DeployTopPanel.Controls.Add($DeployStatusLabel)
     $Controls['DeployStatusLabel'] = $DeployStatusLabel
