@@ -1198,6 +1198,10 @@ function Initialize-DATMainForm {
         $DeployPurpose = if ($Controls['DeployPurposeRequiredRadio'].Checked) { 'Required' } else { 'Available' }
         $DeployAction  = if ($Controls['DeployActionUninstallRadio'].Checked) { 'Uninstall' } else { 'Install' }
         $UserNotif     = $Controls['DeployUserNotifCombo'].Text
+        # MW toggles. Unchecked (default) = installs/restarts respect the collection's MW;
+        # this is what enables overnight silent reboots for DriverUpdates apps.
+        $OverrideSW       = [bool]$Controls['DeployOverrideSWCheck'].Checked
+        $RebootOutsideSW  = [bool]$Controls['DeployRebootOutsideSWCheck'].Checked
 
         # Read schedule. When the checkbox is off, leave $AvailableAt/$DeadlineAt as $null
         # and Invoke-DATDeployApplications keeps its current "now" behavior.
@@ -1217,9 +1221,11 @@ function Initialize-DATMainForm {
                 if ($DeployPurpose -eq 'Required') { "`nDeadline: $($DeadlineAt.ToString('yyyy-MM-dd HH:mm'))" } else { '' })
         } else { 'Available immediately' }
 
+        $MWSummary = "Install outside MW: $(if ($OverrideSW) { 'Yes' } else { 'No (confined to MW)' })`nRestart outside MW: $(if ($RebootOutsideSW) { 'Yes' } else { 'No (deferred to MW)' })"
+
         $Confirm = Show-DATFormMessage `
-            -Message ("Create {0} deployment(s) on '{1}'?`n`nPurpose: {2}`nAction: {3}`nNotification: {4}`n{5}" -f `
-                $AppNames.Count, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $ScheduleSummary) `
+            -Message ("Create {0} deployment(s) on '{1}'?`n`nPurpose: {2}`nAction: {3}`nNotification: {4}`n{5}`n{6}" -f `
+                $AppNames.Count, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $ScheduleSummary, $MWSummary) `
             -Type Question
         if ($Confirm -ne 'Yes') { return }
 
@@ -1243,17 +1249,19 @@ function Initialize-DATMainForm {
         $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
         $DeployScript = {
-            param($ModulePath, $ConnParams, $AppNames, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $AvailableAt, $DeadlineAt, $LogQueue)
+            param($ModulePath, $ConnParams, $AppNames, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $AvailableAt, $DeadlineAt, $OverrideSW, $RebootOutsideSW, $LogQueue)
 
             Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
             Register-DATQueueLogSubscriber -LogQueue $LogQueue
 
             $DeployArgs = @{
-                Applications     = $AppNames
-                CollectionName   = $CollectionName
-                DeployPurpose    = $DeployPurpose
-                DeployAction     = $DeployAction
-                UserNotification = $UserNotif
+                Applications                  = $AppNames
+                CollectionName                = $CollectionName
+                DeployPurpose                 = $DeployPurpose
+                DeployAction                  = $DeployAction
+                UserNotification              = $UserNotif
+                OverrideServiceWindow         = $OverrideSW
+                RebootOutsideOfServiceWindow  = $RebootOutsideSW
             }
             if ($AvailableAt) { $DeployArgs['AvailableDateTime'] = $AvailableAt }
             if ($DeadlineAt)  { $DeployArgs['DeadlineDateTime']  = $DeadlineAt  }
@@ -1272,6 +1280,8 @@ function Initialize-DATMainForm {
             AddArgument($UserNotif).
             AddArgument($AvailableAt).
             AddArgument($DeadlineAt).
+            AddArgument($OverrideSW).
+            AddArgument($RebootOutsideSW).
             AddArgument($script:LogQueue) | Out-Null
         $script:DeployHandle = $script:DeployRunspace.BeginInvoke()
 

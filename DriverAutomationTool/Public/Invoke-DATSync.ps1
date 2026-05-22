@@ -1219,37 +1219,165 @@ function Invoke-DATSyncSinglePackage {
                     # Invoke-DATApply.ps1 in DriverUpdates mode to drive the per-DUP
                     # silent installer (vendor-tested install path, no pnputil).
                     $ManifestEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+                    # Outer try wraps BOTH phases so OverlayTempDir is always cleaned up,
+                    # even if the parallel pre-download phase throws unexpectedly.
                     try {
+
+                    # === Phase 1: parallel DUP pre-download ===
+                    # The previous serial loop was the dominant time cost in a sync run:
+                    # 30+ DUPs at 10-500MB each, downloaded one at a time, with up to
+                    # ~8 minutes of retry backoff per failure - easily 1-3 hours per
+                    # model. Splitting download (network-bound) from extraction/staging
+                    # (local-CPU) lets us run downloads in parallel while keeping the
+                    # fragile extraction waterfall sequential. ThrottleLimit=4 keeps a
+                    # reasonable cap on concurrent BITS jobs without saturating the link.
+                    # PS 5.1 has no -Parallel and falls back to the serial Invoke-DATDownload
+                    # path so the module's declared minimum stays compatible.
+                    $UseParallelDl = ($PSVersionTable.PSVersion.Major -ge 7)
+                    $ParallelThrottle = 4
+                    $DlSummary = if ($UseParallelDl) {
+                        "parallel x$ParallelThrottle"
+                    } else {
+                        'serial (PS 5.1 fallback)'
+                    }
+                    Write-DATLog -Message "Pre-downloading $($IndividualDrivers.Count) DUP(s) - $DlSummary" -Severity 1
+
+                    $DownloadResults = if ($UseParallelDl) {
+                        # Capture variables for $using: in the parallel block.
+                        $JobOverlayDir = $OverlayTempDir
+                        $JobVerifyHash = [bool]$VerifyDownloadHash
+                        $JobLogQueue   = [System.Collections.Concurrent.ConcurrentQueue[hashtable]]::new()
+
+                        # -AsJob gives us a job handle we can poll while threads run,
+                        # so the GUI sees per-DUP "Downloaded" lines as they happen
+                        # instead of one wall of text at the end.
+                        $DlJob = $IndividualDrivers | ForEach-Object -ThrottleLimit $ParallelThrottle -AsJob -Parallel {
+                            $Drv = $_
+                            $DestDir   = $using:JobOverlayDir
+                            $VerifyHash = $using:JobVerifyHash
+                            $LogQ      = $using:JobLogQueue
+                            $DriverExePath = Join-Path $DestDir $Drv.FileName
+                            $Status = 'Success'
+                            $ErrorMsg = $null
+
+                            try {
+                                $LogQ.Enqueue(@{ Msg = "  Downloading: $($Drv.Name) -> $($Drv.FileName)"; Sev = 1 })
+                                Import-Module BitsTransfer -ErrorAction Stop
+                                Start-BitsTransfer -Source $Drv.Url -Destination $DriverExePath `
+                                    -RetryInterval 60 -RetryTimeout 600 -Priority Foreground -ErrorAction Stop
+
+                                if ($Drv.Size -and (Test-Path $DriverExePath)) {
+                                    $ActualSize = (Get-Item $DriverExePath).Length
+                                    if ($ActualSize -ne [long]$Drv.Size) {
+                                        Remove-Item $DriverExePath -Force -ErrorAction SilentlyContinue
+                                        throw "Size mismatch (expected $($Drv.Size), got $ActualSize)"
+                                    }
+                                }
+                                if ($VerifyHash -and $Drv.HashMD5) {
+                                    $ActualHash = (Get-FileHash $DriverExePath -Algorithm MD5).Hash
+                                    if ($ActualHash -ne $Drv.HashMD5) {
+                                        Remove-Item $DriverExePath -Force -ErrorAction SilentlyContinue
+                                        throw "Hash mismatch (MD5)"
+                                    }
+                                }
+                                Unblock-File -Path $DriverExePath -ErrorAction SilentlyContinue
+                                $SizeMB = [math]::Round((Get-Item $DriverExePath).Length / 1MB, 2)
+                                $LogQ.Enqueue(@{ Msg = "  Downloaded: $($Drv.FileName) ($SizeMB MB)"; Sev = 1 })
+                            } catch {
+                                $Status = 'Failed'
+                                $ErrorMsg = $_.Exception.Message
+                                $LogQ.Enqueue(@{ Msg = "  WARNING: Download failed for $($Drv.Name): $ErrorMsg"; Sev = 2 })
+                            }
+
+                            [PSCustomObject]@{
+                                FileName = $Drv.FileName
+                                Path     = $DriverExePath
+                                Status   = $Status
+                                Error    = $ErrorMsg
+                            }
+                        }
+
+                        # Drain the queue while the parallel job runs so logs flow live.
+                        $LogEntry = $null
+                        while ($DlJob.State -eq 'Running' -or $DlJob.State -eq 'NotStarted') {
+                            while ($JobLogQueue.TryDequeue([ref]$LogEntry)) {
+                                Write-DATLog -Message $LogEntry.Msg -Severity $LogEntry.Sev
+                            }
+                            Start-Sleep -Milliseconds 500
+                        }
+                        # Final drain after the job transitions out of Running.
+                        while ($JobLogQueue.TryDequeue([ref]$LogEntry)) {
+                            Write-DATLog -Message $LogEntry.Msg -Severity $LogEntry.Sev
+                        }
+
+                        $JobResults = $DlJob | Receive-Job
+                        $DlJob | Remove-Job -Force -ErrorAction SilentlyContinue
+                        $JobResults
+                    } else {
+                        # PS 5.1: keep the existing serial Invoke-DATDownload path so we
+                        # preserve its exponential-backoff retry behavior. Single-threaded
+                        # but at least logs flow normally and no -Parallel dependency.
+                        $SerialResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+                        foreach ($Drv in $IndividualDrivers) {
+                            $DriverExePath = Join-Path $OverlayTempDir $Drv.FileName
+                            $Status = 'Success'; $ErrorMsg = $null
+                            try {
+                                Write-DATLog -Message "  Downloading: $($Drv.Name) -> $($Drv.FileName)" -Severity 1
+                                $DlParams = @{
+                                    Url             = $Drv.Url
+                                    DestinationPath = $DriverExePath
+                                    MaxRetries      = 2
+                                    TimeoutSeconds  = 600
+                                }
+                                if ($Drv.Size) { $DlParams['ExpectedSize'] = [long]$Drv.Size }
+                                if ($VerifyDownloadHash -and $Drv.HashMD5) {
+                                    $DlParams['ExpectedHash']  = $Drv.HashMD5
+                                    $DlParams['HashAlgorithm'] = 'MD5'
+                                }
+                                $DlPath = Invoke-DATDownload @DlParams
+                                if (-not $DlPath) {
+                                    $Status = 'Failed'; $ErrorMsg = 'Timed out'
+                                } else {
+                                    Unblock-File -Path $DriverExePath -ErrorAction SilentlyContinue
+                                }
+                            } catch {
+                                $Status = 'Failed'; $ErrorMsg = $_.Exception.Message
+                                Write-DATLog -Message "  WARNING: Download failed for $($Drv.Name): $ErrorMsg" -Severity 2
+                            }
+                            $SerialResults.Add([PSCustomObject]@{
+                                FileName = $Drv.FileName
+                                Path     = $DriverExePath
+                                Status   = $Status
+                                Error    = $ErrorMsg
+                            })
+                        }
+                        $SerialResults
+                    }
+
+                    # Lookup map for the sequential extraction loop below.
+                    $DownloadMap = @{}
+                    foreach ($DlRes in $DownloadResults) { $DownloadMap[$DlRes.FileName] = $DlRes }
+                    $DlSucceeded = @($DownloadResults | Where-Object { $_.Status -eq 'Success' }).Count
+                    $DlFailed    = $DownloadResults.Count - $DlSucceeded
+                    Write-DATLog -Message "Pre-download complete: $DlSucceeded succeeded, $DlFailed failed" -Severity 1
+
+                    # === Phase 2: sequential extraction/staging using the pre-downloaded files ===
                         foreach ($IndvDriver in $IndividualDrivers) {
                             $OverlayTag = if ($IndvDriver.IsMissing) { '[MISSING]' } else { '[UPDATE]' }
                             Write-DATLog -Message "  $OverlayTag Overlaying: $($IndvDriver.Category) - $($IndvDriver.Name) v$($IndvDriver.Version) ($($IndvDriver.ReleaseDate))" -Severity 1
                             Write-DATLog -Message "    Download URL: $($IndvDriver.Url)" -Severity 1
 
                             try {
-                                # Download individual driver .exe to temp (10 min timeout per driver)
-                                $DriverExePath = Join-Path $OverlayTempDir $IndvDriver.FileName
-                                $IndvDlParams = @{
-                                    Url             = $IndvDriver.Url
-                                    DestinationPath = $DriverExePath
-                                    MaxRetries      = 2
-                                    TimeoutSeconds  = 600
-                                }
-                                if ($IndvDriver.Size) {
-                                    $IndvDlParams['ExpectedSize'] = [long]$IndvDriver.Size
-                                }
-                                if ($VerifyDownloadHash -and $IndvDriver.HashMD5) {
-                                    $IndvDlParams['ExpectedHash'] = $IndvDriver.HashMD5
-                                    $IndvDlParams['HashAlgorithm'] = 'MD5'
-                                }
-                                $DlResult = Invoke-DATDownload @IndvDlParams
-                                if (-not $DlResult) {
-                                    Write-DATLog -Message "  WARNING: Download timed out for $($IndvDriver.Name) - skipping this driver" -Severity 2
+                                # Pull the pre-downloaded file path from the parallel phase above.
+                                # Skip cleanly if the download failed - the per-DUP error was already
+                                # logged during the pre-download phase.
+                                $DlEntry = $DownloadMap[$IndvDriver.FileName]
+                                if (-not $DlEntry -or $DlEntry.Status -ne 'Success') {
+                                    Write-DATLog -Message "  Skipping $($IndvDriver.Name) - pre-download did not produce a usable file" -Severity 2
                                     continue
                                 }
-
-                                # Remove Mark of the Web so Windows doesn't block execution
-                                # (WebRequest downloads get Zone.Identifier ADS from internet zone)
-                                Unblock-File -Path $DriverExePath -ErrorAction SilentlyContinue
+                                $DriverExePath = $DlEntry.Path
 
                                 # DriverUpdates: keep the DUP intact and stage it flat in the package
                                 # source. Apply-side invokes each DUP's own silent installer (the
