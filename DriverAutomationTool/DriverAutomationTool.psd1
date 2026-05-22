@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '1.11.1'
+    ModuleVersion     = '1.11.2'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = 'Automates downloading, packaging, and distributing Dell and Lenovo drivers and BIOS updates for SCCM/ConfigMgr environments. 1.11.1 restores the BITS-to-WebRequest fallback in the parallel Driver Updates pre-download path: 1.10.0 parallelization only called Start-BitsTransfer directly, so BITS error 0x800704DD ("user has not logged on to the network") on unattended SYSTEM-context runs caused every DUP to fail. WebRequest fallback (HttpWebRequest, no user-session dependency) now mirrors the serial Invoke-DATDownload path so scheduled-task runs succeed.'
+    Description       = 'Automates downloading, packaging, and distributing Dell and Lenovo drivers and BIOS updates for SCCM/ConfigMgr environments. 1.11.2 fixes "Could not set custom return codes ... Unable to find type [Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass]" by explicitly Add-Type''ing the ConfigMgr ApplicationManagement SDK assembly (the CM module loads it lazily inside cmdlet binaries, but our static [Type]::Member references need it in the AppDomain), and adds a Dell catalog diagnostic that logs when a newer SoftwareComponent revision exists for a driver family but was filtered out (e.g. picking A03 when A05 exists), showing the rejected revision''s SystemIDs and OS codes so the operator can immediately see whether the filter dropped it on SystemID or OS-code mismatch.'
     PowerShellVersion = '5.1'
     FunctionsToExport = @(
         'Get-DATDriverPack'

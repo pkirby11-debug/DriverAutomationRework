@@ -714,10 +714,35 @@ function Get-DellIndividualDrivers {
     # keeps this from catching legitimate drive controller drivers like Intel RST.
     $StorageFirmwarePattern = '(Solid State Drive|\bSSD\b|Hard Drive|\bHDD\b)\s+Firmware\s+Update'
 
+    # Family key normalizer - used by both the per-family newest-revision pre-scan
+    # (below, for diagnostic "newer rejected" logging) and the post-scan dedup.
+    # See the long-form comment near the dedup site for rationale on each regex.
+    $GetFamilyKey = {
+        param([string]$RawName)
+        $k = $RawName
+        $k = $k -replace ',?\s*A\d{2,3}$', ''
+        $k = $k -replace '\s+Driver\s+and\s+.+\s+Application$', ' Driver'
+        $k = $k -replace '\s+and\s+NVIDIA\s+Control\s+Panel\s+Application$', ''
+        $k = $k -replace '\s*\([^)]*\)', ''
+        $k = $k -replace '\b[A-Za-z0-9][A-Za-z0-9\-]*(?:/[A-Za-z0-9][A-Za-z0-9\-]*)+\b', ''
+        $k = $k -replace '\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+){3,}\b', ''
+        $k = $k -replace '\b(UWD|DCH|Desktop|Bundle)\b', ''
+        $k = $k -replace '\b(?:GT|GTX|RTX|RX|GS|GE|TI|XT|XTX|Super)\b', ''
+        $k = $k -replace '\b[A-Za-z]?[0-9x]{3,5}\b', ''
+        ($k -replace '\s+', ' ').Trim().ToLowerInvariant()
+    }
+
     # Scan all catalog(s) and collect matching drivers.
     # When multiple catalogs are available (multi-SystemID models), each catalog is
     # scanned independently and results are merged. Deduplication happens at the end.
     $MatchedDrivers = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    # Tracks the newest entry per family key seen IN THE CATALOG, regardless of
+    # whether it passed the OS / SystemID / date filters. Used after dedup to
+    # surface "a newer revision was filtered out" warnings - we couldn't tell
+    # otherwise why the tool kept picking an older revision (the catalog had a
+    # newer one, but it targeted a different SystemID/OS we silently skipped).
+    $RawNewestPerFamily = @{}
 
     foreach ($CatalogPath in $CatalogPaths) {
         $CatalogFileName = Split-Path $CatalogPath -Leaf
@@ -740,9 +765,16 @@ function Get-DellIndividualDrivers {
         $SkippedWrongOS = 0
         $SkippedDate = 0
 
-        # --- Diagnostic pre-scan: count SystemID matches regardless of other filters ---
-        # This reveals whether the catalog has entries for this model at all, and what
-        # packageTypes they use (in case Dell uses non-LWXP types for newer drivers).
+        # --- Diagnostic pre-scan ---
+        # Two passes in one loop:
+        # 1. Count SystemID matches regardless of other filters - reveals whether the
+        #    catalog has entries for this model at all, and what packageTypes they use.
+        # 2. Track the newest dateTime per family key across ALL driver-like components
+        #    (packageType LW*), regardless of which SystemID or OS they target. Used
+        #    after the main scan to surface "a newer revision exists but was filtered
+        #    out" diagnostics so the operator can see WHY the tool picked an older
+        #    revision (typically the rejected revision targets a different SystemID
+        #    or OS code list than the user's model).
         $PreScanTotal = 0
         $PreScanPkgTypes = @{}
         foreach ($Component in $Xml.Manifest.SoftwareComponent) {
@@ -757,6 +789,28 @@ function Get-DellIndividualDrivers {
                 $PT = if ($Component.packageType) { $Component.packageType } else { '(none)' }
                 if (-not $PreScanPkgTypes.ContainsKey($PT)) { $PreScanPkgTypes[$PT] = 0 }
                 $PreScanPkgTypes[$PT]++
+            }
+
+            # Track newest per family across ALL driver-like components (no SystemID/OS
+            # filter here - that's the whole point of this map).
+            $PrePT = $Component.packageType
+            if ($PrePT -and $PrePT -notmatch '^LW') { continue }
+            $PreDN = $Component.Name.Display.'#cdata-section'
+            if (-not $PreDN) { continue }
+            $PreDate = $null
+            try { $PreDate = [datetime]::Parse($Component.dateTime) } catch { continue }
+            $PreKey = & $GetFamilyKey $PreDN
+            if (-not $RawNewestPerFamily.ContainsKey($PreKey) -or
+                $PreDate -gt $RawNewestPerFamily[$PreKey].ParsedDate) {
+                $RawNewestPerFamily[$PreKey] = [PSCustomObject]@{
+                    Name        = $PreDN
+                    Version     = $Component.dellVersion
+                    ReleaseDate = $Component.dateTime
+                    ParsedDate  = $PreDate
+                    SystemIDs   = ((@($Component.SupportedSystems.Brand.Model.SystemID) | Where-Object { $_ }) -join ',')
+                    OsCodes     = ((@($Component.SupportedOperatingSystems.OperatingSystem.osCode) | Where-Object { $_ }) -join ',')
+                    Source      = $CatalogFileName
+                }
             }
         }
         $PkgTypeSummary = ($PreScanPkgTypes.GetEnumerator() | Sort-Object Name |
@@ -960,32 +1014,10 @@ function Get-DellIndividualDrivers {
     # date. Drivers that target genuinely different products keep distinct keys (e.g.
     # "Intel I225 NIC Driver" stays separate from "Intel X710 Ethernet Controller
     # Driver" because the chip codes I225/X710 are not slash-separated lists).
-    $GetFamilyKey = {
-        param([string]$RawName)
-        $k = $RawName
-        # Trailing Dell revision (",Axx" or ", Axx")
-        $k = $k -replace ',?\s*A\d{2,3}$', ''
-        # "Driver and <bundled UWP app> Application" -> "Driver"
-        $k = $k -replace '\s+Driver\s+and\s+.+\s+Application$', ' Driver'
-        # "and NVIDIA Control Panel Application" tail
-        $k = $k -replace '\s+and\s+NVIDIA\s+Control\s+Panel\s+Application$', ''
-        # Parenthesized text
-        $k = $k -replace '\s*\([^)]*\)', ''
-        # Slash-separated chip/SKU lists (2+ tokens):
-        # "AX211/AX210/AX200/AX201/9260/9560/9462", "Pxx0/Pxx00/GV1xx", "I210/X550/X710"
-        $k = $k -replace '\b[A-Za-z0-9][A-Za-z0-9\-]*(?:/[A-Za-z0-9][A-Za-z0-9\-]*)+\b', ''
-        # Hyphen-separated chip lists ("BE2xx-AX4xx-AX2xx-9xxx")
-        $k = $k -replace '\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+){3,}\b', ''
-        # Bundle/style suffix tokens that vary across releases of the same driver
-        # (UWD = legacy bundle name, DCH = new bundle, Desktop = workstation marker)
-        $k = $k -replace '\b(UWD|DCH|Desktop|Bundle)\b', ''
-        # Standalone series labels left over after chip-list strips ("GT", "GTX", "RTX"...)
-        $k = $k -replace '\b(?:GT|GTX|RTX|RX|GS|GE|TI|XT|XTX|Super)\b', ''
-        # Loose chip codes left dangling after the list strip ("AX211", "Axx00", "x000")
-        $k = $k -replace '\b[A-Za-z]?[0-9x]{3,5}\b', ''
-        # Collapse whitespace, trim, lowercase
-        ($k -replace '\s+', ' ').Trim().ToLowerInvariant()
-    }
+    #
+    # The actual $GetFamilyKey scriptblock is defined ABOVE the catalog loop so the
+    # pre-scan (which populates $RawNewestPerFamily for diagnostics) and this dedup
+    # share the same normalizer.
 
     # Group by (Category, FamilyKey). Including Category prevents a (rare) name
     # collision across unrelated categories (e.g. an "X Driver" classified as Audio
@@ -1021,6 +1053,26 @@ function Get-DellIndividualDrivers {
     foreach ($Drv in $LatestPerDriver) {
         $Tag = if ($Drv.IsMissing) { '[MISSING]' } else { '[UPDATE]' }
         Write-DATLog -Message "  $Tag $($Drv.Category): $($Drv.Name) v$($Drv.Version) ($($Drv.ReleaseDate))" -Severity 1
+    }
+
+    # Diagnostic: for each winner, check whether a NEWER revision exists in the
+    # catalog but was filtered out (typically by SystemID or OS-code mismatch).
+    # This is the "we picked A03 even though A05 exists" case - log the rejected
+    # revision's SystemIDs and OS codes so the operator can immediately see why
+    # the filter dropped it, instead of having to diff the catalog by hand.
+    foreach ($Drv in $LatestPerDriver) {
+        $FK = & $GetFamilyKey $Drv.Name
+        if (-not $RawNewestPerFamily.ContainsKey($FK)) { continue }
+        $RN = $RawNewestPerFamily[$FK]
+        if ($RN.ParsedDate -le $Drv.ParsedDate) { continue }
+        $DaysDiff = [int]($RN.ParsedDate - $Drv.ParsedDate).TotalDays
+        Write-DATLog -Message "  NOTE: a newer revision of '$($Drv.Name)' exists in the catalog but was filtered out:" -Severity 2
+        Write-DATLog -Message "    Chosen   : v$($Drv.Version) ($($Drv.ReleaseDate))" -Severity 2
+        Write-DATLog -Message "    Rejected : '$($RN.Name)' v$($RN.Version) ($($RN.ReleaseDate)) - $DaysDiff days newer" -Severity 2
+        Write-DATLog -Message "    Rejected SupportedSystems SystemIDs: [$($RN.SystemIDs)]" -Severity 2
+        Write-DATLog -Message "    Rejected SupportedOperatingSystems osCodes: [$($RN.OsCodes)]" -Severity 2
+        Write-DATLog -Message "    Your target SystemID(s): [$($SystemIDs -join ',')]" -Severity 2
+        Write-DATLog -Message "    If the rejected SystemIDs don't include yours, or its OS codes don't match your target OS, that's why it was skipped." -Severity 2
     }
 
     return @($LatestPerDriver)
