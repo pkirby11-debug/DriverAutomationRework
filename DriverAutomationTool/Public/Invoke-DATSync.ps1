@@ -1283,9 +1283,61 @@ function Invoke-DATSyncSinglePackage {
 
                             try {
                                 $LogQ.Enqueue(@{ Msg = "  Downloading: $($Drv.Name) -> $($Drv.FileName)"; Sev = 1 })
-                                Import-Module BitsTransfer -ErrorAction Stop
-                                Start-BitsTransfer -Source $Drv.Url -Destination $DriverExePath `
-                                    -RetryInterval 60 -RetryTimeout 600 -Priority Foreground -ErrorAction Stop
+
+                                # Try BITS first. BITS is faster and resumable, but fails with
+                                # 0x800704DD ("user has not logged on to the network") when this
+                                # process runs as SYSTEM / a service account with no interactive
+                                # session - which is the normal scheduled-task deployment mode
+                                # for this tool. When that happens, fall back to a direct
+                                # HttpWebRequest, which doesn't depend on BITS or user logon
+                                # state. Mirrors the BITS-then-WebRequest sequence in the serial
+                                # Invoke-DATDownload helper, but inlined here because the
+                                # parallel runspace doesn't see module-private functions.
+                                $TransferOk = $false
+                                $BitsError = $null
+                                try {
+                                    Import-Module BitsTransfer -ErrorAction Stop
+                                    Start-BitsTransfer -Source $Drv.Url -Destination $DriverExePath `
+                                        -RetryInterval 60 -RetryTimeout 600 -Priority Foreground -ErrorAction Stop
+                                    $TransferOk = $true
+                                } catch {
+                                    $BitsError = $_.Exception.Message
+                                    Remove-Item $DriverExePath -Force -ErrorAction SilentlyContinue
+                                }
+
+                                if (-not $TransferOk) {
+                                    $LogQ.Enqueue(@{ Msg = "  BITS failed for $($Drv.FileName) ($BitsError) - falling back to WebRequest"; Sev = 2 })
+
+                                    # TLS 1.2 is required by dl.dell.com
+                                    if ([System.Net.ServicePointManager]::SecurityProtocol -notmatch 'Tls12') {
+                                        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+                                    }
+
+                                    $WebReq = [System.Net.HttpWebRequest]::Create($Drv.Url)
+                                    $WebReq.Method = 'GET'
+                                    $WebReq.AllowAutoRedirect = $true
+                                    $WebReq.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                                    $WebReq.Timeout = 60000
+                                    $WebReq.ReadWriteTimeout = 30000
+
+                                    $WebResp = $null
+                                    $WebStream = $null
+                                    $WebFileStream = $null
+                                    try {
+                                        $WebResp = $WebReq.GetResponse()
+                                        $WebStream = $WebResp.GetResponseStream()
+                                        $WebFileStream = [System.IO.FileStream]::new($DriverExePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+                                        $Buf = [byte[]]::new(65536)
+                                        while (($BytesRead = $WebStream.Read($Buf, 0, $Buf.Length)) -gt 0) {
+                                            $WebFileStream.Write($Buf, 0, $BytesRead)
+                                        }
+                                        $TransferOk = $true
+                                    } finally {
+                                        if ($WebFileStream) { $WebFileStream.Dispose() }
+                                        if ($WebStream)     { $WebStream.Dispose() }
+                                        if ($WebResp)       { $WebResp.Close() }
+                                    }
+                                }
 
                                 if ($Drv.Size -and (Test-Path $DriverExePath)) {
                                     $ActualSize = (Get-Item $DriverExePath).Length
