@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '1.11.3'
+    ModuleVersion     = '1.11.4'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = 'Automates downloading, packaging, and distributing Dell and Lenovo drivers and BIOS updates for SCCM/ConfigMgr environments. 1.11.3 widens the Dell individual-driver OS filter to accept Dell''s newer year-based osCode format (W21H4 / W21P4, observed on the late-2026 Intel Arc A06 driver). DCU treats these as Win11-applicable, so without the wider match the tool was silently keeping older revisions like A03 instead of picking up A06. Pattern W2[0-9]* covers W21*-W29* so future builds don''t need another code change.'
+    Description       = 'Automates downloading, packaging, and distributing Dell and Lenovo drivers and BIOS updates for SCCM/ConfigMgr environments. 1.11.4 fixes a typo in Invoke-DATDeployApplications that made every Deploy Applications run fail with "A parameter cannot be found that matches parameter name RebootOutsideOfServiceWindow". The correct New-CMApplicationDeployment parameter is RebootOutsideServiceWindow (no "Of"). The function parameter is renamed to match the cmdlet and the misspelled name is kept as an alias so external scripts written against 1.10.0-1.11.3 keep working.'
     PowerShellVersion = '5.1'
     FunctionsToExport = @(
         'Get-DATDriverPack'
