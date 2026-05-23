@@ -29,11 +29,15 @@ function Invoke-DATDeployApplications {
     .PARAMETER OverrideServiceWindow
         When $true, the deployment installs outside of any maintenance window applied to
         the target collection. Default $false keeps installs constrained to the MW.
-    .PARAMETER RebootOutsideOfServiceWindow
+    .PARAMETER RebootOutsideServiceWindow
         When $true, a restart triggered by ForceReboot can fire outside the maintenance
         window. Default $false defers the restart until the next MW - this is what
         enables the typical "install whenever, reboot silently between 10pm-5am" flow
         when combined with UserNotification=HideAll and a Required deployment.
+
+        Accepts -RebootOutsideOfServiceWindow as an alias for callers from 1.10.0-1.11.3
+        that used the misspelled name (which silently broke deployment because the
+        underlying New-CMApplicationDeployment cmdlet doesn't have the "Of" form).
     .OUTPUTS
         Array of hashtables: { Name, Status ('Created'|'Skipped'|'Failed'), Error }
     #>
@@ -73,7 +77,11 @@ function Invoke-DATDeployApplications {
         # callers who don't set these get the safe overnight-reboot behavior.
         [bool]$OverrideServiceWindow = $false,
 
-        [bool]$RebootOutsideOfServiceWindow = $false
+        # The cmdlet's actual parameter name is RebootOutsideServiceWindow (no "Of").
+        # The misspelled RebootOutsideOfServiceWindow alias is kept so 1.10.0-1.11.3
+        # callers (the GUI and any external scripts) keep working through the upgrade.
+        [Alias('RebootOutsideOfServiceWindow')]
+        [bool]$RebootOutsideServiceWindow = $false
     )
 
     $ConnectParams = @{ SiteServer = $SiteServer }
@@ -133,15 +141,15 @@ function Invoke-DATDeployApplications {
                 }
 
                 $DeployParams = @{
-                    InputObject                   = $App
-                    CollectionName                = $CollectionName
-                    DeployAction                  = $DeployAction
-                    DeployPurpose                 = $DeployPurpose
-                    UserNotification              = $UserNotification
-                    AvailableDateTime             = $EffectiveAvailable
-                    OverrideServiceWindow         = $OverrideServiceWindow
-                    RebootOutsideOfServiceWindow  = $RebootOutsideOfServiceWindow
-                    ErrorAction                   = 'Stop'
+                    InputObject                  = $App
+                    CollectionName               = $CollectionName
+                    DeployAction                 = $DeployAction
+                    DeployPurpose                = $DeployPurpose
+                    UserNotification             = $UserNotification
+                    AvailableDateTime            = $EffectiveAvailable
+                    OverrideServiceWindow        = $OverrideServiceWindow
+                    RebootOutsideServiceWindow   = $RebootOutsideServiceWindow
+                    ErrorAction                  = 'Stop'
                 }
                 if ($DeployPurpose -eq 'Required') {
                     $DeployParams['DeadlineDateTime'] = $EffectiveDeadline

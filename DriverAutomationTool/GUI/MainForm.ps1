@@ -1255,13 +1255,13 @@ function Initialize-DATMainForm {
             Register-DATQueueLogSubscriber -LogQueue $LogQueue
 
             $DeployArgs = @{
-                Applications                  = $AppNames
-                CollectionName                = $CollectionName
-                DeployPurpose                 = $DeployPurpose
-                DeployAction                  = $DeployAction
-                UserNotification              = $UserNotif
-                OverrideServiceWindow         = $OverrideSW
-                RebootOutsideOfServiceWindow  = $RebootOutsideSW
+                Applications                 = $AppNames
+                CollectionName               = $CollectionName
+                DeployPurpose                = $DeployPurpose
+                DeployAction                 = $DeployAction
+                UserNotification             = $UserNotif
+                OverrideServiceWindow        = $OverrideSW
+                RebootOutsideServiceWindow   = $RebootOutsideSW
             }
             if ($AvailableAt) { $DeployArgs['AvailableDateTime'] = $AvailableAt }
             if ($DeadlineAt)  { $DeployArgs['DeadlineDateTime']  = $DeadlineAt  }
