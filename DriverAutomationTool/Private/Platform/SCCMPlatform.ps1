@@ -2145,6 +2145,16 @@ function Copy-DATApplyScript {
     <#
     .SYNOPSIS
         Copies Invoke-DATApply.ps1 into an Application's content source directory.
+    .DESCRIPTION
+        Hash-compares the bundled script with what's already staged at the
+        destination. If they match, the copy is skipped and the function
+        returns $false so the caller can decide that no DT-content change
+        occurred. Otherwise the file is rewritten and the function returns
+        $true. Avoiding the no-op copy is what lets the upstream DT idempotency
+        check decide "nothing changed since last sync - don't bump revision".
+    .OUTPUTS
+        Boolean. $true if the destination was (re-)written, $false if it was
+        already current.
     #>
     [CmdletBinding()]
     param(
@@ -2159,8 +2169,18 @@ function Copy-DATApplyScript {
     if (-not (Test-Path $DestinationPath)) {
         throw "Content destination does not exist: $DestinationPath"
     }
-    Copy-Item -Path $SourceScript -Destination (Join-Path $DestinationPath 'Invoke-DATApply.ps1') -Force
+    $DestFile = Join-Path $DestinationPath 'Invoke-DATApply.ps1'
+    if (Test-Path $DestFile) {
+        $SrcHash  = (Get-FileHash -Path $SourceScript -Algorithm SHA256).Hash
+        $DestHash = (Get-FileHash -Path $DestFile     -Algorithm SHA256).Hash
+        if ($SrcHash -eq $DestHash) {
+            Write-DATLog -Message "Invoke-DATApply.ps1 in $DestinationPath already current - skipping copy" -Severity 1
+            return $false
+        }
+    }
+    Copy-Item -Path $SourceScript -Destination $DestFile -Force
     Write-DATLog -Message "Staged Invoke-DATApply.ps1 into $DestinationPath" -Severity 1
+    return $true
 }
 
 # Vendor exit-code map used by DAT-managed deployment types. Each entry becomes
@@ -2374,14 +2394,22 @@ function New-DATConfigMgrApplication {
     Assert-DATConfigMgrConnected
 
     if (-not $Description) {
-        $Description = if ($Mode -eq 'Driver') {
-            "Driver Pack - $Manufacturer $Model - Version $Version"
-        } else {
-            "BIOS Update - $Manufacturer $Model - Version $Version"
+        # DriverUpdates used to land in the else branch and inherit the
+        # "BIOS Update - ..." prefix, which is why the console showed
+        # BIOS Update text in the Administrator Comments column on
+        # "Driver Updates - <model>" Applications. Switch on Mode so each
+        # type gets its own prefix.
+        $Description = switch ($Mode) {
+            'BIOS'          { "BIOS Update - $Manufacturer $Model - Version $Version" }
+            'DriverUpdates' { "Driver Updates - $Manufacturer $Model - Version $Version" }
+            default         { "Driver Pack - $Manufacturer $Model - Version $Version" }
         }
     }
 
-    Copy-DATApplyScript -DestinationPath $SourcePath
+    # Stage the apply script. The return value tells us whether the file on
+    # disk actually changed - the DT idempotency check below needs that so it
+    # doesn't skip a real content update just because the cmdlet args match.
+    $ScriptChanged = Copy-DATApplyScript -DestinationPath $SourcePath
 
     $OriginalLocation = Get-Location
     try {
@@ -2409,16 +2437,31 @@ function New-DATConfigMgrApplication {
                     -LocalizedDescription $Description `
                     -ErrorAction Stop
             } else {
-                Write-DATLog -Message "Updating existing Application: $Name" -Severity 1
-                try {
-                    Set-CMApplication -Name $Name `
-                        -Description $Description `
-                        -SoftwareVersion $Version `
-                        -LocalizedApplicationName $Name `
-                        -LocalizedDescription $Description `
-                        -ErrorAction Stop
-                } catch {
-                    Write-DATLog -Message "Warning: could not update Application properties: $($_.Exception.Message)" -Severity 2
+                # Idempotency: a Set-CMApplication call bumps the Application's
+                # SDMPackageVersion (the CI revision clients reconcile against)
+                # even when every passed value matches the existing one. On a
+                # daily sync that revision treadmill is what drives the
+                # 0x87D00314 "CI Version Info timed out" cascade on clients -
+                # they can't catch up to the new CI version before the next one
+                # lands. Skip the call when nothing visible to clients changed.
+                $AppDiffs = @()
+                if ($App.SoftwareVersion       -ne $Version)     { $AppDiffs += 'SoftwareVersion' }
+                if ($App.LocalizedDescription  -ne $Description) { $AppDiffs += 'LocalizedDescription' }
+                if ($App.LocalizedDisplayName  -ne $Name)        { $AppDiffs += 'LocalizedDisplayName' }
+                if ($AppDiffs.Count -eq 0) {
+                    Write-DATLog -Message "Application '$Name' properties already current - skipping update to avoid revision bump" -Severity 1
+                } else {
+                    Write-DATLog -Message "Updating existing Application: $Name (changed: $($AppDiffs -join ', '))" -Severity 1
+                    try {
+                        Set-CMApplication -Name $Name `
+                            -Description $Description `
+                            -SoftwareVersion $Version `
+                            -LocalizedApplicationName $Name `
+                            -LocalizedDescription $Description `
+                            -ErrorAction Stop
+                    } catch {
+                        Write-DATLog -Message "Warning: could not update Application properties: $($_.Exception.Message)" -Severity 2
+                    }
                 }
             }
         }
@@ -2477,9 +2520,53 @@ function New-DATConfigMgrApplication {
                 # Update-in-place also preserves the DT's internal ID so any
                 # existing deployments keep working, and it keeps attached
                 # requirement rules intact (no re-attach churn).
-                Write-DATLog -Message "Updating deployment type '$DTName' for $Name in place (RebootBehavior=$RebootBehavior)" -Severity 1
-                Set-CMScriptDeploymentType @DTParams | Out-Null
-                Write-DATLog -Message "Deployment type '$DTName' updated (install command, content, detection script refreshed; existing requirement rules preserved)" -Severity 1
+                #
+                # Idempotency: Set-CMScriptDeploymentType bumps the parent
+                # Application's CI revision on every successful call regardless
+                # of whether the passed values differ from what's already on the
+                # DT. Daily sync runs on hundreds of DAT-managed apps then build
+                # up a revision treadmill that clients can't reconcile through,
+                # surfacing as 0x87D00314 ("CI Version Info timed out") across
+                # the fleet. Deserialize the existing App's SDMPackageXML, read
+                # the DT's current values, and only call Set-CMScriptDeploymentType
+                # when at least one comparison field actually differs OR the
+                # staged Invoke-DATApply.ps1 was just rewritten (in which case the
+                # content hash changed and we DO need the DT update so the DP
+                # picks up the new script).
+                $DTDiffs = @()
+                if ($ScriptChanged) { $DTDiffs += 'StagedScript' }
+                try {
+                    Initialize-DATConfigMgrSDKTypes
+                    $FullApp = Get-CMApplication -Name $Name -ErrorAction Stop | Select-Object -First 1
+                    if ($FullApp -and $FullApp.SDMPackageXML) {
+                        $SDM = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::DeserializeFromString($FullApp.SDMPackageXML, $true)
+                        $EDT = $SDM.DeploymentTypes | Where-Object { $_.Title -eq $DTName } | Select-Object -First 1
+                        if ($EDT -and $EDT.Installer) {
+                            $EI = $EDT.Installer
+                            $ExistingContentLocation = (@($EI.Contents) | Select-Object -First 1).Location
+                            if ($EI.InstallCommandLine -ne $InstallCommand)       { $DTDiffs += 'InstallCommandLine' }
+                            if ($ExistingContentLocation -ne $SourcePath)         { $DTDiffs += 'ContentLocation' }
+                            if ("$($EI.PostInstallBehavior)" -ne $RebootBehavior) { $DTDiffs += 'PostInstallBehavior' }
+                            if ([int]$EI.MaxExecuteTime -ne [int]$Timeout)        { $DTDiffs += 'MaxExecuteTime' }
+                        } else {
+                            # SDM doesn't expose the DT we expected - fall back to update
+                            $DTDiffs += 'SDMReadFailed'
+                        }
+                    } else {
+                        $DTDiffs += 'NoSDMXML'
+                    }
+                } catch {
+                    Write-DATLog -Message "DT idempotency pre-check failed (will update to be safe): $($_.Exception.Message)" -Severity 2
+                    $DTDiffs += 'PreCheckException'
+                }
+
+                if ($DTDiffs.Count -eq 0) {
+                    Write-DATLog -Message "Deployment type '$DTName' params and content unchanged - skipping update to avoid CI revision bump" -Severity 1
+                } else {
+                    Write-DATLog -Message "Updating deployment type '$DTName' for $Name in place (RebootBehavior=$RebootBehavior; changed: $($DTDiffs -join ', '))" -Severity 1
+                    Set-CMScriptDeploymentType @DTParams | Out-Null
+                    Write-DATLog -Message "Deployment type '$DTName' updated (install command, content, detection script refreshed; existing requirement rules preserved)" -Severity 1
+                }
             } else {
                 Write-DATLog -Message "Creating new deployment type '$DTName' for $Name (RebootBehavior=$RebootBehavior)" -Severity 1
                 Add-CMScriptDeploymentType @DTParams | Out-Null
