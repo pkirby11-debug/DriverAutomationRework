@@ -970,6 +970,22 @@ function Get-DellIndividualDrivers {
             }
             $DownloadUrl = '{0}/{1}' -f $DriverBaseUrl.TrimEnd('/'), $DownloadPath
 
+            # Extract PCI hardware IDs the DUP targets, for apply-time hardware
+            # applicability filtering. The catalog lists them under
+            # SupportedDDCMDevices/PCIInfo as vendorID/deviceID (+ optional
+            # subVendorID/subDeviceID). We emit the "VEN_xxxx&DEV_xxxx" token
+            # (the apply script matches it as a substring against each present
+            # device's hardware IDs). DUPs with no PCIInfo (firmware utilities,
+            # chipset INF bundles, UWP apps) get an empty list and are always
+            # run at apply time - we only skip a DUP when it declares hardware
+            # and NONE of it is present (conservative).
+            $HardwareIds = [System.Collections.Generic.List[string]]::new()
+            foreach ($Pci in @($Component.SupportedDDCMDevices.PCIInfo)) {
+                if (-not $Pci -or -not $Pci.vendorID -or -not $Pci.deviceID) { continue }
+                $Token = 'VEN_{0}&DEV_{1}' -f $Pci.vendorID.Trim().ToUpper(), $Pci.deviceID.Trim().ToUpper()
+                if (-not $HardwareIds.Contains($Token)) { $HardwareIds.Add($Token) }
+            }
+
             $MatchedDrivers.Add([PSCustomObject]@{
                 Category    = $ResolvedCategory
                 Name        = $DisplayName
@@ -981,6 +997,7 @@ function Get-DellIndividualDrivers {
                 HashMD5     = $Component.hashMD5
                 Size        = $Component.size
                 IsMissing   = $IsMissing
+                HardwareIds = @($HardwareIds)
             })
             $CatalogMatched++
         }
