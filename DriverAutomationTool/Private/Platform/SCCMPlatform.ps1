@@ -2224,49 +2224,36 @@ $script:DATCustomReturnCodes = @(
 function Initialize-DATConfigMgrSDKTypes {
     <#
     .SYNOPSIS
-        Resolves and caches the ConfigMgr ApplicationManagement SDK types we
-        use to hand-edit Application SDMPackageXML.
+        Resolves and caches SccmSerializer, used to (de)serialize Application
+        SDMPackageXML.
     .DESCRIPTION
-        Functions that mutate Application SDMPackageXML (Set-DATDeploymentType-
-        ReturnCodes, Update-DATApplicationCommands) need SccmSerializer,
-        ErrorClass and CustomError from the ConfigMgr ApplicationManagement SDK.
+        We only resolve SccmSerializer by name. The other types we once needed
+        here (ErrorClass / CustomError) are NOT reliably locatable by name on
+        every console build - in the field, searching every loaded assembly AND
+        force-loading the whole ApplicationManagement* DLL family both failed to
+        find them. Set-DATInstallerReturnCodes therefore derives those two types
+        from a live return-code object instead. SccmSerializer, by contrast,
+        resolves fine, so it's the only one handled here.
 
-        Two problems had to be solved:
+        Resolution is done via reflection off the loaded Assembly objects rather
+        than PowerShell's [Namespace.Type] syntax, which doesn't reliably resolve
+        CM SDK types. We search every loaded assembly and, if SccmSerializer
+        still isn't found, load the ApplicationManagement* DLL family from the
+        console bin directory and search again.
 
-        1. PowerShell's [Namespace.Type] static syntax doesn't reliably resolve
-           these types on every console build even after the DLL is loaded, so
-           we pull System.Type objects via reflection instead.
-
-        2. The types are NOT all in one assembly. Depending on the console
-           build, SccmSerializer can live in
-           Microsoft.ConfigurationManagement.ApplicationManagement.dll while
-           ErrorClass / CustomError live in a sibling assembly (e.g.
-           ...ApplicationManagement.*.dll). An earlier version only inspected a
-           single DLL and so reported "is loaded but does not expose expected
-           type(s): ErrorClass, CustomError".
-
-        So we resolve EACH type by searching every loaded assembly, and if any
-        are still missing we load the whole ApplicationManagement* DLL family
-        from the console bin directory and search again. Results are cached in
-        script scope. Callers go through ConvertFrom-/ConvertTo-DATSdkApplicationXml
-        and Set-DATInstallerReturnCodes rather than naming the types directly.
-
-        Idempotent - returns immediately once the types are cached.
+        Idempotent - returns immediately once the type is cached.
     #>
     [CmdletBinding()]
     param()
 
-    if ($script:DATSdkType_SccmSerializer -and $script:DATSdkType_ErrorClass -and $script:DATSdkType_CustomError) {
+    if ($script:DATSdkType_SccmSerializer) {
         return
     }
 
     $AsmShortName = 'Microsoft.ConfigurationManagement.ApplicationManagement'
     $SerializerName = "$AsmShortName.Serialization.SccmSerializer"
-    $ErrorClassName = "$AsmShortName.ErrorClass"
-    $CustomErrorName = "$AsmShortName.CustomError"
 
-    # Find a type by full name across EVERY loaded assembly (the types can be
-    # split across sibling SDK assemblies, so we can't assume one DLL has them).
+    # Find a type by full name across EVERY loaded assembly.
     $FindType = {
         param([string]$FullName)
         foreach ($Assembly in [System.AppDomain]::CurrentDomain.GetAssemblies()) {
@@ -2277,15 +2264,13 @@ function Initialize-DATConfigMgrSDKTypes {
         return $null
     }
 
-    $Serializer  = & $FindType $SerializerName
-    $ErrorClass  = & $FindType $ErrorClassName
-    $CustomError = & $FindType $CustomErrorName
+    $Serializer = & $FindType $SerializerName
 
-    # If anything is still missing, load the ApplicationManagement* DLL family
-    # from the console bin directory and retry. The bin dir is taken from an
-    # already-loaded ApplicationManagement assembly, falling back to probing up
-    # from the ConfigurationManager module path.
-    if (-not ($Serializer -and $ErrorClass -and $CustomError)) {
+    # If not found, load the ApplicationManagement* DLL family from the console
+    # bin directory and retry. The bin dir is taken from an already-loaded
+    # ApplicationManagement assembly, falling back to probing up from the
+    # ConfigurationManager module path.
+    if (-not $Serializer) {
         $BinDir = $null
         $LoadedAppMgmt = [System.AppDomain]::CurrentDomain.GetAssemblies() |
             Where-Object { -not $_.IsDynamic -and $_.GetName().Name -like "$AsmShortName*" } |
@@ -2313,22 +2298,14 @@ function Initialize-DATConfigMgrSDKTypes {
         }
         Write-DATLog -Message "Loaded ConfigMgr ApplicationManagement SDK assemblies from $BinDir ($($Dlls.Count) file(s))" -Severity 1
 
-        if (-not $Serializer)  { $Serializer  = & $FindType $SerializerName }
-        if (-not $ErrorClass)  { $ErrorClass  = & $FindType $ErrorClassName }
-        if (-not $CustomError) { $CustomError = & $FindType $CustomErrorName }
+        $Serializer = & $FindType $SerializerName
     }
 
-    $Missing = @()
-    if (-not $Serializer)  { $Missing += $SerializerName }
-    if (-not $ErrorClass)  { $Missing += $ErrorClassName }
-    if (-not $CustomError) { $Missing += $CustomErrorName }
-    if ($Missing.Count -gt 0) {
-        throw "Could not resolve required ConfigMgr SDK type(s) in any loaded assembly: $($Missing -join ', '). The console build may be incompatible."
+    if (-not $Serializer) {
+        throw "Could not resolve $SerializerName in any loaded assembly. The console build may be incompatible."
     }
 
     $script:DATSdkType_SccmSerializer = $Serializer
-    $script:DATSdkType_ErrorClass     = $ErrorClass
-    $script:DATSdkType_CustomError    = $CustomError
 }
 
 function ConvertFrom-DATSdkApplicationXml {
@@ -2379,8 +2356,17 @@ function Set-DATInstallerReturnCodes {
         Applies the DAT-standard vendor exit-code map ($script:DATCustomReturnCodes)
         to an SDK Installer object's CustomReturnCodes collection, in place.
     .DESCRIPTION
-        Shared by Set-DATDeploymentTypeReturnCodes and Update-DATApplicationCommands
-        so the ErrorClass / CustomError reflection lives in exactly one place.
+        Shared by Set-DATDeploymentTypeReturnCodes and Update-DATApplicationCommands.
+
+        The CustomError and ErrorClass types are read straight off a live
+        return-code object rather than resolved by name. On some console builds
+        those types live in an assembly we cannot locate by name (searching
+        every loaded assembly and force-loading the whole ApplicationManagement*
+        DLL family both failed in the field), but every script deployment type
+        ships with default return codes (0/1707/3010/1641/1618) that are already
+        CustomError instances - so we take the types from one of those. This
+        cannot fail to find the type, because the object already exists.
+
         Idempotent: a code already present is updated in place, not duplicated.
     .OUTPUTS
         Hashtable @{ Added = <int>; Updated = <int> }.
@@ -2390,17 +2376,25 @@ function Set-DATInstallerReturnCodes {
         [Parameter(Mandatory)]
         $Installer
     )
-    Initialize-DATConfigMgrSDKTypes
 
     $ReturnCodes = $Installer.CustomReturnCodes
     if ($null -eq $ReturnCodes) {
         throw "Deployment type Installer has no CustomReturnCodes collection to update."
     }
 
+    # Derive the CustomError + ErrorClass types from an existing entry (the DT's
+    # default return codes). Reflection on a live instance always resolves.
+    $Sample = @($ReturnCodes)[0]
+    if (-not $Sample) {
+        throw "Deployment type has no existing return codes to derive the SDK CustomError type from - cannot add custom return codes on this console build."
+    }
+    $CustomErrorType = $Sample.GetType()
+    $ErrorClassType  = $Sample.Class.GetType()
+
     $Added = 0
     $Updated = 0
     foreach ($Def in $script:DATCustomReturnCodes) {
-        $ClassEnum = [System.Enum]::Parse($script:DATSdkType_ErrorClass, $Def.Class, $true)
+        $ClassEnum = [System.Enum]::Parse($ErrorClassType, $Def.Class, $true)
         $Existing = $ReturnCodes | Where-Object { $_.Code -eq [int]$Def.Code } | Select-Object -First 1
         if ($Existing) {
             if ($Existing.Class -ne $ClassEnum -or $Existing.Name -ne $Def.Name) {
@@ -2409,7 +2403,7 @@ function Set-DATInstallerReturnCodes {
                 $Updated++
             }
         } else {
-            $NewErr = [System.Activator]::CreateInstance($script:DATSdkType_CustomError)
+            $NewErr = [System.Activator]::CreateInstance($CustomErrorType)
             $NewErr.Code = [int]$Def.Code
             $NewErr.Class = $ClassEnum
             $NewErr.Name = $Def.Name
