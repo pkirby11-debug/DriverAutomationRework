@@ -2229,21 +2229,26 @@ function Initialize-DATConfigMgrSDKTypes {
     .DESCRIPTION
         Functions that mutate Application SDMPackageXML (Set-DATDeploymentType-
         ReturnCodes, Update-DATApplicationCommands) need SccmSerializer,
-        ErrorClass and CustomError from the ConfigMgr ApplicationManagement
-        SDK assembly.
+        ErrorClass and CustomError from the ConfigMgr ApplicationManagement SDK.
 
-        The previous approach Add-Type'd the DLL and then referred to the types
-        with PowerShell's [Namespace.Type] static syntax. On some console
-        builds that syntax NEVER resolves the types even after the assembly is
-        loaded (PowerShell's type-name resolver doesn't always pick up types
-        from a LoadFrom/lazily-loaded CM assembly), producing the recurring
-        "Unable to find type [...ErrorClass]" failure.
+        Two problems had to be solved:
 
-        This version pulls the System.Type objects straight off the loaded
-        Assembly via reflection (Assembly.GetType) and caches them in
-        script scope. Reflection on a concrete Assembly object doesn't depend
-        on PowerShell's resolver, so it works regardless of how the DLL was
-        loaded. Callers go through ConvertFrom-/ConvertTo-DATSdkApplicationXml
+        1. PowerShell's [Namespace.Type] static syntax doesn't reliably resolve
+           these types on every console build even after the DLL is loaded, so
+           we pull System.Type objects via reflection instead.
+
+        2. The types are NOT all in one assembly. Depending on the console
+           build, SccmSerializer can live in
+           Microsoft.ConfigurationManagement.ApplicationManagement.dll while
+           ErrorClass / CustomError live in a sibling assembly (e.g.
+           ...ApplicationManagement.*.dll). An earlier version only inspected a
+           single DLL and so reported "is loaded but does not expose expected
+           type(s): ErrorClass, CustomError".
+
+        So we resolve EACH type by searching every loaded assembly, and if any
+        are still missing we load the whole ApplicationManagement* DLL family
+        from the console bin directory and search again. Results are cached in
+        script scope. Callers go through ConvertFrom-/ConvertTo-DATSdkApplicationXml
         and Set-DATInstallerReturnCodes rather than naming the types directly.
 
         Idempotent - returns immediately once the types are cached.
@@ -2256,57 +2261,74 @@ function Initialize-DATConfigMgrSDKTypes {
     }
 
     $AsmShortName = 'Microsoft.ConfigurationManagement.ApplicationManagement'
+    $SerializerName = "$AsmShortName.Serialization.SccmSerializer"
+    $ErrorClassName = "$AsmShortName.ErrorClass"
+    $CustomErrorName = "$AsmShortName.CustomError"
 
-    # Prefer an already-loaded instance - the CM provider loads this assembly
-    # lazily once a CM cmdlet touches Application objects (which has happened by
-    # the time we get here), so it's usually already in the AppDomain.
-    $Asm = [System.AppDomain]::CurrentDomain.GetAssemblies() |
-        Where-Object { $_.GetName().Name -eq $AsmShortName } |
-        Select-Object -First 1
-
-    if (-not $Asm) {
-        $CmModule = Get-Module ConfigurationManager
-        if (-not $CmModule) {
-            throw "ConfigurationManager module is not loaded - cannot locate the SCCM SDK assemblies. Run Connect-DATConfigMgr first."
+    # Find a type by full name across EVERY loaded assembly (the types can be
+    # split across sibling SDK assemblies, so we can't assume one DLL has them).
+    $FindType = {
+        param([string]$FullName)
+        foreach ($Assembly in [System.AppDomain]::CurrentDomain.GetAssemblies()) {
+            $Resolved = $null
+            try { $Resolved = $Assembly.GetType($FullName, $false) } catch { }
+            if ($Resolved) { return $Resolved }
         }
-
-        # The DLL sits in the console bin root, but the PS module sometimes
-        # lives a folder or two below it - probe a few levels up from its path.
-        $SearchDirs = [System.Collections.Generic.List[string]]::new()
-        $Dir = Split-Path $CmModule.Path -Parent
-        for ($i = 0; $i -lt 4 -and $Dir; $i++) {
-            $SearchDirs.Add($Dir)
-            $Dir = Split-Path $Dir -Parent
-        }
-        $DllPath = $null
-        foreach ($D in $SearchDirs) {
-            $Candidate = Join-Path $D "$AsmShortName.dll"
-            if (Test-Path $Candidate) { $DllPath = $Candidate; break }
-        }
-        if (-not $DllPath) {
-            throw "SCCM ApplicationManagement SDK assembly '$AsmShortName.dll' not found near the ConfigurationManager module. Searched: $($SearchDirs -join '; ')."
-        }
-        try {
-            $Asm = [System.Reflection.Assembly]::LoadFrom($DllPath)
-        } catch {
-            throw "Found SCCM SDK assembly at '$DllPath' but could not load it: $($_.Exception.Message)"
-        }
-        Write-DATLog -Message "Loaded SCCM ApplicationManagement SDK via reflection: $DllPath" -Severity 1
+        return $null
     }
 
-    # Pull the types straight off the Assembly - no dependency on PowerShell's
-    # [typename] resolver, which is what was failing before.
-    $script:DATSdkType_SccmSerializer = $Asm.GetType("$AsmShortName.Serialization.SccmSerializer", $false)
-    $script:DATSdkType_ErrorClass     = $Asm.GetType("$AsmShortName.ErrorClass", $false)
-    $script:DATSdkType_CustomError    = $Asm.GetType("$AsmShortName.CustomError", $false)
+    $Serializer  = & $FindType $SerializerName
+    $ErrorClass  = & $FindType $ErrorClassName
+    $CustomError = & $FindType $CustomErrorName
+
+    # If anything is still missing, load the ApplicationManagement* DLL family
+    # from the console bin directory and retry. The bin dir is taken from an
+    # already-loaded ApplicationManagement assembly, falling back to probing up
+    # from the ConfigurationManager module path.
+    if (-not ($Serializer -and $ErrorClass -and $CustomError)) {
+        $BinDir = $null
+        $LoadedAppMgmt = [System.AppDomain]::CurrentDomain.GetAssemblies() |
+            Where-Object { -not $_.IsDynamic -and $_.GetName().Name -like "$AsmShortName*" } |
+            Select-Object -First 1
+        if ($LoadedAppMgmt -and $LoadedAppMgmt.Location) {
+            $BinDir = Split-Path $LoadedAppMgmt.Location -Parent
+        } else {
+            $CmModule = Get-Module ConfigurationManager
+            if (-not $CmModule) {
+                throw "ConfigurationManager module is not loaded - cannot locate the SCCM SDK assemblies. Run Connect-DATConfigMgr first."
+            }
+            $Dir = Split-Path $CmModule.Path -Parent
+            for ($i = 0; $i -lt 4 -and $Dir -and -not $BinDir; $i++) {
+                if (Test-Path (Join-Path $Dir "$AsmShortName.dll")) { $BinDir = $Dir }
+                else { $Dir = Split-Path $Dir -Parent }
+            }
+        }
+        if (-not $BinDir) {
+            throw "Could not locate the ConfigMgr console bin directory to load the ApplicationManagement SDK assemblies."
+        }
+
+        $Dlls = @(Get-ChildItem -Path $BinDir -Filter "$AsmShortName*.dll" -ErrorAction SilentlyContinue)
+        foreach ($Dll in $Dlls) {
+            try { [void][System.Reflection.Assembly]::LoadFrom($Dll.FullName) } catch { }
+        }
+        Write-DATLog -Message "Loaded ConfigMgr ApplicationManagement SDK assemblies from $BinDir ($($Dlls.Count) file(s))" -Severity 1
+
+        if (-not $Serializer)  { $Serializer  = & $FindType $SerializerName }
+        if (-not $ErrorClass)  { $ErrorClass  = & $FindType $ErrorClassName }
+        if (-not $CustomError) { $CustomError = & $FindType $CustomErrorName }
+    }
 
     $Missing = @()
-    if (-not $script:DATSdkType_SccmSerializer) { $Missing += 'Serialization.SccmSerializer' }
-    if (-not $script:DATSdkType_ErrorClass)     { $Missing += 'ErrorClass' }
-    if (-not $script:DATSdkType_CustomError)    { $Missing += 'CustomError' }
+    if (-not $Serializer)  { $Missing += $SerializerName }
+    if (-not $ErrorClass)  { $Missing += $ErrorClassName }
+    if (-not $CustomError) { $Missing += $CustomErrorName }
     if ($Missing.Count -gt 0) {
-        throw "SCCM SDK assembly '$($Asm.Location)' is loaded but does not expose expected type(s): $($Missing -join ', '). The console build may be incompatible."
+        throw "Could not resolve required ConfigMgr SDK type(s) in any loaded assembly: $($Missing -join ', '). The console build may be incompatible."
     }
+
+    $script:DATSdkType_SccmSerializer = $Serializer
+    $script:DATSdkType_ErrorClass     = $ErrorClass
+    $script:DATSdkType_CustomError    = $CustomError
 }
 
 function ConvertFrom-DATSdkApplicationXml {
