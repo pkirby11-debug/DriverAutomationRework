@@ -162,7 +162,7 @@ function Update-DATApplicationCommands {
                 # showed up as 0x87D00314 (CI Version Info timed out) on the
                 # fleet after the first run.
                 $CmApp = Get-CMApplication -Name $AppName -ErrorAction Stop | Select-Object -First 1
-                $AppDef = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::DeserializeFromString($CmApp.SDMPackageXML, $true)
+                $AppDef = ConvertFrom-DATSdkApplicationXml -Xml $CmApp.SDMPackageXML
                 $DT = $AppDef.DeploymentTypes | Where-Object { $_.Title -eq 'Install' } | Select-Object -First 1
                 if (-not $DT) {
                     throw "Application '$AppName' has no 'Install' deployment type"
@@ -199,25 +199,9 @@ function Update-DATApplicationCommands {
                 $RcAdded = 0
                 $RcUpdated = 0
                 if (-not $SkipReturnCodes) {
-                    $ReturnCodes = $DT.Installer.CustomReturnCodes
-                    foreach ($Def in $script:DATCustomReturnCodes) {
-                        $ClassEnum = [Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass]::($Def.Class)
-                        $Existing = $ReturnCodes | Where-Object { $_.Code -eq [int]$Def.Code } | Select-Object -First 1
-                        if ($Existing) {
-                            if ($Existing.Class -ne $ClassEnum -or $Existing.Name -ne $Def.Name) {
-                                $Existing.Class = $ClassEnum
-                                $Existing.Name = $Def.Name
-                                $RcUpdated++
-                            }
-                        } else {
-                            $NewErr = New-Object Microsoft.ConfigurationManagement.ApplicationManagement.CustomError
-                            $NewErr.Code = [int]$Def.Code
-                            $NewErr.Class = $ClassEnum
-                            $NewErr.Name = $Def.Name
-                            [void]$ReturnCodes.Add($NewErr)
-                            $RcAdded++
-                        }
-                    }
+                    $Rc = Set-DATInstallerReturnCodes -Installer $DT.Installer
+                    $RcAdded = $Rc.Added
+                    $RcUpdated = $Rc.Updated
                 }
 
                 if (-not $InstallCmdNeedsUpdate -and $RcAdded -eq 0 -and $RcUpdated -eq 0) {
@@ -258,7 +242,7 @@ function Update-DATApplicationCommands {
                     $DT.Installer.InstallCommandLine = $NewCmd
                 }
 
-                $NewXml = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::SerializeToString($AppDef, $true)
+                $NewXml = ConvertTo-DATSdkApplicationXml -AppDef $AppDef
                 $CmApp.SetPropertyValue('SDMPackageXML', $NewXml)
                 $CmApp.Put() | Out-Null
                 Write-DATLog -Message "[$AppName] DT rebuilt in one revision (Mode=$Mode, install-cmd=$InstallCmdNeedsUpdate, return-codes added=$RcAdded updated=$RcUpdated)" -Severity 1
