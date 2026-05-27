@@ -2224,49 +2224,178 @@ $script:DATCustomReturnCodes = @(
 function Initialize-DATConfigMgrSDKTypes {
     <#
     .SYNOPSIS
-        Eagerly loads the ConfigMgr ApplicationManagement SDK assembly so our
-        explicit type references resolve.
+        Resolves and caches the ConfigMgr ApplicationManagement SDK types we
+        use to hand-edit Application SDMPackageXML.
     .DESCRIPTION
-        Functions that mutate Application SDMPackageXML by hand (e.g.
-        Set-DATDeploymentTypeReturnCodes, Update-DATApplicationCommands)
-        reference types like
-        [Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass]
-        and
-        [Microsoft.ConfigurationManagement.ApplicationManagement.CustomError]
-        directly. Importing the ConfigurationManager module loads its cmdlets,
-        but the SDK DLL that contains those types is loaded LAZILY - only when
-        a CM cmdlet binary internally instantiates one - so PowerShell's
-        own type resolver can't see them yet. The first call to
-        [Type]::Member then throws "Unable to find type [...]" even though
-        the ConfigurationManager module is loaded and the CM cmdlets work.
+        Functions that mutate Application SDMPackageXML (Set-DATDeploymentType-
+        ReturnCodes, Update-DATApplicationCommands) need SccmSerializer,
+        ErrorClass and CustomError from the ConfigMgr ApplicationManagement
+        SDK assembly.
 
-        Add-Type'ing the DLL up front into our AppDomain makes the static
-        type references resolve. Idempotent and safe to call repeatedly -
-        skips the load if the marker type is already known.
+        The previous approach Add-Type'd the DLL and then referred to the types
+        with PowerShell's [Namespace.Type] static syntax. On some console
+        builds that syntax NEVER resolves the types even after the assembly is
+        loaded (PowerShell's type-name resolver doesn't always pick up types
+        from a LoadFrom/lazily-loaded CM assembly), producing the recurring
+        "Unable to find type [...ErrorClass]" failure.
+
+        This version pulls the System.Type objects straight off the loaded
+        Assembly via reflection (Assembly.GetType) and caches them in
+        script scope. Reflection on a concrete Assembly object doesn't depend
+        on PowerShell's resolver, so it works regardless of how the DLL was
+        loaded. Callers go through ConvertFrom-/ConvertTo-DATSdkApplicationXml
+        and Set-DATInstallerReturnCodes rather than naming the types directly.
+
+        Idempotent - returns immediately once the types are cached.
     #>
     [CmdletBinding()]
     param()
 
-    # Already loaded? Nothing to do.
-    if ('Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass' -as [Type]) {
+    if ($script:DATSdkType_SccmSerializer -and $script:DATSdkType_ErrorClass -and $script:DATSdkType_CustomError) {
         return
     }
 
-    $CmModule = Get-Module ConfigurationManager
-    if (-not $CmModule) {
-        throw "ConfigurationManager module is not loaded - cannot locate the SCCM SDK assemblies. Run Connect-DATConfigMgr first."
+    $AsmShortName = 'Microsoft.ConfigurationManagement.ApplicationManagement'
+
+    # Prefer an already-loaded instance - the CM provider loads this assembly
+    # lazily once a CM cmdlet touches Application objects (which has happened by
+    # the time we get here), so it's usually already in the AppDomain.
+    $Asm = [System.AppDomain]::CurrentDomain.GetAssemblies() |
+        Where-Object { $_.GetName().Name -eq $AsmShortName } |
+        Select-Object -First 1
+
+    if (-not $Asm) {
+        $CmModule = Get-Module ConfigurationManager
+        if (-not $CmModule) {
+            throw "ConfigurationManager module is not loaded - cannot locate the SCCM SDK assemblies. Run Connect-DATConfigMgr first."
+        }
+
+        # The DLL sits in the console bin root, but the PS module sometimes
+        # lives a folder or two below it - probe a few levels up from its path.
+        $SearchDirs = [System.Collections.Generic.List[string]]::new()
+        $Dir = Split-Path $CmModule.Path -Parent
+        for ($i = 0; $i -lt 4 -and $Dir; $i++) {
+            $SearchDirs.Add($Dir)
+            $Dir = Split-Path $Dir -Parent
+        }
+        $DllPath = $null
+        foreach ($D in $SearchDirs) {
+            $Candidate = Join-Path $D "$AsmShortName.dll"
+            if (Test-Path $Candidate) { $DllPath = $Candidate; break }
+        }
+        if (-not $DllPath) {
+            throw "SCCM ApplicationManagement SDK assembly '$AsmShortName.dll' not found near the ConfigurationManager module. Searched: $($SearchDirs -join '; ')."
+        }
+        try {
+            $Asm = [System.Reflection.Assembly]::LoadFrom($DllPath)
+        } catch {
+            throw "Found SCCM SDK assembly at '$DllPath' but could not load it: $($_.Exception.Message)"
+        }
+        Write-DATLog -Message "Loaded SCCM ApplicationManagement SDK via reflection: $DllPath" -Severity 1
     }
 
-    # The SDK DLL ships alongside ConfigurationManager.psd1 in <console>\bin\
-    $BinDir = Split-Path $CmModule.Path -Parent
-    $SDKAssembly = Join-Path $BinDir 'Microsoft.ConfigurationManagement.ApplicationManagement.dll'
+    # Pull the types straight off the Assembly - no dependency on PowerShell's
+    # [typename] resolver, which is what was failing before.
+    $script:DATSdkType_SccmSerializer = $Asm.GetType("$AsmShortName.Serialization.SccmSerializer", $false)
+    $script:DATSdkType_ErrorClass     = $Asm.GetType("$AsmShortName.ErrorClass", $false)
+    $script:DATSdkType_CustomError    = $Asm.GetType("$AsmShortName.CustomError", $false)
 
-    if (-not (Test-Path $SDKAssembly)) {
-        throw "SCCM ApplicationManagement SDK assembly not found at $SDKAssembly"
+    $Missing = @()
+    if (-not $script:DATSdkType_SccmSerializer) { $Missing += 'Serialization.SccmSerializer' }
+    if (-not $script:DATSdkType_ErrorClass)     { $Missing += 'ErrorClass' }
+    if (-not $script:DATSdkType_CustomError)    { $Missing += 'CustomError' }
+    if ($Missing.Count -gt 0) {
+        throw "SCCM SDK assembly '$($Asm.Location)' is loaded but does not expose expected type(s): $($Missing -join ', '). The console build may be incompatible."
+    }
+}
+
+function ConvertFrom-DATSdkApplicationXml {
+    <#
+    .SYNOPSIS
+        Deserializes an Application's SDMPackageXML into an editable SDK object
+        via SccmSerializer (resolved by reflection, see Initialize-DATConfigMgrSDKTypes).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Xml
+    )
+    Initialize-DATConfigMgrSDKTypes
+    $Method = $script:DATSdkType_SccmSerializer.GetMethods() |
+        Where-Object { $_.Name -eq 'DeserializeFromString' -and $_.IsStatic -and $_.GetParameters().Count -eq 2 } |
+        Select-Object -First 1
+    if (-not $Method) {
+        throw "SccmSerializer.DeserializeFromString(string, bool) overload not found on this console build."
+    }
+    return $Method.Invoke($null, @($Xml, $true))
+}
+
+function ConvertTo-DATSdkApplicationXml {
+    <#
+    .SYNOPSIS
+        Serializes an edited SDK Application object back to SDMPackageXML via
+        SccmSerializer (resolved by reflection).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $AppDef
+    )
+    Initialize-DATConfigMgrSDKTypes
+    $Method = $script:DATSdkType_SccmSerializer.GetMethods() |
+        Where-Object { $_.Name -eq 'SerializeToString' -and $_.IsStatic -and $_.GetParameters().Count -eq 2 } |
+        Select-Object -First 1
+    if (-not $Method) {
+        throw "SccmSerializer.SerializeToString(object, bool) overload not found on this console build."
+    }
+    return $Method.Invoke($null, @($AppDef, $true))
+}
+
+function Set-DATInstallerReturnCodes {
+    <#
+    .SYNOPSIS
+        Applies the DAT-standard vendor exit-code map ($script:DATCustomReturnCodes)
+        to an SDK Installer object's CustomReturnCodes collection, in place.
+    .DESCRIPTION
+        Shared by Set-DATDeploymentTypeReturnCodes and Update-DATApplicationCommands
+        so the ErrorClass / CustomError reflection lives in exactly one place.
+        Idempotent: a code already present is updated in place, not duplicated.
+    .OUTPUTS
+        Hashtable @{ Added = <int>; Updated = <int> }.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Installer
+    )
+    Initialize-DATConfigMgrSDKTypes
+
+    $ReturnCodes = $Installer.CustomReturnCodes
+    if ($null -eq $ReturnCodes) {
+        throw "Deployment type Installer has no CustomReturnCodes collection to update."
     }
 
-    Add-Type -Path $SDKAssembly -ErrorAction Stop
-    Write-DATLog -Message "Loaded SCCM ApplicationManagement SDK: $SDKAssembly" -Severity 1
+    $Added = 0
+    $Updated = 0
+    foreach ($Def in $script:DATCustomReturnCodes) {
+        $ClassEnum = [System.Enum]::Parse($script:DATSdkType_ErrorClass, $Def.Class, $true)
+        $Existing = $ReturnCodes | Where-Object { $_.Code -eq [int]$Def.Code } | Select-Object -First 1
+        if ($Existing) {
+            if ($Existing.Class -ne $ClassEnum -or $Existing.Name -ne $Def.Name) {
+                $Existing.Class = $ClassEnum
+                $Existing.Name = $Def.Name
+                $Updated++
+            }
+        } else {
+            $NewErr = [System.Activator]::CreateInstance($script:DATSdkType_CustomError)
+            $NewErr.Code = [int]$Def.Code
+            $NewErr.Class = $ClassEnum
+            $NewErr.Name = $Def.Name
+            [void]$ReturnCodes.Add($NewErr)
+            $Added++
+        }
+    }
+    return @{ Added = $Added; Updated = $Updated }
 }
 
 function Set-DATDeploymentTypeReturnCodes {
@@ -2295,9 +2424,11 @@ function Set-DATDeploymentTypeReturnCodes {
     )
 
     Assert-DATConfigMgrConnected
-    Initialize-DATConfigMgrSDKTypes
 
     try {
+        # SDK type resolution happens lazily inside the helpers below; keeping it
+        # in the try means a loader failure logs the non-fatal warning rather than
+        # aborting the (already-created) Application.
         $App = Get-CMApplication -Name $ApplicationName -ErrorAction Stop | Select-Object -First 1
         if (-not $App) {
             throw "Application '$ApplicationName' not found"
@@ -2308,51 +2439,23 @@ function Set-DATDeploymentTypeReturnCodes {
             throw "Application '$ApplicationName' has no SDMPackageXML to modify"
         }
 
-        # SccmSerializer / CustomError / ErrorClass live in
-        # Microsoft.ConfigurationManagement.ApplicationManagement.dll, which
-        # Initialize-DATConfigMgrSDKTypes loaded explicitly above. The CM
-        # module's lazy-load can't be relied on to make these resolvable to
-        # PowerShell's static type lookup - we hit
-        # "Unable to find type [Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass]"
-        # otherwise.
-        $AppDef = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::DeserializeFromString($Xml, $true)
+        $AppDef = ConvertFrom-DATSdkApplicationXml -Xml $Xml
         $DT = $AppDef.DeploymentTypes | Where-Object { $_.Title -eq $DeploymentTypeName } | Select-Object -First 1
         if (-not $DT) {
             throw "Deployment type '$DeploymentTypeName' not found on application '$ApplicationName'"
         }
 
-        $Installer = $DT.Installer
-        $ReturnCodes = $Installer.CustomReturnCodes
-        $Added = 0
-        $Updated = 0
-        foreach ($Def in $script:DATCustomReturnCodes) {
-            $ClassEnum = [Microsoft.ConfigurationManagement.ApplicationManagement.ErrorClass]::($Def.Class)
-            $Existing = $ReturnCodes | Where-Object { $_.Code -eq [int]$Def.Code } | Select-Object -First 1
-            if ($Existing) {
-                if ($Existing.Class -ne $ClassEnum -or $Existing.Name -ne $Def.Name) {
-                    $Existing.Class = $ClassEnum
-                    $Existing.Name = $Def.Name
-                    $Updated++
-                }
-            } else {
-                $NewErr = New-Object Microsoft.ConfigurationManagement.ApplicationManagement.CustomError
-                $NewErr.Code = [int]$Def.Code
-                $NewErr.Class = $ClassEnum
-                $NewErr.Name = $Def.Name
-                [void]$ReturnCodes.Add($NewErr)
-                $Added++
-            }
-        }
+        $Rc = Set-DATInstallerReturnCodes -Installer $DT.Installer
 
-        if ($Added -eq 0 -and $Updated -eq 0) {
+        if ($Rc.Added -eq 0 -and $Rc.Updated -eq 0) {
             Write-DATLog -Message "Return codes already current on $ApplicationName\$DeploymentTypeName - no change" -Severity 1
             return
         }
 
-        $NewXml = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::SerializeToString($AppDef, $true)
+        $NewXml = ConvertTo-DATSdkApplicationXml -AppDef $AppDef
         $App.SetPropertyValue('SDMPackageXML', $NewXml)
         $App.Put() | Out-Null
-        Write-DATLog -Message "Updated return codes on $ApplicationName\$DeploymentTypeName (added=$Added, updated=$Updated)" -Severity 1
+        Write-DATLog -Message "Updated return codes on $ApplicationName\$DeploymentTypeName (added=$($Rc.Added), updated=$($Rc.Updated))" -Severity 1
     } catch {
         # Non-fatal: the application + DT itself were created/updated before
         # this call. Return-code mapping is an enhancement, not a hard
@@ -2557,10 +2660,9 @@ function New-DATConfigMgrApplication {
                 $DTDiffs = @()
                 if ($ScriptChanged) { $DTDiffs += 'StagedScript' }
                 try {
-                    Initialize-DATConfigMgrSDKTypes
                     $FullApp = Get-CMApplication -Name $Name -ErrorAction Stop | Select-Object -First 1
                     if ($FullApp -and $FullApp.SDMPackageXML) {
-                        $SDM = [Microsoft.ConfigurationManagement.ApplicationManagement.Serialization.SccmSerializer]::DeserializeFromString($FullApp.SDMPackageXML, $true)
+                        $SDM = ConvertFrom-DATSdkApplicationXml -Xml $FullApp.SDMPackageXML
                         $EDT = $SDM.DeploymentTypes | Where-Object { $_.Title -eq $DTName } | Select-Object -First 1
                         if ($EDT -and $EDT.Installer) {
                             $EI = $EDT.Installer
