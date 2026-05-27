@@ -2358,14 +2358,24 @@ function Set-DATInstallerReturnCodes {
     .DESCRIPTION
         Shared by Set-DATDeploymentTypeReturnCodes and Update-DATApplicationCommands.
 
-        The CustomError and ErrorClass types are read straight off a live
-        return-code object rather than resolved by name. On some console builds
-        those types live in an assembly we cannot locate by name (searching
-        every loaded assembly and force-loading the whole ApplicationManagement*
-        DLL family both failed in the field), but every script deployment type
-        ships with default return codes (0/1707/3010/1641/1618) that are already
-        CustomError instances - so we take the types from one of those. This
-        cannot fail to find the type, because the object already exists.
+        The CustomError and ErrorClass types are read from the Installer's
+        PROPERTY-TYPE METADATA rather than by name or from a live element:
+
+        - By name fails on some console builds - searching every loaded assembly
+          AND force-loading the whole ApplicationManagement* DLL family both
+          failed to find ErrorClass/CustomError in the field.
+        - From a live element fails too: a freshly-created script DT comes back
+          with a NULL CustomReturnCodes collection (Add-CMScriptDeploymentType
+          does not seed the default 0/1707/3010/1641/1618 codes), so there's
+          nothing to sample.
+
+        The CustomReturnCodes property's declared type always references
+        CustomError in metadata, and the CLR resolves that type ref off the
+        already-loaded Installer assembly regardless of how it was loaded - no
+        name lookup, no live instance required. ErrorClass is then the type of
+        CustomError's Class property. If the collection itself is null we
+        instantiate it (the declared concrete type, or List<CustomError> when
+        the property is an interface) and assign it back.
 
         Idempotent: a code already present is updated in place, not duplicated.
     .OUTPUTS
@@ -2377,19 +2387,58 @@ function Set-DATInstallerReturnCodes {
         $Installer
     )
 
-    $ReturnCodes = $Installer.CustomReturnCodes
-    if ($null -eq $ReturnCodes) {
-        throw "Deployment type Installer has no CustomReturnCodes collection to update."
+    $InstallerType = $Installer.GetType()
+    $RcProp = $InstallerType.GetProperty('CustomReturnCodes')
+    if (-not $RcProp) {
+        throw "Installer type '$($InstallerType.FullName)' exposes no CustomReturnCodes property."
+    }
+    $RcCollectionType = $RcProp.PropertyType
+
+    # Element type (CustomError). Prefer IEnumerable<T> - its T is unambiguously
+    # the element type - then fall back to the collection's own/base generic args.
+    $IEnumerableOpen = [System.Collections.Generic.IEnumerable[object]].GetGenericTypeDefinition()
+    $CustomErrorType = $null
+    foreach ($Candidate in (@($RcCollectionType) + @($RcCollectionType.GetInterfaces()))) {
+        if ($Candidate.IsGenericType -and $Candidate.GetGenericTypeDefinition() -eq $IEnumerableOpen) {
+            $CustomErrorType = $Candidate.GetGenericArguments()[0]
+            break
+        }
+    }
+    if (-not $CustomErrorType) {
+        $Probe = $RcCollectionType
+        while ($Probe -and -not $CustomErrorType) {
+            if ($Probe.IsGenericType) {
+                $GenArgs = $Probe.GetGenericArguments()
+                $CustomErrorType = $GenArgs[$GenArgs.Length - 1]
+            } else {
+                $Probe = $Probe.BaseType
+            }
+        }
+    }
+    if (-not $CustomErrorType) {
+        throw "Could not determine the CustomError element type from CustomReturnCodes property type '$($RcCollectionType.FullName)'."
     }
 
-    # Derive the CustomError + ErrorClass types from an existing entry (the DT's
-    # default return codes). Reflection on a live instance always resolves.
-    $Sample = @($ReturnCodes)[0]
-    if (-not $Sample) {
-        throw "Deployment type has no existing return codes to derive the SDK CustomError type from - cannot add custom return codes on this console build."
+    $ClassProp = $CustomErrorType.GetProperty('Class')
+    if (-not $ClassProp) {
+        throw "Resolved CustomError type '$($CustomErrorType.FullName)' has no Class property."
     }
-    $CustomErrorType = $Sample.GetType()
-    $ErrorClassType  = $Sample.Class.GetType()
+    $ErrorClassType = $ClassProp.PropertyType
+
+    # Ensure the collection exists - it's null on a freshly-created script DT.
+    $ReturnCodes = $Installer.CustomReturnCodes
+    if ($null -eq $ReturnCodes) {
+        if (-not $RcProp.CanWrite) {
+            throw "CustomReturnCodes is null and the property is read-only on '$($InstallerType.FullName)' - cannot initialize return codes."
+        }
+        if ($RcCollectionType.IsInterface -or $RcCollectionType.IsAbstract) {
+            $ListType = [System.Collections.Generic.List[object]].GetGenericTypeDefinition().MakeGenericType($CustomErrorType)
+            $ReturnCodes = [System.Activator]::CreateInstance($ListType)
+        } else {
+            $ReturnCodes = [System.Activator]::CreateInstance($RcCollectionType)
+        }
+        $RcProp.SetValue($Installer, $ReturnCodes, $null)
+    }
 
     $Added = 0
     $Updated = 0
