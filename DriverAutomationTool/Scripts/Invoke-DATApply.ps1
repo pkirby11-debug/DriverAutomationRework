@@ -204,6 +204,81 @@ function Get-DeviceManufacturer {
 }
 
 # -------------------------------------------------------------------------
+# Virtual machine detection
+# -------------------------------------------------------------------------
+function Test-IsVirtualMachine {
+    <#
+        Returns $true if this host is a virtual machine. OEM driver/BIOS DUPs
+        never apply to VMs (no physical hardware to update), and pushing them
+        to AVD/VDI session hosts is at best wasted work and at worst causes
+        spurious failures. We gate the whole apply on this so a VM never
+        installs drivers even when targeting or requirement rules leak.
+
+        IMPORTANT: physical Surface devices report Manufacturer
+        "Microsoft Corporation" too, so we only treat a Microsoft box as a VM
+        when the Model also looks virtual ("Virtual Machine" for Hyper-V/AVD) -
+        never on Manufacturer alone.
+    #>
+    try {
+        $CS = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        $Model = "$($CS.Model)"
+        $Mfr   = "$($CS.Manufacturer)"
+
+        # Manufacturers that only exist as hypervisors / cloud platforms.
+        $VMManufacturers = @('VMware', 'innotek', 'QEMU', 'Xen', 'Amazon EC2',
+            'Google', 'OpenStack', 'Red Hat', 'Parallels', 'Nutanix')
+        foreach ($p in $VMManufacturers) {
+            if ($Mfr -like "*$p*") { return $true }
+        }
+
+        # Model strings that only appear on virtual hardware.
+        $VMModels = @('Virtual Machine', 'VMware', 'VirtualBox', 'Virtual Platform',
+            'HVM domU', 'KVM', 'Bochs', 'Google Compute Engine', 'Parallels')
+        foreach ($p in $VMModels) {
+            if ($Model -like "*$p*") { return $true }
+        }
+
+        # Hyper-V / Azure Virtual Desktop: Manufacturer "Microsoft Corporation"
+        # AND a virtual-looking model. Guarded so physical Surface hardware
+        # (also "Microsoft Corporation") is NOT misclassified.
+        if ($Mfr -like '*Microsoft*' -and $Model -like '*Virtual*') { return $true }
+
+        return $false
+    } catch {
+        # If we can't read the hardware info, assume physical - skipping a real
+        # device would be worse than attempting an install that self-checks.
+        Write-Log "VM detection failed ($($_.Exception.Message)) - assuming physical device" -Severity 2
+        return $false
+    }
+}
+
+# -------------------------------------------------------------------------
+# Present-hardware enumeration (for DUP applicability filtering)
+# -------------------------------------------------------------------------
+function Get-PresentHardwareTokens {
+    <#
+        Returns a HashSet of "VEN_xxxx&DEV_xxxx" tokens for every PCI device
+        currently present on this machine. The DriverUpdates manifest records
+        the same tokens per DUP (from the Dell catalog's PCIInfo), so the apply
+        loop can skip a DUP whose target hardware isn't installed - e.g. a
+        Qualcomm NIC DUP on a box that shipped with an Intel NIC.
+    #>
+    $Tokens = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    try {
+        foreach ($Dev in (Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop)) {
+            foreach ($HwId in @($Dev.HardwareID)) {
+                if ($HwId -match 'VEN_[0-9A-Fa-f]{4}&DEV_[0-9A-Fa-f]{4}') {
+                    [void]$Tokens.Add($Matches[0].ToUpperInvariant())
+                }
+            }
+        }
+    } catch {
+        Write-Log "Could not enumerate present hardware ($($_.Exception.Message)) - hardware applicability filtering disabled for this run" -Severity 2
+    }
+    return $Tokens
+}
+
+# -------------------------------------------------------------------------
 # BIOS version check
 # -------------------------------------------------------------------------
 function Get-CurrentBIOSVersion {
@@ -540,6 +615,15 @@ function Install-DriverUpdates {
         return $null  # unknown ordering - caller should treat as "needs install"
     }
 
+    # Enumerate the PCI hardware present on this device once, up front. Used to
+    # skip DUPs whose target hardware isn't installed (e.g. a Qualcomm NIC DUP
+    # on an Intel-NIC SKU). Conservative: a DUP is only skipped when it declares
+    # hardware tokens AND none are present. DUPs with no tokens (firmware, apps,
+    # chipset INF bundles) always run and self-check as before.
+    $PresentHw = Get-PresentHardwareTokens
+    Write-Log "Enumerated $($PresentHw.Count) present PCI hardware token(s) for applicability filtering"
+    $SkippedHw = 0
+
     $Index = 0
     foreach ($Drv in $Drivers) {
         $Index++
@@ -547,6 +631,25 @@ function Install-DriverUpdates {
         $DriverLabel = "[$Index/$($Drivers.Count)] $($Drv.Category) - $($Drv.Name) v$($Drv.Version)"
         $CompKey = & $SanitizeKey $Drv.FileName
         $CompKeyPath = Join-Path $ComponentsRoot $CompKey
+
+        # Hardware applicability filter. If the manifest lists target hardware
+        # for this DUP and the enumeration succeeded, only run it when at least
+        # one target device is present. This runs BEFORE the file-existence
+        # check so a non-applicable DUP whose .EXE was quarantined by AV doesn't
+        # get counted as a failure - it's simply not for this device.
+        $DupHwIds = @($Drv.HardwareIds)
+        $HwApplicable = $true
+        if ($DupHwIds.Count -gt 0 -and $PresentHw.Count -gt 0) {
+            $HwApplicable = $false
+            foreach ($Token in $DupHwIds) {
+                if ($PresentHw.Contains([string]$Token)) { $HwApplicable = $true; break }
+            }
+            if (-not $HwApplicable) {
+                Write-Log "$DriverLabel - target hardware not present (DUP targets: $($DupHwIds -join ', ')) - skipping"
+                $SkippedHw++
+                continue
+            }
+        }
 
         # Per-DUP version skip: if we already installed this exact DUP at >= the
         # manifest version, don't re-run it. Saves the bulk of the deploy time on
@@ -565,9 +668,14 @@ function Install-DriverUpdates {
         }
 
         if (-not (Test-Path $DriverExe)) {
-            Write-Log "$DriverLabel - DUP not found at $DriverExe - SKIPPED" -Severity 2
+            # Reaching here means the DUP IS applicable to this device's hardware
+            # (or declared none), so a missing file is a real problem - most often
+            # AV/Defender quarantined the .EXE in the CM cache. Surface it loudly
+            # and recommend the exclusion; non-applicable DUPs were already skipped
+            # above and never trip this.
+            Write-Log "$DriverLabel - DUP not found at $DriverExe (applicable to this device). Most likely AV/Defender quarantined it - exclude the CCM cache (e.g. %WINDIR%\ccmcache) from real-time scanning." -Severity 2
             $Failed++
-            $FailureLines.Add(("{0} (missing file)" -f $Drv.FileName))
+            $FailureLines.Add(("{0} (missing file - possible AV quarantine)" -f $Drv.FileName))
             continue
         }
 
@@ -666,7 +774,7 @@ function Install-DriverUpdates {
         Write-Log "Component marker GC failed: $($_.Exception.Message)" -Severity 2
     }
 
-    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $NotApply not-applicable, $Failed failed"
+    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $SkippedHw skipped (hardware not present), $NotApply not-applicable, $Failed failed"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
     }
@@ -895,6 +1003,17 @@ try {
 
     if (-not (Test-Path $ContentPath)) {
         throw "ContentPath does not exist: $ContentPath"
+    }
+
+    # Virtual machine guard. OEM drivers/BIOS don't apply to VMs; AVD/VDI
+    # session hosts that slip into a target collection (or an app missing its
+    # requirement rules) must not attempt an install. Exit cleanly as
+    # "Installed" so the deployment reports success (nothing to do) rather than
+    # a failure that pages someone.
+    if (Test-IsVirtualMachine) {
+        Write-Log "Device is a virtual machine - OEM driver/BIOS updates do not apply. Skipping install and reporting success."
+        Write-DetectionMarker -Status 'Installed'
+        exit 0
     }
 
     $DeviceMfr = Get-DeviceManufacturer

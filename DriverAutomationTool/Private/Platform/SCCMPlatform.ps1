@@ -1974,6 +1974,11 @@ function Initialize-DATGlobalConditions {
     $Conditions['SystemSKU']    = Get-DATGlobalCondition -Name 'DAT - Computer SystemSKU'    -Namespace 'root\wmi'   -Class 'MS_SystemInformation'        -Property 'SystemSKU'    -DataType String
     $Conditions['Manufacturer'] = Get-DATGlobalCondition -Name 'DAT - Computer Manufacturer' -Namespace 'root\cimv2' -Class 'Win32_ComputerSystem'        -Property 'Manufacturer' -DataType String
     $Conditions['ComputerModel']= Get-DATGlobalCondition -Name 'DAT - Computer Model'        -Namespace 'root\cimv2' -Class 'Win32_ComputerSystemProduct' -Property 'Version'      -DataType String
+    # Win32_ComputerSystem.Model reports "Virtual Machine" on Hyper-V/AVD,
+    # "VMware Virtual Platform" on VMware, etc. Used to exclude VMs from
+    # driver/BIOS deployments (the ComputerModel condition above queries the
+    # product Version instead, which doesn't carry the virtual marker).
+    $Conditions['ComputerSystemModel'] = Get-DATGlobalCondition -Name 'DAT - Computer Model (System)' -Namespace 'root\cimv2' -Class 'Win32_ComputerSystem' -Property 'Model' -DataType String
     return $Conditions
 }
 
@@ -2010,6 +2015,22 @@ function New-DATApplicationRequirementRules {
     # there is no -Value parameter for the OneOf/NoneOf operators.
     $MfrRule = $Conditions['Manufacturer'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value1 $MfrValues
     $Rules.Add($MfrRule)
+
+    # Exclude virtual machines. Hyper-V / Azure Virtual Desktop session hosts
+    # report Win32_ComputerSystem.Model = "Virtual Machine", so a "Model does
+    # not contain Virtual" rule keeps the deployment from evaluating on them.
+    # This matters most for Surface/Microsoft apps, whose Manufacturer rule
+    # ("Microsoft Corporation") otherwise matches Hyper-V VMs. The apply script
+    # also guards against VMs at run time (covers existing apps and non-Hyper-V
+    # hypervisors); this rule stops the deployment from targeting them at all.
+    if ($Conditions.ContainsKey('ComputerSystemModel') -and $Conditions['ComputerSystemModel']) {
+        try {
+            $VMRule = $Conditions['ComputerSystemModel'] | New-CMRequirementRuleCommonValue -RuleOperator NotContains -Value1 'Virtual'
+            $Rules.Add($VMRule)
+        } catch {
+            Write-DATLog -Message "Could not build VM-exclusion requirement rule (continuing without it - apply-time VM guard still applies): $($_.Exception.Message)" -Severity 2
+        }
+    }
 
     if ($Manufacturer -eq 'Dell' -and $SystemSKU) {
         $SKUList = @($SystemSKU | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })

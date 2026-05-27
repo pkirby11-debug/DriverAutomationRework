@@ -1492,6 +1492,11 @@ function Invoke-DATSyncSinglePackage {
                                         Category    = $IndvDriver.Category
                                         ReleaseDate = $IndvDriver.ReleaseDate
                                         Size        = $StagedSize
+                                        # PCI hardware tokens (VEN_xxxx&DEV_xxxx) this DUP targets.
+                                        # Empty = no hardware declared in catalog -> apply script
+                                        # always runs it. Non-empty -> apply script only runs it
+                                        # when a matching device is present (conservative filter).
+                                        HardwareIds = @($IndvDriver.HardwareIds)
                                     })
                                     Write-DATLog -Message "  Staged DUP: $($IndvDriver.FileName) ($([math]::Round($StagedSize / 1MB, 2)) MB)" -Severity 1
                                     continue
@@ -1639,7 +1644,8 @@ function Invoke-DATSyncSinglePackage {
                                 generatedAt   = (Get-Date).ToUniversalTime().ToString('o')
                                 drivers       = @($ManifestEntries)
                             }
-                            $ManifestObj | ConvertTo-Json -Depth 4 | Set-Content -Path $ManifestPath -Encoding UTF8
+                            # Depth 5: manifest -> drivers[] -> driver -> HardwareIds[] -> values
+                            $ManifestObj | ConvertTo-Json -Depth 5 | Set-Content -Path $ManifestPath -Encoding UTF8
                             Write-DATLog -Message "Wrote DriverUpdates manifest: $($ManifestEntries.Count) DUP(s) -> $ManifestPath" -Severity 1
                         }
 
