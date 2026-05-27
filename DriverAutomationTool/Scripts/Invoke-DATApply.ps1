@@ -149,8 +149,13 @@ function Write-Log {
         [ValidateSet(1, 2, 3)][int]$Severity = 1
     )
     $Now = Get-Date
-    $Offset = [System.TimeZone]::CurrentTimeZone.GetUtcOffset($Now).TotalMinutes
-    $TimeStr = '{0}+{1}' -f $Now.ToString('HH:mm:ss.fff'), $Offset
+    # CMTrace timezone bias: UTC offset in minutes, sign FLIPPED (machines west
+    # of UTC get a positive bias) and a single sign char. The old '{0}+{1}'
+    # hardcoded a '+' then appended the raw offset, so US time zones produced
+    # "...+-300" - which CMTrace can't parse, leaving a wrong/blank date-time.
+    $Offset = [int][System.TimeZone]::CurrentTimeZone.GetUtcOffset($Now).TotalMinutes
+    $Bias = if ($Offset -le 0) { '+{0}' -f (-$Offset) } else { '-{0}' -f $Offset }
+    $TimeStr = '{0}{1}' -f $Now.ToString('HH:mm:ss.fff'), $Bias
     $Context = try { [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { $env:USERNAME }
     $Thread = [System.Threading.Thread]::CurrentThread.ManagedThreadId
     $Entry = '<![LOG[{0}]LOG]!><time="{1}" date="{2}" component="DATApply" context="{3}" type="{4}" thread="{5}" file="">' -f `

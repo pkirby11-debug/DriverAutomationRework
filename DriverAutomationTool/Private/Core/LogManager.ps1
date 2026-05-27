@@ -33,11 +33,15 @@ function Write-DATLog {
         New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
     }
 
-    # Build CMTrace-compatible timestamp
+    # Build CMTrace-compatible timestamp. The timezone bias is the UTC offset
+    # in minutes with the sign FLIPPED (machines west of UTC get a positive
+    # bias) and a single sign char. The old '{0}+{1}' hardcoded a '+' and then
+    # appended the raw offset, so US time zones produced "...+-300" - which
+    # CMTrace can't parse, leaving a wrong/blank date-time on every line.
     $Now = Get-Date
-    $UtcOffset = [System.TimeZone]::CurrentTimeZone.GetUtcOffset($Now)
-    $OffsetMinutes = $UtcOffset.TotalMinutes
-    $TimeStr = '{0}+{1}' -f $Now.ToString('HH:mm:ss.fff'), $OffsetMinutes
+    $OffsetMinutes = [int][System.TimeZone]::CurrentTimeZone.GetUtcOffset($Now).TotalMinutes
+    $Bias = if ($OffsetMinutes -le 0) { '+{0}' -f (-$OffsetMinutes) } else { '-{0}' -f $OffsetMinutes }
+    $TimeStr = '{0}{1}' -f $Now.ToString('HH:mm:ss.fff'), $Bias
 
     $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $Context = if ($Identity) { $Identity.Name } else { $env:USERNAME }
