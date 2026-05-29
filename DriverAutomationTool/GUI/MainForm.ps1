@@ -1203,6 +1203,18 @@ function Initialize-DATMainForm {
         $OverrideSW       = [bool]$Controls['DeployOverrideSWCheck'].Checked
         $RebootOutsideSW  = [bool]$Controls['DeployRebootOutsideSWCheck'].Checked
 
+        # Maintenance-window creation (optional). When checked, a window is ensured on
+        # the target collection before deploying so signaled reboots defer to it.
+        $CreateMW   = [bool]$Controls['DeployCreateMWCheck'].Checked
+        $MWStart    = $Controls['DeployMWStartPicker'].Value
+        $MWDuration = ([int]$Controls['DeployMWHoursNUD'].Value * 60) + [int]$Controls['DeployMWMinutesNUD'].Value
+        $MWRecur    = $Controls['DeployMWRecurCombo'].Text
+        $MWDay      = $Controls['DeployMWDayCombo'].Text
+        if ($CreateMW -and ($MWDuration -lt 1 -or $MWDuration -gt 1440)) {
+            Show-DATFormMessage -Message 'Maintenance window duration must be between 1 minute and 24 hours (1440 minutes).' -Type Warning
+            return
+        }
+
         # Read schedule. When the checkbox is off, leave $AvailableAt/$DeadlineAt as $null
         # and Invoke-DATDeployApplications keeps its current "now" behavior.
         $AvailableAt = $null
@@ -1223,9 +1235,14 @@ function Initialize-DATMainForm {
 
         $MWSummary = "Install outside MW: $(if ($OverrideSW) { 'Yes' } else { 'No (confined to MW)' })`nRestart outside MW: $(if ($RebootOutsideSW) { 'Yes' } else { 'No (deferred to MW)' })"
 
+        $MWCreateSummary = if ($CreateMW) {
+            $Rec = if ($MWRecur -eq 'Weekly') { "Weekly ($MWDay)" } else { $MWRecur }
+            "Create MW: Yes - {0:yyyy-MM-dd HH:mm}, {1} min, {2}`n  (NOTE: a window governs ALL deployments to this collection - updates and task sequences too)" -f $MWStart, $MWDuration, $Rec
+        } else { 'Create MW: No' }
+
         $Confirm = Show-DATFormMessage `
-            -Message ("Create {0} deployment(s) on '{1}'?`n`nPurpose: {2}`nAction: {3}`nNotification: {4}`n{5}`n{6}" -f `
-                $AppNames.Count, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $ScheduleSummary, $MWSummary) `
+            -Message ("Create {0} deployment(s) on '{1}'?`n`nPurpose: {2}`nAction: {3}`nNotification: {4}`n{5}`n{6}`n{7}" -f `
+                $AppNames.Count, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $ScheduleSummary, $MWSummary, $MWCreateSummary) `
             -Type Question
         if ($Confirm -ne 'Yes') { return }
 
@@ -1249,7 +1266,7 @@ function Initialize-DATMainForm {
         $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
         $DeployScript = {
-            param($ModulePath, $ConnParams, $AppNames, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $AvailableAt, $DeadlineAt, $OverrideSW, $RebootOutsideSW, $LogQueue)
+            param($ModulePath, $ConnParams, $AppNames, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $AvailableAt, $DeadlineAt, $OverrideSW, $RebootOutsideSW, $CreateMW, $MWStart, $MWDuration, $MWRecur, $MWDay, $LogQueue)
 
             Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
             Register-DATQueueLogSubscriber -LogQueue $LogQueue
@@ -1265,6 +1282,13 @@ function Initialize-DATMainForm {
             }
             if ($AvailableAt) { $DeployArgs['AvailableDateTime'] = $AvailableAt }
             if ($DeadlineAt)  { $DeployArgs['DeadlineDateTime']  = $DeadlineAt  }
+            if ($CreateMW) {
+                $DeployArgs['EnsureMaintenanceWindow'] = $true
+                $DeployArgs['MWStart']                 = $MWStart
+                $DeployArgs['MWDurationMinutes']        = $MWDuration
+                $DeployArgs['MWRecurrence']             = $MWRecur
+                $DeployArgs['MWDayOfWeek']              = $MWDay
+            }
 
             return Invoke-DATDeployApplications @ConnParams @DeployArgs
         }
@@ -1282,6 +1306,11 @@ function Initialize-DATMainForm {
             AddArgument($DeadlineAt).
             AddArgument($OverrideSW).
             AddArgument($RebootOutsideSW).
+            AddArgument($CreateMW).
+            AddArgument($MWStart).
+            AddArgument($MWDuration).
+            AddArgument($MWRecur).
+            AddArgument($MWDay).
             AddArgument($script:LogQueue) | Out-Null
         $script:DeployHandle = $script:DeployRunspace.BeginInvoke()
 
@@ -1326,19 +1355,28 @@ function Initialize-DATMainForm {
                 $Results = $script:DeployRunspace.EndInvoke($script:DeployHandle)
                 $script:DeployRunspace.Dispose()
 
-                $Created = @($Results | Where-Object { $_.Status -eq 'Created' })
-                $Skipped = @($Results | Where-Object { $_.Status -eq 'Skipped' })
-                $Failed  = @($Results | Where-Object { $_.Status -eq 'Failed'  })
+                # Pull the optional maintenance-window row out of the app deploy rows so
+                # it isn't miscounted as a deployment (it's prefixed "[Maintenance Window]").
+                $MWRow  = @($Results | Where-Object { "$($_.Name)".StartsWith('[Maintenance Window]') }) | Select-Object -First 1
+                $AppRes = @($Results | Where-Object { -not "$($_.Name)".StartsWith('[Maintenance Window]') })
+
+                $Created = @($AppRes | Where-Object { $_.Status -eq 'Created' })
+                $Skipped = @($AppRes | Where-Object { $_.Status -eq 'Skipped' })
+                $Failed  = @($AppRes | Where-Object { $_.Status -eq 'Failed'  })
+                $MWFailed = ($MWRow -and $MWRow.Status -eq 'Failed')
 
                 $Summary = "Created: $($Created.Count), Skipped: $($Skipped.Count), Failed: $($Failed.Count)"
+                if ($MWRow) { $Summary += " | MW: $($MWRow.Status)" }
                 $script:TimerControls['StatusStripLabel'].Text = "Deploy complete - $Summary"
                 $script:TimerControls['DeployStatusLabel'].Text = "Last deploy: $Summary"
                 $script:TimerControls['DeployStatusLabel'].ForeColor = [System.Drawing.Color]::Gray
 
-                if ($Failed.Count -eq 0) {
+                if ($Failed.Count -eq 0 -and -not $MWFailed) {
                     Show-DATFormMessage -Message "Deployment complete.`n`n$Summary" -Type Information
                 } else {
-                    $FailList = ($Failed | ForEach-Object { "$($_.Name): $($_.Error)" }) -join "`n"
+                    $FailLines = @($Failed | ForEach-Object { "$($_.Name): $($_.Error)" })
+                    if ($MWFailed) { $FailLines += "$($MWRow.Name): $($MWRow.Error)" }
+                    $FailList = $FailLines -join "`n"
                     Show-DATFormMessage -Message "Deployment finished with errors.`n`n$Summary`n`nFailed:`n$FailList" -Type Warning
                 }
             } catch {

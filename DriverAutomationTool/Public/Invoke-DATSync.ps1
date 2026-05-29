@@ -536,8 +536,8 @@ function Invoke-DATSyncSinglePackage {
         # DriverUpdates into 'Driver', which on the refresh path rebuilt the
         # deployment type with the wrong install command (-Mode Driver against
         # a folder of DUPs), wrote the detection marker to the Drivers subkey
-        # instead of DriverUpdates, and bypassed the DriverUpdates-only
-        # RebootBehavior=ForceReboot in New-DATConfigMgrApplication.
+        # instead of DriverUpdates, and used the wrong timeout/runtime budget in
+        # New-DATConfigMgrApplication.
         $AppMode = switch ($Type) {
             'BIOS'          { 'BIOS' }
             'DriverUpdates' { 'DriverUpdates' }

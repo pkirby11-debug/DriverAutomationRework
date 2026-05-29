@@ -711,8 +711,9 @@ function New-DATMainForm {
     # Top filter / options panel (added to tab later for correct dock order)
     $DeployTopPanel = New-Object System.Windows.Forms.Panel
     $DeployTopPanel.Dock = 'Top'
-    # Height grew (255 -> 275) to fit the maintenance-window checkboxes added in 1.10.0.
-    $DeployTopPanel.Height = 275
+    # Height grew 255 -> 275 (MW behavior checkboxes, 1.10.0), then 275 -> 355 (1.13.0)
+    # to fit the "create maintenance window on collection" section in Deployment Options.
+    $DeployTopPanel.Height = 355
 
     # --- Application type filter (which kind of apps to list) ---
     $DeployTypeGroup = New-Object System.Windows.Forms.GroupBox
@@ -799,7 +800,7 @@ function New-DATMainForm {
     $DeployOptGroup.Text = 'Deployment Options'
     $DeployOptGroup.Location = New-Object System.Drawing.Point(470, 5)
     # Grew 130 -> 150 to fit the MW checkboxes at y=125.
-    $DeployOptGroup.Size = New-Object System.Drawing.Size(540, 150)
+    $DeployOptGroup.Size = New-Object System.Drawing.Size(540, 235)
     $DeployOptGroup.Anchor = 'Top,Left,Right'
     $DeployTopPanel.Controls.Add($DeployOptGroup)
 
@@ -912,8 +913,9 @@ function New-DATMainForm {
 
     # --- Maintenance window behavior ---
     # Default (both unchecked) keeps installs AND restarts confined to the collection's
-    # maintenance windows - which is what lets DriverUpdates (ForceReboot) restart silently
-    # overnight without prompting users during the day. Admins can opt out per-deployment.
+    # maintenance windows - so a driver/BIOS update that signals reboot-required (the
+    # install script's exit 3010) restarts silently overnight instead of prompting users
+    # during the day. Admins can opt out per-deployment.
     $DeployOverrideSWCheck = New-Object System.Windows.Forms.CheckBox
     $DeployOverrideSWCheck.Text = 'Install outside maintenance window'
     $DeployOverrideSWCheck.Location = New-Object System.Drawing.Point(15, 125)
@@ -928,15 +930,127 @@ function New-DATMainForm {
     $DeployOptGroup.Controls.Add($DeployRebootOutsideSWCheck)
     $Controls['DeployRebootOutsideSWCheck'] = $DeployRebootOutsideSWCheck
 
+    # --- Create / ensure a maintenance window on the target collection ---
+    # Lets a reboot the install script signals (exit 3010) defer to this window
+    # instead of firing right after install. The window is general (ApplyTo=Any) so
+    # it also governs software updates and task sequences on the collection - meant
+    # for servicing collections, not broad targets (warned in the deploy confirm).
+    $DeployCreateMWCheck = New-Object System.Windows.Forms.CheckBox
+    $DeployCreateMWCheck.Text = 'Create / ensure maintenance window on collection'
+    $DeployCreateMWCheck.Location = New-Object System.Drawing.Point(15, 152)
+    $DeployCreateMWCheck.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployCreateMWCheck)
+    $Controls['DeployCreateMWCheck'] = $DeployCreateMWCheck
+
+    $DeployMWStartLabel = New-Object System.Windows.Forms.Label
+    $DeployMWStartLabel.Text = 'Start:'
+    $DeployMWStartLabel.Location = New-Object System.Drawing.Point(30, 180)
+    $DeployMWStartLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployMWStartLabel)
+
+    $DeployMWStartPicker = New-Object System.Windows.Forms.DateTimePicker
+    $DeployMWStartPicker.Location = New-Object System.Drawing.Point(78, 176)
+    $DeployMWStartPicker.Width = 150
+    $DeployMWStartPicker.Format = 'Custom'
+    $DeployMWStartPicker.CustomFormat = 'yyyy-MM-dd HH:mm'
+    # Default to 22:00 today - a sensible overnight start the admin can adjust.
+    $DeployMWStartPicker.Value = (Get-Date).Date.AddHours(22)
+    $DeployMWStartPicker.Enabled = $false
+    $DeployOptGroup.Controls.Add($DeployMWStartPicker)
+    $Controls['DeployMWStartPicker'] = $DeployMWStartPicker
+
+    $DeployMWDurLabel = New-Object System.Windows.Forms.Label
+    $DeployMWDurLabel.Text = 'Dur:'
+    $DeployMWDurLabel.Location = New-Object System.Drawing.Point(240, 180)
+    $DeployMWDurLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployMWDurLabel)
+
+    $DeployMWHoursNUD = New-Object System.Windows.Forms.NumericUpDown
+    $DeployMWHoursNUD.Location = New-Object System.Drawing.Point(278, 176)
+    $DeployMWHoursNUD.Width = 42
+    $DeployMWHoursNUD.Minimum = 0
+    $DeployMWHoursNUD.Maximum = 24
+    $DeployMWHoursNUD.Value = 4
+    $DeployMWHoursNUD.Enabled = $false
+    $DeployOptGroup.Controls.Add($DeployMWHoursNUD)
+    $Controls['DeployMWHoursNUD'] = $DeployMWHoursNUD
+
+    $DeployMWHoursLabel = New-Object System.Windows.Forms.Label
+    $DeployMWHoursLabel.Text = 'h'
+    $DeployMWHoursLabel.Location = New-Object System.Drawing.Point(323, 180)
+    $DeployMWHoursLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployMWHoursLabel)
+
+    $DeployMWMinutesNUD = New-Object System.Windows.Forms.NumericUpDown
+    $DeployMWMinutesNUD.Location = New-Object System.Drawing.Point(342, 176)
+    $DeployMWMinutesNUD.Width = 42
+    $DeployMWMinutesNUD.Minimum = 0
+    $DeployMWMinutesNUD.Maximum = 59
+    $DeployMWMinutesNUD.Value = 0
+    $DeployMWMinutesNUD.Enabled = $false
+    $DeployOptGroup.Controls.Add($DeployMWMinutesNUD)
+    $Controls['DeployMWMinutesNUD'] = $DeployMWMinutesNUD
+
+    $DeployMWMinutesLabel = New-Object System.Windows.Forms.Label
+    $DeployMWMinutesLabel.Text = 'm'
+    $DeployMWMinutesLabel.Location = New-Object System.Drawing.Point(387, 180)
+    $DeployMWMinutesLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployMWMinutesLabel)
+
+    $DeployMWRecurLabel = New-Object System.Windows.Forms.Label
+    $DeployMWRecurLabel.Text = 'Recurrence:'
+    $DeployMWRecurLabel.Location = New-Object System.Drawing.Point(30, 208)
+    $DeployMWRecurLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployMWRecurLabel)
+
+    $DeployMWRecurCombo = New-Object System.Windows.Forms.ComboBox
+    $DeployMWRecurCombo.Location = New-Object System.Drawing.Point(115, 204)
+    $DeployMWRecurCombo.Width = 100
+    $DeployMWRecurCombo.DropDownStyle = 'DropDownList'
+    $DeployMWRecurCombo.Items.AddRange(@('None', 'Daily', 'Weekly'))
+    $DeployMWRecurCombo.SelectedItem = 'Daily'
+    $DeployMWRecurCombo.Enabled = $false
+    $DeployOptGroup.Controls.Add($DeployMWRecurCombo)
+    $Controls['DeployMWRecurCombo'] = $DeployMWRecurCombo
+
+    $DeployMWDayLabel = New-Object System.Windows.Forms.Label
+    $DeployMWDayLabel.Text = 'Day:'
+    $DeployMWDayLabel.Location = New-Object System.Drawing.Point(228, 208)
+    $DeployMWDayLabel.AutoSize = $true
+    $DeployOptGroup.Controls.Add($DeployMWDayLabel)
+
+    $DeployMWDayCombo = New-Object System.Windows.Forms.ComboBox
+    $DeployMWDayCombo.Location = New-Object System.Drawing.Point(268, 204)
+    $DeployMWDayCombo.Width = 110
+    $DeployMWDayCombo.DropDownStyle = 'DropDownList'
+    $DeployMWDayCombo.Items.AddRange(@('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'))
+    $DeployMWDayCombo.SelectedItem = 'Sunday'
+    $DeployMWDayCombo.Enabled = $false
+    $DeployOptGroup.Controls.Add($DeployMWDayCombo)
+    $Controls['DeployMWDayCombo'] = $DeployMWDayCombo
+
+    # Enable the MW fields only when the checkbox is on; the Day picker only when
+    # the checkbox is on AND recurrence is Weekly. Shared by both events.
+    $UpdateMWEnabled = {
+        $On = $DeployCreateMWCheck.Checked
+        $DeployMWStartPicker.Enabled = $On
+        $DeployMWHoursNUD.Enabled    = $On
+        $DeployMWMinutesNUD.Enabled  = $On
+        $DeployMWRecurCombo.Enabled  = $On
+        $DeployMWDayCombo.Enabled    = ($On -and $DeployMWRecurCombo.Text -eq 'Weekly')
+    }.GetNewClosure()
+    $DeployCreateMWCheck.Add_CheckedChanged($UpdateMWEnabled)
+    $DeployMWRecurCombo.Add_SelectedIndexChanged($UpdateMWEnabled)
+
     # --- Collection picker + action row ---
     $DeployCollectionLabel = New-Object System.Windows.Forms.Label
     $DeployCollectionLabel.Text = 'Target Collection:'
-    $DeployCollectionLabel.Location = New-Object System.Drawing.Point(10, 175)
+    $DeployCollectionLabel.Location = New-Object System.Drawing.Point(10, 255)
     $DeployCollectionLabel.AutoSize = $true
     $DeployTopPanel.Controls.Add($DeployCollectionLabel)
 
     $DeployCollectionCombo = New-Object System.Windows.Forms.ComboBox
-    $DeployCollectionCombo.Location = New-Object System.Drawing.Point(125, 172)
+    $DeployCollectionCombo.Location = New-Object System.Drawing.Point(125, 252)
     $DeployCollectionCombo.Width = 500
     $DeployCollectionCombo.DropDownStyle = 'DropDown'  # editable so users can type/filter
     $DeployCollectionCombo.AutoCompleteMode = 'SuggestAppend'
@@ -947,7 +1061,7 @@ function New-DATMainForm {
 
     $DeployRefreshCollectionsButton = New-Object System.Windows.Forms.Button
     $DeployRefreshCollectionsButton.Text = 'Refresh Collections'
-    $DeployRefreshCollectionsButton.Location = New-Object System.Drawing.Point(635, 170)
+    $DeployRefreshCollectionsButton.Location = New-Object System.Drawing.Point(635, 250)
     $DeployRefreshCollectionsButton.Width = 140
     $DeployRefreshCollectionsButton.Anchor = 'Top,Right'
     $DeployTopPanel.Controls.Add($DeployRefreshCollectionsButton)
@@ -956,33 +1070,33 @@ function New-DATMainForm {
     # --- App-list action row ---
     $DeployRefreshAppsButton = New-Object System.Windows.Forms.Button
     $DeployRefreshAppsButton.Text = 'Refresh Applications'
-    $DeployRefreshAppsButton.Location = New-Object System.Drawing.Point(10, 210)
+    $DeployRefreshAppsButton.Location = New-Object System.Drawing.Point(10, 290)
     $DeployRefreshAppsButton.Width = 150
     $DeployTopPanel.Controls.Add($DeployRefreshAppsButton)
     $Controls['DeployRefreshAppsButton'] = $DeployRefreshAppsButton
 
     $DeploySelectAllButton = New-Object System.Windows.Forms.Button
     $DeploySelectAllButton.Text = 'Select All'
-    $DeploySelectAllButton.Location = New-Object System.Drawing.Point(170, 210)
+    $DeploySelectAllButton.Location = New-Object System.Drawing.Point(170, 290)
     $DeploySelectAllButton.Width = 90
     $DeployTopPanel.Controls.Add($DeploySelectAllButton)
     $Controls['DeploySelectAllButton'] = $DeploySelectAllButton
 
     $DeploySelectNoneButton = New-Object System.Windows.Forms.Button
     $DeploySelectNoneButton.Text = 'Select None'
-    $DeploySelectNoneButton.Location = New-Object System.Drawing.Point(265, 210)
+    $DeploySelectNoneButton.Location = New-Object System.Drawing.Point(265, 290)
     $DeploySelectNoneButton.Width = 90
     $DeployTopPanel.Controls.Add($DeploySelectNoneButton)
     $Controls['DeploySelectNoneButton'] = $DeploySelectNoneButton
 
     $DeployAppsSearchLabel = New-Object System.Windows.Forms.Label
     $DeployAppsSearchLabel.Text = 'Search:'
-    $DeployAppsSearchLabel.Location = New-Object System.Drawing.Point(370, 214)
+    $DeployAppsSearchLabel.Location = New-Object System.Drawing.Point(370, 294)
     $DeployAppsSearchLabel.AutoSize = $true
     $DeployTopPanel.Controls.Add($DeployAppsSearchLabel)
 
     $DeployAppsSearchBox = New-Object System.Windows.Forms.TextBox
-    $DeployAppsSearchBox.Location = New-Object System.Drawing.Point(420, 211)
+    $DeployAppsSearchBox.Location = New-Object System.Drawing.Point(420, 291)
     $DeployAppsSearchBox.Width = 300
     $DeployTopPanel.Controls.Add($DeployAppsSearchBox)
     $Controls['DeployAppsSearchBox'] = $DeployAppsSearchBox
@@ -990,7 +1104,7 @@ function New-DATMainForm {
     $DeployButton = New-Object System.Windows.Forms.Button
     $DeployButton.Text = 'Deploy Selected'
     $DeployButton.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-    $DeployButton.Location = New-Object System.Drawing.Point(10, 245)
+    $DeployButton.Location = New-Object System.Drawing.Point(10, 325)
     $DeployButton.Size = New-Object System.Drawing.Size(160, 26)
     $DeployButton.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
     $DeployButton.ForeColor = [System.Drawing.Color]::White
@@ -1001,7 +1115,7 @@ function New-DATMainForm {
     $DeployStatusLabel = New-Object System.Windows.Forms.Label
     $DeployStatusLabel.Text = 'Connect to ConfigMgr to populate collections, then click Refresh Applications.'
     $DeployStatusLabel.ForeColor = [System.Drawing.Color]::Gray
-    $DeployStatusLabel.Location = New-Object System.Drawing.Point(180, 251)
+    $DeployStatusLabel.Location = New-Object System.Drawing.Point(180, 331)
     $DeployStatusLabel.AutoSize = $true
     $DeployTopPanel.Controls.Add($DeployStatusLabel)
     $Controls['DeployStatusLabel'] = $DeployStatusLabel

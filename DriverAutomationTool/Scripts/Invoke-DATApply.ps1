@@ -104,18 +104,52 @@ $script:FailsafeLogPath = if (Test-Path (Join-Path $env:SystemRoot 'CCM\Logs')) 
     Join-Path $env:SystemRoot 'Temp\DATApply.log'
 }
 
+# -------------------------------------------------------------------------
+# CMTrace line formatting (shared by the trap, startup marker, and Write-Log)
+# -------------------------------------------------------------------------
+# Everything written to DATApply.log goes through Format-CMTraceLine so the
+# whole file is valid CMTrace. The trap and startup marker used to write bare
+# "[HH:mm:ss.fff] [TRAP]..." text into the same file, and CMTrace shows a
+# wrong/blank date-time on any line that isn't in the <![LOG[..]]> format -
+# which is the "date and time messed up" symptom on DATApply.log.
+#
+# Bias = UTC offset in minutes, sign flipped (west of UTC is positive: US
+# Eastern -> "+300"; east is negative: IST -> "-330"), single sign char -
+# CMTrace can't parse "+-300". Computed once here so the trap doesn't do
+# time-zone math while handling an error. Time/date are rendered with
+# InvariantCulture so a non-US client locale can't swap the ':' time-separator
+# specifier for '.' and break the field.
+$script:LogTZBias = try {
+    $OffsetMin = [int][System.TimeZone]::CurrentTimeZone.GetUtcOffset((Get-Date)).TotalMinutes
+    if ($OffsetMin -le 0) { '+{0}' -f (-$OffsetMin) } else { '-{0}' -f $OffsetMin }
+} catch { '+000' }
+
+function Format-CMTraceLine {
+    param(
+        [string]$Message,
+        [ValidateSet(1, 2, 3)][int]$Severity = 1
+    )
+    $Now = Get-Date
+    $Inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $TimeStr = '{0}{1}' -f $Now.ToString('HH:mm:ss.fff', $Inv), $script:LogTZBias
+    $Context = try { [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { $env:USERNAME }
+    $Thread  = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+    return '<![LOG[{0}]LOG]!><time="{1}" date="{2}" component="DATApply" context="{3}" type="{4}" thread="{5}" file="">' -f `
+        $Message, $TimeStr, $Now.ToString('MM-dd-yyyy', $Inv), $Context, $Severity, $Thread
+}
+
 # Trap anything that escapes the main try/catch - this guarantees at least one
 # line gets logged no matter where initialization fails. Without this, a
 # terminating error during function definition or variable setup would produce
-# "exit code 1, no log" with no clue what happened.
+# "exit code 1, no log" with no clue what happened. Format-CMTraceLine is
+# defined above so it's available the moment this trap can fire.
 trap {
     try {
-        $TrapLine = '[{0}] [TRAP] {1} | at {2} | {3}' -f `
-            (Get-Date -Format 'HH:mm:ss.fff'),
+        $TrapMsg = '[TRAP] {0} | at {1} | {2}' -f `
             $_.Exception.Message,
             $_.InvocationInfo.PositionMessage.Trim(),
             $_.ScriptStackTrace
-        Add-Content -Path $script:FailsafeLogPath -Value $TrapLine -ErrorAction SilentlyContinue
+        Add-Content -Path $script:FailsafeLogPath -Value (Format-CMTraceLine -Message $TrapMsg -Severity 3) -ErrorAction SilentlyContinue
     } catch { }
     exit 1
 }
@@ -126,9 +160,9 @@ $script:RebootRequired = $false
 # Startup marker - writes before any other logic runs so we can confirm the
 # script survived param binding and attribute processing.
 try {
-    $StartupLine = '[{0}] [START] PID={1} PS={2} Mode={3} Version={4} Package=''{5}''' -f `
-        (Get-Date -Format 'HH:mm:ss.fff'), $PID, $PSVersionTable.PSVersion, $Mode, $Version, $PackageName
-    Add-Content -Path $script:FailsafeLogPath -Value $StartupLine -ErrorAction SilentlyContinue
+    $StartupMsg = '[START] PID={0} PS={1} Mode={2} Version={3} Package=''{4}''' -f `
+        $PID, $PSVersionTable.PSVersion, $Mode, $Version, $PackageName
+    Add-Content -Path $script:FailsafeLogPath -Value (Format-CMTraceLine -Message $StartupMsg -Severity 1) -ErrorAction SilentlyContinue
 } catch { }
 
 # -------------------------------------------------------------------------
@@ -148,18 +182,10 @@ function Write-Log {
         [Parameter(Mandatory)][string]$Message,
         [ValidateSet(1, 2, 3)][int]$Severity = 1
     )
-    $Now = Get-Date
-    # CMTrace timezone bias: UTC offset in minutes, sign FLIPPED (machines west
-    # of UTC get a positive bias) and a single sign char. The old '{0}+{1}'
-    # hardcoded a '+' then appended the raw offset, so US time zones produced
-    # "...+-300" - which CMTrace can't parse, leaving a wrong/blank date-time.
-    $Offset = [int][System.TimeZone]::CurrentTimeZone.GetUtcOffset($Now).TotalMinutes
-    $Bias = if ($Offset -le 0) { '+{0}' -f (-$Offset) } else { '-{0}' -f $Offset }
-    $TimeStr = '{0}{1}' -f $Now.ToString('HH:mm:ss.fff'), $Bias
-    $Context = try { [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { $env:USERNAME }
-    $Thread = [System.Threading.Thread]::CurrentThread.ManagedThreadId
-    $Entry = '<![LOG[{0}]LOG]!><time="{1}" date="{2}" component="DATApply" context="{3}" type="{4}" thread="{5}" file="">' -f `
-        $Message, $TimeStr, $Now.ToString('MM-dd-yyyy'), $Context, $Severity, $Thread
+    # Format-CMTraceLine (top of script) owns the CMTrace timestamp/bias/locale
+    # handling so every line in DATApply.log - including the trap and startup
+    # markers - shares one parseable format.
+    $Entry = Format-CMTraceLine -Message $Message -Severity $Severity
     try { Add-Content -Path $LogFile -Value $Entry -ErrorAction Stop } catch {
         Add-Content -Path ($LogFile -replace '\.log$', '_alt.log') -Value $Entry -ErrorAction SilentlyContinue
     }
