@@ -39,8 +39,25 @@ function Invoke-DATDeployApplications {
         Accepts -RebootOutsideOfServiceWindow as an alias for callers from 1.10.0-1.11.3
         that used the misspelled name (which silently broke deployment because the
         underlying New-CMApplicationDeployment cmdlet doesn't have the "Of" form).
+    .PARAMETER EnsureMaintenanceWindow
+        When set, create/ensure a maintenance window on the target collection before
+        deploying (idempotent by -MWName). Lets a reboot the install script signals be
+        deferred to the window instead of firing right after install. The window is
+        general (ApplyTo=Any), so it also governs software updates and task sequences on
+        that collection - intend it for servicing collections, not broad targets.
+    .PARAMETER MWStart
+        Window start date/time. Defaults to 22:00 today when omitted.
+    .PARAMETER MWDurationMinutes
+        Window length in minutes (1-1440). Default 240 (4 hours).
+    .PARAMETER MWRecurrence
+        'None' (one-time), 'Daily' (default), or 'Weekly'.
+    .PARAMETER MWDayOfWeek
+        Day for weekly recurrence. Ignored unless -MWRecurrence is 'Weekly'.
+    .PARAMETER MWName
+        Maintenance-window name / idempotency key. Default 'DAT Servicing Window'.
     .OUTPUTS
-        Array of hashtables: { Name, Status ('Created'|'Skipped'|'Failed'), Error }
+        Array of hashtables: { Name, Status ('Created'|'Skipped'|'Failed'), Error }.
+        When -EnsureMaintenanceWindow is used, one extra row reports the window result.
     #>
     [CmdletBinding()]
     param(
@@ -82,7 +99,27 @@ function Invoke-DATDeployApplications {
         # The misspelled RebootOutsideOfServiceWindow alias is kept so 1.10.0-1.11.3
         # callers (the GUI and any external scripts) keep working through the upgrade.
         [Alias('RebootOutsideOfServiceWindow')]
-        [bool]$RebootOutsideServiceWindow = $false
+        [bool]$RebootOutsideServiceWindow = $false,
+
+        # Optional: create/ensure a maintenance window on the target collection before
+        # deploying, so a reboot the install script signals (exit 3010) is deferred to
+        # it. Idempotent by MWName. The window is general (ApplyTo=Any), so it also
+        # governs software updates and task sequences on the collection - intended for
+        # servicing collections, not broad "All Workstations"-style targets.
+        [switch]$EnsureMaintenanceWindow,
+
+        [Nullable[datetime]]$MWStart,
+
+        [ValidateRange(1, 1440)]
+        [int]$MWDurationMinutes = 240,
+
+        [ValidateSet('None', 'Daily', 'Weekly')]
+        [string]$MWRecurrence = 'Daily',
+
+        [ValidateSet('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')]
+        [string]$MWDayOfWeek = 'Sunday',
+
+        [string]$MWName = 'DAT Servicing Window'
     )
 
     $ConnectParams = @{ SiteServer = $SiteServer }
@@ -105,6 +142,18 @@ function Invoke-DATDeployApplications {
         }
         if ($Collection.CollectionType -ne 2) {
             throw "Collection '$CollectionName' is not a device collection (CollectionType=$($Collection.CollectionType))."
+        }
+
+        # Ensure the maintenance window once, up front, before any deployment is
+        # created - so reboots the install script signals (exit 3010) are deferred
+        # to it. Non-fatal: a window failure is logged and surfaced as a result row,
+        # but the deployments still proceed.
+        if ($EnsureMaintenanceWindow) {
+            $MWStartEffective = if ($MWStart) { [datetime]$MWStart } else { (Get-Date).Date.AddHours(22) }
+            $MWResult = Set-DATCollectionMaintenanceWindow -CollectionName $CollectionName `
+                -StartDateTime $MWStartEffective -DurationMinutes $MWDurationMinutes `
+                -Recurrence $MWRecurrence -DayOfWeek $MWDayOfWeek -Name $MWName
+            $Results.Add(@{ Name = "[Maintenance Window] $MWName"; Status = $MWResult.Status; Error = $MWResult.Error })
         }
 
         Write-DATLog -Message "Deploying $($Applications.Count) application(s) to collection '$CollectionName' as $DeployPurpose / $DeployAction" -Severity 1

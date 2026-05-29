@@ -815,6 +815,129 @@ function Get-DATDeviceCollections {
     return @($Names)
 }
 
+function Set-DATCollectionMaintenanceWindow {
+    <#
+    .SYNOPSIS
+        Creates or updates a single DAT-owned maintenance window on a device collection.
+    .DESCRIPTION
+        Ensures one maintenance window (matched by Name) exists on the target collection
+        so a reboot the install script signals (exit 3010) is deferred to it instead of
+        firing immediately. Idempotent by Name: updates the window's schedule in place if
+        it already exists, creates it otherwise, and never touches other (admin-created)
+        windows on the collection.
+
+        The window is created with ApplyTo=Any (a general window) because that is the only
+        window type that gates Application installs and their restarts. A general window
+        also constrains software updates and task sequences on the collection - callers
+        should warn the operator before applying this to broad collections.
+    .PARAMETER CollectionName
+        Target device collection. Must already exist.
+    .PARAMETER StartDateTime
+        Window start. For recurring windows the time-of-day is what repeats.
+    .PARAMETER DurationMinutes
+        Window length in minutes (1-1440).
+    .PARAMETER Recurrence
+        'None' (one-time), 'Daily', or 'Weekly'.
+    .PARAMETER DayOfWeek
+        Day for weekly recurrence (e.g. 'Sunday'). Ignored for None/Daily.
+    .PARAMETER Name
+        Window name, used as the idempotency key. Defaults to 'DAT Servicing Window'.
+    .OUTPUTS
+        Hashtable @{ Status = 'Created'|'Updated'|'Skipped'|'Failed'; Name; Error }
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$CollectionName,
+
+        [Parameter(Mandatory)]
+        [datetime]$StartDateTime,
+
+        [ValidateRange(1, 1440)]
+        [int]$DurationMinutes = 240,
+
+        [ValidateSet('None', 'Daily', 'Weekly')]
+        [string]$Recurrence = 'Daily',
+
+        [ValidateSet('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')]
+        [string]$DayOfWeek = 'Sunday',
+
+        [string]$Name = 'DAT Servicing Window'
+    )
+
+    Assert-DATConfigMgrConnected
+
+    # Guard: these cmdlets ship with the ConfigMgr console module, but bail out
+    # cleanly (rather than throwing into the deploy loop) if a build lacks them.
+    foreach ($Cmd in @('New-CMSchedule', 'New-CMMaintenanceWindow', 'Get-CMMaintenanceWindow', 'Set-CMMaintenanceWindow')) {
+        if (-not (Get-Command $Cmd -ErrorAction SilentlyContinue)) {
+            $Msg = "Maintenance-window cmdlet '$Cmd' is not available in this ConfigMgr console build."
+            Write-DATLog -Message $Msg -Severity 3
+            return @{ Status = 'Failed'; Name = $Name; Error = $Msg }
+        }
+    }
+
+    $OriginalLocation = Get-Location
+    try {
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
+
+        # Duration rides on the schedule token (the MW cmdlets have no duration
+        # parameter of their own). Use whole hours when it divides evenly so the
+        # console shows "4 hours" rather than "240 minutes".
+        $DurInterval = 'Minutes'
+        $DurCount    = $DurationMinutes
+        if ($DurationMinutes % 60 -eq 0) {
+            $DurInterval = 'Hours'
+            $DurCount    = $DurationMinutes / 60
+        }
+
+        # Recurrence: Daily uses RecurInterval Days; Weekly uses DayOfWeek (its own
+        # parameter set, so RecurInterval must NOT be passed); None is one-time.
+        $SchedParams = @{
+            Start            = $StartDateTime
+            DurationInterval = $DurInterval
+            DurationCount    = $DurCount
+            ErrorAction      = 'Stop'
+        }
+        switch ($Recurrence) {
+            'Daily'  { $SchedParams['RecurInterval'] = 'Days'; $SchedParams['RecurCount'] = 1 }
+            'Weekly' { $SchedParams['DayOfWeek']     = $DayOfWeek; $SchedParams['RecurCount'] = 1 }
+            default  { $SchedParams['Nonrecurring']  = $true }
+        }
+        $Schedule = New-CMSchedule @SchedParams
+
+        $RecurDesc = switch ($Recurrence) {
+            'Daily'  { 'daily' }
+            'Weekly' { "weekly on $DayOfWeek" }
+            default  { 'one-time' }
+        }
+        Write-DATLog -Message ("Ensuring maintenance window '{0}' on '{1}': starts {2:yyyy-MM-dd HH:mm}, {3} min, {4} (ApplyTo=Any)" -f `
+            $Name, $CollectionName, $StartDateTime, $DurationMinutes, $RecurDesc) -Severity 1
+
+        $Existing = Get-CMMaintenanceWindow -CollectionName $CollectionName -MaintenanceWindowName $Name -ErrorAction SilentlyContinue
+
+        if ($PSCmdlet.ShouldProcess("$Name on $CollectionName", 'Ensure maintenance window')) {
+            if ($Existing) {
+                Set-CMMaintenanceWindow -CollectionName $CollectionName -MaintenanceWindowName $Name `
+                    -Schedule $Schedule -ApplyTo Any -ErrorAction Stop
+                Write-DATLog -Message "Updated existing maintenance window '$Name' on '$CollectionName'" -Severity 1
+                return @{ Status = 'Updated'; Name = $Name }
+            } else {
+                New-CMMaintenanceWindow -CollectionName $CollectionName -Name $Name `
+                    -Schedule $Schedule -ApplyTo Any -ErrorAction Stop | Out-Null
+                Write-DATLog -Message "Created maintenance window '$Name' on '$CollectionName'" -Severity 1
+                return @{ Status = 'Created'; Name = $Name }
+            }
+        }
+        return @{ Status = 'Skipped'; Name = $Name }
+    } catch {
+        Write-DATLog -Message "Failed to ensure maintenance window '$Name' on '$CollectionName': $($_.Exception.Message)" -Severity 3
+        return @{ Status = 'Failed'; Name = $Name; Error = $_.Exception.Message }
+    } finally {
+        Set-Location -Path $OriginalLocation
+    }
+}
+
 function Get-DATKnownModels {
     <#
     .SYNOPSIS
