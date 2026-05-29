@@ -309,6 +309,58 @@ function Get-PresentHardwareTokens {
     return $Tokens
 }
 
+function Get-PresentGpuVendors {
+    <#
+        Returns a HashSet of the GPU brands actually present as display adapters:
+        'NVIDIA' (VEN_10DE), 'AMD' (VEN_1002/1022), 'Intel' (VEN_8086). Used to skip
+        graphics DUPs for a brand the device doesn't have.
+
+        Uses Win32_VideoController (display adapters) specifically, NOT every PCI
+        device - Intel and AMD also ship NICs/chipsets under the same vendor IDs, so
+        only the display adapter's vendor proves a GPU of that brand is installed.
+        Dell ships every GPU option's DUP for a model and many graphics DUPs carry no
+        PCIInfo, so without this an NVIDIA installer runs on an AMD/Intel box and may
+        report "no compatible hardware" as a generic exit 1 (a false deployment
+        failure). Returns an empty set if enumeration fails (callers then don't filter).
+    #>
+    $Vendors = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    # 1) Active display adapters. Covers Intel iGPUs and any GPU that already has its
+    #    real driver. VEN_8086 is only trusted here (display class) because Intel also
+    #    ships NICs/chipsets/SATA under 8086 - the raw-PCI scan below would over-match.
+    try {
+        foreach ($Vc in (Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)) {
+            $Id = "$($Vc.PNPDeviceID)"
+            if ($Id -match 'VEN_([0-9A-Fa-f]{4})') {
+                switch ($Matches[1].ToUpperInvariant()) {
+                    '10DE' { [void]$Vendors.Add('NVIDIA') }
+                    '1002' { [void]$Vendors.Add('AMD') }
+                    '8086' { [void]$Vendors.Add('Intel') }
+                }
+            }
+        }
+    } catch {
+        Write-Log "Could not enumerate display adapters ($($_.Exception.Message)) - relying on PCI scan for GPU-vendor filtering" -Severity 2
+    }
+
+    # 2) Raw PCI presence for the GPU-specific vendor IDs. Catches a discrete NVIDIA or
+    #    AMD GPU that is physically present but still on the Microsoft Basic Display
+    #    driver (so Win32_VideoController shows "Basic Display Adapter" without the real
+    #    vendor) - exactly the box that NEEDS its GPU driver. VEN_10DE is NVIDIA-only and
+    #    VEN_1002 is AMD/ATI graphics-only (AMD CPUs/chipsets are VEN_1022), so these are
+    #    safe to treat as a present GPU; Intel is intentionally not inferred from raw PCI.
+    try {
+        foreach ($Dev in (Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop)) {
+            foreach ($HwId in @($Dev.HardwareID)) {
+                if     ($HwId -match 'VEN_10DE') { [void]$Vendors.Add('NVIDIA') }
+                elseif ($HwId -match 'VEN_1002') { [void]$Vendors.Add('AMD') }
+            }
+        }
+    } catch { }
+
+    return $Vendors
+}
+
 # -------------------------------------------------------------------------
 # BIOS version check
 # -------------------------------------------------------------------------
@@ -645,6 +697,18 @@ function Install-DriverUpdates {
         if ($ni -eq $nt) { return 0 }
         return $null  # unknown ordering - caller should treat as "needs install"
     }
+    # Infer the GPU brand a Video DUP targets from its name. Returns
+    # 'NVIDIA'/'AMD'/'Intel', or $null when it can't tell (then we don't filter on it).
+    # Only meaningful for Category=Video DUPs.
+    $GetDupGpuVendor = {
+        param([string]$Name)
+        switch -Regex ($Name) {
+            '(?i)nvidia|geforce|quadro|\brtx\b|\bgtx\b|\bnvs\b' { return 'NVIDIA' }
+            '(?i)radeon|firepro|\bamd\b|\bati\b'                { return 'AMD' }
+            '(?i)intel|\buhd\b|\bhd graphics\b|iris|\barc\b'     { return 'Intel' }
+            default { return $null }
+        }
+    }
 
     # Enumerate the PCI hardware present on this device once, up front. Used to
     # skip DUPs whose target hardware isn't installed (e.g. a Qualcomm NIC DUP
@@ -655,6 +719,19 @@ function Install-DriverUpdates {
     Write-Log "Enumerated $($PresentHw.Count) present PCI hardware token(s) for applicability filtering"
     $SkippedHw = 0
 
+    # GPU brands actually present, for vendor-aware filtering of graphics DUPs that
+    # carry no PCIInfo (Dell ships every GPU option's DUP per model). A graphics DUP
+    # for a brand the device doesn't have is skipped before it runs; if one slips
+    # through (brand undeterminable, or display enumeration failed) and errors, the
+    # failure handler below forgives it as not-applicable rather than failing the app.
+    $PresentGpuVendors = Get-PresentGpuVendors
+    if ($PresentGpuVendors.Count -gt 0) {
+        Write-Log "Present GPU vendor(s): $(@($PresentGpuVendors) -join ', ')"
+    } else {
+        Write-Log "No GPU vendors detected (or enumeration failed) - graphics DUPs will not be vendor-filtered this run" -Severity 2
+    }
+    $SkippedGpu = 0
+
     $Index = 0
     foreach ($Drv in $Drivers) {
         $Index++
@@ -662,6 +739,10 @@ function Install-DriverUpdates {
         $DriverLabel = "[$Index/$($Drivers.Count)] $($Drv.Category) - $($Drv.Name) v$($Drv.Version)"
         $CompKey = & $SanitizeKey $Drv.FileName
         $CompKeyPath = Join-Path $ComponentsRoot $CompKey
+
+        # GPU brand this DUP targets (only inferred for Video DUPs). Used both by the
+        # vendor pre-skip just below and the failure-forgive in the exit-code handler.
+        $DupVendor = if ($Drv.Category -eq 'Video') { & $GetDupGpuVendor $Drv.Name } else { $null }
 
         # Hardware applicability filter. If the manifest lists target hardware
         # for this DUP and the enumeration succeeded, only run it when at least
@@ -680,6 +761,16 @@ function Install-DriverUpdates {
                 $SkippedHw++
                 continue
             }
+        }
+
+        # GPU-vendor applicability filter (covers graphics DUPs with no PCIInfo, which
+        # the token filter above can't catch). Skip a Video DUP when we can name its
+        # GPU brand AND that brand isn't among the device's display adapters. Only
+        # skips on positive evidence: brand undeterminable or no GPUs detected -> run.
+        if ($DupVendor -and $PresentGpuVendors.Count -gt 0 -and -not $PresentGpuVendors.Contains($DupVendor)) {
+            Write-Log "$DriverLabel - no $DupVendor GPU present (device GPUs: $(@($PresentGpuVendors) -join ', ')) - skipping"
+            $SkippedGpu++
+            continue
         }
 
         # Per-DUP version skip: if we already installed this exact DUP at >= the
@@ -770,9 +861,23 @@ function Install-DriverUpdates {
             $NotApply++
             Write-Log "$DriverLabel - exit $DupCode (not applicable to this device) in ${Elapsed}s"
         } else {
-            $Failed++
-            $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
-            Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s" -Severity 2
+            # Forgive a graphics DUP that errored for a GPU brand we can't confirm is
+            # present. Dell ships every model's GPU DUPs and non-matching NVIDIA/AMD
+            # installers often report "no compatible hardware" as a generic exit 1
+            # rather than a clean not-applicable code (3/4/5). We treat that as
+            # not-applicable so one inapplicable graphics DUP can't fail the whole
+            # deployment. A Video DUP whose brand IS present that fails is a real
+            # failure and still counts (so genuine graphics-driver breakage surfaces).
+            $GpuVendorPresent = ($DupVendor -and $PresentGpuVendors.Contains($DupVendor))
+            if ($Drv.Category -eq 'Video' -and -not $GpuVendorPresent) {
+                $NotApply++
+                $VendorNote = if ($DupVendor) { "no $DupVendor GPU confirmed" } else { 'GPU brand undeterminable' }
+                Write-Log "$DriverLabel - exit $DupCode (graphics DUP, $VendorNote - treating as not applicable) in ${Elapsed}s" -Severity 2
+            } else {
+                $Failed++
+                $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
+                Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s" -Severity 2
+            }
         }
     }
 
@@ -805,7 +910,7 @@ function Install-DriverUpdates {
         Write-Log "Component marker GC failed: $($_.Exception.Message)" -Severity 2
     }
 
-    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $SkippedHw skipped (hardware not present), $NotApply not-applicable, $Failed failed"
+    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $SkippedHw skipped (hardware not present), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Failed failed"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
     }
