@@ -912,8 +912,9 @@ function New-DATMainForm {
 
     # --- Maintenance window behavior ---
     # Default (both unchecked) keeps installs AND restarts confined to the collection's
-    # maintenance windows - which is what lets DriverUpdates (ForceReboot) restart silently
-    # overnight without prompting users during the day. Admins can opt out per-deployment.
+    # maintenance windows - so a driver/BIOS update that signals reboot-required (the
+    # install script's exit 3010) restarts silently overnight instead of prompting users
+    # during the day. Admins can opt out per-deployment.
     $DeployOverrideSWCheck = New-Object System.Windows.Forms.CheckBox
     $DeployOverrideSWCheck.Text = 'Install outside maintenance window'
     $DeployOverrideSWCheck.Location = New-Object System.Drawing.Point(15, 125)

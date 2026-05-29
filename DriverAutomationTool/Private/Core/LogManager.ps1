@@ -38,10 +38,13 @@ function Write-DATLog {
     # bias) and a single sign char. The old '{0}+{1}' hardcoded a '+' and then
     # appended the raw offset, so US time zones produced "...+-300" - which
     # CMTrace can't parse, leaving a wrong/blank date-time on every line.
+    # Time/date are rendered with InvariantCulture so a non-US locale can't swap
+    # the ':' time-separator specifier for '.' and break the field.
     $Now = Get-Date
+    $Inv = [System.Globalization.CultureInfo]::InvariantCulture
     $OffsetMinutes = [int][System.TimeZone]::CurrentTimeZone.GetUtcOffset($Now).TotalMinutes
     $Bias = if ($OffsetMinutes -le 0) { '+{0}' -f (-$OffsetMinutes) } else { '-{0}' -f $OffsetMinutes }
-    $TimeStr = '{0}{1}' -f $Now.ToString('HH:mm:ss.fff'), $Bias
+    $TimeStr = '{0}{1}' -f $Now.ToString('HH:mm:ss.fff', $Inv), $Bias
 
     $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $Context = if ($Identity) { $Identity.Name } else { $env:USERNAME }
@@ -49,7 +52,7 @@ function Write-DATLog {
 
     # CMTrace format
     $LogEntry = '<![LOG[{0}]LOG]!><time="{1}" date="{2}" component="{3}" context="{4}" type="{5}" thread="{6}" file="">' -f `
-        $Message, $TimeStr, $Now.ToString('MM-dd-yyyy'), $Component, $Context, $Severity, $Thread
+        $Message, $TimeStr, $Now.ToString('MM-dd-yyyy', $Inv), $Component, $Context, $Severity, $Thread
 
     try {
         Add-Content -Path $LogFile -Value $LogEntry -ErrorAction Stop

@@ -30,10 +30,11 @@ function Invoke-DATDeployApplications {
         When $true, the deployment installs outside of any maintenance window applied to
         the target collection. Default $false keeps installs constrained to the MW.
     .PARAMETER RebootOutsideServiceWindow
-        When $true, a restart triggered by ForceReboot can fire outside the maintenance
-        window. Default $false defers the restart until the next MW - this is what
-        enables the typical "install whenever, reboot silently between 10pm-5am" flow
-        when combined with UserNotification=HideAll and a Required deployment.
+        When $true, a restart required to complete an install (the install script's exit
+        3010 soft reboot) can fire outside the maintenance window. Default $false defers
+        the restart until the next MW - this is what enables the typical "install
+        whenever, reboot silently between 10pm-5am" flow when combined with
+        UserNotification=HideAll and a Required deployment.
 
         Accepts -RebootOutsideOfServiceWindow as an alias for callers from 1.10.0-1.11.3
         that used the misspelled name (which silently broke deployment because the

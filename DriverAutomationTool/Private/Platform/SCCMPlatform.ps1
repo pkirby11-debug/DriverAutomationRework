@@ -2674,14 +2674,21 @@ function New-DATConfigMgrApplication {
 
             $ExistingDT = Get-CMDeploymentType -ApplicationName $Name -DeploymentTypeName $DTName -ErrorAction SilentlyContinue
 
-            # DriverUpdates apps target already-built devices where the new drivers
-            # don't take effect until the OS reloads them, so always force a restart
-            # after a successful install. SCCM honors the deployment's UserNotification
-            # setting (default DisplayAll) and displays the standard restart countdown
-            # to the logged-on user. Driver/BIOS modes stay on BasedOnExitCode - those
-            # paths already signal 3010 from the install script when truly needed and
-            # have their own pre-reboot handling (e.g., BitLocker suspension).
-            $RebootBehavior = if ($Mode -eq 'DriverUpdates') { 'ForceReboot' } else { 'BasedOnExitCode' }
+            # All modes use BasedOnExitCode so the install script's exit code drives
+            # the restart: Invoke-DATApply.ps1 returns 3010 only when a vendor utility
+            # actually signaled reboot-required (Dell DUP/Flash64W 2/6, Lenovo SRSETUP
+            # 256, pnputil 3010/259), and 0 otherwise. Combined with the deployment's
+            # RebootOutsideServiceWindow=$false default, a genuine soft reboot is then
+            # deferred to the collection's maintenance window.
+            #
+            # DriverUpdates previously used ForceReboot to guarantee a driver reload,
+            # but ForceReboot restarts after ANY successful exit - including a run where
+            # every DUP was skipped (hardware not present / already current) and the
+            # script logged "Success - no reboot required". That is what popped the
+            # restart countdown on devices that had nothing to install. Trusting the
+            # vendor exit code is both accurate (a DUP needing a reload returns 2) and
+            # honors the maintenance window.
+            $RebootBehavior = 'BasedOnExitCode'
 
             # Parameters shared by both the create (Add-CMScriptDeploymentType) and
             # update (Set-CMScriptDeploymentType) cmdlets.
