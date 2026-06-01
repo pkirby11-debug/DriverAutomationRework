@@ -45,6 +45,10 @@
 .PARAMETER LogPath
     Optional override. Default: C:\Windows\CCM\Logs if present, else C:\Windows\Temp.
 
+.PARAMETER MaxLogSizeMB
+    Roll DATApply.log over to a single .lo_ companion once it reaches this many MB,
+    so the log keeps appending across runs without growing without bound. Default 5.
+
 .PARAMETER DebugMode
     Do not actually install drivers / flash BIOS; just log what would happen.
 
@@ -92,6 +96,9 @@ param(
 
     [string]$LogPath,
 
+    [ValidateRange(1, 1024)]
+    [int]$MaxLogSizeMB = 5,
+
     [switch]$DebugMode
 )
 
@@ -138,6 +145,30 @@ function Format-CMTraceLine {
         $Message, $TimeStr, $Now.ToString('MM-dd-yyyy', $Inv), $Context, $Severity, $Thread
 }
 
+# Size-capped log rollover. DATApply.log appends across runs (every write is
+# Add-Content); this keeps it from growing without bound. When the file reaches the
+# cap it's rolled to a single ".lo_" companion (replacing any previous one) and a
+# fresh ".log" starts - the CMTrace-standard pair, which CMTrace shows merged, so
+# recent history survives one rollover. On-disk size stays ~2x the cap. Non-fatal:
+# if the file is locked (e.g. open in CMTrace) we just keep appending this run.
+$script:MaxLogBytes = [long]$MaxLogSizeMB * 1MB
+function Invoke-LogRollover {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        if (-not (Test-Path $Path)) { return }
+        if ((Get-Item -Path $Path -ErrorAction Stop).Length -lt $script:MaxLogBytes) { return }
+        $Rolled = $Path -replace '\.log$', '.lo_'
+        Remove-Item -Path $Rolled -Force -ErrorAction SilentlyContinue
+        Move-Item -Path $Path -Destination $Rolled -Force -ErrorAction Stop
+    } catch {
+        # Locked/unreadable - leave it and keep appending; next run will retry.
+    }
+}
+
+# Roll the canonical log before the startup marker (and everything after) writes to
+# it, so a fresh run starts a fresh file once the cap is hit.
+Invoke-LogRollover -Path $script:FailsafeLogPath
+
 # Trap anything that escapes the main try/catch - this guarantees at least one
 # line gets logged no matter where initialization fails. Without this, a
 # terminating error during function definition or variable setup would produce
@@ -176,6 +207,9 @@ if (-not (Test-Path $LogPath)) {
     New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
 }
 $LogFile = Join-Path $LogPath 'DATApply.log'
+# If -LogPath pointed somewhere other than the failsafe path, that file wasn't
+# rolled above - cap it too before Write-Log starts appending to it.
+if ($LogFile -ne $script:FailsafeLogPath) { Invoke-LogRollover -Path $LogFile }
 
 function Write-Log {
     param(
