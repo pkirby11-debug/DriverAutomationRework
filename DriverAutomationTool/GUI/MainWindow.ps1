@@ -70,6 +70,9 @@ function New-DATMainWindow {
     [void](Set-DATComboText -Combo $Controls['DeployMWRecurCombo'] -Value 'Daily')
     [void](Set-DATComboText -Combo $Controls['DeployMWDayCombo'] -Value 'Sunday')
 
+    # Apply the light/dark palette following the Windows app theme.
+    Set-DATWindowTheme -Window $Window -Mode System
+
     return $Controls
 }
 
@@ -102,12 +105,18 @@ function Initialize-DATMainWindow {
         [hashtable]$Controls
     )
 
-    $Window = $Controls['MainWindow']
+    # Event-handler scriptblocks can see $script: (module) scope but NOT this
+    # function's locals in the STA-runspace launch model, so the shared controls
+    # map, window, cursors, and log list box live in module scope. Handlers use
+    # the bare names ($Controls, $Window, ...), which resolve up to these.
+    $script:Controls = $Controls
+    $script:Window = $Controls['MainWindow']
+    $script:LogListBox = $Controls['LogListBox']
     $script:SyncCancellation = $null
     $script:Initializing = $true
 
-    $WaitCursor = [System.Windows.Input.Cursors]::Wait
-    $DefaultCursor = [System.Windows.Input.Cursors]::Arrow
+    $script:WaitCursor = [System.Windows.Input.Cursors]::Wait
+    $script:DefaultCursor = [System.Windows.Input.Cursors]::Arrow
 
     # --- OS Selection Change: enable/disable manufacturer checkboxes ---
     # Dell drivers don't need build versions (plain "Windows 11" / "Windows 10")
@@ -154,10 +163,9 @@ function Initialize-DATMainWindow {
     })
 
     # --- Register log subscriber for GUI ---
-    $LogListBox = $Controls['LogListBox']
     Register-DATLogSubscriber -Action {
         param($Event)
-        Add-DATWindowLogEntry -LogListBox $LogListBox -LogEvent $Event
+        Add-DATWindowLogEntry -LogListBox $script:LogListBox -LogEvent $Event
     }
 
     # --- Refresh Models Button ---
@@ -856,6 +864,12 @@ function Initialize-DATMainWindow {
                 }
 
                 $script:TimerControls['StatusStripLabel'].Text = "Removing $($Candidates.Count) overlay TS package(s)..."
+
+                # Re-derive connection details: the button-handler locals are not
+                # in scope inside this deferred timer tick.
+                $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+                $ConnParams = @{ SiteServer = $script:Controls['SiteServerInput'].Text; SiteCode = $script:Controls['SiteCodeInput'].Text }
+                if ($script:Controls['UseSSLCheckBox'].IsChecked) { $ConnParams['UseSSL'] = $true }
 
                 $RemovalScript = {
                     param($ModulePath, $ConnParams, $CleanSource, $LogQueue)
