@@ -3,36 +3,30 @@ function Start-DATGui {
     .SYNOPSIS
         Launches the Driver Automation Tool graphical user interface.
     .DESCRIPTION
-        Opens the modern WPF GUI for interactive driver pack management.
+        Opens the modern WPF GUI. WPF requires an STA thread (pwsh defaults to
+        MTA), so the window runs on a dedicated STA runspace. WPF dispatches
+        user-input events RE-ENTRANTLY from its native message pump, and that
+        callback resolves commands only from the runspace's GLOBAL session state -
+        so the GUI runspace loads the module body globally (every DAT function is
+        then reachable from the event handlers) in addition to importing it (for
+        Get-Module and the background work runspaces).
 
-        WPF requires an STA thread, and pwsh defaults to MTA, so the GUI is
-        hosted on a dedicated STA runspace. Critically, WPF dispatches user-input
-        events (button clicks, etc.) RE-ENTRANTLY from its native message pump,
-        and that callback can only resolve commands from the runspace's GLOBAL
-        session state - functions that live only in module/private scope are
-        invisible to it (the window's Loaded event happens to fire while the
-        module call is still on the stack, which is why settings load worked even
-        when clicks did not).
-
-        To make every DAT function reachable from the event handlers, the GUI
-        runspace both imports the module (for Get-Module / the background
-        runspaces) AND dot-sources it into the runspace's global scope, so the
-        window's handlers - which are bound to that global scope - can always
-        resolve the helpers and cmdlets they call.
+        Startup errors inside the runspace are surfaced to the host and written to
+        the module log directory, so a failure to launch is never silent.
     .EXAMPLE
         Start-DATGui
-        Launches the GUI with default settings.
     .EXAMPLE
         Import-Module DriverAutomationTool; Start-DATGui
-        Imports the module and launches the GUI.
     #>
     [CmdletBinding()]
     param()
 
     Write-DATLog -Message "Starting Driver Automation Tool GUI" -Severity 1
 
-    $ManifestPath = Join-Path $script:ModuleRoot 'DriverAutomationTool.psd1'
-    $Psm1Path     = Join-Path $script:ModuleRoot 'DriverAutomationTool.psm1'
+    $ModuleRoot   = $script:ModuleRoot
+    $ManifestPath = Join-Path $ModuleRoot 'DriverAutomationTool.psd1'
+    $Psm1Path     = Join-Path $ModuleRoot 'DriverAutomationTool.psm1'
+    $StartupLog   = Join-Path $script:LogPath 'DATGui-startup.log'
 
     $Runspace = [runspacefactory]::CreateRunspace()
     $Runspace.ApartmentState = [System.Threading.ApartmentState]::STA
@@ -42,29 +36,53 @@ function Start-DATGui {
     $PowerShell = [PowerShell]::Create()
     $PowerShell.Runspace = $Runspace
     [void]$PowerShell.AddScript({
-        param($ManifestPath, $Psm1Path)
+        param($ManifestPath, $Psm1Path, $ModuleRoot, $StartupLog)
+        try {
+            Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
 
-        Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
+            # Import for Get-Module (window version / ModuleBase) and a clean
+            # instance for the background work runspaces to re-import.
+            Import-Module $ManifestPath -Force
 
-        # Import the module: gives Get-Module (window version / ModuleBase) and a
-        # clean instance for the background work runspaces to re-import.
-        Import-Module $ManifestPath -Force
+            # Load the module body into THIS runspace's GLOBAL scope so every DAT
+            # function exists globally - WPF's re-entrant event callbacks resolve
+            # commands only from the global session state. A .psm1 cannot be
+            # dot-sourced by path (PowerShell only dot-sources .ps1), so build a
+            # scriptblock from the .psm1 text, seeding $PSScriptRoot (which the
+            # module body uses to locate the .ps1 files it dot-sources), and
+            # dot-source that.
+            $Psm1Text = Get-Content -Raw -LiteralPath $Psm1Path
+            $Loader   = [scriptblock]::Create('$PSScriptRoot = $args[0]' + [Environment]::NewLine + $Psm1Text)
+            . $Loader $ModuleRoot
 
-        # ALSO dot-source the module into THIS runspace's global scope, so every
-        # DAT function exists globally. The window built below has its event
-        # handlers bound to this scope, and WPF's re-entrant event callbacks can
-        # only resolve commands from the global session state.
-        . $Psm1Path
+            if (-not (Get-Command Show-DATMainWindow -ErrorAction SilentlyContinue)) {
+                throw "Show-DATMainWindow was not defined after loading the module globally."
+            }
 
-        Show-DATMainWindow   # blocks until the window closes
-    }).AddArgument($ManifestPath).AddArgument($Psm1Path)
+            Show-DATMainWindow   # blocks until the window closes
+        } catch {
+            $Detail = "{0}`r`n{1}`r`n{2}" -f $_.Exception.Message, $_.ScriptStackTrace, ($_ | Out-String)
+            try { Set-Content -LiteralPath $StartupLog -Value $Detail -ErrorAction SilentlyContinue } catch { }
+            throw
+        }
+    }).AddArgument($ManifestPath).AddArgument($Psm1Path).AddArgument($ModuleRoot).AddArgument($StartupLog)
 
+    $InvokeError = $null
     try {
         $PowerShell.Invoke()
+    } catch {
+        $InvokeError = $_
     } finally {
+        $StreamErrors = @($PowerShell.Streams.Error)
         $PowerShell.Dispose()
         $Runspace.Close()
         $Runspace.Dispose()
+    }
+
+    if ($InvokeError -or $StreamErrors.Count -gt 0) {
+        Write-Warning "Start-DATGui: the GUI runspace reported a startup error (also saved to $StartupLog):"
+        if ($InvokeError) { Write-Warning ($InvokeError | Out-String) }
+        foreach ($StreamError in $StreamErrors) { Write-Warning ($StreamError | Out-String) }
     }
 
     Write-DATLog -Message "GUI closed" -Severity 1
