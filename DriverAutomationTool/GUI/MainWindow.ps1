@@ -45,7 +45,7 @@ function New-DATMainWindow {
 
     # --- Version labels ---
     $ModVer = (Get-Module DriverAutomationTool).Version
-    if (-not $ModVer) { $ModVer = '2.1.4' }
+    if (-not $ModVer) { $ModVer = '2.1.5' }
     $Window.Title = "Driver Automation Tool v$ModVer"
     $Controls['VersionLabel'].Text = "v$ModVer"
 
@@ -143,7 +143,7 @@ function Initialize-DATMainWindow {
         DeployTimer              = $null
     }
 
-    # Stash the whole GUI context in module scope. Every handler fetches it with
+    # Stash the whole GUI context in global scope. Every handler fetches it with
     # $gui = Get-DATGui (the one primitive that works in the WPF event context).
     Set-DATGui @{
         Controls      = $Controls
@@ -152,6 +152,34 @@ function Initialize-DATMainWindow {
         DefaultCursor = $DefaultCursor
         G             = $G
     }
+
+    # Safety net: an unhandled exception in any WPF event handler tears the whole
+    # window down. Catch it on the dispatcher, show the cause (including the
+    # PowerShell line and a snapshot of the GUI state), and keep the window open.
+    $Window.Dispatcher.add_UnhandledException({
+        param($DSender, $DArgs)
+        $Lines = @("$($DArgs.Exception.Message)")
+        try {
+            if ($DArgs.Exception -is [System.Management.Automation.IContainsErrorRecord]) {
+                $Lines += ''
+                $Lines += $DArgs.Exception.ErrorRecord.InvocationInfo.PositionMessage
+            }
+        } catch { }
+        try {
+            $State = $global:DATGui
+            $Lines += ''
+            $Lines += "GUI state present: $($null -ne $State)"
+            if ($State) {
+                $Lines += "Controls keys: $(@($State.Controls.Keys).Count); has ModelGridData: $($State.Controls.ContainsKey('ModelGridData'))"
+            }
+        } catch { }
+        try {
+            [void][System.Windows.MessageBox]::Show(($Lines -join [Environment]::NewLine),
+                'Driver Automation Tool - unhandled error',
+                [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+        } catch { }
+        $DArgs.Handled = $true
+    })
 
     # --- OS Selection Change: enable/disable manufacturer checkboxes ---
     # Dell drivers don't need build versions (plain "Windows 11" / "Windows 10")
