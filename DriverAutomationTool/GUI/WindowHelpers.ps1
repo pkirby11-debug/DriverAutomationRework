@@ -9,12 +9,58 @@ function Get-DATSystemUsesLightTheme {
         Defaults to light if the preference cannot be read.
     #>
     try {
-        $Key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
-        $Value = Get-ItemPropertyValue -Path $Key -Name 'AppsUseLightTheme' -ErrorAction Stop
+        # Use the .NET registry API directly - it does not depend on the HKCU:
+        # PSDrive being mounted in the (child STA) runspace.
+        $Value = [Microsoft.Win32.Registry]::GetValue(
+            'HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize',
+            'AppsUseLightTheme', $null)
+        if ($null -eq $Value) { return $true }
         return ([int]$Value -ne 0)
     } catch {
         return $true
     }
+}
+
+function Get-DATCMState {
+    <#
+    .SYNOPSIS
+        Returns the ConfigMgr connection state from module scope.
+    .DESCRIPTION
+        WPF event handlers cannot resolve $script: variables in the re-entrant
+        event context, but they CAN call module functions (which run in module
+        scope). Connect-DATConfigMgr sets the flags in that same scope, so this
+        getter surfaces them reliably to the GUI handlers.
+    #>
+    [pscustomobject]@{
+        Connected  = [bool]$script:CMConnected
+        SiteCode   = $script:CMSiteCode
+        SiteServer = $script:CMSiteServer
+    }
+}
+
+function Set-DATGui {
+    <#
+    .SYNOPSIS
+        Stores the GUI state object (controls, window, cursors, mutable state) in
+        global scope so handlers can retrieve it via Get-DATGui.
+    #>
+    param($State)
+    $global:DATGui = $State
+}
+
+function Get-DATGui {
+    <#
+    .SYNOPSIS
+        Returns the GUI state object from global scope.
+    .DESCRIPTION
+        The single reliable primitive in the WPF re-entrant event context is a
+        module function call resolving from the runspace's GLOBAL session state.
+        Start-DATGui dot-sources the module globally so these helpers are global;
+        the state itself lives in $global:DATGui so a handler always reads the
+        same object the window was wired with.
+        Returns: @{ Controls=<hashtable>; Window=<Window>; WaitCursor; DefaultCursor; G=<mutable state> }.
+    #>
+    $global:DATGui
 }
 
 function Set-DATWindowTheme {
@@ -186,7 +232,9 @@ function New-DATGridTable {
     $SelCol = $Table.Columns.Add('Selected', [bool])
     $SelCol.DefaultValue = $false
     foreach ($Name in $Columns) { [void]$Table.Columns.Add($Name, [string]) }
-    return $Table
+    # ,$Table (array-wrap) stops PowerShell from enumerating the DataTable into
+    # its rows on output - an empty table would otherwise return $null.
+    return , $Table
 }
 
 function Complete-DATGridEdit {
@@ -213,13 +261,13 @@ function Get-DATGridSelectedRows {
     param($Table)
 
     $Rows = [System.Collections.Generic.List[System.Data.DataRow]]::new()
-    if ($null -eq $Table) { return $Rows }
+    if ($null -eq $Table) { return , $Rows }
     foreach ($Row in $Table.Rows) {
         if ($Row.RowState -ne [System.Data.DataRowState]::Deleted -and [bool]$Row['Selected']) {
             $Rows.Add($Row)
         }
     }
-    return $Rows
+    return , $Rows
 }
 
 function Set-DATGridChecks {
@@ -360,7 +408,7 @@ function Get-DATSelectedModels {
             SystemID     = $Row['SystemID']
         })
     }
-    return $Selected
+    return , $Selected
 }
 
 function Get-DATSelectedNames {
@@ -374,7 +422,7 @@ function Get-DATSelectedNames {
     foreach ($Row in (Get-DATGridSelectedRows -Table $Table)) {
         $Selected.Add([string]$Row['Name'])
     }
-    return $Selected
+    return , $Selected
 }
 
 function Select-DATKnownModelsInGrid {
