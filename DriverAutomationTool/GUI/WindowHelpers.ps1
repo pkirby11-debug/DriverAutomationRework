@@ -2,6 +2,67 @@
 # Presentation helpers shared by the main window event layer. No business
 # logic here - these only adapt WPF controls to the shapes the handlers want.
 
+function Get-DATSystemUsesLightTheme {
+    <#
+    .SYNOPSIS
+        Returns $true when Windows is set to the light app theme, $false for dark.
+        Defaults to light if the preference cannot be read.
+    #>
+    try {
+        $Key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+        $Value = Get-ItemPropertyValue -Path $Key -Name 'AppsUseLightTheme' -ErrorAction Stop
+        return ([int]$Value -ne 0)
+    } catch {
+        return $true
+    }
+}
+
+function Set-DATWindowTheme {
+    <#
+    .SYNOPSIS
+        Applies a light or dark palette to the window's theme brush resources.
+    .DESCRIPTION
+        The XAML references these brushes via {DynamicResource}, so replacing the
+        resource values re-colours the whole window. Some native control chrome
+        (ComboBox popups, CheckBox glyphs) only partially follows dark mode without
+        a dedicated theming library.
+    .PARAMETER Mode
+        'System' (default) follows the Windows app theme; 'Light' / 'Dark' force it.
+    #>
+    param(
+        $Window,
+        [ValidateSet('System', 'Light', 'Dark')]
+        [string]$Mode = 'System'
+    )
+
+    if ($null -eq $Window) { return }
+
+    $UseLight = switch ($Mode) {
+        'Light' { $true }
+        'Dark'  { $false }
+        default { Get-DATSystemUsesLightTheme }
+    }
+
+    $Palette = if ($UseLight) {
+        @{
+            WinBg = '#FFF3F3F3'; PanelBg = '#FFFFFFFF'; CtrlBg = '#FFFFFFFF'; GridBg = '#FFFFFFFF'
+            GridAltBg = '#FFF7F9FB'; GridHeaderBg = '#FFEFEFEF'; Fg = '#FF1B1B1B'; SubtleFg = '#FF6E6E6E'
+            BorderClr = '#FFD0D0D0'; StatusBg = '#FFE8E8E8'
+        }
+    } else {
+        @{
+            WinBg = '#FF1F1F1F'; PanelBg = '#FF2B2B2B'; CtrlBg = '#FF2D2D2D'; GridBg = '#FF252526'
+            GridAltBg = '#FF2D2D30'; GridHeaderBg = '#FF3A3A3D'; Fg = '#FFF0F0F0'; SubtleFg = '#FFB0B0B0'
+            BorderClr = '#FF3F3F3F'; StatusBg = '#FF2B2B2B'
+        }
+    }
+
+    foreach ($Key in $Palette.Keys) {
+        $Color = [System.Windows.Media.ColorConverter]::ConvertFromString($Palette[$Key])
+        $Window.Resources[$Key] = [System.Windows.Media.SolidColorBrush]::new($Color)
+    }
+}
+
 function Show-DATWindowMessage {
     <#
     .SYNOPSIS

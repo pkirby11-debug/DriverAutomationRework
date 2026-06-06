@@ -7,21 +7,37 @@
     MinHeight="600" MinWidth="900"
     WindowStartupLocation="CenterScreen"
     FontFamily="Segoe UI" FontSize="12"
-    Background="#FFF3F3F3">
+    Background="{DynamicResource WinBg}"
+    TextOptions.TextFormattingMode="Display">
 
     <!--
         DriverAutomationTool main window (WPF).
-        Pure layout: every interactive control carries an x:Name that the
-        event layer (MainWindow.ps1) resolves into the $Controls hashtable.
-        No business logic here. DataGrids bind to DataTable views created in
-        New-DATMainWindow; static ComboBox items are sys:String so SelectedItem
-        is a plain string.
+        Pure layout: every interactive control carries an x:Name that the event
+        layer (MainWindow.ps1) resolves into the $Controls hashtable. Colours come
+        from the theme brush resources below (light defaults); Set-DATWindowTheme
+        swaps them at runtime to follow the Windows light/dark app setting. Layout
+        uses Grid/DockPanel star-sizing so it scales with the window.
     -->
 
     <Window.Resources>
+        <!-- ===== Theme brushes (light defaults; replaced at runtime for dark) ===== -->
+        <SolidColorBrush x:Key="WinBg" Color="#FFF3F3F3" />
+        <SolidColorBrush x:Key="PanelBg" Color="#FFFFFFFF" />
+        <SolidColorBrush x:Key="CtrlBg" Color="#FFFFFFFF" />
+        <SolidColorBrush x:Key="GridBg" Color="#FFFFFFFF" />
+        <SolidColorBrush x:Key="GridAltBg" Color="#FFF7F9FB" />
+        <SolidColorBrush x:Key="GridHeaderBg" Color="#FFEFEFEF" />
+        <SolidColorBrush x:Key="Fg" Color="#FF1B1B1B" />
+        <SolidColorBrush x:Key="SubtleFg" Color="#FF6E6E6E" />
+        <SolidColorBrush x:Key="BorderClr" Color="#FFD0D0D0" />
+        <SolidColorBrush x:Key="StatusBg" Color="#FFE8E8E8" />
+
+        <!-- Accent is theme-independent -->
+        <SolidColorBrush x:Key="AccentBg" Color="#FF0078D4" />
+
         <!-- Accent (primary action) button -->
         <Style x:Key="AccentButton" TargetType="Button">
-            <Setter Property="Background" Value="#FF0078D4" />
+            <Setter Property="Background" Value="{DynamicResource AccentBg}" />
             <Setter Property="Foreground" Value="White" />
             <Setter Property="FontWeight" Value="SemiBold" />
             <Setter Property="BorderThickness" Value="0" />
@@ -39,7 +55,7 @@
                                 <Setter TargetName="Bd" Property="Background" Value="#FF106EBE" />
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
-                                <Setter TargetName="Bd" Property="Background" Value="#FFB0B0B0" />
+                                <Setter TargetName="Bd" Property="Background" Value="#FF7A7A7A" />
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -50,8 +66,9 @@
         <!-- Standard (secondary) button -->
         <Style x:Key="StandardButton" TargetType="Button">
             <Setter Property="Padding" Value="12,5" />
-            <Setter Property="Background" Value="White" />
-            <Setter Property="BorderBrush" Value="#FFADADAD" />
+            <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="Cursor" Value="Hand" />
         </Style>
@@ -59,32 +76,48 @@
         <Style TargetType="GroupBox">
             <Setter Property="Padding" Value="8" />
             <Setter Property="Margin" Value="0,0,0,10" />
-            <Setter Property="BorderBrush" Value="#FFD0D0D0" />
+            <Setter Property="Background" Value="{DynamicResource PanelBg}" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
         </Style>
 
         <Style TargetType="Label">
             <Setter Property="Padding" Value="0,0,4,0" />
             <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
         </Style>
 
         <Style TargetType="TextBox">
             <Setter Property="Padding" Value="3,2" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
+            <Setter Property="CaretBrush" Value="{DynamicResource Fg}" />
         </Style>
 
         <Style TargetType="ComboBox">
             <Setter Property="Height" Value="24" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
         </Style>
 
         <Style TargetType="CheckBox">
             <Setter Property="VerticalAlignment" Value="Center" />
             <Setter Property="Margin" Value="0,4" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
         </Style>
 
         <Style TargetType="RadioButton">
             <Setter Property="VerticalAlignment" Value="Center" />
             <Setter Property="Margin" Value="0,4,12,4" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+        </Style>
+
+        <Style TargetType="DatePicker">
+            <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
         </Style>
 
         <Style TargetType="DataGrid">
@@ -94,37 +127,54 @@
             <Setter Property="HeadersVisibility" Value="Column" />
             <Setter Property="GridLinesVisibility" Value="Horizontal" />
             <Setter Property="RowHeaderWidth" Value="0" />
-            <Setter Property="Background" Value="White" />
-            <Setter Property="AlternatingRowBackground" Value="#FFF7F9FB" />
-            <Setter Property="BorderBrush" Value="#FFD0D0D0" />
+            <Setter Property="Background" Value="{DynamicResource GridBg}" />
+            <Setter Property="RowBackground" Value="{DynamicResource GridBg}" />
+            <Setter Property="AlternatingRowBackground" Value="{DynamicResource GridAltBg}" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
+            <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource BorderClr}" />
             <Setter Property="SelectionMode" Value="Extended" />
             <Setter Property="SelectionUnit" Value="FullRow" />
+        </Style>
+
+        <Style TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="{DynamicResource GridHeaderBg}" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="Padding" Value="6,4" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
+            <Setter Property="BorderThickness" Value="0,0,1,1" />
+        </Style>
+
+        <Style TargetType="DataGridCell">
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
         </Style>
     </Window.Resources>
 
     <DockPanel LastChildFill="True">
 
         <!-- ===================== HEADER ===================== -->
-        <Border DockPanel.Dock="Top" Height="50" Background="#FF0078D4">
+        <Border DockPanel.Dock="Top" Height="50" Background="{DynamicResource AccentBg}">
             <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="15,0">
                 <TextBlock Text="Driver Automation Tool" Foreground="White"
                            FontSize="20" FontWeight="Bold" VerticalAlignment="Center" />
-                <TextBlock x:Name="VersionLabel" Text="" Foreground="#FFE0E0E0"
+                <TextBlock x:Name="VersionLabel" Text="" Foreground="#FFE6F1FB"
                            FontSize="12" Margin="12,0,0,0" VerticalAlignment="Bottom"
                            Padding="0,0,0,4" />
             </StackPanel>
         </Border>
 
         <!-- ===================== STATUS BAR (very bottom) ===================== -->
-        <StatusBar DockPanel.Dock="Bottom" Background="#FFE8E8E8">
+        <StatusBar DockPanel.Dock="Bottom" Background="{DynamicResource StatusBg}">
             <StatusBarItem>
-                <TextBlock x:Name="StatusStripLabel" Text="Ready" />
+                <TextBlock x:Name="StatusStripLabel" Text="Ready" Foreground="{DynamicResource Fg}" />
             </StatusBarItem>
         </StatusBar>
 
         <!-- ===================== BOTTOM ACTION BAR ===================== -->
-        <Border DockPanel.Dock="Bottom" Height="56" Background="#FFEAEAEA"
-                BorderBrush="#FFD0D0D0" BorderThickness="0,1,0,0">
+        <Border DockPanel.Dock="Bottom" Height="56" Background="{DynamicResource StatusBg}"
+                BorderBrush="{DynamicResource BorderClr}" BorderThickness="0,1,0,0">
             <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0">
                 <Button x:Name="StartButton" Content="Start Sync" Style="{StaticResource AccentButton}"
                         Width="170" Height="38" FontSize="14" Margin="0,0,10,0" />
@@ -138,7 +188,8 @@
         </Border>
 
         <!-- ===================== TABS ===================== -->
-        <TabControl x:Name="TabControl" Margin="6" Padding="0">
+        <TabControl x:Name="TabControl" Margin="6" Padding="0" Background="{DynamicResource WinBg}"
+                    BorderBrush="{DynamicResource BorderClr}">
 
             <!-- ============ Tab 1: Models ============ -->
             <TabItem Header="Models">
@@ -196,8 +247,8 @@
             <TabItem Header="SCCM Settings">
                 <Grid Margin="10">
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="500" />
-                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" MinWidth="470" />
+                        <ColumnDefinition Width="*" MinWidth="380" />
                     </Grid.ColumnDefinitions>
 
                     <!-- Left column: connection, paths, options -->
@@ -222,7 +273,7 @@
                                 </StackPanel>
                                 <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,6,0,0">
                                     <Button x:Name="ConnectButton" Content="Connect" Style="{StaticResource StandardButton}" Width="100" />
-                                    <TextBlock x:Name="ConnStatusLabel" Text="Not Connected" Foreground="Gray"
+                                    <TextBlock x:Name="ConnStatusLabel" Text="Not Connected" Foreground="{DynamicResource SubtleFg}"
                                                VerticalAlignment="Center" Margin="12,0,0,0" />
                                 </StackPanel>
                             </Grid>
@@ -314,10 +365,10 @@
                 <DockPanel Margin="10" LastChildFill="True">
                     <StackPanel DockPanel.Dock="Top" Margin="0,0,0,8">
                         <ProgressBar x:Name="ProgressBar" Height="24" Minimum="0" Maximum="100" />
-                        <TextBlock x:Name="StatusLabel" Text="Ready" FontSize="13" Margin="0,8,0,0" />
+                        <TextBlock x:Name="StatusLabel" Text="Ready" FontSize="13" Margin="0,8,0,0" Foreground="{DynamicResource Fg}" />
                     </StackPanel>
                     <ListBox x:Name="LogListBox" FontFamily="Consolas" FontSize="12"
-                             Background="#FF1E1E1E" Foreground="#FFC8C8C8"
+                             Background="#FF1E1E1E" Foreground="#FFC8C8C8" BorderBrush="{DynamicResource BorderClr}"
                              ScrollViewer.HorizontalScrollBarVisibility="Auto"
                              ScrollViewer.VerticalScrollBarVisibility="Auto" />
                 </DockPanel>
@@ -334,9 +385,9 @@
                                 <sys:String>Drivers Only</sys:String>
                                 <sys:String>BIOS Only</sys:String>
                             </ComboBox>
-                            <Button x:Name="PkgDeleteButton" Content="Remove Selected" Style="{StaticResource StandardButton}" Width="130" Margin="0,0,8,0" Foreground="DarkRed" />
+                            <Button x:Name="PkgDeleteButton" Content="Remove Selected" Style="{StaticResource StandardButton}" Width="130" Margin="0,0,8,0" Foreground="#FFC42B1C" />
                             <CheckBox x:Name="PkgIncludeDriverPkgsCheckBox" Content="Include Driver Packages" Margin="0,0,16,0" />
-                            <Button x:Name="PkgCleanupOverlayButton" Content="Cleanup Overlay TS Packages..." Style="{StaticResource StandardButton}" Width="210" Foreground="DarkRed" />
+                            <Button x:Name="PkgCleanupOverlayButton" Content="Cleanup Overlay TS Packages..." Style="{StaticResource StandardButton}" Width="210" Foreground="#FFC42B1C" />
                         </WrapPanel>
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
                             <Label Content="Action:" Width="55" />
@@ -384,9 +435,9 @@
                         <!-- Filters + options row -->
                         <Grid>
                             <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="220" />
-                                <ColumnDefinition Width="220" />
-                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" MinWidth="210" />
+                                <ColumnDefinition Width="Auto" MinWidth="210" />
+                                <ColumnDefinition Width="*" MinWidth="430" />
                             </Grid.ColumnDefinitions>
 
                             <GroupBox Grid.Column="0" Header="Application Type" Margin="0,0,10,10">
@@ -426,14 +477,14 @@
                                     </Grid.RowDefinitions>
 
                                     <!-- Purpose + Action -->
-                                    <StackPanel Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal">
+                                    <WrapPanel Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal">
                                         <Label Content="Purpose:" />
                                         <RadioButton x:Name="DeployPurposeAvailableRadio" GroupName="DeployPurpose" Content="Available" IsChecked="True" />
                                         <RadioButton x:Name="DeployPurposeRequiredRadio" GroupName="DeployPurpose" Content="Required" />
                                         <Label Content="Action:" Margin="12,0,0,0" />
                                         <RadioButton x:Name="DeployActionInstallRadio" GroupName="DeployAction" Content="Install" IsChecked="True" />
                                         <RadioButton x:Name="DeployActionUninstallRadio" GroupName="DeployAction" Content="Uninstall" />
-                                    </StackPanel>
+                                    </WrapPanel>
 
                                     <!-- User notification -->
                                     <StackPanel Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
@@ -446,7 +497,7 @@
                                     </StackPanel>
 
                                     <!-- Schedule -->
-                                    <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
+                                    <WrapPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
                                         <CheckBox x:Name="DeployScheduleCheck" Content="Schedule" Width="105" />
                                         <Label Content="Avail:" />
                                         <DatePicker x:Name="DeployAvailablePicker" Width="120" IsEnabled="False" />
@@ -454,18 +505,18 @@
                                         <Label Content="Deadline:" Margin="12,0,0,0" />
                                         <DatePicker x:Name="DeployDeadlinePicker" Width="120" IsEnabled="False" />
                                         <TextBox x:Name="DeployDeadlineTime" Width="55" Margin="4,0,0,0" Text="00:00" IsEnabled="False" />
-                                    </StackPanel>
+                                    </WrapPanel>
 
                                     <!-- MW behavior -->
-                                    <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
+                                    <WrapPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
                                         <CheckBox x:Name="DeployOverrideSWCheck" Content="Install outside maintenance window" Margin="0,4,18,4" />
                                         <CheckBox x:Name="DeployRebootOutsideSWCheck" Content="Restart outside maintenance window" />
-                                    </StackPanel>
+                                    </WrapPanel>
 
                                     <!-- Create MW -->
                                     <CheckBox Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="2" x:Name="DeployCreateMWCheck"
                                               Content="Create / ensure maintenance window on collection" Margin="0,6,0,0" />
-                                    <StackPanel Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="18,4,0,0">
+                                    <WrapPanel Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="18,4,0,0">
                                         <Label Content="Start:" />
                                         <DatePicker x:Name="DeployMWStartPicker" Width="120" IsEnabled="False" />
                                         <TextBox x:Name="DeployMWStartTime" Width="55" Margin="4,0,0,0" Text="22:00" IsEnabled="False" />
@@ -490,17 +541,22 @@
                                             <sys:String>Friday</sys:String>
                                             <sys:String>Saturday</sys:String>
                                         </ComboBox>
-                                    </StackPanel>
+                                    </WrapPanel>
                                 </Grid>
                             </GroupBox>
                         </Grid>
 
-                        <!-- Collection picker -->
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
-                            <Label Content="Target Collection:" Width="115" />
-                            <ComboBox x:Name="DeployCollectionCombo" Width="500" IsEditable="True" Margin="0,0,10,0" />
-                            <Button x:Name="DeployRefreshCollectionsButton" Content="Refresh Collections" Style="{StaticResource StandardButton}" Width="140" />
-                        </StackPanel>
+                        <!-- Collection picker (stretches with the window) -->
+                        <Grid Margin="0,0,0,6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Label Grid.Column="0" Content="Target Collection:" Width="115" />
+                            <ComboBox x:Name="DeployCollectionCombo" Grid.Column="1" IsEditable="True" Margin="0,0,10,0" />
+                            <Button x:Name="DeployRefreshCollectionsButton" Grid.Column="2" Content="Refresh Collections" Style="{StaticResource StandardButton}" Width="140" />
+                        </Grid>
 
                         <!-- App action row -->
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
@@ -512,7 +568,7 @@
                         </StackPanel>
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
                             <Button x:Name="DeployButton" Content="Deploy Selected" Style="{StaticResource AccentButton}" Width="160" Height="28" Margin="0,0,12,0" />
-                            <TextBlock x:Name="DeployStatusLabel" VerticalAlignment="Center" Foreground="Gray"
+                            <TextBlock x:Name="DeployStatusLabel" VerticalAlignment="Center" Foreground="{DynamicResource SubtleFg}"
                                        Text="Connect to ConfigMgr to populate collections, then click Refresh Applications." />
                         </StackPanel>
                     </StackPanel>

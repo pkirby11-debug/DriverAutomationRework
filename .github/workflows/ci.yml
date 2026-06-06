@@ -70,6 +70,9 @@ jobs:
           $config = New-PesterConfiguration
           $config.Run.Path          = './DriverAutomationTool/Tests'
           $config.Run.Exit          = $true
+          # Integration-tagged tests hit live vendor catalogs (download.lenovo.com,
+          # downloads.dell.com) which a hosted runner may not reach - run them locally.
+          $config.Filter.ExcludeTag = 'Integration'
           $config.Output.Verbosity  = 'Detailed'
           $config.TestResult.Enabled = $true
           $config.TestResult.OutputPath = 'testResults.xml'
