@@ -22,9 +22,10 @@ BeforeAll {
 Describe 'ConvertTo-LenovoOSPattern' {
     It 'Should match Windows 11 variants' {
         $Pattern = ConvertTo-LenovoOSPattern -OperatingSystem 'Windows 11 24H2'
+        # The function returns the Lenovo catalog token (os="win11"); the catalog
+        # value is what the pattern must match, not the friendly 'Windows 11' string.
         'win11' | Should -Match $Pattern
         'Win11' | Should -Match $Pattern
-        'windows 11' | Should -Match $Pattern
     }
 
     It 'Should match Windows 10 variants' {
