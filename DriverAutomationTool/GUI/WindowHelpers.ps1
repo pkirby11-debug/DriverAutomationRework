@@ -232,7 +232,9 @@ function New-DATGridTable {
     $SelCol = $Table.Columns.Add('Selected', [bool])
     $SelCol.DefaultValue = $false
     foreach ($Name in $Columns) { [void]$Table.Columns.Add($Name, [string]) }
-    return $Table
+    # ,$Table (array-wrap) stops PowerShell from enumerating the DataTable into
+    # its rows on output - an empty table would otherwise return $null.
+    return , $Table
 }
 
 function Complete-DATGridEdit {
@@ -259,13 +261,13 @@ function Get-DATGridSelectedRows {
     param($Table)
 
     $Rows = [System.Collections.Generic.List[System.Data.DataRow]]::new()
-    if ($null -eq $Table) { return $Rows }
+    if ($null -eq $Table) { return , $Rows }
     foreach ($Row in $Table.Rows) {
         if ($Row.RowState -ne [System.Data.DataRowState]::Deleted -and [bool]$Row['Selected']) {
             $Rows.Add($Row)
         }
     }
-    return $Rows
+    return , $Rows
 }
 
 function Set-DATGridChecks {
@@ -406,7 +408,7 @@ function Get-DATSelectedModels {
             SystemID     = $Row['SystemID']
         })
     }
-    return $Selected
+    return , $Selected
 }
 
 function Get-DATSelectedNames {
@@ -420,7 +422,7 @@ function Get-DATSelectedNames {
     foreach ($Row in (Get-DATGridSelectedRows -Table $Table)) {
         $Selected.Add([string]$Row['Name'])
     }
-    return $Selected
+    return , $Selected
 }
 
 function Select-DATKnownModelsInGrid {
