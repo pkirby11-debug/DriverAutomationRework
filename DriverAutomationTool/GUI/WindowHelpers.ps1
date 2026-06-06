@@ -9,11 +9,32 @@ function Get-DATSystemUsesLightTheme {
         Defaults to light if the preference cannot be read.
     #>
     try {
-        $Key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
-        $Value = Get-ItemPropertyValue -Path $Key -Name 'AppsUseLightTheme' -ErrorAction Stop
+        # Use the .NET registry API directly - it does not depend on the HKCU:
+        # PSDrive being mounted in the (child STA) runspace.
+        $Value = [Microsoft.Win32.Registry]::GetValue(
+            'HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize',
+            'AppsUseLightTheme', $null)
+        if ($null -eq $Value) { return $true }
         return ([int]$Value -ne 0)
     } catch {
         return $true
+    }
+}
+
+function Get-DATCMState {
+    <#
+    .SYNOPSIS
+        Returns the ConfigMgr connection state from module scope.
+    .DESCRIPTION
+        WPF event handlers cannot resolve $script: variables in the re-entrant
+        event context, but they CAN call module functions (which run in module
+        scope). Connect-DATConfigMgr sets the flags in that same scope, so this
+        getter surfaces them reliably to the GUI handlers.
+    #>
+    [pscustomobject]@{
+        Connected  = [bool]$script:CMConnected
+        SiteCode   = $script:CMSiteCode
+        SiteServer = $script:CMSiteServer
     }
 }
 

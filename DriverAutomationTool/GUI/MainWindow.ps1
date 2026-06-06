@@ -1,8 +1,17 @@
 # GUI MainWindow (WPF) - layout loader + event handlers.
 # New-DATMainWindow loads the XAML and returns the $Controls hashtable;
-# Initialize-DATMainWindow wires every event. Business logic calls into the
-# same Public cmdlets the WinForms GUI used. Show-DATMainWindow is the entry
+# Initialize-DATMainWindow wires every event. Show-DATMainWindow is the entry
 # point used by Start-DATGui.
+#
+# IMPORTANT - event-handler scoping:
+#   The GUI runs on a dedicated STA runspace (pwsh is MTA by default and WPF
+#   needs STA). WPF dispatches events RE-ENTRANTLY inside that runspace, and in
+#   that context PowerShell does NOT resolve $script: variables or the wiring
+#   function's locals - only module FUNCTIONS resolve. So every handler/tick is
+#   defined as a closure (.GetNewClosure()), which bakes the values it needs
+#   into the scriptblock itself: $Controls / $Window / cursors are captured
+#   locals, mutable cross-handler state lives in the captured $G hashtable, and
+#   ConfigMgr connection state is read via the Get-DATCMState module function.
 
 function New-DATMainWindow {
     <#
@@ -33,7 +42,7 @@ function New-DATMainWindow {
 
     # --- Version labels ---
     $ModVer = (Get-Module DriverAutomationTool).Version
-    if (-not $ModVer) { $ModVer = '2.0.0' }
+    if (-not $ModVer) { $ModVer = '2.1.1' }
     $Window.Title = "Driver Automation Tool v$ModVer"
     $Controls['VersionLabel'].Text = "v$ModVer"
 
@@ -105,24 +114,40 @@ function Initialize-DATMainWindow {
         [hashtable]$Controls
     )
 
-    # Event-handler scriptblocks can see $script: (module) scope but NOT this
-    # function's locals in the STA-runspace launch model, so the shared controls
-    # map, window, cursors, and log list box live in module scope. Handlers use
-    # the bare names ($Controls, $Window, ...), which resolve up to these.
-    $script:Controls = $Controls
-    $script:Window = $Controls['MainWindow']
-    $script:LogListBox = $Controls['LogListBox']
-    $script:SyncCancellation = $null
-    $script:Initializing = $true
+    # Captured-by-closure references (immutable - the same objects for the whole
+    # session). Every handler is .GetNewClosure() so these travel with it.
+    $Window = $Controls['MainWindow']
+    $WaitCursor = [System.Windows.Input.Cursors]::Wait
+    $DefaultCursor = [System.Windows.Input.Cursors]::Arrow
 
-    $script:WaitCursor = [System.Windows.Input.Cursors]::Wait
-    $script:DefaultCursor = [System.Windows.Input.Cursors]::Arrow
+    # Mutable cross-handler state. A single hashtable captured by every closure;
+    # mutating its entries is visible to all handlers and timer ticks because
+    # they share the one object.
+    $G = @{
+        Initializing             = $true
+        LogQueue                 = $null
+        SyncRunspace             = $null
+        SyncHandle               = $null
+        SyncTimer                = $null
+        DeleteRunspace           = $null
+        DeleteHandle             = $null
+        DeleteTimer              = $null
+        OverlayDiscoveryRunspace = $null
+        OverlayDiscoveryHandle   = $null
+        OverlayDiscoveryTimer    = $null
+        OverlayRemoveRunspace    = $null
+        OverlayRemoveHandle      = $null
+        OverlayRemoveTimer       = $null
+        DeployRunspace           = $null
+        DeployHandle             = $null
+        DeployTimer              = $null
+    }
 
     # --- OS Selection Change: enable/disable manufacturer checkboxes ---
     # Dell drivers don't need build versions (plain "Windows 11" / "Windows 10")
     # Lenovo drivers need build versions ("Windows 11 23H2" etc.)
     $Controls['OsCombo'].Add_SelectionChanged({
-        if ($script:Initializing) { return }
+        if ($G.Initializing) { return }
         $SelectedOS = Get-DATComboText $Controls['OsCombo']
         $IsPlainOS = ($SelectedOS -match '^Windows 1[01]$')
 
@@ -139,7 +164,7 @@ function Initialize-DATMainWindow {
             $Controls['UpdateIndividualCheckBox'].IsChecked = $false
         }
         $Controls['MicrosoftCheckBox'].IsEnabled = $true
-    })
+    }.GetNewClosure())
 
     # Set initial manufacturer checkbox state based on default OS selection
     $InitOS = Get-DATComboText $Controls['OsCombo']
@@ -155,18 +180,18 @@ function Initialize-DATMainWindow {
 
     # --- Dell Checkbox Change: enable/disable individual drivers option ---
     $Controls['DellCheckBox'].Add_Click({
-        if ($script:Initializing) { return }
+        if ($G.Initializing) { return }
         $Controls['UpdateIndividualCheckBox'].IsEnabled = [bool]$Controls['DellCheckBox'].IsChecked
         if (-not $Controls['DellCheckBox'].IsChecked) {
             $Controls['UpdateIndividualCheckBox'].IsChecked = $false
         }
-    })
+    }.GetNewClosure())
 
     # --- Register log subscriber for GUI ---
-    Register-DATLogSubscriber -Action {
+    Register-DATLogSubscriber -Action ({
         param($Event)
-        Add-DATWindowLogEntry -LogListBox $script:LogListBox -LogEvent $Event
-    }
+        Add-DATWindowLogEntry -LogListBox $Controls['LogListBox'] -LogEvent $Event
+    }.GetNewClosure())
 
     # --- Refresh Models Button ---
     $Controls['RefreshButton'].Add_Click({
@@ -207,7 +232,7 @@ function Initialize-DATMainWindow {
             $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models"
 
             # Auto-select known models if checkbox is checked and SCCM is connected
-            if ($Controls['KnownModelsCheckBox'].IsChecked -and $script:CMConnected -and $ModelCount -gt 0) {
+            if ($Controls['KnownModelsCheckBox'].IsChecked -and (Get-DATCMState).Connected -and $ModelCount -gt 0) {
                 $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - querying SCCM inventory and existing packages..."
                 try {
                     $KnownModels = Get-DATKnownModels -Manufacturers $Manufacturers
@@ -224,7 +249,7 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    })
+    }.GetNewClosure())
 
     # --- Search Box - filter models ---
     $Controls['SearchBox'].Add_TextChanged({
@@ -235,24 +260,24 @@ function Initialize-DATMainWindow {
             $Escaped = ConvertTo-DATLikeLiteral $SearchText
             $Controls['ModelGridData'].DefaultView.RowFilter = "[Model] LIKE '%$Escaped%'"
         }
-    })
+    }.GetNewClosure())
 
     # --- Select All / None ---
     $Controls['SelectAllButton'].Add_Click({
         Complete-DATGridEdit $Controls['ModelGrid']
         Set-DATGridChecks -Table $Controls['ModelGridData'] -Checked $true -VisibleOnly
-    })
+    }.GetNewClosure())
 
     $Controls['SelectNoneButton'].Add_Click({
         Complete-DATGridEdit $Controls['ModelGrid']
         Set-DATGridChecks -Table $Controls['ModelGridData'] -Checked $false
-    })
+    }.GetNewClosure())
 
     # --- Known Models Checkbox ---
     $Controls['KnownModelsCheckBox'].Add_Click({
         if ($Controls['KnownModelsCheckBox'].IsChecked -and
             $Controls['ModelGridData'].Rows.Count -gt 0 -and
-            $script:CMConnected) {
+            (Get-DATCMState).Connected) {
 
             $Window.Cursor = $WaitCursor
             $Controls['StatusStripLabel'].Text = 'Querying SCCM inventory and existing packages for known models...'
@@ -272,7 +297,7 @@ function Initialize-DATMainWindow {
                 $Window.Cursor = $DefaultCursor
             }
         }
-    })
+    }.GetNewClosure())
 
     # --- Connect Button ---
     $Controls['ConnectButton'].Add_Click({
@@ -295,10 +320,11 @@ function Initialize-DATMainWindow {
             if ($SSL) { $Params['UseSSL'] = $true }
 
             Connect-DATConfigMgr @Params
+            $SiteCode = (Get-DATCMState).SiteCode
 
-            $Controls['ConnStatusLabel'].Text = "Connected (Site: $($script:CMSiteCode))"
+            $Controls['ConnStatusLabel'].Text = "Connected (Site: $SiteCode)"
             $Controls['ConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Green
-            $Controls['SiteCodeInput'].Text = $script:CMSiteCode
+            $Controls['SiteCodeInput'].Text = $SiteCode
 
             $Controls['KnownModelsCheckBox'].IsEnabled = $true
 
@@ -328,34 +354,34 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    })
+    }.GetNewClosure())
 
     # --- Browse Buttons ---
     $Controls['DLBrowseButton'].Add_Click({
         $Path = Show-DATFolderDialog -Description 'Select download path' -InitialPath $Controls['DownloadPathInput'].Text
         if ($Path) { $Controls['DownloadPathInput'].Text = $Path }
-    })
+    }.GetNewClosure())
 
     $Controls['PkgBrowseButton'].Add_Click({
         $Path = Show-DATFolderDialog -Description 'Select package source path' -InitialPath $Controls['PackagePathInput'].Text
         if ($Path) { $Controls['PackagePathInput'].Text = $Path }
-    })
+    }.GetNewClosure())
 
     # --- Compress Package Checkbox ---
     $Controls['CompressPackageCheckBox'].Add_Click({
-        if ($script:Initializing) { return }
+        if ($G.Initializing) { return }
         $Controls['CompressionTypeCombo'].IsEnabled = [bool]$Controls['CompressPackageCheckBox'].IsChecked
-    })
+    }.GetNewClosure())
 
     # --- Deployment Platform Change: enable/disable Clean Unused Drivers ---
     $Controls['DeployPlatformCombo'].Add_SelectionChanged({
-        if ($script:Initializing) { return }
+        if ($G.Initializing) { return }
         $IsDriverPkg = (Get-DATComboText $Controls['DeployPlatformCombo']) -in @('ConfigMgr - Driver Pkg', 'ConfigMgr - Driver Pkg (Test)')
         $Controls['CleanUnusedCheckBox'].IsEnabled = $IsDriverPkg
         if (-not $IsDriverPkg) {
             $Controls['CleanUnusedCheckBox'].IsChecked = $false
         }
-    })
+    }.GetNewClosure())
 
     # --- Schedule checkbox: enable/disable the date+time pickers as a block ---
     $Controls['DeployScheduleCheck'].Add_Click({
@@ -364,7 +390,7 @@ function Initialize-DATMainWindow {
         $Controls['DeployAvailableTime'].IsEnabled   = $On
         $Controls['DeployDeadlinePicker'].IsEnabled  = $On
         $Controls['DeployDeadlineTime'].IsEnabled    = $On
-    })
+    }.GetNewClosure())
 
     # --- Maintenance-window fields enabled only when the MW checkbox is on;
     #     Day picker only when on AND recurrence is Weekly. ---
@@ -376,7 +402,7 @@ function Initialize-DATMainWindow {
         $Controls['DeployMWMinutesNUD'].IsEnabled  = $On
         $Controls['DeployMWRecurCombo'].IsEnabled  = $On
         $Controls['DeployMWDayCombo'].IsEnabled    = ($On -and (Get-DATComboText $Controls['DeployMWRecurCombo']) -eq 'Weekly')
-    }
+    }.GetNewClosure()
     $Controls['DeployCreateMWCheck'].Add_Click($UpdateMWEnabled)
     $Controls['DeployMWRecurCombo'].Add_SelectionChanged($UpdateMWEnabled)
 
@@ -394,7 +420,7 @@ function Initialize-DATMainWindow {
             return
         }
 
-        if (-not $script:CMConnected) {
+        if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Please connect to ConfigMgr on the SCCM Settings tab.' -Type Warning
             return
         }
@@ -458,7 +484,7 @@ function Initialize-DATMainWindow {
         $Controls['ProgressBar'].IsIndeterminate = $true
 
         $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
-        $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+        $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
         $SyncScript = {
             param($ModulePath, $SyncParams, $LogQueue)
@@ -467,90 +493,86 @@ function Initialize-DATMainWindow {
             Invoke-DATSync @SyncParams
         }
 
-        $script:SyncRunspace = [System.Management.Automation.PowerShell]::Create()
-        $script:SyncRunspace.AddScript($SyncScript).AddArgument($ModulePath).AddArgument($SyncParams).AddArgument($script:LogQueue) | Out-Null
-        $script:SyncHandle = $script:SyncRunspace.BeginInvoke()
+        $G.SyncRunspace = [System.Management.Automation.PowerShell]::Create()
+        $G.SyncRunspace.AddScript($SyncScript).AddArgument($ModulePath).AddArgument($SyncParams).AddArgument($G.LogQueue) | Out-Null
+        $G.SyncHandle = $G.SyncRunspace.BeginInvoke()
 
-        if ($script:SyncTimer) { $script:SyncTimer.Stop() }
+        if ($G.SyncTimer) { $G.SyncTimer.Stop() }
+        $G.SyncTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $G.SyncTimer.Interval = [timespan]::FromMilliseconds(500)
 
-        # Capture controls in script scope so the timer tick can reach them.
-        $script:TimerControls = $Controls
+        $G.SyncTimer.Add_Tick({
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
-        $script:SyncTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $script:SyncTimer.Interval = [timespan]::FromMilliseconds(500)
+            if ($null -eq $G.SyncHandle) { return }
+            if (-not $G.SyncHandle.IsCompleted) { return }
 
-        $script:SyncTimer.Add_Tick({
-            Update-DATLogListFromQueue -ListBox $script:TimerControls['LogListBox'] -Queue $script:LogQueue
-
-            if ($null -eq $script:SyncHandle) { return }
-            if (-not $script:SyncHandle.IsCompleted) { return }
-
-            $script:SyncTimer.Stop()
-            Update-DATLogListFromQueue -ListBox $script:TimerControls['LogListBox'] -Queue $script:LogQueue
+            $G.SyncTimer.Stop()
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
             try {
-                $Results = $script:SyncRunspace.EndInvoke($script:SyncHandle)
+                $Results = $G.SyncRunspace.EndInvoke($G.SyncHandle)
 
                 if ($Results -and @($Results).Count -gt 0) {
                     $SuccessCount = @($Results | Where-Object { $_.Status -eq 'Success' }).Count
                     $SkipCount = @($Results | Where-Object { $_.Status -eq 'Skipped' }).Count
                     $ErrorCount = @($Results | Where-Object { $_.Status -eq 'Error' }).Count
 
-                    $script:TimerControls['ProgressBar'].IsIndeterminate = $false
-                    $script:TimerControls['ProgressBar'].Value = $script:TimerControls['ProgressBar'].Maximum
+                    $Controls['ProgressBar'].IsIndeterminate = $false
+                    $Controls['ProgressBar'].Value = $Controls['ProgressBar'].Maximum
 
                     if ($ErrorCount -gt 0 -and $SuccessCount -eq 0) {
-                        $script:TimerControls['StatusLabel'].Text = "Sync failed - $ErrorCount error(s)"
+                        $Controls['StatusLabel'].Text = "Sync failed - $ErrorCount error(s)"
                         Show-DATWindowMessage -Message "Sync failed!`n`nErrors: $ErrorCount`nSkipped: $SkipCount" -Type Error
                     } elseif ($ErrorCount -gt 0) {
-                        $script:TimerControls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $ErrorCount error(s)"
+                        $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $ErrorCount error(s)"
                         Show-DATWindowMessage -Message "Sync complete with warnings.`n`nSuccess: $SuccessCount`nSkipped: $SkipCount`nErrors: $ErrorCount" -Type Warning
                     } else {
-                        $script:TimerControls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $SkipCount skipped"
+                        $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $SkipCount skipped"
                         Show-DATWindowMessage -Message "Sync complete!`n`nSuccess: $SuccessCount`nSkipped: $SkipCount" -Type Information
                     }
                 } else {
-                    $RunspaceErrors = $script:SyncRunspace.Streams.Error
+                    $RunspaceErrors = $G.SyncRunspace.Streams.Error
                     if ($RunspaceErrors -and $RunspaceErrors.Count -gt 0) {
                         $ErrMsg = $RunspaceErrors[0].Exception.Message
-                        $script:TimerControls['StatusLabel'].Text = 'Sync failed'
+                        $Controls['StatusLabel'].Text = 'Sync failed'
                         Show-DATWindowMessage -Message "Sync failed: $ErrMsg" -Type Error
                     } else {
-                        $script:TimerControls['StatusLabel'].Text = 'Sync complete - no packages to process'
+                        $Controls['StatusLabel'].Text = 'Sync complete - no packages to process'
                         Show-DATWindowMessage -Message "Sync complete - no packages were selected for processing." -Type Information
                     }
                 }
             } catch {
-                $script:TimerControls['StatusLabel'].Text = 'Sync failed'
+                $Controls['StatusLabel'].Text = 'Sync failed'
                 Show-DATWindowMessage -Message "Sync failed: $($_.Exception.Message)" -Type Error
             } finally {
-                if ($script:SyncRunspace) {
-                    $script:SyncRunspace.Dispose()
-                    $script:SyncRunspace = $null
+                if ($G.SyncRunspace) {
+                    $G.SyncRunspace.Dispose()
+                    $G.SyncRunspace = $null
                 }
-                $script:SyncHandle = $null
-                $script:LogQueue = $null
-                $script:TimerControls['StartButton'].IsEnabled = $true
-                $script:TimerControls['StopButton'].IsEnabled = $false
-                $script:TimerControls['ProgressBar'].IsIndeterminate = $false
+                $G.SyncHandle = $null
+                $G.LogQueue = $null
+                $Controls['StartButton'].IsEnabled = $true
+                $Controls['StopButton'].IsEnabled = $false
+                $Controls['ProgressBar'].IsIndeterminate = $false
             }
-        })
+        }.GetNewClosure())
 
-        $script:SyncTimer.Start()
-    })
+        $G.SyncTimer.Start()
+    }.GetNewClosure())
 
     # --- Stop Sync Button ---
     $Controls['StopButton'].Add_Click({
-        if ($script:SyncRunspace -and $script:SyncHandle -and -not $script:SyncHandle.IsCompleted) {
+        if ($G.SyncRunspace -and $G.SyncHandle -and -not $G.SyncHandle.IsCompleted) {
             Write-DATLog -Message 'Sync operation cancelled by user' -Severity 2
 
-            $script:SyncRunspace.Stop()
-            if ($script:SyncTimer) { $script:SyncTimer.Stop() }
+            $G.SyncRunspace.Stop()
+            if ($G.SyncTimer) { $G.SyncTimer.Stop() }
 
-            $script:SyncRunspace.Dispose()
-            $script:SyncRunspace = $null
-            $script:SyncHandle = $null
-            $script:LogQueue = $null
+            $G.SyncRunspace.Dispose()
+            $G.SyncRunspace = $null
+            $G.SyncHandle = $null
+            $G.LogQueue = $null
 
             [void]$Controls['LogListBox'].Items.Add('[Cancelled] Sync operation cancelled by user')
             if ($Controls['LogListBox'].Items.Count -gt 0) {
@@ -562,7 +584,7 @@ function Initialize-DATMainWindow {
             $Controls['StartButton'].IsEnabled = $true
             $Controls['StopButton'].IsEnabled = $false
         }
-    })
+    }.GetNewClosure())
 
     # --- Health Check Button ---
     $Controls['HealthCheckButton'].Add_Click({
@@ -579,7 +601,7 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    })
+    }.GetNewClosure())
 
     # --- Save Settings Button ---
     $Controls['SaveSettingsButton'].Add_Click({
@@ -624,11 +646,11 @@ function Initialize-DATMainWindow {
         } catch {
             Show-DATWindowMessage -Message "Failed to save settings: $($_.Exception.Message)" -Type Error
         }
-    })
+    }.GetNewClosure())
 
     # --- Package Management - Refresh ---
     $Controls['PkgRefreshButton'].Add_Click({
-        if (-not $script:CMConnected) {
+        if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
         }
@@ -664,18 +686,18 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    })
+    }.GetNewClosure())
 
     # --- Package Management - Select All / Select None ---
     $Controls['PkgSelectAllButton'].Add_Click({
         Complete-DATGridEdit $Controls['PkgGrid']
         Set-DATGridChecks -Table $Controls['PkgGridData'] -Checked $true
-    })
+    }.GetNewClosure())
 
     $Controls['PkgSelectNoneButton'].Add_Click({
         Complete-DATGridEdit $Controls['PkgGrid']
         Set-DATGridChecks -Table $Controls['PkgGridData'] -Checked $false
-    })
+    }.GetNewClosure())
 
     # --- Package Management - Search ---
     $Controls['PkgSearchBox'].Add_TextChanged({
@@ -686,7 +708,7 @@ function Initialize-DATMainWindow {
             $Escaped = ConvertTo-DATLikeLiteral $SearchText
             $Controls['PkgGridData'].DefaultView.RowFilter = "[Name] LIKE '%$Escaped%' OR [Manufacturer] LIKE '%$Escaped%'"
         }
-    })
+    }.GetNewClosure())
 
     # --- Package Management - Delete ---
     $Controls['PkgDeleteButton'].Add_Click({
@@ -715,7 +737,7 @@ function Initialize-DATMainWindow {
         $Controls['PkgApplyButton'].IsEnabled   = $false
         $Controls['StatusStripLabel'].Text      = "Removing $($PackagesToRemove.Count) package(s)..."
 
-        $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+        $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
         $DeleteScript = {
             param($ModulePath, $ConnParams, $PackagesToRemove, $CleanSource, $LogQueue)
@@ -724,38 +746,36 @@ function Initialize-DATMainWindow {
             return Invoke-DATRemovePackages @ConnParams -Packages $PackagesToRemove -CleanSource:$CleanSource
         }
 
-        $script:DeleteRunspace = [System.Management.Automation.PowerShell]::Create()
-        $script:DeleteRunspace.AddScript($DeleteScript).AddArgument($ModulePath).AddArgument($ConnParams).AddArgument($PackagesToRemove).AddArgument($CleanSource).AddArgument($script:LogQueue) | Out-Null
-        $script:DeleteHandle = $script:DeleteRunspace.BeginInvoke()
+        $G.DeleteRunspace = [System.Management.Automation.PowerShell]::Create()
+        $G.DeleteRunspace.AddScript($DeleteScript).AddArgument($ModulePath).AddArgument($ConnParams).AddArgument($PackagesToRemove).AddArgument($CleanSource).AddArgument($G.LogQueue) | Out-Null
+        $G.DeleteHandle = $G.DeleteRunspace.BeginInvoke()
 
-        $script:TimerControls = $Controls
+        if ($G.DeleteTimer) { $G.DeleteTimer.Stop() }
+        $G.DeleteTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $G.DeleteTimer.Interval = [timespan]::FromMilliseconds(500)
 
-        if ($script:DeleteTimer) { $script:DeleteTimer.Stop() }
-        $script:DeleteTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $script:DeleteTimer.Interval = [timespan]::FromMilliseconds(500)
+        $G.DeleteTimer.Add_Tick({
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
-        $script:DeleteTimer.Add_Tick({
-            Update-DATLogListFromQueue -ListBox $script:TimerControls['LogListBox'] -Queue $script:LogQueue
+            if ($null -eq $G.DeleteHandle -or -not $G.DeleteHandle.IsCompleted) { return }
 
-            if ($null -eq $script:DeleteHandle -or -not $script:DeleteHandle.IsCompleted) { return }
+            $G.DeleteTimer.Stop()
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
-            $script:DeleteTimer.Stop()
-            Update-DATLogListFromQueue -ListBox $script:TimerControls['LogListBox'] -Queue $script:LogQueue
-
-            $script:TimerControls['PkgDeleteButton'].IsEnabled  = $true
-            $script:TimerControls['PkgRefreshButton'].IsEnabled = $true
-            $script:TimerControls['PkgApplyButton'].IsEnabled   = $true
+            $Controls['PkgDeleteButton'].IsEnabled  = $true
+            $Controls['PkgRefreshButton'].IsEnabled = $true
+            $Controls['PkgApplyButton'].IsEnabled   = $true
 
             try {
-                $Results   = $script:DeleteRunspace.EndInvoke($script:DeleteHandle)
+                $Results   = $G.DeleteRunspace.EndInvoke($G.DeleteHandle)
                 $Succeeded = @($Results | Where-Object { $_.Status -eq 'Success' })
                 $Failed    = @($Results | Where-Object { $_.Status -eq 'Failed' })
 
-                $script:DeleteRunspace.Dispose()
+                $G.DeleteRunspace.Dispose()
 
-                $script:TimerControls['PkgSearchBox'].Text = ''
-                Invoke-DATClick $script:TimerControls['PkgRefreshButton']
-                $script:TimerControls['StatusStripLabel'].Text = "Removed $($Succeeded.Count) package(s)"
+                $Controls['PkgSearchBox'].Text = ''
+                Invoke-DATClick $Controls['PkgRefreshButton']
+                $Controls['StatusStripLabel'].Text = "Removed $($Succeeded.Count) package(s)"
 
                 if ($Failed.Count -eq 0) {
                     Show-DATWindowMessage -Message "Removed $($Succeeded.Count) package(s) successfully." -Type Information
@@ -767,21 +787,21 @@ function Initialize-DATMainWindow {
                     Show-DATWindowMessage -Message "$($Succeeded.Count) removed, $($Failed.Count) failed.`n`nFailed:`n$FailList`n`nCheck the DAT log for details." -Type Warning
                 }
             } catch {
-                $script:TimerControls['StatusStripLabel'].Text = 'Package removal failed'
+                $Controls['StatusStripLabel'].Text = 'Package removal failed'
                 Show-DATWindowMessage -Message "Package removal failed: $($_.Exception.Message)" -Type Error
             } finally {
-                $script:DeleteHandle = $null
+                $G.DeleteHandle = $null
             }
-        })
+        }.GetNewClosure())
 
-        $script:DeleteTimer.Start()
-    })
+        $G.DeleteTimer.Start()
+    }.GetNewClosure())
 
     # --- Cleanup Overlay TS Packages -----------------------------------------
     # Two-phase: discovery (-DiscoveryOnly) then, on confirm, removal (-Force).
     # Both phases use background runspaces with a tick-timer for log drain.
     $Controls['PkgCleanupOverlayButton'].Add_Click({
-        if (-not $script:CMConnected) {
+        if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first (SCCM Settings tab).' -Type Warning
             return
         }
@@ -796,7 +816,7 @@ function Initialize-DATMainWindow {
         $Controls['PkgApplyButton'].IsEnabled          = $false
         $Controls['StatusStripLabel'].Text = 'Scanning for legacy overlay TS packages...'
 
-        $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+        $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
         $DiscoveryScript = {
             param($ModulePath, $ConnParams, $LogQueue)
@@ -805,36 +825,35 @@ function Initialize-DATMainWindow {
             return Invoke-DATCleanupOverlayPackages @ConnParams -DiscoveryOnly
         }
 
-        $script:OverlayDiscoveryRunspace = [System.Management.Automation.PowerShell]::Create()
-        $script:OverlayDiscoveryRunspace.AddScript($DiscoveryScript).
-            AddArgument($ModulePath).AddArgument($ConnParams).AddArgument($script:LogQueue) | Out-Null
-        $script:OverlayDiscoveryHandle = $script:OverlayDiscoveryRunspace.BeginInvoke()
+        $G.OverlayDiscoveryRunspace = [System.Management.Automation.PowerShell]::Create()
+        $G.OverlayDiscoveryRunspace.AddScript($DiscoveryScript).
+            AddArgument($ModulePath).AddArgument($ConnParams).AddArgument($G.LogQueue) | Out-Null
+        $G.OverlayDiscoveryHandle = $G.OverlayDiscoveryRunspace.BeginInvoke()
 
-        $script:TimerControls = $Controls
-        if ($script:OverlayDiscoveryTimer) { $script:OverlayDiscoveryTimer.Stop() }
-        $script:OverlayDiscoveryTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $script:OverlayDiscoveryTimer.Interval = [timespan]::FromMilliseconds(500)
-        $script:OverlayDiscoveryTimer.Add_Tick({
-            Update-DATLogListFromQueue -ListBox $script:TimerControls['LogListBox'] -Queue $script:LogQueue
+        if ($G.OverlayDiscoveryTimer) { $G.OverlayDiscoveryTimer.Stop() }
+        $G.OverlayDiscoveryTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $G.OverlayDiscoveryTimer.Interval = [timespan]::FromMilliseconds(500)
+        $G.OverlayDiscoveryTimer.Add_Tick({
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
-            if ($null -eq $script:OverlayDiscoveryHandle -or -not $script:OverlayDiscoveryHandle.IsCompleted) { return }
-            $script:OverlayDiscoveryTimer.Stop()
+            if ($null -eq $G.OverlayDiscoveryHandle -or -not $G.OverlayDiscoveryHandle.IsCompleted) { return }
+            $G.OverlayDiscoveryTimer.Stop()
 
             $ReEnable = {
-                $script:TimerControls['PkgCleanupOverlayButton'].IsEnabled = $true
-                $script:TimerControls['PkgDeleteButton'].IsEnabled         = $true
-                $script:TimerControls['PkgRefreshButton'].IsEnabled        = $true
-                $script:TimerControls['PkgApplyButton'].IsEnabled          = $true
+                $Controls['PkgCleanupOverlayButton'].IsEnabled = $true
+                $Controls['PkgDeleteButton'].IsEnabled         = $true
+                $Controls['PkgRefreshButton'].IsEnabled        = $true
+                $Controls['PkgApplyButton'].IsEnabled          = $true
             }
 
             try {
-                $Candidates = @($script:OverlayDiscoveryRunspace.EndInvoke($script:OverlayDiscoveryHandle))
-                $script:OverlayDiscoveryRunspace.Dispose()
-                $script:OverlayDiscoveryHandle = $null
+                $Candidates = @($G.OverlayDiscoveryRunspace.EndInvoke($G.OverlayDiscoveryHandle))
+                $G.OverlayDiscoveryRunspace.Dispose()
+                $G.OverlayDiscoveryHandle = $null
 
                 if ($Candidates.Count -eq 0) {
                     & $ReEnable
-                    $script:TimerControls['StatusStripLabel'].Text = 'No overlay TS packages found.'
+                    $Controls['StatusStripLabel'].Text = 'No overlay TS packages found.'
                     Show-DATWindowMessage -Message 'No legacy overlay TS packages were found - nothing to clean up.' -Type Information
                     return
                 }
@@ -846,7 +865,7 @@ function Initialize-DATMainWindow {
                     $ListPreview += "`n  ... and $($Candidates.Count - 25) more (full list in Progress log)"
                 }
 
-                $CleanSource = [bool]$script:TimerControls['CleanSourceCheckBox'].IsChecked
+                $CleanSource = [bool]$Controls['CleanSourceCheckBox'].IsChecked
                 $SourceNote = if ($CleanSource) {
                     "`nThe 'Clean source' checkbox is ON - source folders WILL be deleted."
                 } else {
@@ -859,17 +878,11 @@ function Initialize-DATMainWindow {
                     -Type Question
                 if ($Confirm -ne 'Yes') {
                     & $ReEnable
-                    $script:TimerControls['StatusStripLabel'].Text = "Cleanup cancelled ($($Candidates.Count) candidate(s) found)."
+                    $Controls['StatusStripLabel'].Text = "Cleanup cancelled ($($Candidates.Count) candidate(s) found)."
                     return
                 }
 
-                $script:TimerControls['StatusStripLabel'].Text = "Removing $($Candidates.Count) overlay TS package(s)..."
-
-                # Re-derive connection details: the button-handler locals are not
-                # in scope inside this deferred timer tick.
-                $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
-                $ConnParams = @{ SiteServer = $script:Controls['SiteServerInput'].Text; SiteCode = $script:Controls['SiteCodeInput'].Text }
-                if ($script:Controls['UseSSLCheckBox'].IsChecked) { $ConnParams['UseSSL'] = $true }
+                $Controls['StatusStripLabel'].Text = "Removing $($Candidates.Count) overlay TS package(s)..."
 
                 $RemovalScript = {
                     param($ModulePath, $ConnParams, $CleanSource, $LogQueue)
@@ -878,61 +891,61 @@ function Initialize-DATMainWindow {
                     return Invoke-DATCleanupOverlayPackages @ConnParams -CleanSource:$CleanSource -Force -Confirm:$false
                 }
 
-                $script:OverlayRemoveRunspace = [System.Management.Automation.PowerShell]::Create()
-                $script:OverlayRemoveRunspace.AddScript($RemovalScript).
-                    AddArgument($ModulePath).AddArgument($ConnParams).AddArgument($CleanSource).AddArgument($script:LogQueue) | Out-Null
-                $script:OverlayRemoveHandle = $script:OverlayRemoveRunspace.BeginInvoke()
+                $G.OverlayRemoveRunspace = [System.Management.Automation.PowerShell]::Create()
+                $G.OverlayRemoveRunspace.AddScript($RemovalScript).
+                    AddArgument($ModulePath).AddArgument($ConnParams).AddArgument($CleanSource).AddArgument($G.LogQueue) | Out-Null
+                $G.OverlayRemoveHandle = $G.OverlayRemoveRunspace.BeginInvoke()
 
-                if ($script:OverlayRemoveTimer) { $script:OverlayRemoveTimer.Stop() }
-                $script:OverlayRemoveTimer = New-Object System.Windows.Threading.DispatcherTimer
-                $script:OverlayRemoveTimer.Interval = [timespan]::FromMilliseconds(500)
-                $script:OverlayRemoveTimer.Add_Tick({
-                    Update-DATLogListFromQueue -ListBox $script:TimerControls['LogListBox'] -Queue $script:LogQueue
+                if ($G.OverlayRemoveTimer) { $G.OverlayRemoveTimer.Stop() }
+                $G.OverlayRemoveTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $G.OverlayRemoveTimer.Interval = [timespan]::FromMilliseconds(500)
+                $G.OverlayRemoveTimer.Add_Tick({
+                    Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
-                    if ($null -eq $script:OverlayRemoveHandle -or -not $script:OverlayRemoveHandle.IsCompleted) { return }
-                    $script:OverlayRemoveTimer.Stop()
+                    if ($null -eq $G.OverlayRemoveHandle -or -not $G.OverlayRemoveHandle.IsCompleted) { return }
+                    $G.OverlayRemoveTimer.Stop()
 
-                    $script:TimerControls['PkgCleanupOverlayButton'].IsEnabled = $true
-                    $script:TimerControls['PkgDeleteButton'].IsEnabled         = $true
-                    $script:TimerControls['PkgRefreshButton'].IsEnabled        = $true
-                    $script:TimerControls['PkgApplyButton'].IsEnabled          = $true
+                    $Controls['PkgCleanupOverlayButton'].IsEnabled = $true
+                    $Controls['PkgDeleteButton'].IsEnabled         = $true
+                    $Controls['PkgRefreshButton'].IsEnabled        = $true
+                    $Controls['PkgApplyButton'].IsEnabled          = $true
 
                     try {
-                        $Results = @($script:OverlayRemoveRunspace.EndInvoke($script:OverlayRemoveHandle))
-                        $script:OverlayRemoveRunspace.Dispose()
-                        $script:OverlayRemoveHandle = $null
+                        $Results = @($G.OverlayRemoveRunspace.EndInvoke($G.OverlayRemoveHandle))
+                        $G.OverlayRemoveRunspace.Dispose()
+                        $G.OverlayRemoveHandle = $null
 
                         $Removed = @($Results | Where-Object { $_.Status -eq 'Removed' }).Count
                         $Failed  = @($Results | Where-Object { $_.Status -eq 'Failed'  })
 
-                        Invoke-DATClick $script:TimerControls['PkgRefreshButton']
+                        Invoke-DATClick $Controls['PkgRefreshButton']
 
                         if ($Failed.Count -eq 0) {
-                            $script:TimerControls['StatusStripLabel'].Text = "Cleanup complete - $Removed package(s) removed."
+                            $Controls['StatusStripLabel'].Text = "Cleanup complete - $Removed package(s) removed."
                             Show-DATWindowMessage -Message "Cleanup complete.`n`nRemoved: $Removed package(s)" -Type Information
                         } else {
                             $FailList = ($Failed | ForEach-Object { "$($_.PackageID) ($($_.Name)): $($_.Error)" }) -join "`n"
-                            $script:TimerControls['StatusStripLabel'].Text = "Cleanup finished with $($Failed.Count) failure(s)."
+                            $Controls['StatusStripLabel'].Text = "Cleanup finished with $($Failed.Count) failure(s)."
                             Show-DATWindowMessage -Message "Cleanup finished.`n`nRemoved: $Removed`nFailed: $($Failed.Count)`n`n$FailList" -Type Warning
                         }
                     } catch {
-                        $script:TimerControls['StatusStripLabel'].Text = 'Cleanup failed'
+                        $Controls['StatusStripLabel'].Text = 'Cleanup failed'
                         Show-DATWindowMessage -Message "Cleanup failed: $($_.Exception.Message)" -Type Error
                     }
-                })
-                $script:OverlayRemoveTimer.Start()
+                }.GetNewClosure())
+                $G.OverlayRemoveTimer.Start()
             } catch {
                 & $ReEnable
-                $script:TimerControls['StatusStripLabel'].Text = 'Discovery failed'
+                $Controls['StatusStripLabel'].Text = 'Discovery failed'
                 Show-DATWindowMessage -Message "Overlay package discovery failed: $($_.Exception.Message)" -Type Error
             }
-        })
-        $script:OverlayDiscoveryTimer.Start()
-    })
+        }.GetNewClosure())
+        $G.OverlayDiscoveryTimer.Start()
+    }.GetNewClosure())
 
     # --- Package Management - Apply Action ---
     $Controls['PkgApplyButton'].Add_Click({
-        if (-not $script:CMConnected) {
+        if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
         }
@@ -1015,11 +1028,11 @@ function Initialize-DATMainWindow {
 
         Show-DATWindowMessage -Message "Action complete: $SuccessCount succeeded, $ErrorCount failed." -Type Information
         Invoke-DATClick $Controls['PkgRefreshButton']
-    })
+    }.GetNewClosure())
 
     # --- Deploy Applications - Refresh Collections ---
     $Controls['DeployRefreshCollectionsButton'].Add_Click({
-        if (-not $script:CMConnected) {
+        if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
         }
@@ -1039,11 +1052,11 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    })
+    }.GetNewClosure())
 
     # --- Deploy Applications - Refresh Apps ---
     $Controls['DeployRefreshAppsButton'].Add_Click({
-        if (-not $script:CMConnected) {
+        if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
         }
@@ -1111,18 +1124,18 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    })
+    }.GetNewClosure())
 
     # --- Deploy Applications - Select All / None ---
     $Controls['DeploySelectAllButton'].Add_Click({
         Complete-DATGridEdit $Controls['DeployAppsGrid']
         Set-DATGridChecks -Table $Controls['DeployAppsGridData'] -Checked $true -VisibleOnly
-    })
+    }.GetNewClosure())
 
     $Controls['DeploySelectNoneButton'].Add_Click({
         Complete-DATGridEdit $Controls['DeployAppsGrid']
         Set-DATGridChecks -Table $Controls['DeployAppsGridData'] -Checked $false
-    })
+    }.GetNewClosure())
 
     # --- Deploy Applications - Search filter ---
     $Controls['DeployAppsSearchBox'].Add_TextChanged({
@@ -1133,11 +1146,11 @@ function Initialize-DATMainWindow {
             $Escaped = ConvertTo-DATLikeLiteral $SearchText
             $Controls['DeployAppsGridData'].DefaultView.RowFilter = "[Name] LIKE '%$Escaped%' OR [Manufacturer] LIKE '%$Escaped%'"
         }
-    })
+    }.GetNewClosure())
 
     # --- Deploy Applications - Deploy Selected (background runspace) ---
     $Controls['DeployButton'].Add_Click({
-        if (-not $script:CMConnected) {
+        if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
         }
@@ -1232,7 +1245,7 @@ function Initialize-DATMainWindow {
         $Controls['TabControl'].SelectedIndex = 2
         $Controls['LogListBox'].Items.Clear()
 
-        $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+        $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
         $DeployScript = {
             param($ModulePath, $ConnParams, $AppNames, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $AvailableAt, $DeadlineAt, $OverrideSW, $RebootOutsideSW, $CreateMW, $MWStart, $MWDuration, $MWRecur, $MWDay, $LogQueue)
@@ -1262,8 +1275,8 @@ function Initialize-DATMainWindow {
             return Invoke-DATDeployApplications @ConnParams @DeployArgs
         }
 
-        $script:DeployRunspace = [System.Management.Automation.PowerShell]::Create()
-        $script:DeployRunspace.AddScript($DeployScript).
+        $G.DeployRunspace = [System.Management.Automation.PowerShell]::Create()
+        $G.DeployRunspace.AddScript($DeployScript).
             AddArgument($ModulePath).
             AddArgument($ConnParams).
             AddArgument($AppNames).
@@ -1280,29 +1293,27 @@ function Initialize-DATMainWindow {
             AddArgument($MWDuration).
             AddArgument($MWRecur).
             AddArgument($MWDay).
-            AddArgument($script:LogQueue) | Out-Null
-        $script:DeployHandle = $script:DeployRunspace.BeginInvoke()
+            AddArgument($G.LogQueue) | Out-Null
+        $G.DeployHandle = $G.DeployRunspace.BeginInvoke()
 
-        $script:TimerControls = $Controls
+        if ($G.DeployTimer) { $G.DeployTimer.Stop() }
+        $G.DeployTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $G.DeployTimer.Interval = [timespan]::FromMilliseconds(500)
 
-        if ($script:DeployTimer) { $script:DeployTimer.Stop() }
-        $script:DeployTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $script:DeployTimer.Interval = [timespan]::FromMilliseconds(500)
+        $G.DeployTimer.Add_Tick({
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
-        $script:DeployTimer.Add_Tick({
-            Update-DATLogListFromQueue -ListBox $script:TimerControls['LogListBox'] -Queue $script:LogQueue
+            if ($null -eq $G.DeployHandle -or -not $G.DeployHandle.IsCompleted) { return }
+            $G.DeployTimer.Stop()
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
-            if ($null -eq $script:DeployHandle -or -not $script:DeployHandle.IsCompleted) { return }
-            $script:DeployTimer.Stop()
-            Update-DATLogListFromQueue -ListBox $script:TimerControls['LogListBox'] -Queue $script:LogQueue
-
-            $script:TimerControls['DeployButton'].IsEnabled                  = $true
-            $script:TimerControls['DeployRefreshAppsButton'].IsEnabled       = $true
-            $script:TimerControls['DeployRefreshCollectionsButton'].IsEnabled = $true
+            $Controls['DeployButton'].IsEnabled                  = $true
+            $Controls['DeployRefreshAppsButton'].IsEnabled       = $true
+            $Controls['DeployRefreshCollectionsButton'].IsEnabled = $true
 
             try {
-                $Results = $script:DeployRunspace.EndInvoke($script:DeployHandle)
-                $script:DeployRunspace.Dispose()
+                $Results = $G.DeployRunspace.EndInvoke($G.DeployHandle)
+                $G.DeployRunspace.Dispose()
 
                 $MWRow  = @($Results | Where-Object { "$($_.Name)".StartsWith('[Maintenance Window]') }) | Select-Object -First 1
                 $AppRes = @($Results | Where-Object { -not "$($_.Name)".StartsWith('[Maintenance Window]') })
@@ -1314,9 +1325,9 @@ function Initialize-DATMainWindow {
 
                 $Summary = "Created: $($Created.Count), Skipped: $($Skipped.Count), Failed: $($Failed.Count)"
                 if ($MWRow) { $Summary += " | MW: $($MWRow.Status)" }
-                $script:TimerControls['StatusStripLabel'].Text = "Deploy complete - $Summary"
-                $script:TimerControls['DeployStatusLabel'].Text = "Last deploy: $Summary"
-                $script:TimerControls['DeployStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Gray
+                $Controls['StatusStripLabel'].Text = "Deploy complete - $Summary"
+                $Controls['DeployStatusLabel'].Text = "Last deploy: $Summary"
+                $Controls['DeployStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Gray
 
                 if ($Failed.Count -eq 0 -and -not $MWFailed) {
                     Show-DATWindowMessage -Message "Deployment complete.`n`n$Summary" -Type Information
@@ -1327,18 +1338,18 @@ function Initialize-DATMainWindow {
                     Show-DATWindowMessage -Message "Deployment finished with errors.`n`n$Summary`n`nFailed:`n$FailList" -Type Warning
                 }
             } catch {
-                $script:TimerControls['StatusStripLabel'].Text = 'Deploy failed'
-                $script:TimerControls['DeployStatusLabel'].Text = "Deploy failed: $($_.Exception.Message)"
-                $script:TimerControls['DeployStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Red
+                $Controls['StatusStripLabel'].Text = 'Deploy failed'
+                $Controls['DeployStatusLabel'].Text = "Deploy failed: $($_.Exception.Message)"
+                $Controls['DeployStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Red
                 Show-DATWindowMessage -Message "Deployment failed: $($_.Exception.Message)" -Type Error
             } finally {
-                $script:DeployHandle = $null
-                $script:LogQueue = $null
+                $G.DeployHandle = $null
+                $G.LogQueue = $null
             }
-        })
+        }.GetNewClosure())
 
-        $script:DeployTimer.Start()
-    })
+        $G.DeployTimer.Start()
+    }.GetNewClosure())
 
     # --- Load saved settings on window load ---
     $Window.Add_Loaded({
@@ -1410,10 +1421,11 @@ function Initialize-DATMainWindow {
                         if ($Controls['UseSSLCheckBox'].IsChecked) { $AutoParams['UseSSL'] = $true }
 
                         Connect-DATConfigMgr @AutoParams
+                        $SiteCode = (Get-DATCMState).SiteCode
 
-                        $Controls['ConnStatusLabel'].Text = "Connected (Site: $($script:CMSiteCode))"
+                        $Controls['ConnStatusLabel'].Text = "Connected (Site: $SiteCode)"
                         $Controls['ConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Green
-                        $Controls['SiteCodeInput'].Text = $script:CMSiteCode
+                        $Controls['SiteCodeInput'].Text = $SiteCode
                         $Controls['KnownModelsCheckBox'].IsEnabled = $true
 
                         $DPData = $Controls['DPGridData']
@@ -1464,6 +1476,6 @@ function Initialize-DATMainWindow {
         $Controls['UpdateIndividualCheckBox'].IsEnabled = [bool]$Controls['DellCheckBox'].IsChecked
 
         # Enable event handlers now that initialization is complete
-        $script:Initializing = $false
-    })
+        $G.Initializing = $false
+    }.GetNewClosure())
 }
