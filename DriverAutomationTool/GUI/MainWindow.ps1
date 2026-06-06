@@ -3,15 +3,18 @@
 # Initialize-DATMainWindow wires every event. Show-DATMainWindow is the entry
 # point used by Start-DATGui.
 #
-# IMPORTANT - event-handler scoping:
+# IMPORTANT - event-handler model:
 #   The GUI runs on a dedicated STA runspace (pwsh is MTA by default and WPF
 #   needs STA). WPF dispatches events RE-ENTRANTLY inside that runspace, and in
-#   that context PowerShell does NOT resolve $script: variables or the wiring
-#   function's locals - only module FUNCTIONS resolve. So every handler/tick is
-#   defined as a closure (.GetNewClosure()), which bakes the values it needs
-#   into the scriptblock itself: $Controls / $Window / cursors are captured
-#   locals, mutable cross-handler state lives in the captured $G hashtable, and
-#   ConfigMgr connection state is read via the Get-DATCMState module function.
+#   that context the ONLY thing PowerShell resolves reliably is a call to a
+#   module FUNCTION - not function locals, not $script: variables, and not
+#   GetNewClosure (which rebinds the scriptblock to a throwaway module that
+#   cannot see this module's own functions). So:
+#     * every handler/tick is a PLAIN scriptblock (module functions resolve), and
+#     * it fetches all its state with $gui = Get-DATGui (a module function) and
+#       then uses $gui.Controls / $gui.Window / $gui.G, instead of relying on
+#       any captured or script-scoped variable.
+#   Initialize-DATMainWindow stashes that state with Set-DATGui.
 
 function New-DATMainWindow {
     <#
@@ -42,7 +45,7 @@ function New-DATMainWindow {
 
     # --- Version labels ---
     $ModVer = (Get-Module DriverAutomationTool).Version
-    if (-not $ModVer) { $ModVer = '2.1.1' }
+    if (-not $ModVer) { $ModVer = '2.1.2' }
     $Window.Title = "Driver Automation Tool v$ModVer"
     $Controls['VersionLabel'].Text = "v$ModVer"
 
@@ -114,15 +117,12 @@ function Initialize-DATMainWindow {
         [hashtable]$Controls
     )
 
-    # Captured-by-closure references (immutable - the same objects for the whole
-    # session). Every handler is .GetNewClosure() so these travel with it.
     $Window = $Controls['MainWindow']
     $WaitCursor = [System.Windows.Input.Cursors]::Wait
     $DefaultCursor = [System.Windows.Input.Cursors]::Arrow
 
-    # Mutable cross-handler state. A single hashtable captured by every closure;
-    # mutating its entries is visible to all handlers and timer ticks because
-    # they share the one object.
+    # Mutable cross-handler state (runspace handles, timers, queue, init flag).
+    # Stored once in module scope; handlers read/mutate it via Get-DATGui.
     $G = @{
         Initializing             = $true
         LogQueue                 = $null
@@ -143,10 +143,21 @@ function Initialize-DATMainWindow {
         DeployTimer              = $null
     }
 
+    # Stash the whole GUI context in module scope. Every handler fetches it with
+    # $gui = Get-DATGui (the one primitive that works in the WPF event context).
+    Set-DATGui @{
+        Controls      = $Controls
+        Window        = $Window
+        WaitCursor    = $WaitCursor
+        DefaultCursor = $DefaultCursor
+        G             = $G
+    }
+
     # --- OS Selection Change: enable/disable manufacturer checkboxes ---
     # Dell drivers don't need build versions (plain "Windows 11" / "Windows 10")
     # Lenovo drivers need build versions ("Windows 11 23H2" etc.)
     $Controls['OsCombo'].Add_SelectionChanged({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
         if ($G.Initializing) { return }
         $SelectedOS = Get-DATComboText $Controls['OsCombo']
         $IsPlainOS = ($SelectedOS -match '^Windows 1[01]$')
@@ -164,7 +175,7 @@ function Initialize-DATMainWindow {
             $Controls['UpdateIndividualCheckBox'].IsChecked = $false
         }
         $Controls['MicrosoftCheckBox'].IsEnabled = $true
-    }.GetNewClosure())
+    })
 
     # Set initial manufacturer checkbox state based on default OS selection
     $InitOS = Get-DATComboText $Controls['OsCombo']
@@ -180,21 +191,26 @@ function Initialize-DATMainWindow {
 
     # --- Dell Checkbox Change: enable/disable individual drivers option ---
     $Controls['DellCheckBox'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
         if ($G.Initializing) { return }
         $Controls['UpdateIndividualCheckBox'].IsEnabled = [bool]$Controls['DellCheckBox'].IsChecked
         if (-not $Controls['DellCheckBox'].IsChecked) {
             $Controls['UpdateIndividualCheckBox'].IsChecked = $false
         }
-    }.GetNewClosure())
+    })
 
     # --- Register log subscriber for GUI ---
-    Register-DATLogSubscriber -Action ({
+    Register-DATLogSubscriber -Action {
         param($Event)
-        Add-DATWindowLogEntry -LogListBox $Controls['LogListBox'] -LogEvent $Event
-    }.GetNewClosure())
+        $gui = Get-DATGui
+        if ($gui) { Add-DATWindowLogEntry -LogListBox $gui.Controls['LogListBox'] -LogEvent $Event }
+    }
 
     # --- Refresh Models Button ---
     $Controls['RefreshButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+
         $Data = $Controls['ModelGridData']
         $Data.Rows.Clear()
         $Controls['StatusStripLabel'].Text = 'Loading models...'
@@ -249,10 +265,11 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    }.GetNewClosure())
+    })
 
     # --- Search Box - filter models ---
     $Controls['SearchBox'].Add_TextChanged({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         $SearchText = $Controls['SearchBox'].Text
         if ([string]::IsNullOrEmpty($SearchText)) {
             $Controls['ModelGridData'].DefaultView.RowFilter = ''
@@ -260,21 +277,25 @@ function Initialize-DATMainWindow {
             $Escaped = ConvertTo-DATLikeLiteral $SearchText
             $Controls['ModelGridData'].DefaultView.RowFilter = "[Model] LIKE '%$Escaped%'"
         }
-    }.GetNewClosure())
+    })
 
     # --- Select All / None ---
     $Controls['SelectAllButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         Complete-DATGridEdit $Controls['ModelGrid']
         Set-DATGridChecks -Table $Controls['ModelGridData'] -Checked $true -VisibleOnly
-    }.GetNewClosure())
+    })
 
     $Controls['SelectNoneButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         Complete-DATGridEdit $Controls['ModelGrid']
         Set-DATGridChecks -Table $Controls['ModelGridData'] -Checked $false
-    }.GetNewClosure())
+    })
 
     # --- Known Models Checkbox ---
     $Controls['KnownModelsCheckBox'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
         if ($Controls['KnownModelsCheckBox'].IsChecked -and
             $Controls['ModelGridData'].Rows.Count -gt 0 -and
             (Get-DATCMState).Connected) {
@@ -297,10 +318,13 @@ function Initialize-DATMainWindow {
                 $Window.Cursor = $DefaultCursor
             }
         }
-    }.GetNewClosure())
+    })
 
     # --- Connect Button ---
     $Controls['ConnectButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+
         $Server = $Controls['SiteServerInput'].Text
         $Code = $Controls['SiteCodeInput'].Text
         $SSL = [bool]$Controls['UseSSLCheckBox'].IsChecked
@@ -354,47 +378,53 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    }.GetNewClosure())
+    })
 
     # --- Browse Buttons ---
     $Controls['DLBrowseButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         $Path = Show-DATFolderDialog -Description 'Select download path' -InitialPath $Controls['DownloadPathInput'].Text
         if ($Path) { $Controls['DownloadPathInput'].Text = $Path }
-    }.GetNewClosure())
+    })
 
     $Controls['PkgBrowseButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         $Path = Show-DATFolderDialog -Description 'Select package source path' -InitialPath $Controls['PackagePathInput'].Text
         if ($Path) { $Controls['PackagePathInput'].Text = $Path }
-    }.GetNewClosure())
+    })
 
     # --- Compress Package Checkbox ---
     $Controls['CompressPackageCheckBox'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
         if ($G.Initializing) { return }
         $Controls['CompressionTypeCombo'].IsEnabled = [bool]$Controls['CompressPackageCheckBox'].IsChecked
-    }.GetNewClosure())
+    })
 
     # --- Deployment Platform Change: enable/disable Clean Unused Drivers ---
     $Controls['DeployPlatformCombo'].Add_SelectionChanged({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
         if ($G.Initializing) { return }
         $IsDriverPkg = (Get-DATComboText $Controls['DeployPlatformCombo']) -in @('ConfigMgr - Driver Pkg', 'ConfigMgr - Driver Pkg (Test)')
         $Controls['CleanUnusedCheckBox'].IsEnabled = $IsDriverPkg
         if (-not $IsDriverPkg) {
             $Controls['CleanUnusedCheckBox'].IsChecked = $false
         }
-    }.GetNewClosure())
+    })
 
     # --- Schedule checkbox: enable/disable the date+time pickers as a block ---
     $Controls['DeployScheduleCheck'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         $On = [bool]$Controls['DeployScheduleCheck'].IsChecked
         $Controls['DeployAvailablePicker'].IsEnabled = $On
         $Controls['DeployAvailableTime'].IsEnabled   = $On
         $Controls['DeployDeadlinePicker'].IsEnabled  = $On
         $Controls['DeployDeadlineTime'].IsEnabled    = $On
-    }.GetNewClosure())
+    })
 
     # --- Maintenance-window fields enabled only when the MW checkbox is on;
     #     Day picker only when on AND recurrence is Weekly. ---
     $UpdateMWEnabled = {
+        $gui = Get-DATGui; $Controls = $gui.Controls
         $On = [bool]$Controls['DeployCreateMWCheck'].IsChecked
         $Controls['DeployMWStartPicker'].IsEnabled = $On
         $Controls['DeployMWStartTime'].IsEnabled   = $On
@@ -402,12 +432,14 @@ function Initialize-DATMainWindow {
         $Controls['DeployMWMinutesNUD'].IsEnabled  = $On
         $Controls['DeployMWRecurCombo'].IsEnabled  = $On
         $Controls['DeployMWDayCombo'].IsEnabled    = ($On -and (Get-DATComboText $Controls['DeployMWRecurCombo']) -eq 'Weekly')
-    }.GetNewClosure()
+    }
     $Controls['DeployCreateMWCheck'].Add_Click($UpdateMWEnabled)
     $Controls['DeployMWRecurCombo'].Add_SelectionChanged($UpdateMWEnabled)
 
     # --- Start Sync Button ---
     $Controls['StartButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+
         $SelectedModels = Get-DATSelectedModels -Table $Controls['ModelGridData']
         if ($SelectedModels.Count -eq 0) {
             Show-DATWindowMessage -Message 'Please select at least one model.' -Type Warning
@@ -502,6 +534,7 @@ function Initialize-DATMainWindow {
         $G.SyncTimer.Interval = [timespan]::FromMilliseconds(500)
 
         $G.SyncTimer.Add_Tick({
+            $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
             Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
             if ($null -eq $G.SyncHandle) { return }
@@ -556,13 +589,14 @@ function Initialize-DATMainWindow {
                 $Controls['StopButton'].IsEnabled = $false
                 $Controls['ProgressBar'].IsIndeterminate = $false
             }
-        }.GetNewClosure())
+        })
 
         $G.SyncTimer.Start()
-    }.GetNewClosure())
+    })
 
     # --- Stop Sync Button ---
     $Controls['StopButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
         if ($G.SyncRunspace -and $G.SyncHandle -and -not $G.SyncHandle.IsCompleted) {
             Write-DATLog -Message 'Sync operation cancelled by user' -Severity 2
 
@@ -584,10 +618,12 @@ function Initialize-DATMainWindow {
             $Controls['StartButton'].IsEnabled = $true
             $Controls['StopButton'].IsEnabled = $false
         }
-    }.GetNewClosure())
+    })
 
     # --- Health Check Button ---
     $Controls['HealthCheckButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
         $Controls['TabControl'].SelectedIndex = 2
         $Window.Cursor = $WaitCursor
         try {
@@ -601,10 +637,11 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    }.GetNewClosure())
+    })
 
     # --- Save Settings Button ---
     $Controls['SaveSettingsButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         try {
             Complete-DATGridEdit $Controls['DPGrid']
             Complete-DATGridEdit $Controls['DPGGrid']
@@ -646,10 +683,12 @@ function Initialize-DATMainWindow {
         } catch {
             Show-DATWindowMessage -Message "Failed to save settings: $($_.Exception.Message)" -Type Error
         }
-    }.GetNewClosure())
+    })
 
     # --- Package Management - Refresh ---
     $Controls['PkgRefreshButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
         if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
@@ -686,21 +725,24 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    }.GetNewClosure())
+    })
 
     # --- Package Management - Select All / Select None ---
     $Controls['PkgSelectAllButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         Complete-DATGridEdit $Controls['PkgGrid']
         Set-DATGridChecks -Table $Controls['PkgGridData'] -Checked $true
-    }.GetNewClosure())
+    })
 
     $Controls['PkgSelectNoneButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         Complete-DATGridEdit $Controls['PkgGrid']
         Set-DATGridChecks -Table $Controls['PkgGridData'] -Checked $false
-    }.GetNewClosure())
+    })
 
     # --- Package Management - Search ---
     $Controls['PkgSearchBox'].Add_TextChanged({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         $SearchText = $Controls['PkgSearchBox'].Text
         if ([string]::IsNullOrEmpty($SearchText)) {
             $Controls['PkgGridData'].DefaultView.RowFilter = ''
@@ -708,10 +750,11 @@ function Initialize-DATMainWindow {
             $Escaped = ConvertTo-DATLikeLiteral $SearchText
             $Controls['PkgGridData'].DefaultView.RowFilter = "[Name] LIKE '%$Escaped%' OR [Manufacturer] LIKE '%$Escaped%'"
         }
-    }.GetNewClosure())
+    })
 
     # --- Package Management - Delete ---
     $Controls['PkgDeleteButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
         Complete-DATGridEdit $Controls['PkgGrid']
         $SelectedRows = @(Get-DATGridSelectedRows -Table $Controls['PkgGridData'])
         if ($SelectedRows.Count -eq 0) {
@@ -755,6 +798,7 @@ function Initialize-DATMainWindow {
         $G.DeleteTimer.Interval = [timespan]::FromMilliseconds(500)
 
         $G.DeleteTimer.Add_Tick({
+            $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
             Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
             if ($null -eq $G.DeleteHandle -or -not $G.DeleteHandle.IsCompleted) { return }
@@ -792,23 +836,25 @@ function Initialize-DATMainWindow {
             } finally {
                 $G.DeleteHandle = $null
             }
-        }.GetNewClosure())
+        })
 
         $G.DeleteTimer.Start()
-    }.GetNewClosure())
+    })
 
     # --- Cleanup Overlay TS Packages -----------------------------------------
     # Two-phase: discovery (-DiscoveryOnly) then, on confirm, removal (-Force).
     # Both phases use background runspaces with a tick-timer for log drain.
     $Controls['PkgCleanupOverlayButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
         if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first (SCCM Settings tab).' -Type Warning
             return
         }
 
+        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+
         $ConnParams = @{ SiteServer = $Controls['SiteServerInput'].Text; SiteCode = $Controls['SiteCodeInput'].Text }
         if ($Controls['UseSSLCheckBox'].IsChecked) { $ConnParams['UseSSL'] = $true }
-        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
 
         $Controls['PkgCleanupOverlayButton'].IsEnabled = $false
         $Controls['PkgDeleteButton'].IsEnabled         = $false
@@ -834,6 +880,7 @@ function Initialize-DATMainWindow {
         $G.OverlayDiscoveryTimer = New-Object System.Windows.Threading.DispatcherTimer
         $G.OverlayDiscoveryTimer.Interval = [timespan]::FromMilliseconds(500)
         $G.OverlayDiscoveryTimer.Add_Tick({
+            $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
             Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
             if ($null -eq $G.OverlayDiscoveryHandle -or -not $G.OverlayDiscoveryHandle.IsCompleted) { return }
@@ -884,6 +931,10 @@ function Initialize-DATMainWindow {
 
                 $Controls['StatusStripLabel'].Text = "Removing $($Candidates.Count) overlay TS package(s)..."
 
+                $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+                $ConnParams = @{ SiteServer = $Controls['SiteServerInput'].Text; SiteCode = $Controls['SiteCodeInput'].Text }
+                if ($Controls['UseSSLCheckBox'].IsChecked) { $ConnParams['UseSSL'] = $true }
+
                 $RemovalScript = {
                     param($ModulePath, $ConnParams, $CleanSource, $LogQueue)
                     Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
@@ -900,6 +951,7 @@ function Initialize-DATMainWindow {
                 $G.OverlayRemoveTimer = New-Object System.Windows.Threading.DispatcherTimer
                 $G.OverlayRemoveTimer.Interval = [timespan]::FromMilliseconds(500)
                 $G.OverlayRemoveTimer.Add_Tick({
+                    $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
                     Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
                     if ($null -eq $G.OverlayRemoveHandle -or -not $G.OverlayRemoveHandle.IsCompleted) { return }
@@ -932,19 +984,21 @@ function Initialize-DATMainWindow {
                         $Controls['StatusStripLabel'].Text = 'Cleanup failed'
                         Show-DATWindowMessage -Message "Cleanup failed: $($_.Exception.Message)" -Type Error
                     }
-                }.GetNewClosure())
+                })
                 $G.OverlayRemoveTimer.Start()
             } catch {
                 & $ReEnable
                 $Controls['StatusStripLabel'].Text = 'Discovery failed'
                 Show-DATWindowMessage -Message "Overlay package discovery failed: $($_.Exception.Message)" -Type Error
             }
-        }.GetNewClosure())
+        })
         $G.OverlayDiscoveryTimer.Start()
-    }.GetNewClosure())
+    })
 
     # --- Package Management - Apply Action ---
     $Controls['PkgApplyButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
         if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
@@ -1028,10 +1082,12 @@ function Initialize-DATMainWindow {
 
         Show-DATWindowMessage -Message "Action complete: $SuccessCount succeeded, $ErrorCount failed." -Type Information
         Invoke-DATClick $Controls['PkgRefreshButton']
-    }.GetNewClosure())
+    })
 
     # --- Deploy Applications - Refresh Collections ---
     $Controls['DeployRefreshCollectionsButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
         if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
@@ -1052,10 +1108,12 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    }.GetNewClosure())
+    })
 
     # --- Deploy Applications - Refresh Apps ---
     $Controls['DeployRefreshAppsButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
         if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
@@ -1124,21 +1182,24 @@ function Initialize-DATMainWindow {
         } finally {
             $Window.Cursor = $DefaultCursor
         }
-    }.GetNewClosure())
+    })
 
     # --- Deploy Applications - Select All / None ---
     $Controls['DeploySelectAllButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         Complete-DATGridEdit $Controls['DeployAppsGrid']
         Set-DATGridChecks -Table $Controls['DeployAppsGridData'] -Checked $true -VisibleOnly
-    }.GetNewClosure())
+    })
 
     $Controls['DeploySelectNoneButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         Complete-DATGridEdit $Controls['DeployAppsGrid']
         Set-DATGridChecks -Table $Controls['DeployAppsGridData'] -Checked $false
-    }.GetNewClosure())
+    })
 
     # --- Deploy Applications - Search filter ---
     $Controls['DeployAppsSearchBox'].Add_TextChanged({
+        $gui = Get-DATGui; $Controls = $gui.Controls
         $SearchText = $Controls['DeployAppsSearchBox'].Text
         if ([string]::IsNullOrEmpty($SearchText)) {
             $Controls['DeployAppsGridData'].DefaultView.RowFilter = ''
@@ -1146,10 +1207,11 @@ function Initialize-DATMainWindow {
             $Escaped = ConvertTo-DATLikeLiteral $SearchText
             $Controls['DeployAppsGridData'].DefaultView.RowFilter = "[Name] LIKE '%$Escaped%' OR [Manufacturer] LIKE '%$Escaped%'"
         }
-    }.GetNewClosure())
+    })
 
     # --- Deploy Applications - Deploy Selected (background runspace) ---
     $Controls['DeployButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
         if (-not (Get-DATCMState).Connected) {
             Show-DATWindowMessage -Message 'Connect to ConfigMgr first.' -Type Warning
             return
@@ -1301,6 +1363,7 @@ function Initialize-DATMainWindow {
         $G.DeployTimer.Interval = [timespan]::FromMilliseconds(500)
 
         $G.DeployTimer.Add_Tick({
+            $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
             Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
 
             if ($null -eq $G.DeployHandle -or -not $G.DeployHandle.IsCompleted) { return }
@@ -1346,13 +1409,18 @@ function Initialize-DATMainWindow {
                 $G.DeployHandle = $null
                 $G.LogQueue = $null
             }
-        }.GetNewClosure())
+        })
 
         $G.DeployTimer.Start()
-    }.GetNewClosure())
+    })
 
     # --- Load saved settings on window load ---
     $Window.Add_Loaded({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window; $G = $gui.G
+
+        # Re-apply the theme now the window is fully loaded (belt-and-suspenders).
+        try { Set-DATWindowTheme -Window $Window -Mode System } catch { }
+
         try {
             $Config = Get-DATConfig
             if ($Config) {
@@ -1477,5 +1545,5 @@ function Initialize-DATMainWindow {
 
         # Enable event handlers now that initialization is complete
         $G.Initializing = $false
-    }.GetNewClosure())
+    })
 }

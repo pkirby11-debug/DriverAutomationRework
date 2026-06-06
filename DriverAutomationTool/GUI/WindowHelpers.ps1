@@ -38,6 +38,30 @@ function Get-DATCMState {
     }
 }
 
+function Set-DATGui {
+    <#
+    .SYNOPSIS
+        Stores the GUI state object (controls, window, cursors, mutable state) in
+        module scope so handlers can retrieve it via Get-DATGui.
+    #>
+    param($State)
+    $script:DATGui = $State
+}
+
+function Get-DATGui {
+    <#
+    .SYNOPSIS
+        Returns the GUI state object from module scope.
+    .DESCRIPTION
+        The single reliable primitive in the WPF re-entrant event context is a
+        module function call. Every event handler is a PLAIN scriptblock (so the
+        module's own functions resolve) and fetches its state through this getter
+        rather than relying on variable scope, which does not resolve there.
+        Returns: @{ Controls=<hashtable>; Window=<Window>; WaitCursor; DefaultCursor; G=<mutable state> }.
+    #>
+    $script:DATGui
+}
+
 function Set-DATWindowTheme {
     <#
     .SYNOPSIS
