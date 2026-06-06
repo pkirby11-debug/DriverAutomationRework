@@ -54,7 +54,7 @@ jobs:
       - name: PSScriptAnalyzer
         shell: pwsh
         run: |
-          $results = Invoke-ScriptAnalyzer -Path ./DriverAutomationTool -Recurse -Severity @('Error', 'Warning')
+          $results = Invoke-ScriptAnalyzer -Path ./DriverAutomationTool -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
           if ($results) { $results | Format-Table -AutoSize | Out-String | Write-Host }
           $errors   = @($results | Where-Object Severity -eq 'Error')
           $warnings = @($results | Where-Object Severity -eq 'Warning')
