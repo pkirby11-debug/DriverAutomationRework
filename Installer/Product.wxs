@@ -63,10 +63,12 @@
         <!-- ==================== Component: Start Menu Shortcut ==================== -->
         <ComponentGroup Id="ShortcutFiles" Directory="ApplicationProgramsFolder">
             <Component Id="StartMenuShortcut" Guid="A1B2C3D4-E5F6-7890-ABCD-EF1234567899">
+                <!-- v2 targets PowerShell 7 (pwsh). The module is imported by explicit
+                     path, so the install location does not need to be on PSModulePath. -->
                 <Shortcut Id="DATGuiShortcut"
                     Name="Driver Automation Tool"
                     Description="Launch the Driver Automation Tool GUI"
-                    Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
+                    Target="[ProgramFiles64Folder]PowerShell\7\pwsh.exe"
                     Arguments="-NoProfile -ExecutionPolicy Bypass -Command &quot;Import-Module 'C:\ProgramData\WindowsPowerShell\Modules\DriverAutomationTool\DriverAutomationTool.psd1'; Start-DATGui&quot;" />
                 <RemoveFolder Id="CleanUpShortcutDir" On="uninstall" />
                 <RegistryValue Root="HKCU" Key="Software\DriverAutomationTool" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
@@ -175,14 +177,14 @@
         </DirectoryRef>
 
         <ComponentGroup Id="GUIFiles" Directory="GUIDir">
-            <Component Id="FormDefinition" Guid="B6F7A8C9-D0E1-2345-F123-456789ABCD01">
-                <File Source="$(var.SourceDir)\GUI\FormDefinition.ps1" KeyPath="yes" />
+            <Component Id="MainWindowXaml" Guid="B6F7A8C9-D0E1-2345-F123-456789ABCD01">
+                <File Source="$(var.SourceDir)\GUI\MainWindow.xaml" KeyPath="yes" />
             </Component>
-            <Component Id="MainForm" Guid="B6F7A8C9-D0E1-2345-F123-456789ABCD02">
-                <File Source="$(var.SourceDir)\GUI\MainForm.ps1" KeyPath="yes" />
+            <Component Id="MainWindow" Guid="B6F7A8C9-D0E1-2345-F123-456789ABCD02">
+                <File Source="$(var.SourceDir)\GUI\MainWindow.ps1" KeyPath="yes" />
             </Component>
-            <Component Id="FormHelpers" Guid="B6F7A8C9-D0E1-2345-F123-456789ABCD03">
-                <File Source="$(var.SourceDir)\GUI\FormHelpers.ps1" KeyPath="yes" />
+            <Component Id="WindowHelpers" Guid="B6F7A8C9-D0E1-2345-F123-456789ABCD03">
+                <File Source="$(var.SourceDir)\GUI\WindowHelpers.ps1" KeyPath="yes" />
             </Component>
         </ComponentGroup>
 
