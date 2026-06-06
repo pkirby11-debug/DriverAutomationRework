@@ -45,7 +45,7 @@ function New-DATMainWindow {
 
     # --- Version labels ---
     $ModVer = (Get-Module DriverAutomationTool).Version
-    if (-not $ModVer) { $ModVer = '2.1.6' }
+    if (-not $ModVer) { $ModVer = '2.2.0' }
     $Window.Title = "Driver Automation Tool v$ModVer"
     $Controls['VersionLabel'].Text = "v$ModVer"
 
@@ -82,8 +82,16 @@ function New-DATMainWindow {
     [void](Set-DATComboText -Combo $Controls['DeployMWRecurCombo'] -Value 'Daily')
     [void](Set-DATComboText -Combo $Controls['DeployMWDayCombo'] -Value 'Sunday')
 
-    # Apply the light/dark palette following the Windows app theme.
-    Set-DATWindowTheme -Window $Window -Mode System
+    # Apply the saved theme preference before the window is shown (avoids a
+    # light->dark flash on launch). Default to 'System', which Set-DATWindowTheme
+    # resolves dark-first when the Windows preference is unreadable.
+    $ThemeMode = 'System'
+    try {
+        $SavedMode = (Get-DATConfig).options.themeMode
+        if ($SavedMode -in @('System', 'Light', 'Dark')) { $ThemeMode = $SavedMode }
+    } catch { }
+    [void](Set-DATComboText -Combo $Controls['ThemeCombo'] -Value $ThemeMode)
+    Set-DATWindowTheme -Window $Window -Mode $ThemeMode
 
     return $Controls
 }
@@ -126,6 +134,10 @@ function Initialize-DATMainWindow {
     $G = @{
         Initializing             = $true
         LogQueue                 = $null
+        ModelRunspace            = $null
+        ModelHandle              = $null
+        ModelTimer               = $null
+        ModelManufacturers       = @()
         SyncRunspace             = $null
         SyncHandle               = $null
         SyncTimer                = $null
@@ -234,65 +246,126 @@ function Initialize-DATMainWindow {
         if ($gui) { Add-DATWindowLogEntry -LogListBox $gui.Controls['LogListBox'] -LogEvent $Event }
     }
 
-    # --- Refresh Models Button ---
+    # --- Refresh Models Button (background runspace; keeps the UI responsive) ---
+    # The catalog model lists (Dell/Lenovo/Surface) are the slow part - on a cold
+    # cache they download and parse large catalogs, which used to freeze the window
+    # ("Not Responding"). They now run on a background runspace; the grid is filled
+    # and the optional known-model selection (which needs THIS runspace's live CM
+    # connection) runs back on the UI thread when the worker finishes.
     $Controls['RefreshButton'].Add_Click({
-        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
-        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+        if ($G.ModelHandle) { return }   # a load is already running
 
-        $Data = $Controls['ModelGridData']
-        $Data.Rows.Clear()
-        $Controls['StatusStripLabel'].Text = 'Loading models...'
-        $Window.Cursor = $WaitCursor
+        $Manufacturers = @()
+        if ($Controls['DellCheckBox'].IsChecked)      { $Manufacturers += 'Dell' }
+        if ($Controls['LenovoCheckBox'].IsChecked)    { $Manufacturers += 'Lenovo' }
+        if ($Controls['MicrosoftCheckBox'].IsChecked) { $Manufacturers += 'Microsoft' }
 
-        try {
-            $Manufacturers = @()
-            if ($Controls['DellCheckBox'].IsChecked)      { $Manufacturers += 'Dell' }
-            if ($Controls['LenovoCheckBox'].IsChecked)    { $Manufacturers += 'Lenovo' }
-            if ($Controls['MicrosoftCheckBox'].IsChecked) { $Manufacturers += 'Microsoft' }
-
-            $Data.BeginLoadData()
-            try {
-                foreach ($Make in $Manufacturers) {
-                    $Models = switch ($Make) {
-                        'Dell'      { Get-DellModelList }
-                        'Lenovo'    { Get-LenovoModelList }
-                        'Microsoft' { Get-SurfaceModelList }
-                    }
-
-                    foreach ($M in $Models) {
-                        $ID = if ($M.SystemID) { $M.SystemID }
-                              elseif ($M.MachineType) { $M.MachineType }
-                              elseif ($M.DownloadID) { $M.DownloadID }
-                              else { '' }
-                        $Plat = if ($M.Platform) { $M.Platform } else { '' }
-                        [void]$Data.Rows.Add($false, $M.Manufacturer, $M.Model, $ID, $Plat)
-                    }
-                }
-            } finally {
-                $Data.EndLoadData()
-            }
-
-            $ModelCount = $Data.Rows.Count
-            $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models"
-
-            # Auto-select known models if checkbox is checked and SCCM is connected
-            if ($Controls['KnownModelsCheckBox'].IsChecked -and (Get-DATCMState).Connected -and $ModelCount -gt 0) {
-                $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - querying SCCM inventory and existing packages..."
-                try {
-                    $KnownModels = Get-DATKnownModels -Manufacturers $Manufacturers
-                    $MatchCount = Select-DATKnownModelsInGrid -Table $Data -KnownModels $KnownModels
-                    $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - $MatchCount known model(s) selected (inventory + packages)"
-                } catch {
-                    Write-DATLog -Message "Known models auto-select failed: $($_.Exception.Message)" -Severity 2
-                    $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models (known models query failed)"
-                }
-            }
-        } catch {
-            Show-DATWindowMessage -Message "Error loading models: $($_.Exception.Message)" -Type Error
-            $Controls['StatusStripLabel'].Text = 'Error loading models'
-        } finally {
-            $Window.Cursor = $DefaultCursor
+        if ($Manufacturers.Count -eq 0) {
+            Show-DATWindowMessage -Message 'Select at least one manufacturer first.' -Type Warning
+            return
         }
+
+        $Controls['ModelGridData'].Rows.Clear()
+        $Controls['RefreshButton'].IsEnabled = $false
+        $Controls['ModelProgress'].Visibility = [System.Windows.Visibility]::Visible
+        $Controls['ModelProgress'].IsIndeterminate = $true
+        $Controls['StatusStripLabel'].Text = 'Loading models...'
+
+        $G.ModelManufacturers = $Manufacturers
+        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+
+        $ModelScript = {
+            param($ModulePath, $Manufacturers)
+            Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+            $Out = [System.Collections.Generic.List[object]]::new()
+            foreach ($Make in $Manufacturers) {
+                $Models = switch ($Make) {
+                    'Dell'      { Get-DellModelList }
+                    'Lenovo'    { Get-LenovoModelList }
+                    'Microsoft' { Get-SurfaceModelList }
+                }
+                foreach ($M in $Models) {
+                    $ID = if ($M.SystemID) { $M.SystemID }
+                          elseif ($M.MachineType) { $M.MachineType }
+                          elseif ($M.DownloadID) { $M.DownloadID }
+                          else { '' }
+                    $Out.Add([PSCustomObject]@{
+                        Manufacturer = $M.Manufacturer
+                        Model        = $M.Model
+                        SystemID     = $ID
+                        Platform     = if ($M.Platform) { $M.Platform } else { '' }
+                    })
+                }
+            }
+            # Emit each model into the output stream (NOT ,$Out) so EndInvoke hands
+            # the UI thread the individual model objects, not the List as one item.
+            return $Out
+        }
+
+        $G.ModelRunspace = [System.Management.Automation.PowerShell]::Create()
+        $G.ModelRunspace.AddScript($ModelScript).AddArgument($ModulePath).AddArgument($Manufacturers) | Out-Null
+        $G.ModelHandle = $G.ModelRunspace.BeginInvoke()
+
+        if ($G.ModelTimer) { $G.ModelTimer.Stop() }
+        $G.ModelTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $G.ModelTimer.Interval = [timespan]::FromMilliseconds(300)
+
+        $G.ModelTimer.Add_Tick({
+            $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+            if ($null -eq $G.ModelHandle -or -not $G.ModelHandle.IsCompleted) { return }
+            $G.ModelTimer.Stop()
+
+            try {
+                $Models = $G.ModelRunspace.EndInvoke($G.ModelHandle)
+
+                $Data = $Controls['ModelGridData']
+                $Data.BeginLoadData()
+                try {
+                    foreach ($M in $Models) {
+                        [void]$Data.Rows.Add($false, $M.Manufacturer, $M.Model, $M.SystemID, $M.Platform)
+                    }
+                } finally {
+                    $Data.EndLoadData()
+                }
+
+                $ModelCount = $Data.Rows.Count
+                $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models"
+
+                # Known-model auto-select needs THIS runspace's live CM connection.
+                if ($Controls['KnownModelsCheckBox'].IsChecked -and (Get-DATCMState).Connected -and $ModelCount -gt 0) {
+                    $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - querying SCCM inventory and existing packages..."
+                    try {
+                        $KnownModels = Get-DATKnownModels -Manufacturers $G.ModelManufacturers
+                        $MatchCount = Select-DATKnownModelsInGrid -Table $Data -KnownModels $KnownModels
+                        $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - $MatchCount known model(s) selected (inventory + packages)"
+                    } catch {
+                        Write-DATLog -Message "Known models auto-select failed: $($_.Exception.Message)" -Severity 2
+                        $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models (known models query failed)"
+                    }
+                }
+            } catch {
+                Show-DATWindowMessage -Message "Error loading models: $($_.Exception.Message)" -Type Error
+                $Controls['StatusStripLabel'].Text = 'Error loading models'
+            } finally {
+                if ($G.ModelRunspace) { $G.ModelRunspace.Dispose(); $G.ModelRunspace = $null }
+                $G.ModelHandle = $null
+                $Controls['ModelProgress'].IsIndeterminate = $false
+                $Controls['ModelProgress'].Visibility = [System.Windows.Visibility]::Collapsed
+                $Controls['RefreshButton'].IsEnabled = $true
+            }
+        })
+
+        $G.ModelTimer.Start()
+    })
+
+    # --- Theme picker (header): System / Dark / Light ---
+    $Controls['ThemeCombo'].Add_SelectionChanged({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window; $G = $gui.G
+        if ($G.Initializing) { return }
+        $Mode = Get-DATComboText $Controls['ThemeCombo']
+        if ($Mode -notin @('System', 'Light', 'Dark')) { $Mode = 'System' }
+        Set-DATWindowTheme -Window $Window -Mode $Mode
     })
 
     # --- Search Box - filter models ---
@@ -699,6 +772,7 @@ function Initialize-DATMainWindow {
                     deploymentPlatform = (Get-DATComboText $Controls['DeployPlatformCombo'])
                     compressPackage = [bool]$Controls['CompressPackageCheckBox'].IsChecked
                     compressionType = (Get-DATComboText $Controls['CompressionTypeCombo'])
+                    themeMode = (Get-DATComboText $Controls['ThemeCombo'])
                 }
             }
 
@@ -1447,7 +1521,13 @@ function Initialize-DATMainWindow {
         $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window; $G = $gui.G
 
         # Re-apply the theme now the window is fully loaded (belt-and-suspenders).
-        try { Set-DATWindowTheme -Window $Window -Mode System } catch { }
+        # The ThemeCombo already reflects the saved preference (set in
+        # New-DATMainWindow); honour whatever it shows.
+        try {
+            $ThemeMode = Get-DATComboText $Controls['ThemeCombo']
+            if ($ThemeMode -notin @('System', 'Light', 'Dark')) { $ThemeMode = 'System' }
+            Set-DATWindowTheme -Window $Window -Mode $ThemeMode
+        } catch { }
 
         try {
             $Config = Get-DATConfig

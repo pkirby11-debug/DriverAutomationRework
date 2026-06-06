@@ -5,20 +5,32 @@
 function Get-DATSystemUsesLightTheme {
     <#
     .SYNOPSIS
-        Returns $true when Windows is set to the light app theme, $false for dark.
-        Defaults to light if the preference cannot be read.
+        Reads the Windows app theme preference.
+    .OUTPUTS
+        $true  -> Windows is set to the LIGHT app theme
+        $false -> Windows is set to the DARK app theme
+        $null  -> the preference could not be read (caller decides the default)
+    .DESCRIPTION
+        Opens the Personalize key directly off the CurrentUser hive with
+        OpenSubKey. The static Registry.GetValue helper proved unreliable in the
+        child STA runspace (it returned $null even when the value was present,
+        which is why the window came up light on a dark box); OpenSubKey reads it
+        correctly. Returns $null - not a hard light/dark guess - when the value is
+        genuinely missing so Set-DATWindowTheme can apply its dark-first default.
     #>
     try {
-        # Use the .NET registry API directly - it does not depend on the HKCU:
-        # PSDrive being mounted in the (child STA) runspace.
-        $Value = [Microsoft.Win32.Registry]::GetValue(
-            'HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize',
-            'AppsUseLightTheme', $null)
-        if ($null -eq $Value) { return $true }
-        return ([int]$Value -ne 0)
-    } catch {
-        return $true
-    }
+        $Key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
+            'SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize')
+        if ($null -ne $Key) {
+            try {
+                $Value = $Key.GetValue('AppsUseLightTheme', $null)
+            } finally {
+                $Key.Dispose()
+            }
+            if ($null -ne $Value) { return ([int]$Value -ne 0) }
+        }
+    } catch { }
+    return $null
 }
 
 function Get-DATCMState {
@@ -73,7 +85,8 @@ function Set-DATWindowTheme {
         (ComboBox popups, CheckBox glyphs) only partially follows dark mode without
         a dedicated theming library.
     .PARAMETER Mode
-        'System' (default) follows the Windows app theme; 'Light' / 'Dark' force it.
+        'System' (default) follows the Windows app theme, defaulting to DARK when
+        the preference cannot be read (dark-mode-first); 'Light' / 'Dark' force it.
     #>
     param(
         $Window,
@@ -86,20 +99,26 @@ function Set-DATWindowTheme {
     $UseLight = switch ($Mode) {
         'Light' { $true }
         'Dark'  { $false }
-        default { Get-DATSystemUsesLightTheme }
+        default {
+            $Detected = Get-DATSystemUsesLightTheme
+            # Dark-first: when the Windows preference is unreadable, prefer dark.
+            if ($null -eq $Detected) { $false } else { $Detected }
+        }
     }
 
     $Palette = if ($UseLight) {
         @{
-            WinBg = '#FFF3F3F3'; PanelBg = '#FFFFFFFF'; CtrlBg = '#FFFFFFFF'; GridBg = '#FFFFFFFF'
-            GridAltBg = '#FFF7F9FB'; GridHeaderBg = '#FFEFEFEF'; Fg = '#FF1B1B1B'; SubtleFg = '#FF6E6E6E'
-            BorderClr = '#FFD0D0D0'; StatusBg = '#FFE8E8E8'
+            WinBg = '#FFF3F3F3'; PanelBg = '#FFFFFFFF'; CtrlBg = '#FFFFFFFF'; CtrlHoverBg = '#FFEAEAEA'
+            GridBg = '#FFFFFFFF'; GridAltBg = '#FFF7F9FB'; GridHeaderBg = '#FFEFEFEF'
+            Fg = '#FF1B1B1B'; SubtleFg = '#FF6E6E6E'; BorderClr = '#FFD0D0D0'; StatusBg = '#FFE8E8E8'
+            NavBg = '#FFFFFFFF'; NavHoverBg = '#FFEDF3F8'; NavSelBg = '#FFE5F1FB'; NavSelFg = '#FF004C87'
         }
     } else {
         @{
-            WinBg = '#FF1F1F1F'; PanelBg = '#FF2B2B2B'; CtrlBg = '#FF2D2D2D'; GridBg = '#FF252526'
-            GridAltBg = '#FF2D2D30'; GridHeaderBg = '#FF3A3A3D'; Fg = '#FFF0F0F0'; SubtleFg = '#FFB0B0B0'
-            BorderClr = '#FF3F3F3F'; StatusBg = '#FF2B2B2B'
+            WinBg = '#FF1F1F1F'; PanelBg = '#FF2B2B2B'; CtrlBg = '#FF2D2D2D'; CtrlHoverBg = '#FF3A3A3D'
+            GridBg = '#FF252526'; GridAltBg = '#FF2D2D30'; GridHeaderBg = '#FF3A3A3D'
+            Fg = '#FFF0F0F0'; SubtleFg = '#FFB0B0B0'; BorderClr = '#FF3F3F3F'; StatusBg = '#FF2B2B2B'
+            NavBg = '#FF252526'; NavHoverBg = '#FF2F2F30'; NavSelBg = '#FF0E2A3F'; NavSelFg = '#FFFFFFFF'
         }
     }
 

@@ -3,8 +3,8 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:sys="clr-namespace:System;assembly=mscorlib"
     Title="Driver Automation Tool"
-    Height="720" Width="1050"
-    MinHeight="600" MinWidth="900"
+    Height="760" Width="1120"
+    MinHeight="620" MinWidth="960"
     WindowStartupLocation="CenterScreen"
     FontFamily="Segoe UI" FontSize="12"
     Background="{DynamicResource WinBg}"
@@ -14,23 +14,31 @@
         DriverAutomationTool main window (WPF).
         Pure layout: every interactive control carries an x:Name that the event
         layer (MainWindow.ps1) resolves into the $Controls hashtable. Colours come
-        from the theme brush resources below (light defaults); Set-DATWindowTheme
-        swaps them at runtime to follow the Windows light/dark app setting. Layout
+        from the theme brush resources below (dark-mode-first defaults);
+        Set-DATWindowTheme swaps them at runtime to follow the header Theme picker
+        (System / Dark / Light). Navigation is a left sidebar (a templated
+        TabControl with TabStripPlacement="Left"), so the existing
+        $Controls['TabControl'].SelectedIndex handler logic is unchanged. Layout
         uses Grid/DockPanel star-sizing so it scales with the window.
     -->
 
     <Window.Resources>
-        <!-- ===== Theme brushes (light defaults; replaced at runtime for dark) ===== -->
-        <SolidColorBrush x:Key="WinBg" Color="#FFF3F3F3" />
-        <SolidColorBrush x:Key="PanelBg" Color="#FFFFFFFF" />
-        <SolidColorBrush x:Key="CtrlBg" Color="#FFFFFFFF" />
-        <SolidColorBrush x:Key="GridBg" Color="#FFFFFFFF" />
-        <SolidColorBrush x:Key="GridAltBg" Color="#FFF7F9FB" />
-        <SolidColorBrush x:Key="GridHeaderBg" Color="#FFEFEFEF" />
-        <SolidColorBrush x:Key="Fg" Color="#FF1B1B1B" />
-        <SolidColorBrush x:Key="SubtleFg" Color="#FF6E6E6E" />
-        <SolidColorBrush x:Key="BorderClr" Color="#FFD0D0D0" />
-        <SolidColorBrush x:Key="StatusBg" Color="#FFE8E8E8" />
+        <!-- ===== Theme brushes (dark-mode-first defaults; replaced at runtime) ===== -->
+        <SolidColorBrush x:Key="WinBg" Color="#FF1F1F1F" />
+        <SolidColorBrush x:Key="PanelBg" Color="#FF2B2B2B" />
+        <SolidColorBrush x:Key="CtrlBg" Color="#FF2D2D2D" />
+        <SolidColorBrush x:Key="CtrlHoverBg" Color="#FF3A3A3D" />
+        <SolidColorBrush x:Key="GridBg" Color="#FF252526" />
+        <SolidColorBrush x:Key="GridAltBg" Color="#FF2D2D30" />
+        <SolidColorBrush x:Key="GridHeaderBg" Color="#FF3A3A3D" />
+        <SolidColorBrush x:Key="Fg" Color="#FFF0F0F0" />
+        <SolidColorBrush x:Key="SubtleFg" Color="#FFB0B0B0" />
+        <SolidColorBrush x:Key="BorderClr" Color="#FF3F3F3F" />
+        <SolidColorBrush x:Key="StatusBg" Color="#FF2B2B2B" />
+        <SolidColorBrush x:Key="NavBg" Color="#FF252526" />
+        <SolidColorBrush x:Key="NavHoverBg" Color="#FF2F2F30" />
+        <SolidColorBrush x:Key="NavSelBg" Color="#FF0E2A3F" />
+        <SolidColorBrush x:Key="NavSelFg" Color="#FFFFFFFF" />
 
         <!-- Accent is theme-independent -->
         <SolidColorBrush x:Key="AccentBg" Color="#FF0078D4" />
@@ -47,7 +55,7 @@
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
                         <Border x:Name="Bd" Background="{TemplateBinding Background}"
-                                CornerRadius="3" Padding="{TemplateBinding Padding}">
+                                CornerRadius="4" Padding="{TemplateBinding Padding}">
                             <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
                         </Border>
                         <ControlTemplate.Triggers>
@@ -63,14 +71,101 @@
             </Setter>
         </Style>
 
-        <!-- Standard (secondary) button -->
+        <!-- Standard (secondary) button - fully templated so it follows the dark
+             palette (the default WPF button chrome stays light in dark mode). -->
         <Style x:Key="StandardButton" TargetType="Button">
-            <Setter Property="Padding" Value="12,5" />
+            <Setter Property="Padding" Value="12,6" />
             <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
             <Setter Property="Foreground" Value="{DynamicResource Fg}" />
             <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="4" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource CtrlHoverBg}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== Sidebar navigation: templated TabControl + TabItem ===== -->
+        <Style TargetType="TabControl">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabControl">
+                        <Grid Background="{DynamicResource WinBg}">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Border Grid.Column="0" Background="{DynamicResource NavBg}"
+                                    BorderBrush="{DynamicResource BorderClr}" BorderThickness="0,0,1,0">
+                                <StackPanel Width="196">
+                                    <TextBlock Text="NAVIGATION" Foreground="{DynamicResource SubtleFg}"
+                                               FontSize="10" FontWeight="SemiBold" Margin="20,18,0,8" />
+                                    <TabPanel IsItemsHost="True" />
+                                </StackPanel>
+                            </Border>
+                            <Border Grid.Column="1" Background="{DynamicResource WinBg}">
+                                <ContentPresenter ContentSource="SelectedContent" />
+                            </Border>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style TargetType="TabItem">
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border x:Name="NavBd" Background="Transparent" BorderBrush="Transparent"
+                                BorderThickness="3,0,0,0" Padding="17,11" SnapsToDevicePixels="True">
+                            <ContentPresenter ContentSource="Header" VerticalAlignment="Center"
+                                              HorizontalAlignment="Left" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="NavBd" Property="Background" Value="{DynamicResource NavHoverBg}" />
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="NavBd" Property="Background" Value="{DynamicResource NavSelBg}" />
+                                <Setter TargetName="NavBd" Property="BorderBrush" Value="{DynamicResource AccentBg}" />
+                                <Setter Property="Foreground" Value="{DynamicResource NavSelFg}" />
+                                <Setter Property="FontWeight" Value="SemiBold" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Single-click, full-cell checkbox for the grids (replaces
+             DataGridCheckBoxColumn, which needed a click to enter edit mode and
+             a second to toggle, and only registered a hit dead-centre). -->
+        <Style x:Key="GridCheckCell" TargetType="CheckBox">
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="VerticalAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Margin" Value="0" />
         </Style>
 
         <Style TargetType="GroupBox">
@@ -88,7 +183,8 @@
         </Style>
 
         <Style TargetType="TextBox">
-            <Setter Property="Padding" Value="3,2" />
+            <Setter Property="Padding" Value="4,3" />
+            <Setter Property="MinHeight" Value="26" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
             <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
             <Setter Property="Foreground" Value="{DynamicResource Fg}" />
@@ -97,7 +193,7 @@
         </Style>
 
         <Style TargetType="ComboBox">
-            <Setter Property="Height" Value="24" />
+            <Setter Property="Height" Value="26" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
             <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
             <Setter Property="Foreground" Value="{DynamicResource Fg}" />
@@ -133,6 +229,7 @@
             <Setter Property="Foreground" Value="{DynamicResource Fg}" />
             <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
             <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource BorderClr}" />
+            <Setter Property="RowHeight" Value="26" />
             <Setter Property="SelectionMode" Value="Extended" />
             <Setter Property="SelectionUnit" Value="FullRow" />
         </Style>
@@ -155,14 +252,24 @@
     <DockPanel LastChildFill="True">
 
         <!-- ===================== HEADER ===================== -->
-        <Border DockPanel.Dock="Top" Height="50" Background="{DynamicResource AccentBg}">
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="15,0">
-                <TextBlock Text="Driver Automation Tool" Foreground="White"
-                           FontSize="20" FontWeight="Bold" VerticalAlignment="Center" />
-                <TextBlock x:Name="VersionLabel" Text="" Foreground="#FFE6F1FB"
-                           FontSize="12" Margin="12,0,0,0" VerticalAlignment="Bottom"
-                           Padding="0,0,0,4" />
-            </StackPanel>
+        <Border DockPanel.Dock="Top" Height="54" Background="{DynamicResource AccentBg}">
+            <DockPanel LastChildFill="False" Margin="16,0">
+                <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="Driver Automation Tool" Foreground="White"
+                               FontSize="20" FontWeight="Bold" VerticalAlignment="Center" />
+                    <TextBlock x:Name="VersionLabel" Text="" Foreground="#FFE6F1FB"
+                               FontSize="12" Margin="12,0,0,0" VerticalAlignment="Bottom"
+                               Padding="0,0,0,4" />
+                </StackPanel>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="Theme:" Foreground="White" VerticalAlignment="Center" Margin="0,0,8,0" />
+                    <ComboBox x:Name="ThemeCombo" Width="110" SelectedIndex="0" ToolTip="Window colour theme">
+                        <sys:String>System</sys:String>
+                        <sys:String>Dark</sys:String>
+                        <sys:String>Light</sys:String>
+                    </ComboBox>
+                </StackPanel>
+            </DockPanel>
         </Border>
 
         <!-- ===================== STATUS BAR (very bottom) ===================== -->
@@ -173,9 +280,9 @@
         </StatusBar>
 
         <!-- ===================== BOTTOM ACTION BAR ===================== -->
-        <Border DockPanel.Dock="Bottom" Height="56" Background="{DynamicResource StatusBg}"
+        <Border DockPanel.Dock="Bottom" Height="58" Background="{DynamicResource StatusBg}"
                 BorderBrush="{DynamicResource BorderClr}" BorderThickness="0,1,0,0">
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0">
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0">
                 <Button x:Name="StartButton" Content="Start Sync" Style="{StaticResource AccentButton}"
                         Width="170" Height="38" FontSize="14" Margin="0,0,10,0" />
                 <Button x:Name="StopButton" Content="Stop" Style="{StaticResource StandardButton}"
@@ -187,13 +294,13 @@
             </StackPanel>
         </Border>
 
-        <!-- ===================== TABS ===================== -->
-        <TabControl x:Name="TabControl" Margin="6" Padding="0" Background="{DynamicResource WinBg}"
+        <!-- ===================== SIDEBAR NAV + CONTENT ===================== -->
+        <TabControl x:Name="TabControl" TabStripPlacement="Left" Background="{DynamicResource WinBg}"
                     BorderBrush="{DynamicResource BorderClr}">
 
             <!-- ============ Tab 1: Models ============ -->
             <TabItem Header="Models">
-                <DockPanel Margin="10" LastChildFill="True">
+                <DockPanel Margin="16" LastChildFill="True">
                     <StackPanel DockPanel.Dock="Top">
                         <!-- Manufacturers -->
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
@@ -228,12 +335,22 @@
                             <Button x:Name="SelectNoneButton" Content="Select None" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,12,0" />
                             <CheckBox x:Name="KnownModelsCheckBox" Content="Select Known Models" IsEnabled="False" />
                         </StackPanel>
+                        <!-- Busy indicator for the background model load -->
+                        <ProgressBar x:Name="ModelProgress" Height="4" Margin="0,0,0,8" Minimum="0" Maximum="100"
+                                     IsIndeterminate="False" Visibility="Collapsed"
+                                     Background="Transparent" BorderThickness="0" Foreground="{DynamicResource AccentBg}" />
                     </StackPanel>
 
                     <DataGrid x:Name="ModelGrid">
                         <DataGrid.Columns>
-                            <DataGridCheckBoxColumn Header="" Width="30"
-                                Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" />
+                            <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox Style="{StaticResource GridCheckCell}"
+                                                  IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
                             <DataGridTextColumn Header="Manufacturer" Width="110" IsReadOnly="True" Binding="{Binding Manufacturer}" />
                             <DataGridTextColumn Header="Model" Width="*" IsReadOnly="True" Binding="{Binding Model}" />
                             <DataGridTextColumn Header="System ID / Machine Type" Width="200" IsReadOnly="True" Binding="{Binding SystemID}" />
@@ -245,7 +362,7 @@
 
             <!-- ============ Tab 2: SCCM Settings ============ -->
             <TabItem Header="SCCM Settings">
-                <Grid Margin="10">
+                <Grid Margin="16">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" MinWidth="470" />
                         <ColumnDefinition Width="*" MinWidth="380" />
@@ -341,8 +458,14 @@
                         <GroupBox Grid.Row="0" Header="Distribution Points">
                             <DataGrid x:Name="DPGrid">
                                 <DataGrid.Columns>
-                                    <DataGridCheckBoxColumn Header="" Width="30"
-                                        Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" />
+                                    <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <CheckBox Style="{StaticResource GridCheckCell}"
+                                                          IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
                                     <DataGridTextColumn Header="Distribution Point" Width="*" IsReadOnly="True" Binding="{Binding Name}" />
                                 </DataGrid.Columns>
                             </DataGrid>
@@ -350,8 +473,14 @@
                         <GroupBox Grid.Row="1" Header="Distribution Point Groups">
                             <DataGrid x:Name="DPGGrid">
                                 <DataGrid.Columns>
-                                    <DataGridCheckBoxColumn Header="" Width="30"
-                                        Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" />
+                                    <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <CheckBox Style="{StaticResource GridCheckCell}"
+                                                          IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
                                     <DataGridTextColumn Header="Distribution Point Group" Width="*" IsReadOnly="True" Binding="{Binding Name}" />
                                 </DataGrid.Columns>
                             </DataGrid>
@@ -362,7 +491,7 @@
 
             <!-- ============ Tab 3: Progress ============ -->
             <TabItem Header="Progress">
-                <DockPanel Margin="10" LastChildFill="True">
+                <DockPanel Margin="16" LastChildFill="True">
                     <StackPanel DockPanel.Dock="Top" Margin="0,0,0,8">
                         <ProgressBar x:Name="ProgressBar" Height="24" Minimum="0" Maximum="100" />
                         <TextBlock x:Name="StatusLabel" Text="Ready" FontSize="13" Margin="0,8,0,0" Foreground="{DynamicResource Fg}" />
@@ -376,7 +505,7 @@
 
             <!-- ============ Tab 4: Package Management ============ -->
             <TabItem Header="Package Management">
-                <DockPanel Margin="10" LastChildFill="True">
+                <DockPanel Margin="16" LastChildFill="True">
                     <StackPanel DockPanel.Dock="Top">
                         <WrapPanel Margin="0,0,0,6">
                             <Button x:Name="PkgRefreshButton" Content="Refresh Packages" Style="{StaticResource StandardButton}" Width="130" Margin="0,0,8,0" />
@@ -385,9 +514,9 @@
                                 <sys:String>Drivers Only</sys:String>
                                 <sys:String>BIOS Only</sys:String>
                             </ComboBox>
-                            <Button x:Name="PkgDeleteButton" Content="Remove Selected" Style="{StaticResource StandardButton}" Width="130" Margin="0,0,8,0" Foreground="#FFC42B1C" />
+                            <Button x:Name="PkgDeleteButton" Content="Remove Selected" Style="{StaticResource StandardButton}" Width="130" Margin="0,0,8,0" Foreground="#FFE74C3C" />
                             <CheckBox x:Name="PkgIncludeDriverPkgsCheckBox" Content="Include Driver Packages" Margin="0,0,16,0" />
-                            <Button x:Name="PkgCleanupOverlayButton" Content="Cleanup Overlay TS Packages..." Style="{StaticResource StandardButton}" Width="210" Foreground="#FFC42B1C" />
+                            <Button x:Name="PkgCleanupOverlayButton" Content="Cleanup Overlay TS Packages..." Style="{StaticResource StandardButton}" Width="210" Foreground="#FFE74C3C" />
                         </WrapPanel>
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
                             <Label Content="Action:" Width="55" />
@@ -415,8 +544,14 @@
 
                     <DataGrid x:Name="PkgGrid">
                         <DataGrid.Columns>
-                            <DataGridCheckBoxColumn Header="" Width="30"
-                                Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" />
+                            <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox Style="{StaticResource GridCheckCell}"
+                                                  IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
                             <DataGridTextColumn Header="PackageID" Width="80" IsReadOnly="True" Binding="{Binding PackageID}" />
                             <DataGridTextColumn Header="Name" Width="2*" IsReadOnly="True" Binding="{Binding Name}" />
                             <DataGridTextColumn Header="Version" Width="80" IsReadOnly="True" Binding="{Binding Version}" />
@@ -430,7 +565,7 @@
 
             <!-- ============ Tab 5: Deploy Applications ============ -->
             <TabItem Header="Deploy Applications">
-                <DockPanel Margin="10" LastChildFill="True">
+                <DockPanel Margin="16" LastChildFill="True">
                     <StackPanel DockPanel.Dock="Top">
                         <!-- Filters + options row -->
                         <Grid>
@@ -575,8 +710,14 @@
 
                     <DataGrid x:Name="DeployAppsGrid">
                         <DataGrid.Columns>
-                            <DataGridCheckBoxColumn Header="" Width="30"
-                                Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" />
+                            <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox Style="{StaticResource GridCheckCell}"
+                                                  IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
                             <DataGridTextColumn Header="Name" Width="2*" IsReadOnly="True" Binding="{Binding Name}" />
                             <DataGridTextColumn Header="Version" Width="90" IsReadOnly="True" Binding="{Binding Version}" />
                             <DataGridTextColumn Header="Manufacturer" Width="110" IsReadOnly="True" Binding="{Binding Manufacturer}" />
