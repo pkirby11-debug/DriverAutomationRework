@@ -5,29 +5,40 @@
 function Get-DATSystemUsesLightTheme {
     <#
     .SYNOPSIS
-        Reads the Windows app theme preference.
+        Reads the Windows theme preference (app mode + system mode).
     .OUTPUTS
-        $true  -> Windows is set to the LIGHT app theme
-        $false -> Windows is set to the DARK app theme
+        $true  -> Windows is fully LIGHT (both app and system modes are light)
+        $false -> Windows is DARK (either app OR system mode is dark)
         $null  -> the preference could not be read (caller decides the default)
     .DESCRIPTION
-        Opens the Personalize key directly off the CurrentUser hive with
-        OpenSubKey. The static Registry.GetValue helper proved unreliable in the
-        child STA runspace (it returned $null even when the value was present,
-        which is why the window came up light on a dark box); OpenSubKey reads it
-        correctly. Returns $null - not a hard light/dark guess - when the value is
-        genuinely missing so Set-DATWindowTheme can apply its dark-first default.
+        Windows exposes TWO settings under Personalize: AppsUseLightTheme ("app
+        mode", which governs app chrome) and SystemUsesLightTheme ("Windows mode",
+        the taskbar/Start surface). A user who set "Windows mode = Dark" but left
+        "app mode = Light" was getting a light window from System even though their
+        desktop reads as dark - which is what "it will not follow the system theme"
+        was. Dark-mode-first, this returns light only when BOTH modes are light and
+        dark if EITHER is dark, so a dark Windows desktop yields a dark window.
+
+        The key is opened with OpenSubKey off the CurrentUser hive; the static
+        Registry.GetValue helper returned $null in the child STA runspace. $null is
+        returned (not a hard guess) when neither value is present, so
+        Set-DATWindowTheme can apply its dark-first default.
     #>
     try {
         $Key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
             'SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize')
         if ($null -ne $Key) {
             try {
-                $Value = $Key.GetValue('AppsUseLightTheme', $null)
+                $AppsLight   = $Key.GetValue('AppsUseLightTheme', $null)
+                $SystemLight = $Key.GetValue('SystemUsesLightTheme', $null)
             } finally {
                 $Key.Dispose()
             }
-            if ($null -ne $Value) { return ([int]$Value -ne 0) }
+            $Present = @($AppsLight, $SystemLight) | Where-Object { $null -ne $_ }
+            if ($Present.Count -gt 0) {
+                foreach ($V in $Present) { if ([int]$V -eq 0) { return $false } }
+                return $true
+            }
         }
     } catch { }
     return $null

@@ -45,7 +45,7 @@ function New-DATMainWindow {
 
     # --- Version labels ---
     $ModVer = (Get-Module DriverAutomationTool).Version
-    if (-not $ModVer) { $ModVer = '2.2.0' }
+    if (-not $ModVer) { $ModVer = '2.2.1' }
     $Window.Title = "Driver Automation Tool v$ModVer"
     $Controls['VersionLabel'].Text = "v$ModVer"
 
@@ -277,30 +277,33 @@ function Initialize-DATMainWindow {
 
         $ModelScript = {
             param($ModulePath, $Manufacturers)
-            Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
-            $Out = [System.Collections.Generic.List[object]]::new()
-            foreach ($Make in $Manufacturers) {
-                $Models = switch ($Make) {
-                    'Dell'      { Get-DellModelList }
-                    'Lenovo'    { Get-LenovoModelList }
-                    'Microsoft' { Get-SurfaceModelList }
+            $Mod = Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force -PassThru
+            # Get-DellModelList / Get-LenovoModelList / Get-SurfaceModelList are
+            # module-PRIVATE (not exported), so a bare Import-Module does not expose
+            # them to this runspace's session - they only resolve inside the module's
+            # own scope. Run the fetch there with & $Mod { ... }.
+            & $Mod {
+                param($Manufacturers)
+                foreach ($Make in $Manufacturers) {
+                    $Models = switch ($Make) {
+                        'Dell'      { Get-DellModelList }
+                        'Lenovo'    { Get-LenovoModelList }
+                        'Microsoft' { Get-SurfaceModelList }
+                    }
+                    foreach ($M in $Models) {
+                        $ID = if ($M.SystemID) { $M.SystemID }
+                              elseif ($M.MachineType) { $M.MachineType }
+                              elseif ($M.DownloadID) { $M.DownloadID }
+                              else { '' }
+                        [PSCustomObject]@{
+                            Manufacturer = $M.Manufacturer
+                            Model        = $M.Model
+                            SystemID     = $ID
+                            Platform     = if ($M.Platform) { $M.Platform } else { '' }
+                        }
+                    }
                 }
-                foreach ($M in $Models) {
-                    $ID = if ($M.SystemID) { $M.SystemID }
-                          elseif ($M.MachineType) { $M.MachineType }
-                          elseif ($M.DownloadID) { $M.DownloadID }
-                          else { '' }
-                    $Out.Add([PSCustomObject]@{
-                        Manufacturer = $M.Manufacturer
-                        Model        = $M.Model
-                        SystemID     = $ID
-                        Platform     = if ($M.Platform) { $M.Platform } else { '' }
-                    })
-                }
-            }
-            # Emit each model into the output stream (NOT ,$Out) so EndInvoke hands
-            # the UI thread the individual model objects, not the List as one item.
-            return $Out
+            } $Manufacturers
         }
 
         $G.ModelRunspace = [System.Management.Automation.PowerShell]::Create()
@@ -318,6 +321,7 @@ function Initialize-DATMainWindow {
 
             try {
                 $Models = $G.ModelRunspace.EndInvoke($G.ModelHandle)
+                $RsErrors = @($G.ModelRunspace.Streams.Error)
 
                 $Data = $Controls['ModelGridData']
                 $Data.BeginLoadData()
@@ -330,18 +334,24 @@ function Initialize-DATMainWindow {
                 }
 
                 $ModelCount = $Data.Rows.Count
-                $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models"
+                if ($ModelCount -eq 0 -and $RsErrors.Count -gt 0) {
+                    # Surface a background failure instead of silently showing 0.
+                    $Controls['StatusStripLabel'].Text = 'Error loading models'
+                    Show-DATWindowMessage -Message "Error loading models: $($RsErrors[0].Exception.Message)" -Type Error
+                } else {
+                    $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models"
 
-                # Known-model auto-select needs THIS runspace's live CM connection.
-                if ($Controls['KnownModelsCheckBox'].IsChecked -and (Get-DATCMState).Connected -and $ModelCount -gt 0) {
-                    $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - querying SCCM inventory and existing packages..."
-                    try {
-                        $KnownModels = Get-DATKnownModels -Manufacturers $G.ModelManufacturers
-                        $MatchCount = Select-DATKnownModelsInGrid -Table $Data -KnownModels $KnownModels
-                        $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - $MatchCount known model(s) selected (inventory + packages)"
-                    } catch {
-                        Write-DATLog -Message "Known models auto-select failed: $($_.Exception.Message)" -Severity 2
-                        $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models (known models query failed)"
+                    # Known-model auto-select needs THIS runspace's live CM connection.
+                    if ($Controls['KnownModelsCheckBox'].IsChecked -and (Get-DATCMState).Connected -and $ModelCount -gt 0) {
+                        $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - querying SCCM inventory and existing packages..."
+                        try {
+                            $KnownModels = Get-DATKnownModels -Manufacturers $G.ModelManufacturers
+                            $MatchCount = Select-DATKnownModelsInGrid -Table $Data -KnownModels $KnownModels
+                            $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - $MatchCount known model(s) selected (inventory + packages)"
+                        } catch {
+                            Write-DATLog -Message "Known models auto-select failed: $($_.Exception.Message)" -Severity 2
+                            $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models (known models query failed)"
+                        }
                     }
                 }
             } catch {
@@ -559,7 +569,7 @@ function Initialize-DATMainWindow {
         }
 
         # Switch to progress tab
-        $Controls['TabControl'].SelectedIndex = 2
+        $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
         $Controls['LogListBox'].Items.Clear()
 
         $Controls['StartButton'].IsEnabled = $false
@@ -725,7 +735,7 @@ function Initialize-DATMainWindow {
     $Controls['HealthCheckButton'].Add_Click({
         $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
         $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
-        $Controls['TabControl'].SelectedIndex = 2
+        $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
         $Window.Cursor = $WaitCursor
         try {
             $Results = Test-DATCatalogHealth
@@ -1406,7 +1416,7 @@ function Initialize-DATMainWindow {
         $Controls['DeployStatusLabel'].Text = "Deploying $($AppNames.Count) application(s)..."
         $Controls['DeployStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Orange
 
-        $Controls['TabControl'].SelectedIndex = 2
+        $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
         $Controls['LogListBox'].Items.Clear()
 
         $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
