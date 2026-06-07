@@ -390,14 +390,14 @@
                     <StackPanel DockPanel.Dock="Top">
                         <!-- Manufacturers -->
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
-                            <Label Content="Manufacturers:" Width="110" />
+                            <Label Content="Manufacturers:" Width="125" />
                             <CheckBox x:Name="DellCheckBox" Content="Dell" IsChecked="True" Margin="0,0,16,0" />
                             <CheckBox x:Name="LenovoCheckBox" Content="Lenovo" IsChecked="True" Margin="0,0,16,0" />
                             <CheckBox x:Name="MicrosoftCheckBox" Content="Microsoft" />
                         </StackPanel>
                         <!-- OS / Arch / Type -->
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
-                            <Label Content="Operating System:" Width="110" />
+                            <Label Content="Operating System:" Width="125" />
                             <ComboBox x:Name="OsCombo" Width="190" Margin="0,0,16,0" />
                             <Label Content="Architecture:" />
                             <ComboBox x:Name="ArchCombo" Width="90" Margin="0,0,16,0" SelectedIndex="0">
@@ -414,7 +414,7 @@
                         </StackPanel>
                         <!-- Search / actions -->
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                            <Label Content="Search Models:" Width="110" />
+                            <Label Content="Search Models:" Width="125" />
                             <TextBox x:Name="SearchBox" Width="260" Margin="0,0,12,0" />
                             <Button x:Name="RefreshButton" Content="Refresh Models" Style="{StaticResource StandardButton}" Width="132" Margin="0,0,8,0" />
                             <Button x:Name="SelectAllButton" Content="Select All" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,8,0" />
@@ -566,7 +566,7 @@
 
                                     <!-- User notification -->
                                     <StackPanel Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
-                                        <Label Content="User notification:" Width="105" />
+                                        <Label Content="User notification:" Width="125" />
                                         <ComboBox x:Name="DeployUserNotifCombo" Width="220" SelectedIndex="0">
                                             <sys:String>DisplayAll</sys:String>
                                             <sys:String>DisplaySoftwareCenterOnly</sys:String>
@@ -631,7 +631,7 @@
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
-                            <Label Grid.Column="0" Content="Target Collection:" Width="115" />
+                            <Label Grid.Column="0" Content="Target Collection:" Width="125" />
                             <ComboBox x:Name="DeployCollectionCombo" Grid.Column="1" IsEditable="True" Margin="0,0,10,0" />
                             <Button x:Name="DeployRefreshCollectionsButton" Grid.Column="2" Content="Refresh Collections" Style="{StaticResource StandardButton}" Width="164" />
                         </Grid>
@@ -645,7 +645,7 @@
                             <TextBox x:Name="DeployAppsSearchBox" Width="280" />
                         </StackPanel>
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                            <Button x:Name="DeployButton" Content="Deploy Selected" Style="{StaticResource AccentButton}" Width="160" Height="28" Margin="0,0,12,0" />
+                            <Button x:Name="DeployButton" Content="Deploy Selected" Style="{StaticResource AccentButton}" Width="160" Height="32" Margin="0,0,12,0" />
                             <TextBlock x:Name="DeployStatusLabel" VerticalAlignment="Center" Foreground="{DynamicResource SubtleFg}"
                                        Text="Connect to ConfigMgr to populate collections, then click Refresh Applications." />
                         </StackPanel>
@@ -753,7 +753,7 @@
                                     <CheckBox x:Name="VerifyHashCheckBox" Content="Verify download hash (Dell)" Width="250" />
                                 </WrapPanel>
                                 <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                                    <Label Content="Deployment Platform:" Width="130" />
+                                    <Label Content="Deployment Platform:" Width="150" />
                                     <ComboBox x:Name="DeployPlatformCombo" Width="240" SelectedIndex="0">
                                         <sys:String>ConfigMgr - Standard Pkg</sys:String>
                                         <sys:String>ConfigMgr - Driver Pkg</sys:String>
@@ -764,7 +764,7 @@
                                     </ComboBox>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                                    <CheckBox x:Name="CompressPackageCheckBox" Content="Compress Package:" Width="130" />
+                                    <CheckBox x:Name="CompressPackageCheckBox" Content="Compress Package:" Width="150" />
                                     <ComboBox x:Name="CompressionTypeCombo" Width="90" IsEnabled="False" SelectedIndex="0">
                                         <sys:String>ZIP</sys:String>
                                         <sys:String>WIM</sys:String>
