@@ -770,20 +770,25 @@ function Install-DriverUpdates {
     }
     $SkippedGpu = 0
 
-    # Per-DUP stdout/stderr capture. A DUP failing immediately (0.1s exit 1) gives
-    # no clue from its exit code alone - having its console output on disk turns
-    # the next investigation from a guess into "read the log". One subdir per
-    # apply-script run so successive runs don't overwrite each other.
+    # Per-DUP log capture. DUPs are GUI applications - they write NOTHING to
+    # stdout/stderr, so the .stdout/.stderr files are expected to be empty and
+    # exist only as a fallback. The real diagnostic channel is Dell's own
+    # framework log, requested per-DUP via the documented /l= switch (the
+    # .dup.log files): it records why an install failed, and its ABSENCE after
+    # a failure means the process died before Dell's framework even initialized
+    # - the signature of an AV/EDR product terminating the installer at launch.
+    # One subdir per apply-script run so successive runs don't overwrite.
     $DupLogDir = Join-Path $env:WINDIR ('Temp\DATDupLogs\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     try {
         if (-not (Test-Path $DupLogDir)) {
             New-Item -Path $DupLogDir -ItemType Directory -Force | Out-Null
         }
-        Write-Log "Per-DUP stdout/stderr captured to: $DupLogDir"
+        Write-Log "Per-DUP logs captured to: $DupLogDir (*.dup.log = Dell framework log; *.stdout/.stderr are expected to be empty - DUPs are GUI apps)"
     } catch {
         Write-Log "Could not create DUP log directory '$DupLogDir' ($($_.Exception.Message)) - DUP output will not be captured this run" -Severity 2
         $DupLogDir = $null
     }
+    $InstantFailed = 0
 
     $Index = 0
     foreach ($Drv in $Drivers) {
@@ -875,10 +880,16 @@ function Install-DriverUpdates {
         $SafeName = $Drv.FileName -replace '[^\w\.\-]', '_'
         $StdOutLog = if ($DupLogDir) { Join-Path $DupLogDir ($SafeName + '.stdout.log') } else { $null }
         $StdErrLog = if ($DupLogDir) { Join-Path $DupLogDir ($SafeName + '.stderr.log') } else { $null }
+        # /l=<file> is Dell's documented universal DUP switch for the framework
+        # log - the only place a DUP records WHY it failed (console output is
+        # always empty; DUPs are GUI apps). $DupLogDir has no spaces, so the
+        # value needs no quoting.
+        $DupFwLog = if ($DupLogDir) { Join-Path $DupLogDir ($SafeName + '.dup.log') } else { $null }
+        $DupArgs = if ($DupFwLog) { @('/s', "/l=$DupFwLog") } else { @('/s') }
         try {
             $SpParams = @{
                 FilePath         = $DriverExe
-                ArgumentList     = '/s'
+                ArgumentList     = $DupArgs
                 WorkingDirectory = $Path
                 NoNewWindow      = $true
                 PassThru         = $true
@@ -953,8 +964,25 @@ function Install-DriverUpdates {
             } else {
                 $Failed++
                 $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
-                $LogHint = if ($StdOutLog -and $StdErrLog) { " (output: $StdOutLog ; $StdErrLog)" } else { '' }
-                Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s$LogHint" -Severity 2
+                if ($Elapsed -lt 2) { $InstantFailed++ }
+                # Pull the verdict out of Dell's framework log so the apply log
+                # itself says why. No framework log after a failure = the process
+                # was killed before Dell's framework initialized (AV/EDR pattern).
+                $FwHint = 'no log capture this run'
+                if ($DupFwLog) {
+                    if ((Test-Path $DupFwLog) -and ((Get-Item $DupFwLog -ErrorAction SilentlyContinue).Length -gt 0)) {
+                        $FwHint = "framework log: $DupFwLog"
+                        try {
+                            $Tail = @(Get-Content -Path $DupFwLog -ErrorAction Stop | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3)
+                            if ($Tail.Count -gt 0) {
+                                $FwHint += ' | last lines: ' + (($Tail | ForEach-Object { $_.Trim() }) -join ' / ')
+                            }
+                        } catch { }
+                    } else {
+                        $FwHint = "no framework log written - the process died before Dell's DUP framework initialized (typical when AV/EDR terminates the installer at launch)"
+                    }
+                }
+                Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s ($FwHint)" -Severity 2
             }
         }
     }
@@ -988,6 +1016,14 @@ function Install-DriverUpdates {
         Write-Log "Component marker GC failed: $($_.Exception.Message)" -Severity 2
     }
 
+    if ($Failed -gt 0 -and $InstantFailed -eq $Failed) {
+        Write-Log ("All $Failed failed DUP(s) exited within ~2s of launch - too fast to have run Dell's installer logic at all. " +
+            "On a managed endpoint this pattern almost always means an AV/EDR product is terminating self-extracting installers launched from the CM cache, " +
+            "or blocking their payload extraction into $env:WINDIR\Temp. Check the AV/EDR console for block/terminate events on '$Path' at this timestamp " +
+            "and exclude the CM cache. Dell-side default logs (if any) land in C:\ProgramData\Dell\UpdatePackage\Log. " +
+            "Manual differential on this device (elevated cmd): run any failed DUP as '<name>.EXE /s /l=C:\Windows\Temp\duptest.log', then check the exit code " +
+            "and whether duptest.log appears - if it installs fine by hand, the block is specific to the CCMExec-spawned context.") -Severity 3
+    }
     Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Failed failed"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
