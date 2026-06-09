@@ -744,14 +744,18 @@ function Install-DriverUpdates {
         }
     }
 
-    # Enumerate the PCI hardware present on this device once, up front. Used to
-    # skip DUPs whose target hardware isn't installed (e.g. a Qualcomm NIC DUP
-    # on an Intel-NIC SKU). Conservative: a DUP is only skipped when it declares
-    # hardware tokens AND none are present. DUPs with no tokens (firmware, apps,
-    # chipset INF bundles) always run and self-check as before.
+    # Enumerate the PCI hardware present on this device, used to advise on each
+    # DUP's catalog-declared target hardware. The filter is ADVISORY ONLY: a
+    # mismatch is logged but the DUP still runs. Field evidence (Precision 3660:
+    # Intel UHD and I219 NIC DUPs skipped despite the hardware being present)
+    # showed Dell's per-driver PCIInfo metadata does not reliably enumerate
+    # every device ID a DUP actually supports, so enforcing the filter caused
+    # false-negative skips. We keep the enumeration and log the catalog/device
+    # mismatch as a diagnostic, but defer to the DUP's own applicability self-
+    # check (Dell DUP exit codes 3/4/5 = not-applicable) for the actual decision.
     $PresentHw = Get-PresentHardwareTokens
-    Write-Log "Enumerated $($PresentHw.Count) present PCI hardware token(s) for applicability filtering"
-    $SkippedHw = 0
+    Write-Log "Enumerated $($PresentHw.Count) present PCI hardware token(s) for applicability advisory"
+    $HwAdvisories = 0
 
     # GPU brands actually present, for vendor-aware filtering of graphics DUPs that
     # carry no PCIInfo (Dell ships every GPU option's DUP per model). A graphics DUP
@@ -778,22 +782,22 @@ function Install-DriverUpdates {
         # vendor pre-skip just below and the failure-forgive in the exit-code handler.
         $DupVendor = if ($Drv.Category -eq 'Video') { & $GetDupGpuVendor $Drv.Name } else { $null }
 
-        # Hardware applicability filter. If the manifest lists target hardware
-        # for this DUP and the enumeration succeeded, only run it when at least
-        # one target device is present. This runs BEFORE the file-existence
-        # check so a non-applicable DUP whose .EXE was quarantined by AV doesn't
-        # get counted as a failure - it's simply not for this device.
+        # Hardware applicability advisory. The DUP runs regardless - we just log
+        # when the catalog's declared target hardware isn't seen on the device,
+        # so a catalog/device-ID mismatch is visible without causing the DUP to
+        # be skipped. Dell's PCIInfo doesn't reliably list every device ID a DUP
+        # supports (Intel UHD and I219 NIC variants in the field), so enforcing
+        # this filter produced false-negative skips; the DUP's own exit code is
+        # the source of truth instead.
         $DupHwIds = @($Drv.HardwareIds)
-        $HwApplicable = $true
         if ($DupHwIds.Count -gt 0 -and $PresentHw.Count -gt 0) {
-            $HwApplicable = $false
+            $HwMatched = $false
             foreach ($Token in $DupHwIds) {
-                if ($PresentHw.Contains([string]$Token)) { $HwApplicable = $true; break }
+                if ($PresentHw.Contains([string]$Token)) { $HwMatched = $true; break }
             }
-            if (-not $HwApplicable) {
-                Write-Log "$DriverLabel - target hardware not present (DUP targets: $($DupHwIds -join ', ')) - skipping"
-                $SkippedHw++
-                continue
+            if (-not $HwMatched) {
+                Write-Log "$DriverLabel - hardware advisory: catalog targets ($($DupHwIds -join ', ')) not matched against present devices (running anyway; DUP will self-check)" -Severity 2
+                $HwAdvisories++
             }
         }
 
@@ -824,12 +828,13 @@ function Install-DriverUpdates {
         }
 
         if (-not (Test-Path $DriverExe)) {
-            # Reaching here means the DUP IS applicable to this device's hardware
-            # (or declared none), so a missing file is a real problem - most often
-            # AV/Defender quarantined the .EXE in the CM cache. Surface it loudly
-            # and recommend the exclusion; non-applicable DUPs were already skipped
-            # above and never trip this.
-            Write-Log "$DriverLabel - DUP not found at $DriverExe (applicable to this device). Most likely AV/Defender quarantined it - exclude the CCM cache (e.g. %WINDIR%\ccmcache) from real-time scanning." -Severity 2
+            # A missing DUP .EXE is most often AV/Defender quarantining it in the
+            # CM cache. Surface it loudly and recommend the exclusion. (Hardware
+            # applicability is advisory now, so even DUPs whose target hardware
+            # appears absent reach this check and are counted as failures if their
+            # file is missing - the DUP's own exit code is what decides absent vs.
+            # error when the file is present.)
+            Write-Log "$DriverLabel - DUP not found at $DriverExe. Most likely AV/Defender quarantined it - exclude the CCM cache (e.g. %WINDIR%\ccmcache) from real-time scanning." -Severity 2
             $Failed++
             $FailureLines.Add(("{0} (missing file - possible AV quarantine)" -f $Drv.FileName))
             continue
@@ -944,7 +949,7 @@ function Install-DriverUpdates {
         Write-Log "Component marker GC failed: $($_.Exception.Message)" -Severity 2
     }
 
-    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $SkippedHw skipped (hardware not present), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Failed failed"
+    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Failed failed"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
     }
