@@ -770,6 +770,21 @@ function Install-DriverUpdates {
     }
     $SkippedGpu = 0
 
+    # Per-DUP stdout/stderr capture. A DUP failing immediately (0.1s exit 1) gives
+    # no clue from its exit code alone - having its console output on disk turns
+    # the next investigation from a guess into "read the log". One subdir per
+    # apply-script run so successive runs don't overwrite each other.
+    $DupLogDir = Join-Path $env:WINDIR ('Temp\DATDupLogs\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    try {
+        if (-not (Test-Path $DupLogDir)) {
+            New-Item -Path $DupLogDir -ItemType Directory -Force | Out-Null
+        }
+        Write-Log "Per-DUP stdout/stderr captured to: $DupLogDir"
+    } catch {
+        Write-Log "Could not create DUP log directory '$DupLogDir' ($($_.Exception.Message)) - DUP output will not be captured this run" -Severity 2
+        $DupLogDir = $null
+    }
+
     $Index = 0
     foreach ($Drv in $Drivers) {
         $Index++
@@ -789,7 +804,7 @@ function Install-DriverUpdates {
         # supports (Intel UHD and I219 NIC variants in the field), so enforcing
         # this filter produced false-negative skips; the DUP's own exit code is
         # the source of truth instead.
-        $DupHwIds = @($Drv.HardwareIds)
+        $DupHwIds = @($Drv.HardwareIds | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace($_) })
         if ($DupHwIds.Count -gt 0 -and $PresentHw.Count -gt 0) {
             $HwMatched = $false
             foreach ($Token in $DupHwIds) {
@@ -846,9 +861,32 @@ function Install-DriverUpdates {
         # /s alone is the documented silent switch for modern Dell driver DUPs.
         # /r=0 is BIOS-DUP syntax and driver DUPs reject it (instant exit) - do NOT pass it.
         # If a DUP returns code 2 we map it to 3010 at the end so SCCM handles reboot.
+        #
+        # WorkingDirectory: Dell DUPs extract their payload to the current working
+        # directory and fail immediately if it isn't writable - which is what the
+        # BIOS-flash code below has always set explicitly. Without it the DUPs
+        # inherited PowerShell's CWD (typically C:\Windows\System32 under
+        # CCMExec/SYSTEM), where the extract was refused and the DUP exited 1 in
+        # ~0.1s before doing any real work.
+        #
+        # RedirectStandard{Output,Error}: capture each DUP's console output to a
+        # per-DUP log so a "exit 1 in 0.1s" failure is diagnosable from the file
+        # the DUP actually wrote to - no more guessing.
+        $SafeName = $Drv.FileName -replace '[^\w\.\-]', '_'
+        $StdOutLog = if ($DupLogDir) { Join-Path $DupLogDir ($SafeName + '.stdout.log') } else { $null }
+        $StdErrLog = if ($DupLogDir) { Join-Path $DupLogDir ($SafeName + '.stderr.log') } else { $null }
         try {
-            $Proc = Start-Process -FilePath $DriverExe -ArgumentList '/s' `
-                -NoNewWindow -PassThru -ErrorAction Stop
+            $SpParams = @{
+                FilePath         = $DriverExe
+                ArgumentList     = '/s'
+                WorkingDirectory = $Path
+                NoNewWindow      = $true
+                PassThru         = $true
+                ErrorAction      = 'Stop'
+            }
+            if ($StdOutLog) { $SpParams['RedirectStandardOutput'] = $StdOutLog }
+            if ($StdErrLog) { $SpParams['RedirectStandardError']  = $StdErrLog }
+            $Proc = Start-Process @SpParams
             # Touching .Handle forces PS 5.1's Start-Process to retain the OS handle.
             # Without this, $Proc.ExitCode reads as $null after WaitForExit on PS 5.1
             # and every DUP looks like a failure even when it succeeded.
@@ -915,7 +953,8 @@ function Install-DriverUpdates {
             } else {
                 $Failed++
                 $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
-                Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s" -Severity 2
+                $LogHint = if ($StdOutLog -and $StdErrLog) { " (output: $StdOutLog ; $StdErrLog)" } else { '' }
+                Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s$LogHint" -Severity 2
             }
         }
     }
