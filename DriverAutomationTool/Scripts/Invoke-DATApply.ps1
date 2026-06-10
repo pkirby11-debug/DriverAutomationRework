@@ -693,13 +693,21 @@ function Invoke-DCUDriverUpdates {
         return $null
     }
 
-    # DCU 5.x path-option hardening rejects "reserved folders" (the Windows
-    # tree, incl. C:\Windows\Temp) for -exportSettings/-catalogLocation/etc.
-    # with exit 107 - confirmed in the field on 5.6.0.17. Everything DCU
-    # touches lives under ProgramData instead.
-    $SessionDir = Join-Path $env:ProgramData ('DriverAutomationTool\DCU\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    # DCU 5.x path-option hardening rejects "reserved folders" for
+    # -exportSettings/-catalogLocation/etc. with exit 107. Field-confirmed on
+    # 5.6.0.17: BOTH the Windows tree (C:\Windows\Temp) and ProgramData are
+    # reserved. C:\Temp is the path family Dell's own dcu-cli documentation
+    # uses in its examples and sits outside every reserved tree, so the whole
+    # session (catalog, settings backup, logs, repo) lives there.
+    $WorkRoot = Join-Path $env:SystemDrive 'Temp\DriverAutomationTool'
+    $SessionDir = Join-Path $WorkRoot ('DCU\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     try {
         New-Item -Path $SessionDir -ItemType Directory -Force | Out-Null
+        # C:\Temp has no automatic cleanup - prune sessions older than 7 days
+        # so repeated runs don't accumulate logs/catalog copies forever.
+        Get-ChildItem -Path (Join-Path $WorkRoot 'DCU') -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $SessionDir -and $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     } catch {
         Write-Log "Could not create DCU session dir '$SessionDir' ($($_.Exception.Message)) - using built-in DUP engine" -Severity 2
         return $null
@@ -1090,15 +1098,22 @@ function Install-DriverUpdates {
     # locating default extractpath" and an immediate exit 1. We create a known-
     # writable subdir per DUP and override TMP/TEMP for the child process so
     # Dell's framework finds a valid extract destination.
-    # ProgramData, not C:\Windows\Temp: Dell's tooling (DCU 5.x confirmed in
-    # the field) treats the Windows tree as reserved, and Dell's own DUP
-    # default extract location is under ProgramData\Dell - stay in the
-    # location family Dell's framework provably accepts.
-    $DupExtractRoot = Join-Path $env:ProgramData ('DriverAutomationTool\DupExtract\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    # C:\Temp, not ProgramData or C:\Windows\Temp: the framework still logged
+    # "Error locating default extractpath" with TMP pointed at ProgramData,
+    # and DCU 5.x (same Dell path-hardening lineage) field-rejects BOTH the
+    # Windows tree and ProgramData as "reserved folders". C:\Temp is the path
+    # family Dell's own documentation uses and the remaining non-reserved
+    # candidate for the framework's temp resolution.
+    $DupExtractParent = Join-Path $env:SystemDrive 'Temp\DriverAutomationTool\DupExtract'
+    $DupExtractRoot = Join-Path $DupExtractParent (Get-Date -Format 'yyyyMMdd-HHmmss')
     try {
         if (-not (Test-Path $DupExtractRoot)) {
             New-Item -Path $DupExtractRoot -ItemType Directory -Force | Out-Null
         }
+        # C:\Temp has no automatic cleanup - prune extract dirs older than 7 days.
+        Get-ChildItem -Path $DupExtractParent -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $DupExtractRoot -and $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         Write-Log "Per-DUP TMP/TEMP root: $DupExtractRoot (Dell DUPs extract their payload here)"
     } catch {
         Write-Log "Could not create DUP extract directory '$DupExtractRoot' ($($_.Exception.Message)) - DUPs will inherit parent TMP/TEMP" -Severity 2
