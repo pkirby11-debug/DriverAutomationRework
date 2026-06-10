@@ -1319,14 +1319,23 @@ function Write-DATDCUCatalog {
         Writes a Dell Command Update-compatible repository catalog into a
         DriverUpdates package source directory.
     .DESCRIPTION
-        DCU consumes a repository = catalog.xml + DUP payloads (the same layout
-        Dell Repository Manager produces). The package already holds the DUPs;
-        this emits DCUCatalog.xml describing them by cloning each driver's
-        original SoftwareComponent node from Dell's per-model catalog
-        (ComponentXml, captured by Get-DellIndividualDrivers) and rewriting its
-        path attribute to the staged flat filename. baseLocation is left EMPTY
-        on purpose - the client-side apply script patches it to the local
-        content path at run time (the ccmcache path differs per client).
+        DCU consumes a repository = catalog + DUP payloads. The package already
+        holds the DUPs; this emits DCUCatalog.xml describing them by cloning
+        each driver's original SoftwareComponent node from Dell's per-model
+        catalog (ComponentXml, captured by Get-DellIndividualDrivers) and
+        rewriting its path attribute to the staged flat filename.
+
+        The root element gets xmlns="openmanifest" - that's the namespace
+        Dell's own catalog schema is validated against, and DCU 5.x rejects
+        catalogs missing it. The cloned <SoftwareComponent> fragments have no
+        namespace prefix and inherit openmanifest as the default namespace
+        from this parent (their OuterXml didn't re-declare a namespace
+        because they inherited the same default in their source document).
+
+        baseLocation stays EMPTY here - the client-side apply script patches
+        it to the local repo path at run time and wraps the XML in a CAB
+        (DCU 5.x rejects raw .xml for -catalogLocation with "incorrect file
+        type"; .cab is required, matching Dell Repository Manager output).
 
         Output is deterministic for a given driver set (components sorted by
         FileName, no timestamps), so an unchanged driver set produces a
@@ -1353,36 +1362,24 @@ function Write-DATDCUCatalog {
 
     $CatalogPath = Join-Path $PackageSourceDir 'DCUCatalog.xml'
     try {
-        $Doc = New-Object System.Xml.XmlDocument
-        [void]$Doc.AppendChild($Doc.CreateXmlDeclaration('1.0', 'utf-16', $null))
-        $Root = $Doc.CreateElement('Manifest')
-        $Root.SetAttribute('baseLocation', '')
-        $Root.SetAttribute('baseLocationAccessProtocols', '')
-        $Root.SetAttribute('identifier', 'DAT-DriverUpdates')
-        $Root.SetAttribute('releaseID', 'DAT')
-        $Root.SetAttribute('version', '1.0')
-        $Root.SetAttribute('predecessorID', '')
-        [void]$Doc.AppendChild($Root)
+        # Each component's ComponentXml is the OuterXml of a <SoftwareComponent>
+        # from Dell's per-model catalog (no xmlns prefix - it inherited the
+        # default from its parent). Rewrite the path attribute to the bare
+        # staged filename, then drop the bodies inside a Manifest element that
+        # declares xmlns="openmanifest" so they inherit the right default
+        # namespace. Built as a string template because XmlDocument fragment
+        # insertion would strip the inherited namespace context.
+        $Sorted = @($Usable | Sort-Object FileName)
+        $ComponentsXml = ($Sorted | ForEach-Object {
+            ($_.ComponentXml -replace '\bpath\s*=\s*"[^"]*"', ('path="{0}"' -f $_.FileName))
+        }) -join "`r`n"
 
-        foreach ($Drv in ($Usable | Sort-Object FileName)) {
-            $Frag = $Doc.CreateDocumentFragment()
-            $Frag.InnerXml = $Drv.ComponentXml
-            [void]$Root.AppendChild($Frag)
-            # The fragment's element is now the root's last child; per-model
-            # catalogs store a relative FOLDER path - the package stages DUPs
-            # flat, so point path at the bare filename.
-            $Comp = $Root.LastChild
-            if ($Comp -and $Comp.NodeType -eq 'Element') {
-                $Comp.SetAttribute('path', $Drv.FileName)
-            }
-        }
-
-        $Sw = New-Object System.IO.StringWriter
-        $Xw = New-Object System.Xml.XmlTextWriter($Sw)
-        $Xw.Formatting = 'Indented'
-        $Doc.Save($Xw)
-        $NewContent = $Sw.ToString()
-        $Xw.Close()
+        $NewContent = @"
+<?xml version="1.0" encoding="utf-16"?>
+<Manifest xmlns="openmanifest" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" baseLocation="" baseLocationAccessProtocols="" identifier="DAT-DriverUpdates" releaseID="DAT" version="1.0" predecessorID="">
+$ComponentsXml
+</Manifest>
+"@
 
         # Skip the write when nothing changed - rewriting an identical catalog
         # would dirty the package content hash and churn DP refreshes.

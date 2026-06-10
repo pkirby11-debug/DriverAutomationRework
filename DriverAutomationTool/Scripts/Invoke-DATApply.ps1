@@ -834,19 +834,60 @@ function Invoke-DCUDriverUpdates {
         $BaseLocation = $Path
     }
 
-    # Patch baseLocation into a localized catalog copy. The sync writes it
-    # empty because the local path differs per client; DCU resolves each
-    # component's path (bare filename) against baseLocation. The patched copy
-    # goes in the session dir - writing into ccmcache would dirty the CM
-    # content hash and trigger re-download/validation mismatches.
-    $LocalCatalog = Join-Path $SessionDir 'DCUCatalog.local.xml'
+    # Build the catalog DCU consumes. Two transforms from the package-side
+    # DCUCatalog.xml:
+    #
+    #  1. Patch baseLocation -> $BaseLocation. The sync writes it empty
+    #     because the local path differs per client; DCU appends each
+    #     component's path (bare filename) to baseLocation when it resolves
+    #     a DUP. Writing inside ccmcache would dirty the CM content hash,
+    #     so the patched copy goes in the session dir as CatalogPC.xml
+    #     (Dell's standard internal name).
+    #
+    #  2. Wrap into a CAB. DCU 5.x rejects raw .xml for -catalogLocation
+    #     with "incorrect file type" (field-confirmed on 5.6.0.17); .cab
+    #     is what Dell Repository Manager outputs and what DCU validates.
+    #     The CAB just contains CatalogPC.xml - DCU extracts and reads it.
+    $LocalCatalogXml = Join-Path $SessionDir 'CatalogPC.xml'
+    $LocalCatalog    = Join-Path $SessionDir 'DCUCatalog.cab'
     try {
-        $CatDoc = New-Object System.Xml.XmlDocument
-        $CatDoc.Load($CatalogPath)
-        $CatDoc.DocumentElement.SetAttribute('baseLocation', $BaseLocation)
-        $CatDoc.Save($LocalCatalog)
+        # XML mutation goes through a raw string read+write (not XmlDocument)
+        # so the document doesn't get re-serialized through a parser that
+        # could shift the xmlns declarations or whitespace and trip DCU's
+        # strict-mode schema check.
+        $CatXml = [System.IO.File]::ReadAllText($CatalogPath, [System.Text.Encoding]::Unicode)
+        $CatXml = $CatXml -replace 'baseLocation\s*=\s*"[^"]*"', ('baseLocation="{0}"' -f ($BaseLocation -replace '"', '&quot;'))
+        [System.IO.File]::WriteAllText($LocalCatalogXml, $CatXml, [System.Text.Encoding]::Unicode)
     } catch {
         Write-Log "Could not localize DCU catalog ($($_.Exception.Message)) - using built-in DUP engine" -Severity 2
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        return $null
+    }
+
+    $MakeCab = Join-Path $env:WINDIR 'System32\makecab.exe'
+    if (-not (Test-Path $MakeCab)) {
+        Write-Log "makecab.exe not found at $MakeCab (needed to package the catalog as .cab for DCU 5.x) - using built-in DUP engine" -Severity 2
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        return $null
+    }
+    try {
+        $CabOut = Join-Path $SessionDir 'makecab.out.log'
+        $CabErr = Join-Path $SessionDir 'makecab.err.log'
+        # Passing source and dest positionally gives a single-file CAB whose
+        # internal name matches the source filename (CatalogPC.xml) - exactly
+        # the layout Dell Repository Manager produces and DCU expects.
+        $CabProc = Start-Process -FilePath $MakeCab `
+            -ArgumentList "`"$LocalCatalogXml`"", "`"$LocalCatalog`"" `
+            -NoNewWindow -PassThru -Wait `
+            -RedirectStandardOutput $CabOut -RedirectStandardError $CabErr -ErrorAction Stop
+        if ($CabProc.ExitCode -ne 0 -or -not (Test-Path $LocalCatalog)) {
+            Write-Log "makecab.exe exited $($CabProc.ExitCode) packaging the catalog (output: $CabOut) - using built-in DUP engine" -Severity 2
+            try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+            return $null
+        }
+        Write-Log "Packaged DCU catalog: $LocalCatalog (CAB with CatalogPC.xml; baseLocation=$BaseLocation)"
+    } catch {
+        Write-Log "makecab.exe launch failed: $($_.Exception.Message) - using built-in DUP engine" -Severity 2
         try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
         return $null
     }
