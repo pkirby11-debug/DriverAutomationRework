@@ -682,6 +682,24 @@ function Invoke-DCUDriverUpdates {
         return $null
     }
 
+    # Allowlist for the fail-closed scan gate: every update DCU proposes must
+    # be one of the package's staged DUPs. Field evidence made this mandatory:
+    # when DCU 5.6 rejected the custom catalog (SYSTEM_SECURITY_ERROR), it
+    # silently fell back to Dell's CLOUD catalog and selected 12 updates
+    # including a BIOS flash and TPM firmware - content we never approved.
+    # If the allowlist can't be built, the engine refuses to run DCU at all.
+    $ManifestNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    try {
+        $MfDoc = Get-Content -Path (Join-Path $Path 'manifest.json') -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        foreach ($N in @($MfDoc.drivers | ForEach-Object { $_.FileName })) {
+            if ($N) { [void]$ManifestNames.Add([string]$N) }
+        }
+    } catch { }
+    if ($ManifestNames.Count -eq 0) {
+        Write-Log "Could not build the update allowlist from manifest.json - cannot verify DCU scan results, using built-in DUP engine" -Severity 2
+        return $null
+    }
+
     $DcuCli = $null
     foreach ($Root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
         if (-not $Root) { continue }
@@ -783,6 +801,25 @@ function Invoke-DCUDriverUpdates {
                 }
             } catch { }
         }
+    }
+
+    # DCU's catalog-rejection signature (field log, 5.6.0.17):
+    #   "SYSTEM_SECURITY_ERROR is flagged in the scan results"
+    #   "The catalog <path> failed to provide any result"
+    # When these appear, DCU has IGNORED the custom catalog and is operating
+    # from Dell's cloud catalog - the run must not be allowed to install.
+    $CatalogFailurePattern = 'SYSTEM_SECURITY_ERROR|failed to provide any result'
+    $TestCatalogRejected = {
+        param([string[]]$Files)
+        foreach ($F in $Files) {
+            try {
+                if ($F -and (Test-Path $F)) {
+                    $Txt = Get-Content -Path $F -Raw -ErrorAction Stop
+                    if ($Txt -and $Txt -match $CatalogFailurePattern) { return $true }
+                }
+            } catch { }
+        }
+        return $false
     }
 
     # Quotes the last lines of a dcu output log into our log so failures are
@@ -938,18 +975,99 @@ function Invoke-DCUDriverUpdates {
     $CatalogConfigured = $false
 
     try {
-        $CfgCode = & $RunDcu @("/configure", "-catalogLocation=$LocalCatalog", "-outputLog=$SessionDir\dcu-configure.log") 300000 'configure'
-        if ($CfgCode -ne 0) {
-            if ($CfgCode -eq 5) {
-                Write-Log "DCU reports a pending reboot (exit 5) - signaling reboot; DCU works again after restart" -Severity 2
-                $script:RebootRequired = $true
+        # Configure attempt 1: raw XML with -allowXML=enable, dcu-cli's switch
+        # for accepting plain XML catalogs. If this DCU build supports it, the
+        # unsigned-XML path is sanctioned and may clear the SYSTEM_SECURITY_ERROR
+        # rejection seen against the hand-built CAB. An unknown-option or
+        # file-type rejection exits non-zero -> fall through to the CAB
+        # configure that 5.6.0.17 is known to accept.
+        $CatalogInUse = $null
+        $CfgCode = & $RunDcu @("/configure", "-catalogLocation=$LocalCatalogXml", "-allowXML=enable", "-outputLog=$SessionDir\dcu-configure-xml.log") 300000 'configure-xml'
+        if ($CfgCode -eq 0) {
+            $CatalogInUse = $LocalCatalogXml
+            Write-Log "DCU accepted the XML catalog via -allowXML=enable"
+        } else {
+            Write-Log "XML + -allowXML configure attempt exited $(if ($null -eq $CfgCode) { 'timeout/launch' } else { $CfgCode }) - using the CAB catalog"
+            $CfgCode = & $RunDcu @("/configure", "-catalogLocation=$LocalCatalog", "-outputLog=$SessionDir\dcu-configure.log") 300000 'configure'
+            if ($CfgCode -ne 0) {
+                if ($CfgCode -eq 5) {
+                    Write-Log "DCU reports a pending reboot (exit 5) - signaling reboot; DCU works again after restart" -Severity 2
+                    $script:RebootRequired = $true
+                }
+                Write-Log "dcu-cli /configure -catalogLocation failed (exit $(if ($null -eq $CfgCode) { 'timeout/launch' } else { $CfgCode })) - falling back to built-in DUP engine" -Severity 2
+                & $TailConsole 'configure'
+                & $TailLog "$SessionDir\dcu-configure.log"
+                return $null
             }
-            Write-Log "dcu-cli /configure -catalogLocation failed (exit $(if ($null -eq $CfgCode) { 'timeout/launch' } else { $CfgCode })) - falling back to built-in DUP engine" -Severity 2
-            & $TailConsole 'configure'
-            & $TailLog "$SessionDir\dcu-configure.log"
-            return $null
+            $CatalogInUse = $LocalCatalog
         }
         $CatalogConfigured = $true
+
+        # ------------------------------------------------------------------
+        # FAIL-CLOSED GATE. /scan is read-only; nothing installs unless the
+        # scan provably ran from OUR catalog alone:
+        #   1. No catalog-rejection markers in the scan log/console.
+        #   2. A scan report exists and every proposed update's file is one
+        #      of the package's staged DUPs (allowlist) - a single foreign
+        #      item proves DCU consulted its cloud catalog.
+        #   3. Anything ambiguous (no report, unparseable, unexpected exit)
+        #      counts as a failure.
+        # Field justification: when 5.6 rejected the custom catalog it
+        # silently selected 12 cloud updates including a BIOS flash and TPM
+        # firmware. That must never install under this deployment.
+        # ------------------------------------------------------------------
+        $ReportDir = Join-Path $SessionDir 'scan-report'
+        try { New-Item -Path $ReportDir -ItemType Directory -Force | Out-Null } catch { }
+        $ScanLog = Join-Path $SessionDir 'dcu-scan.log'
+        $ScanCode = & $RunDcu @('/scan', "-report=$ReportDir", "-outputLog=$ScanLog") 1800000 'scan'
+
+        if (& $TestCatalogRejected @($ScanLog, (Join-Path $SessionDir 'scan.out.log'), (Join-Path $SessionDir 'scan.err.log'))) {
+            Write-Log "DCU did NOT honor the custom catalog (security rejection / no result from catalog) - it would source updates from Dell's cloud. Installing NOTHING via DCU; falling back to built-in DUP engine." -Severity 3
+            & $TailConsole 'scan'
+            & $TailLog $ScanLog
+            return $null
+        }
+        if ($ScanCode -eq 500) {
+            Write-Log "DCU scan: no applicable updates from the package catalog - everything current"
+            return 0
+        }
+        if ($ScanCode -ne 0) {
+            if ($ScanCode -eq 5) { $script:RebootRequired = $true }
+            Write-Log "dcu-cli /scan exited $(if ($null -eq $ScanCode) { 'timeout/launch' } else { $ScanCode }) - cannot verify catalog provenance; falling back to built-in DUP engine" -Severity 2
+            & $TailConsole 'scan'
+            return $null
+        }
+
+        # Scan exit 0 = updates found. Verify every one against the allowlist.
+        $ScanUpdates = @()
+        $ReportFile = Get-ChildItem -Path $ReportDir -Filter '*.xml' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($ReportFile) {
+            try {
+                $RepDoc = New-Object System.Xml.XmlDocument
+                $RepDoc.Load($ReportFile.FullName)
+                $ScanUpdates = @($RepDoc.SelectNodes("//*[translate(local-name(),'U','u')='update']"))
+            } catch {
+                Write-Log "Could not parse scan report $($ReportFile.FullName): $($_.Exception.Message)" -Severity 2
+            }
+        }
+        if ($ScanUpdates.Count -eq 0) {
+            Write-Log "DCU scan reported updates (exit 0) but the scan report is missing/empty - cannot verify provenance; falling back to built-in DUP engine" -Severity 2
+            return $null
+        }
+        $Foreign = [System.Collections.Generic.List[string]]::new()
+        foreach ($U in $ScanUpdates) {
+            $UFile = [string]$U.GetAttribute('file')
+            $UBase = if ($UFile) { ($UFile -split '[\\/]')[-1] } else { '' }
+            if (-not $UBase -or -not $ManifestNames.Contains($UBase)) {
+                $UName = [string]$U.GetAttribute('name')
+                $Foreign.Add(("{0} ({1})" -f $(if ($UName) { $UName } else { 'unnamed' }), $(if ($UFile) { $UFile } else { 'no file attr' })))
+            }
+        }
+        if ($Foreign.Count -gt 0) {
+            Write-Log ("DCU's scan proposed $($Foreign.Count) update(s) NOT in this package's catalog - proof it consulted Dell's cloud catalog. Installing NOTHING via DCU; falling back to built-in DUP engine. Foreign items: " + (($Foreign | Select-Object -First 5) -join '; ')) -Severity 3
+            return $null
+        }
+        Write-Log "Scan gate passed: $($ScanUpdates.Count) update(s), every one from the package catalog"
 
         # The catalog scopes the run to exactly the synced driver set, so no
         # -updateType filter is needed. -reboot=disable: SCCM owns reboots via
@@ -966,28 +1084,38 @@ function Invoke-DCUDriverUpdates {
             return 1
         }
 
+        $ApplyResult = 1
         switch ($ApplyCode) {
-            0   { Write-Log "DCU applyUpdates: success (exit 0)"; return 0 }
+            0   { Write-Log "DCU applyUpdates: success (exit 0)"; $ApplyResult = 0 }
             1   {
                     Write-Log "DCU applyUpdates: success, reboot required (exit 1)"
                     $script:RebootRequired = $true
-                    return 0
+                    $ApplyResult = 0
                 }
             5   {
                     # Reboot pending from a previous operation blocked the run;
                     # surface the reboot so SCCM clears the pend and retries.
                     Write-Log "DCU applyUpdates: reboot pending from a previous operation (exit 5) - signaling reboot" -Severity 2
                     $script:RebootRequired = $true
-                    return 0
+                    $ApplyResult = 0
                 }
-            500 { Write-Log "DCU applyUpdates: no applicable updates (exit 500) - everything current"; return 0 }
+            500 { Write-Log "DCU applyUpdates: no applicable updates (exit 500) - everything current"; $ApplyResult = 0 }
             default {
                 Write-Log "DCU applyUpdates FAILED (dcu-cli exit $ApplyCode)" -Severity 3
                 & $TailConsole 'applyUpdates'
                 & $TailLog $ApplyLog
-                return 1
+                $ApplyResult = 1
             }
         }
+
+        # Belt-and-braces: applyUpdates re-scans internally. If the catalog
+        # got rejected during THAT pass, updates may have come from Dell's
+        # cloud - never report success on unverified provenance.
+        if ($ApplyResult -eq 0 -and (& $TestCatalogRejected @($ApplyLog, (Join-Path $SessionDir 'applyUpdates.out.log'), (Join-Path $SessionDir 'applyUpdates.err.log')))) {
+            Write-Log "DCU reported success BUT the apply log shows the custom catalog was rejected mid-run - updates may have come from Dell's cloud catalog. Treating as FAILURE; review $ApplyLog." -Severity 3
+            $ApplyResult = 1
+        }
+        return $ApplyResult
     } finally {
         # Only restore when we actually changed the config (configure succeeded).
         # Restore source: pristine copy (the true original) when available, else
@@ -1016,7 +1144,7 @@ function Invoke-DCUDriverUpdates {
                     Write-Log "DCU settings restored from $RestoreSource"
                 } else {
                     if ($RestoreCode -eq 5) { $script:RebootRequired = $true }
-                    Write-Log "DCU settings restore failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - DCU is still pointed at $LocalCatalog; after the next restart run: dcu-cli /configure -importSettings=$RestoreSource (the next engine run also retries automatically)" -Severity 2
+                    Write-Log "DCU settings restore failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - DCU is still pointed at $CatalogInUse; after the next restart run: dcu-cli /configure -importSettings=$RestoreSource (the next engine run also retries automatically)" -Severity 2
                     & $TailConsole 'settings-restore'
                 }
             } else {
