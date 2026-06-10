@@ -693,7 +693,11 @@ function Invoke-DCUDriverUpdates {
         return $null
     }
 
-    $SessionDir = Join-Path $env:WINDIR ('Temp\DATDcu\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    # DCU 5.x path-option hardening rejects "reserved folders" (the Windows
+    # tree, incl. C:\Windows\Temp) for -exportSettings/-catalogLocation/etc.
+    # with exit 107 - confirmed in the field on 5.6.0.17. Everything DCU
+    # touches lives under ProgramData instead.
+    $SessionDir = Join-Path $env:ProgramData ('DriverAutomationTool\DCU\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     try {
         New-Item -Path $SessionDir -ItemType Directory -Force | Out-Null
     } catch {
@@ -787,8 +791,43 @@ function Invoke-DCUDriverUpdates {
         } catch { }
     }
 
-    # Patch baseLocation to the local content path. The sync writes it empty
-    # because the ccmcache path differs per client; DCU resolves each
+    # Build the local repository OUTSIDE the Windows tree. ccmcache lives under
+    # C:\Windows, and the same DCU 5.x reserved-folder rule that rejected
+    # C:\Windows\Temp for CLI options is likely to reject it as a repository
+    # source. Hardlink each staged DUP into the session repo (same volume ->
+    # zero bytes copied, instant, originals untouched so the CM content hash
+    # stays clean); fall back to copying, and to ccmcache directly if even
+    # that fails. Links/copies are removed in finally.
+    $RepoDir = Join-Path $SessionDir 'repo'
+    $BaseLocation = $Path
+    try {
+        New-Item -Path $RepoDir -ItemType Directory -Force | Out-Null
+        $UseCopy = $false
+        $Staged = 0
+        foreach ($Dup in @(Get-ChildItem -Path $Path -Filter '*.exe' -File -ErrorAction Stop)) {
+            $LinkPath = Join-Path $RepoDir $Dup.Name
+            if (-not $UseCopy) {
+                try {
+                    New-Item -ItemType HardLink -Path $LinkPath -Value $Dup.FullName -ErrorAction Stop | Out-Null
+                    $Staged++
+                    continue
+                } catch {
+                    Write-Log "Hardlink failed for $($Dup.Name) ($($_.Exception.Message)) - copying instead" -Severity 2
+                    $UseCopy = $true
+                }
+            }
+            Copy-Item -Path $Dup.FullName -Destination $LinkPath -Force -ErrorAction Stop
+            $Staged++
+        }
+        $BaseLocation = $RepoDir
+        Write-Log "DCU repository staged: $Staged DUP(s) -> $RepoDir ($(if ($UseCopy) { 'copied' } else { 'hardlinked' }))"
+    } catch {
+        Write-Log "Could not stage DCU repository outside ccmcache ($($_.Exception.Message)) - using ccmcache path directly (DCU may reject it as a reserved folder)" -Severity 2
+        $BaseLocation = $Path
+    }
+
+    # Patch baseLocation into a localized catalog copy. The sync writes it
+    # empty because the local path differs per client; DCU resolves each
     # component's path (bare filename) against baseLocation. The patched copy
     # goes in the session dir - writing into ccmcache would dirty the CM
     # content hash and trigger re-download/validation mismatches.
@@ -796,10 +835,11 @@ function Invoke-DCUDriverUpdates {
     try {
         $CatDoc = New-Object System.Xml.XmlDocument
         $CatDoc.Load($CatalogPath)
-        $CatDoc.DocumentElement.SetAttribute('baseLocation', $Path)
+        $CatDoc.DocumentElement.SetAttribute('baseLocation', $BaseLocation)
         $CatDoc.Save($LocalCatalog)
     } catch {
         Write-Log "Could not localize DCU catalog ($($_.Exception.Message)) - using built-in DUP engine" -Severity 2
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
         return $null
     }
 
@@ -879,6 +919,10 @@ function Invoke-DCUDriverUpdates {
                 & $TailConsole 'settings-restore'
             }
         }
+        # Drop the staged repo (hardlinks cost nothing, but a copy fallback
+        # would otherwise leave GBs in ProgramData; originals in ccmcache are
+        # untouched either way).
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     }
 }
 
@@ -1046,7 +1090,11 @@ function Install-DriverUpdates {
     # locating default extractpath" and an immediate exit 1. We create a known-
     # writable subdir per DUP and override TMP/TEMP for the child process so
     # Dell's framework finds a valid extract destination.
-    $DupExtractRoot = Join-Path $env:WINDIR ('Temp\DATDupExtract\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    # ProgramData, not C:\Windows\Temp: Dell's tooling (DCU 5.x confirmed in
+    # the field) treats the Windows tree as reserved, and Dell's own DUP
+    # default extract location is under ProgramData\Dell - stay in the
+    # location family Dell's framework provably accepts.
+    $DupExtractRoot = Join-Path $env:ProgramData ('DriverAutomationTool\DupExtract\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     try {
         if (-not (Test-Path $DupExtractRoot)) {
             New-Item -Path $DupExtractRoot -ItemType Directory -Force | Out-Null
@@ -1259,9 +1307,21 @@ function Install-DriverUpdates {
                     if ((Test-Path $DupFwLog) -and ((Get-Item $DupFwLog -ErrorAction SilentlyContinue).Length -gt 0)) {
                         $FwHint = "framework log: $DupFwLog"
                         try {
-                            $Tail = @(Get-Content -Path $DupFwLog -ErrorAction Stop | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3)
+                            # The framework log ends with a fixed footer (Name of
+                            # Exit Code / Exit Code set to / Result / Execution
+                            # terminated / ######) that buries the actual error
+                            # line just above it. Strip per-line timestamps and
+                            # the footer so the REAL reason is what gets quoted.
+                            $Boilerplate = 'Name of Exit Code|Exit Code set to|^Result:|Execution terminated|^#+$'
+                            $Tail = @(Get-Content -Path $DupFwLog -ErrorAction Stop |
+                                ForEach-Object { ($_ -replace '^\[[^\]]*\]\s*', '').Trim() } |
+                                Where-Object { $_ -and $_ -notmatch $Boilerplate } |
+                                Select-Object -Last 4)
+                            if ($Tail.Count -eq 0) {
+                                $Tail = @(Get-Content -Path $DupFwLog -ErrorAction Stop | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3 | ForEach-Object { $_.Trim() })
+                            }
                             if ($Tail.Count -gt 0) {
-                                $FwHint += ' | last lines: ' + (($Tail | ForEach-Object { $_.Trim() }) -join ' / ')
+                                $FwHint += ' | last lines: ' + ($Tail -join ' / ')
                             }
                         } catch { }
                     } else {
