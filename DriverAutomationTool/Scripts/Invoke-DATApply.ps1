@@ -638,6 +638,194 @@ function Install-DriverContentFromWim {
     }
 }
 
+function Invoke-DCUDriverUpdates {
+    <#
+        Dell Command Update engine for DriverUpdates packages.
+
+        Hands the whole driver install to dcu-cli.exe against a LOCAL repository:
+        the package's staged DUPs + the DCUCatalog.xml the sync wrote (same
+        layout Dell Repository Manager produces). Wins over the built-in DUP
+        loop: DCU inventories the actual device (real PnP IDs + installed
+        versions) so applicability filtering is Dell's own logic, not catalog
+        PCIInfo guesswork; DUP children are spawned by the Dell-signed DCU
+        service (the execution context AV/EDR already trusts); and DCU manages
+        its own extraction paths (no TMP/extractpath games).
+
+        Returns:
+          $null  -> engine NOT attempted (not Dell / no catalog / no dcu-cli /
+                    configure failed). Caller falls back to the built-in DUP
+                    loop. Falling back is always safe here because nothing was
+                    installed yet.
+          0/1    -> authoritative result; /applyUpdates ran. We deliberately do
+                    NOT fall back after a failed apply - DCU may have installed
+                    a subset, and re-running every DUP through the legacy loop
+                    would double-install and double-reboot.
+
+        IMPORTANT exit-code note: dcu-cli's own return codes (0=success,
+        1=reboot required, 5=reboot pending, 500=no applicable updates, others=
+        error) must NEVER be propagated raw - the deployment type's custom
+        return-code map treats 3/4/5 as Success and 2/6 as SoftReboot per the
+        Dell DUP convention, so a raw dcu-cli error 3 would record as Installed.
+        Success here returns 0 (reboot signaled via $script:RebootRequired,
+        same as the DUP loop); failures return 1 with the real code in the log.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    # Dell-only engine - the built-in DUP loop covers everything else.
+    try {
+        if ((Get-DeviceManufacturer) -ne 'Dell') { return $null }
+    } catch { return $null }
+
+    $CatalogPath = Join-Path $Path 'DCUCatalog.xml'
+    if (-not (Test-Path $CatalogPath)) {
+        Write-Log "No DCUCatalog.xml in package (built before 2.2.0) - using built-in DUP engine"
+        return $null
+    }
+
+    $DcuCli = $null
+    foreach ($Root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $Root) { continue }
+        $Candidate = Join-Path $Root 'Dell\CommandUpdate\dcu-cli.exe'
+        if (Test-Path $Candidate) { $DcuCli = $Candidate; break }
+    }
+    if (-not $DcuCli) {
+        Write-Log "Dell Command Update (dcu-cli.exe) not installed on this device - using built-in DUP engine" -Severity 2
+        return $null
+    }
+
+    $SessionDir = Join-Path $env:WINDIR ('Temp\DATDcu\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    try {
+        New-Item -Path $SessionDir -ItemType Directory -Force | Out-Null
+    } catch {
+        Write-Log "Could not create DCU session dir '$SessionDir' ($($_.Exception.Message)) - using built-in DUP engine" -Severity 2
+        return $null
+    }
+
+    Write-Log "Using Dell Command Update engine: $DcuCli"
+
+    # Runs dcu-cli with args, waits up to the timeout, returns the exit code or
+    # $null on launch failure/timeout. dcu-cli is a console app - no window games.
+    $RunDcu = {
+        param([string[]]$DcuArgs, [int]$TimeoutMs, [string]$Label)
+        try {
+            $P = Start-Process -FilePath $DcuCli -ArgumentList $DcuArgs -NoNewWindow -PassThru -ErrorAction Stop
+            $null = $P.Handle
+            if (-not $P.WaitForExit($TimeoutMs)) {
+                Write-Log "dcu-cli $Label timed out after $([int]($TimeoutMs/60000)) minutes - killing" -Severity 2
+                try { $P.Kill() } catch { }
+                return $null
+            }
+            return $P.ExitCode
+        } catch {
+            Write-Log "dcu-cli $Label failed to launch: $($_.Exception.Message)" -Severity 2
+            return $null
+        }
+    }
+
+    # Quotes the last lines of a dcu output log into our log so failures are
+    # diagnosable from DATApply.log alone.
+    $TailLog = {
+        param([string]$LogFilePath)
+        try {
+            if ($LogFilePath -and (Test-Path $LogFilePath)) {
+                $Lines = @(Get-Content -Path $LogFilePath -ErrorAction Stop | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 5)
+                if ($Lines.Count -gt 0) {
+                    Write-Log ("  dcu log tail: " + (($Lines | ForEach-Object { $_.Trim() }) -join ' / ')) -Severity 2
+                }
+            }
+        } catch { }
+    }
+
+    # Patch baseLocation to the local content path. The sync writes it empty
+    # because the ccmcache path differs per client; DCU resolves each
+    # component's path (bare filename) against baseLocation. The patched copy
+    # goes in the session dir - writing into ccmcache would dirty the CM
+    # content hash and trigger re-download/validation mismatches.
+    $LocalCatalog = Join-Path $SessionDir 'DCUCatalog.local.xml'
+    try {
+        $CatDoc = New-Object System.Xml.XmlDocument
+        $CatDoc.Load($CatalogPath)
+        $CatDoc.DocumentElement.SetAttribute('baseLocation', $Path)
+        $CatDoc.Save($LocalCatalog)
+    } catch {
+        Write-Log "Could not localize DCU catalog ($($_.Exception.Message)) - using built-in DUP engine" -Severity 2
+        return $null
+    }
+
+    # Snapshot the machine's DCU settings so pointing catalogLocation at our
+    # repository doesn't permanently hijack a tech's/GUI's Dell-cloud config.
+    # Restore happens in finally - even on timeout or throw.
+    $SettingsBackupDir = Join-Path $SessionDir 'settings-backup'
+    $SettingsBackupFile = $null
+    try {
+        New-Item -Path $SettingsBackupDir -ItemType Directory -Force | Out-Null
+        $ExportCode = & $RunDcu @("/configure", "-exportSettings=$SettingsBackupDir", "-outputLog=$SessionDir\dcu-export.log") 300000 'settings export'
+        if ($ExportCode -eq 0) {
+            $SettingsBackupFile = Get-ChildItem -Path $SettingsBackupDir -Filter '*.xml' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+        }
+        if (-not $SettingsBackupFile) {
+            Write-Log "DCU settings export did not produce a backup (exit $ExportCode) - proceeding; existing DCU config will not be restored after this run" -Severity 2
+        }
+    } catch {
+        Write-Log "DCU settings export failed ($($_.Exception.Message)) - proceeding without restore" -Severity 2
+    }
+
+    try {
+        $CfgCode = & $RunDcu @("/configure", "-catalogLocation=$LocalCatalog", "-outputLog=$SessionDir\dcu-configure.log") 300000 'configure'
+        if ($CfgCode -ne 0) {
+            Write-Log "dcu-cli /configure -catalogLocation failed (exit $(if ($null -eq $CfgCode) { 'timeout/launch' } else { $CfgCode })) - falling back to built-in DUP engine" -Severity 2
+            & $TailLog "$SessionDir\dcu-configure.log"
+            return $null
+        }
+
+        # The catalog scopes the run to exactly the synced driver set, so no
+        # -updateType filter is needed. -reboot=disable: SCCM owns reboots via
+        # our exit code + the DT's BasedOnExitCode behavior.
+        Write-Log "dcu-cli /applyUpdates starting (repository: $Path)"
+        $ApplyLog = Join-Path $SessionDir 'dcu-apply.log'
+        $ApplyCode = & $RunDcu @('/applyUpdates', '-reboot=disable', "-outputLog=$ApplyLog") 6000000 'applyUpdates'
+
+        if ($null -eq $ApplyCode) {
+            # Timeout/launch failure mid-apply: DCU may have installed a subset.
+            # Authoritative failure - do NOT fall back (double-install risk).
+            & $TailLog $ApplyLog
+            return 1
+        }
+
+        switch ($ApplyCode) {
+            0   { Write-Log "DCU applyUpdates: success (exit 0)"; return 0 }
+            1   {
+                    Write-Log "DCU applyUpdates: success, reboot required (exit 1)"
+                    $script:RebootRequired = $true
+                    return 0
+                }
+            5   {
+                    # Reboot pending from a previous operation blocked the run;
+                    # surface the reboot so SCCM clears the pend and retries.
+                    Write-Log "DCU applyUpdates: reboot pending from a previous operation (exit 5) - signaling reboot" -Severity 2
+                    $script:RebootRequired = $true
+                    return 0
+                }
+            500 { Write-Log "DCU applyUpdates: no applicable updates (exit 500) - everything current"; return 0 }
+            default {
+                Write-Log "DCU applyUpdates FAILED (dcu-cli exit $ApplyCode)" -Severity 3
+                & $TailLog $ApplyLog
+                return 1
+            }
+        }
+    } finally {
+        if ($SettingsBackupFile) {
+            $RestoreCode = & $RunDcu @("/configure", "-importSettings=$SettingsBackupFile", "-outputLog=$SessionDir\dcu-restore.log") 300000 'settings restore'
+            if ($RestoreCode -eq 0) {
+                Write-Log "DCU settings restored from backup"
+            } else {
+                Write-Log "DCU settings restore failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - DCU is still pointed at $LocalCatalog; re-run dcu-cli /configure -importSettings=$SettingsBackupFile manually if the GUI needs its old config" -Severity 2
+            }
+        }
+    }
+}
+
 function Install-DriverUpdates {
     <#
         Catalog-only Driver Updates apply path. The package source is a flat folder
@@ -685,6 +873,14 @@ function Install-DriverUpdates {
 
     Write-Log "DriverUpdates manifest: $($Drivers.Count) DUP(s) for $($Manifest.manufacturer) $($Manifest.model) ($($Manifest.operatingSystem))"
     if ($Manifest.generatedAt) { Write-Log "  Manifest generated: $($Manifest.generatedAt)" }
+
+    # Preferred engine: Dell Command Update against the package as a local
+    # repository (see Invoke-DCUDriverUpdates). $null = DCU wasn't attempted
+    # (non-Dell, no catalog, no dcu-cli, or configure failed) -> fall through
+    # to the built-in DUP loop below. A non-null result is authoritative.
+    $DcuExit = Invoke-DCUDriverUpdates -Path $Path
+    if ($null -ne $DcuExit) { return $DcuExit }
+    Write-Log "Continuing with built-in DUP engine"
 
     # Dell DUP success/not-applicable codes (these never count as failure).
     $SuccessCodes    = @(0, 2, 6)

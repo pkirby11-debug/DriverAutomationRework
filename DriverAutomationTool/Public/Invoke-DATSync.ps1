@@ -764,6 +764,21 @@ function Invoke-DATSyncSinglePackage {
                 if ($ExistingToCheck -and $ExistingToCheck.Version -like $FpMatchPattern) {
                     Write-DATLog -Message "Package already contains latest individual drivers (v$($ExistingToCheck.Version))" -Severity 1
 
+                    # Backfill the DCU repository catalog into packages built before
+                    # 2.2.0 (fingerprint-current, so the staging path that normally
+                    # writes it never runs). Only DUPs actually present in the
+                    # existing source go in. The refresh below distributes the
+                    # updated content; if the catalog was already current this is
+                    # a no-op and the content hash doesn't churn.
+                    if ($Type -eq 'DriverUpdates' -and $ExistingToCheck.SourcePath -and (Test-Path $ExistingToCheck.SourcePath)) {
+                        $OnDisk = @($CachedIndividualDrivers | Where-Object {
+                            $_.FileName -and (Test-Path (Join-Path $ExistingToCheck.SourcePath $_.FileName))
+                        })
+                        if ($OnDisk.Count -gt 0) {
+                            [void](Write-DATDCUCatalog -PackageSourceDir $ExistingToCheck.SourcePath -Drivers $OnDisk)
+                        }
+                    }
+
                     $Refresh = & $TryApplicationRefresh $ExistingToCheck $ExistingToCheck.Version
                     if ($Refresh) { return $Refresh }
 
@@ -1647,6 +1662,16 @@ function Invoke-DATSyncSinglePackage {
                             # Depth 5: manifest -> drivers[] -> driver -> HardwareIds[] -> values
                             $ManifestObj | ConvertTo-Json -Depth 5 | Set-Content -Path $ManifestPath -Encoding UTF8
                             Write-DATLog -Message "Wrote DriverUpdates manifest: $($ManifestEntries.Count) DUP(s) -> $ManifestPath" -Severity 1
+
+                            # DCU repository catalog: lets the apply script hand the
+                            # whole install to dcu-cli (Dell-trusted execution +
+                            # device-accurate applicability) using these same staged
+                            # DUPs as a local repository. Only the staged subset goes
+                            # in - a catalog entry without its payload would make DCU
+                            # report a download failure.
+                            $StagedNames = @($ManifestEntries | ForEach-Object { $_.FileName })
+                            $StagedForCatalog = @($IndividualDrivers | Where-Object { $StagedNames -contains $_.FileName })
+                            [void](Write-DATDCUCatalog -PackageSourceDir $PackageSourceDir -Drivers $StagedForCatalog)
                         }
 
                         # Bump the package version to reflect the overlay so the TS apply

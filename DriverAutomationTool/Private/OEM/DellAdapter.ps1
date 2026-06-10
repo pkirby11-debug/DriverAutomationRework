@@ -998,6 +998,10 @@ function Get-DellIndividualDrivers {
                 Size        = $Component.size
                 IsMissing   = $IsMissing
                 HardwareIds = @($HardwareIds)
+                # Raw SoftwareComponent XML from Dell's catalog, carried so the
+                # sync can emit a DCU-compatible repository catalog into the
+                # package (Write-DATDCUCatalog) without re-parsing the source.
+                ComponentXml = $Component.OuterXml
             })
             $CatalogMatched++
         }
@@ -1307,4 +1311,96 @@ function Test-DellCatalogConnectivity {
     }
 
     return $Results
+}
+
+function Write-DATDCUCatalog {
+    <#
+    .SYNOPSIS
+        Writes a Dell Command Update-compatible repository catalog into a
+        DriverUpdates package source directory.
+    .DESCRIPTION
+        DCU consumes a repository = catalog.xml + DUP payloads (the same layout
+        Dell Repository Manager produces). The package already holds the DUPs;
+        this emits DCUCatalog.xml describing them by cloning each driver's
+        original SoftwareComponent node from Dell's per-model catalog
+        (ComponentXml, captured by Get-DellIndividualDrivers) and rewriting its
+        path attribute to the staged flat filename. baseLocation is left EMPTY
+        on purpose - the client-side apply script patches it to the local
+        content path at run time (the ccmcache path differs per client).
+
+        Output is deterministic for a given driver set (components sorted by
+        FileName, no timestamps), so an unchanged driver set produces a
+        byte-identical file and the existing-content comparison below prevents
+        package-content churn (which would otherwise re-trigger DP refresh).
+    .OUTPUTS
+        Boolean. $true if the catalog file was written/updated, $false if it
+        was already current or could not be built (logged).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$PackageSourceDir,
+
+        [Parameter(Mandatory)]
+        [object[]]$Drivers
+    )
+
+    $Usable = @($Drivers | Where-Object { $_.ComponentXml -and $_.FileName })
+    if ($Usable.Count -eq 0) {
+        Write-DATLog -Message "DCU catalog skipped: no drivers carry ComponentXml (objects predate 2.2.0 resolver?)" -Severity 2
+        return $false
+    }
+
+    $CatalogPath = Join-Path $PackageSourceDir 'DCUCatalog.xml'
+    try {
+        $Doc = New-Object System.Xml.XmlDocument
+        [void]$Doc.AppendChild($Doc.CreateXmlDeclaration('1.0', 'utf-16', $null))
+        $Root = $Doc.CreateElement('Manifest')
+        $Root.SetAttribute('baseLocation', '')
+        $Root.SetAttribute('baseLocationAccessProtocols', '')
+        $Root.SetAttribute('identifier', 'DAT-DriverUpdates')
+        $Root.SetAttribute('releaseID', 'DAT')
+        $Root.SetAttribute('version', '1.0')
+        $Root.SetAttribute('predecessorID', '')
+        [void]$Doc.AppendChild($Root)
+
+        foreach ($Drv in ($Usable | Sort-Object FileName)) {
+            $Frag = $Doc.CreateDocumentFragment()
+            $Frag.InnerXml = $Drv.ComponentXml
+            [void]$Root.AppendChild($Frag)
+            # The fragment's element is now the root's last child; per-model
+            # catalogs store a relative FOLDER path - the package stages DUPs
+            # flat, so point path at the bare filename.
+            $Comp = $Root.LastChild
+            if ($Comp -and $Comp.NodeType -eq 'Element') {
+                $Comp.SetAttribute('path', $Drv.FileName)
+            }
+        }
+
+        $Sw = New-Object System.IO.StringWriter
+        $Xw = New-Object System.Xml.XmlTextWriter($Sw)
+        $Xw.Formatting = 'Indented'
+        $Doc.Save($Xw)
+        $NewContent = $Sw.ToString()
+        $Xw.Close()
+
+        # Skip the write when nothing changed - rewriting an identical catalog
+        # would dirty the package content hash and churn DP refreshes.
+        if (Test-Path $CatalogPath) {
+            $OldContent = Get-Content -Path $CatalogPath -Raw -ErrorAction SilentlyContinue
+            if ($OldContent -eq $NewContent) {
+                Write-DATLog -Message "DCU catalog already current: $CatalogPath" -Severity 1
+                return $false
+            }
+        }
+
+        # Write as UTF-16 to match the declaration (Dell catalogs are utf-16;
+        # DCU honors the declared encoding).
+        [System.IO.File]::WriteAllText($CatalogPath, $NewContent, [System.Text.Encoding]::Unicode)
+        Write-DATLog -Message "Wrote DCU repository catalog: $($Usable.Count) component(s) -> $CatalogPath" -Severity 1
+        return $true
+    } catch {
+        Write-DATLog -Message "Failed to write DCU catalog ($($_.Exception.Message)) - package remains usable via the built-in DUP engine" -Severity 2
+        return $false
+    }
 }
