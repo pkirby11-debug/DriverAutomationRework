@@ -701,14 +701,49 @@ function Invoke-DCUDriverUpdates {
         return $null
     }
 
-    Write-Log "Using Dell Command Update engine: $DcuCli"
+    # DCU 3.x has an entirely different CLI grammar (no /configure -option=value
+    # commands) - every call would fail input validation. Gate on 4.0+.
+    $DcuVersion = $null
+    try { $DcuVersion = (Get-Item $DcuCli -ErrorAction Stop).VersionInfo.FileVersion } catch { }
+    if ($DcuVersion) {
+        $ParsedVer = $null
+        if ([version]::TryParse(($DcuVersion -replace '[^\d\.].*$', ''), [ref]$ParsedVer) -and $ParsedVer.Major -lt 4) {
+            Write-Log "Dell Command Update $DcuVersion is too old for the repository CLI (needs 4.0+) - update DCU on this device; using built-in DUP engine" -Severity 2
+            return $null
+        }
+    }
+
+    Write-Log "Using Dell Command Update engine: $DcuCli (version $(if ($DcuVersion) { $DcuVersion } else { 'unknown' }))"
+
+    # dcu-cli enforces a single-instance lock - a scheduled DCU scan or an open
+    # DCU GUI makes every CLI call fail input-validation-style. If DCU is busy,
+    # wait a bounded time for it to finish before giving up the engine.
+    $DcuProcs = @(Get-Process -Name 'dcu-cli', 'DellCommandUpdate' -ErrorAction SilentlyContinue)
+    if ($DcuProcs.Count -gt 0) {
+        Write-Log "DCU already running ($(($DcuProcs | ForEach-Object { '{0} (PID {1})' -f $_.ProcessName, $_.Id }) -join ', ')) - waiting up to 2 minutes for it to finish (dcu-cli is single-instance)" -Severity 2
+        $WaitUntil = (Get-Date).AddSeconds(120)
+        while ((Get-Date) -lt $WaitUntil) {
+            Start-Sleep -Seconds 10
+            $DcuProcs = @(Get-Process -Name 'dcu-cli', 'DellCommandUpdate' -ErrorAction SilentlyContinue)
+            if ($DcuProcs.Count -eq 0) { break }
+        }
+        if ($DcuProcs.Count -gt 0) {
+            Write-Log "DCU still busy after 2 minutes - its single-instance lock would fail our commands; using built-in DUP engine this run" -Severity 2
+            return $null
+        }
+    }
 
     # Runs dcu-cli with args, waits up to the timeout, returns the exit code or
-    # $null on launch failure/timeout. dcu-cli is a console app - no window games.
+    # $null on launch failure/timeout. dcu-cli is a CONSOLE app (unlike DUPs) -
+    # its input-validation errors are printed to stdout/stderr in plain text,
+    # so both streams are captured per-call for failure diagnostics.
     $RunDcu = {
         param([string[]]$DcuArgs, [int]$TimeoutMs, [string]$Label)
+        $OutFile = Join-Path $SessionDir ($Label + '.out.log')
+        $ErrFile = Join-Path $SessionDir ($Label + '.err.log')
         try {
-            $P = Start-Process -FilePath $DcuCli -ArgumentList $DcuArgs -NoNewWindow -PassThru -ErrorAction Stop
+            $P = Start-Process -FilePath $DcuCli -ArgumentList $DcuArgs -NoNewWindow -PassThru `
+                -RedirectStandardOutput $OutFile -RedirectStandardError $ErrFile -ErrorAction Stop
             $null = $P.Handle
             if (-not $P.WaitForExit($TimeoutMs)) {
                 Write-Log "dcu-cli $Label timed out after $([int]($TimeoutMs/60000)) minutes - killing" -Severity 2
@@ -719,6 +754,22 @@ function Invoke-DCUDriverUpdates {
         } catch {
             Write-Log "dcu-cli $Label failed to launch: $($_.Exception.Message)" -Severity 2
             return $null
+        }
+    }
+
+    # Quotes the captured console output for a $RunDcu call into our log.
+    $TailConsole = {
+        param([string]$Label)
+        foreach ($Suffix in @('.out.log', '.err.log')) {
+            $F = Join-Path $SessionDir ($Label + $Suffix)
+            try {
+                if (Test-Path $F) {
+                    $Lines = @(Get-Content -Path $F -ErrorAction Stop | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 5)
+                    if ($Lines.Count -gt 0) {
+                        Write-Log ("  dcu-cli $Label console: " + (($Lines | ForEach-Object { $_.Trim() }) -join ' / ')) -Severity 2
+                    }
+                }
+            } catch { }
         }
     }
 
@@ -759,13 +810,14 @@ function Invoke-DCUDriverUpdates {
     $SettingsBackupFile = $null
     try {
         New-Item -Path $SettingsBackupDir -ItemType Directory -Force | Out-Null
-        $ExportCode = & $RunDcu @("/configure", "-exportSettings=$SettingsBackupDir", "-outputLog=$SessionDir\dcu-export.log") 300000 'settings export'
+        $ExportCode = & $RunDcu @("/configure", "-exportSettings=$SettingsBackupDir", "-outputLog=$SessionDir\dcu-export.log") 300000 'settings-export'
         if ($ExportCode -eq 0) {
             $SettingsBackupFile = Get-ChildItem -Path $SettingsBackupDir -Filter '*.xml' -ErrorAction SilentlyContinue |
                 Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
         }
         if (-not $SettingsBackupFile) {
             Write-Log "DCU settings export did not produce a backup (exit $ExportCode) - proceeding; existing DCU config will not be restored after this run" -Severity 2
+            & $TailConsole 'settings-export'
         }
     } catch {
         Write-Log "DCU settings export failed ($($_.Exception.Message)) - proceeding without restore" -Severity 2
@@ -775,6 +827,7 @@ function Invoke-DCUDriverUpdates {
         $CfgCode = & $RunDcu @("/configure", "-catalogLocation=$LocalCatalog", "-outputLog=$SessionDir\dcu-configure.log") 300000 'configure'
         if ($CfgCode -ne 0) {
             Write-Log "dcu-cli /configure -catalogLocation failed (exit $(if ($null -eq $CfgCode) { 'timeout/launch' } else { $CfgCode })) - falling back to built-in DUP engine" -Severity 2
+            & $TailConsole 'configure'
             & $TailLog "$SessionDir\dcu-configure.log"
             return $null
         }
@@ -789,6 +842,7 @@ function Invoke-DCUDriverUpdates {
         if ($null -eq $ApplyCode) {
             # Timeout/launch failure mid-apply: DCU may have installed a subset.
             # Authoritative failure - do NOT fall back (double-install risk).
+            & $TailConsole 'applyUpdates'
             & $TailLog $ApplyLog
             return 1
         }
@@ -810,17 +864,19 @@ function Invoke-DCUDriverUpdates {
             500 { Write-Log "DCU applyUpdates: no applicable updates (exit 500) - everything current"; return 0 }
             default {
                 Write-Log "DCU applyUpdates FAILED (dcu-cli exit $ApplyCode)" -Severity 3
+                & $TailConsole 'applyUpdates'
                 & $TailLog $ApplyLog
                 return 1
             }
         }
     } finally {
         if ($SettingsBackupFile) {
-            $RestoreCode = & $RunDcu @("/configure", "-importSettings=$SettingsBackupFile", "-outputLog=$SessionDir\dcu-restore.log") 300000 'settings restore'
+            $RestoreCode = & $RunDcu @("/configure", "-importSettings=$SettingsBackupFile", "-outputLog=$SessionDir\dcu-restore.log") 300000 'settings-restore'
             if ($RestoreCode -eq 0) {
                 Write-Log "DCU settings restored from backup"
             } else {
                 Write-Log "DCU settings restore failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - DCU is still pointed at $LocalCatalog; re-run dcu-cli /configure -importSettings=$SettingsBackupFile manually if the GUI needs its old config" -Severity 2
+                & $TailConsole 'settings-restore'
             }
         }
     }
