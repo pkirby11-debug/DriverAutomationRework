@@ -895,8 +895,17 @@ function Invoke-DCUDriverUpdates {
     # Snapshot the machine's DCU settings so pointing catalogLocation at our
     # repository doesn't permanently hijack a tech's/GUI's Dell-cloud config.
     # Restore happens in finally - even on timeout or throw.
+    #
+    # Pristine copy: if a previous run's restore failed (field case: DCU was
+    # mid self-update, exit 3004), the CURRENT settings still point at that
+    # run's session catalog - backing THEM up would launder the hijack into
+    # the "original". A backup whose catalogLocation references our work root
+    # is therefore never promoted to pristine, and restore prefers the
+    # pristine copy (kept at the work root, outside the 7-day session prune).
+    $PristineSettings = Join-Path $WorkRoot 'DCU-pristine-settings.xml'
     $SettingsBackupDir = Join-Path $SessionDir 'settings-backup'
     $SettingsBackupFile = $null
+    $BackupHijacked = $false
     try {
         New-Item -Path $SettingsBackupDir -ItemType Directory -Force | Out-Null
         $ExportCode = & $RunDcu @("/configure", "-exportSettings=$SettingsBackupDir", "-outputLog=$SessionDir\dcu-export.log") 300000 'settings-export'
@@ -904,22 +913,43 @@ function Invoke-DCUDriverUpdates {
             $SettingsBackupFile = Get-ChildItem -Path $SettingsBackupDir -Filter '*.xml' -ErrorAction SilentlyContinue |
                 Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
         }
-        if (-not $SettingsBackupFile) {
+        if ($SettingsBackupFile) {
+            $BackupText = Get-Content -Path $SettingsBackupFile -Raw -ErrorAction SilentlyContinue
+            $BackupHijacked = [bool]($BackupText -and $BackupText -match [regex]::Escape($WorkRoot))
+            if ($BackupHijacked) {
+                Write-Log "Exported DCU settings still point at a previous run's session catalog (an earlier restore failed) - the pristine copy stays the restore source" -Severity 2
+            } else {
+                try { Copy-Item -Path $SettingsBackupFile -Destination $PristineSettings -Force } catch { }
+            }
+        } else {
+            if ($ExportCode -eq 5) {
+                # dcu-cli 5 = a previous operation needs a restart (e.g. DCU's
+                # own self-update). Signal the reboot so the next run can use
+                # DCU cleanly.
+                Write-Log "DCU reports a pending reboot (exit 5) - signaling reboot so DCU works again after restart" -Severity 2
+                $script:RebootRequired = $true
+            }
             Write-Log "DCU settings export did not produce a backup (exit $ExportCode) - proceeding; existing DCU config will not be restored after this run" -Severity 2
             & $TailConsole 'settings-export'
         }
     } catch {
         Write-Log "DCU settings export failed ($($_.Exception.Message)) - proceeding without restore" -Severity 2
     }
+    $CatalogConfigured = $false
 
     try {
         $CfgCode = & $RunDcu @("/configure", "-catalogLocation=$LocalCatalog", "-outputLog=$SessionDir\dcu-configure.log") 300000 'configure'
         if ($CfgCode -ne 0) {
+            if ($CfgCode -eq 5) {
+                Write-Log "DCU reports a pending reboot (exit 5) - signaling reboot; DCU works again after restart" -Severity 2
+                $script:RebootRequired = $true
+            }
             Write-Log "dcu-cli /configure -catalogLocation failed (exit $(if ($null -eq $CfgCode) { 'timeout/launch' } else { $CfgCode })) - falling back to built-in DUP engine" -Severity 2
             & $TailConsole 'configure'
             & $TailLog "$SessionDir\dcu-configure.log"
             return $null
         }
+        $CatalogConfigured = $true
 
         # The catalog scopes the run to exactly the synced driver set, so no
         # -updateType filter is needed. -reboot=disable: SCCM owns reboots via
@@ -959,17 +989,42 @@ function Invoke-DCUDriverUpdates {
             }
         }
     } finally {
-        if ($SettingsBackupFile) {
-            $RestoreCode = & $RunDcu @("/configure", "-importSettings=$SettingsBackupFile", "-outputLog=$SessionDir\dcu-restore.log") 300000 'settings-restore'
-            if ($RestoreCode -eq 0) {
-                Write-Log "DCU settings restored from backup"
+        # Only restore when we actually changed the config (configure succeeded).
+        # Restore source: pristine copy (the true original) when available, else
+        # this run's backup unless it was already hijacked by a failed prior
+        # restore.
+        if ($CatalogConfigured) {
+            $RestoreSource = $null
+            if (Test-Path $PristineSettings) { $RestoreSource = $PristineSettings }
+            elseif ($SettingsBackupFile -and -not $BackupHijacked) { $RestoreSource = $SettingsBackupFile }
+
+            if ($RestoreSource) {
+                # DCU's self-update can hold the config lock right after
+                # applyUpdates (field: exit 3004 "currently performing a self
+                # update") - retry before giving up. Exit 5 (reboot pending)
+                # cannot clear without a restart, so don't retry that.
+                $RestoreCode = $null
+                for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+                    $RestoreCode = & $RunDcu @("/configure", "-importSettings=$RestoreSource", "-outputLog=$SessionDir\dcu-restore.log") 300000 'settings-restore'
+                    if ($RestoreCode -eq 0 -or $RestoreCode -eq 5) { break }
+                    if ($Attempt -lt 3) {
+                        Write-Log "DCU settings restore attempt $Attempt failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - retrying in 30s (DCU may be mid self-update)" -Severity 2
+                        Start-Sleep -Seconds 30
+                    }
+                }
+                if ($RestoreCode -eq 0) {
+                    Write-Log "DCU settings restored from $RestoreSource"
+                } else {
+                    if ($RestoreCode -eq 5) { $script:RebootRequired = $true }
+                    Write-Log "DCU settings restore failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - DCU is still pointed at $LocalCatalog; after the next restart run: dcu-cli /configure -importSettings=$RestoreSource (the next engine run also retries automatically)" -Severity 2
+                    & $TailConsole 'settings-restore'
+                }
             } else {
-                Write-Log "DCU settings restore failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - DCU is still pointed at $LocalCatalog; re-run dcu-cli /configure -importSettings=$SettingsBackupFile manually if the GUI needs its old config" -Severity 2
-                & $TailConsole 'settings-restore'
+                Write-Log "No trustworthy DCU settings source to restore (no pristine copy, and the current settings already pointed at a session catalog) - reconfigure the catalog in the DCU GUI or import an older settings-backup from $WorkRoot\DCU\<session>\settings-backup manually" -Severity 2
             }
         }
         # Drop the staged repo (hardlinks cost nothing, but a copy fallback
-        # would otherwise leave GBs in ProgramData; originals in ccmcache are
+        # would otherwise leave GBs on disk; originals in ccmcache are
         # untouched either way).
         try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     }
