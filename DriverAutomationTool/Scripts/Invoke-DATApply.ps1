@@ -1342,6 +1342,38 @@ function Install-DriverUpdates {
     }
     $SkippedGpu = 0
 
+    # Defender correlation. DUPs run serially, so any Defender ASR/quarantine
+    # event raised between a DUP's start and its exit belongs to that DUP's
+    # window. The vulnerable-driver ASR rule
+    # (56a863a9-875e-4185-98a7-b882c64b5ce5) is called out by name because its
+    # verdict is deterministic - a blocklisted driver fails on EVERY enforcing
+    # device - and the fix is a one-line sync exclusion this log can name
+    # directly, instead of the security team forwarding alerts.
+    $AsrVulnDriverGuid = '56a863a9-875e-4185-98a7-b882c64b5ce5'
+    $GetDefenderFlags = {
+        param([datetime]$Since)
+        $Flags = @()
+        try {
+            # 1121 = ASR rule blocked an action; 1117 = threat action taken
+            # (quarantine). Get-WinEvent throws when zero events match - the
+            # catch turns that (and missing log/3rd-party AV) into "no flags".
+            $Events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = @(1121, 1117); StartTime = $Since } -ErrorAction Stop)
+            foreach ($Ev in $Events) {
+                $X = ''
+                try { $X = $Ev.ToXml() } catch { }
+                $EvPath = if ($X -match "Name='Path'>([^<]+)") { $Matches[1] } else { '' }
+                $Flags += [PSCustomObject]@{
+                    Id                    = $Ev.Id
+                    Path                  = $EvPath
+                    VulnerableDriverRule  = [bool]($X -match $AsrVulnDriverGuid)
+                }
+            }
+        } catch { }
+        return ,$Flags
+    }
+    $DefenderFlagged = 0
+    $VulnExclusionAdvice = [System.Collections.Generic.List[string]]::new()
+
     # Per-DUP framework-log capture. The Dell framework log (.dup.log) is the
     # only place a DUP records why it failed - requested per-DUP via Dell's
     # documented /l= switch. (DUPs are GUI apps and never write to stdout/stderr,
@@ -1537,6 +1569,22 @@ function Install-DriverUpdates {
 
         $Elapsed = [math]::Round(((Get-Date) - $DupStart).TotalSeconds, 1)
 
+        # Checked on success AND failure: a DUP can exit 0 while Defender
+        # silently blocked its driver write (the field Realtek case) - that
+        # silent partial install is exactly what must surface.
+        $DupFlags = & $GetDefenderFlags $DupStart
+        if ($DupFlags.Count -gt 0) {
+            $DefenderFlagged++
+            foreach ($Flag in $DupFlags) {
+                if ($Flag.VulnerableDriverRule) {
+                    Write-Log "$DriverLabel - Defender's ASR vulnerable-driver rule fired during this DUP's run window (event $($Flag.Id), blocked path: $($Flag.Path)). This driver is on Microsoft's vulnerable-driver blocklist and will be blocked on every enforcing device - add '$($Drv.Name)' to the sync's Driver exclusions to stop deploying it." -Severity 3
+                    if (-not $VulnExclusionAdvice.Contains([string]$Drv.Name)) { $VulnExclusionAdvice.Add([string]$Drv.Name) }
+                } else {
+                    Write-Log "$DriverLabel - Defender event $($Flag.Id) during this DUP's run window (path: $($Flag.Path)) - possible AV interference with this install" -Severity 2
+                }
+            }
+        }
+
         if ($DupCode -in $SuccessCodes) {
             $Successful++
             if ($DupCode -in $RebootCodes) { $Rebooted = $true }
@@ -1662,9 +1710,13 @@ function Install-DriverUpdates {
                 "Manual differential (elevated cmd): run any failed DUP as '<name>.EXE /s /l=C:\Windows\Temp\duptest.log' - if it installs by hand, the block is specific to the CCMExec-spawned context.") -Severity 3
         }
     }
-    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Failed failed"
+    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Failed failed$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
+    }
+    if ($VulnExclusionAdvice.Count -gt 0) {
+        Write-Log ("VULNERABLE-DRIVER ADVICE: Defender's vulnerable-driver rule fired for: " + ($VulnExclusionAdvice -join '; ') +
+            ". Add these names to the sync's Driver exclusions (Models tab > Options, or -ExcludeDrivers) and re-sync - the package rebuilds without them and the alerts stop fleet-wide.") -Severity 3
     }
 
     if ($Rebooted) {

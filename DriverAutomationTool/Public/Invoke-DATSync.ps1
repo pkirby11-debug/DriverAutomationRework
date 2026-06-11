@@ -146,6 +146,15 @@ function Invoke-DATSync {
         # driver never reaches a client by any engine.
         [string[]]$ExcludeDrivers = @(),
 
+        # Screen each DriverUpdates DUP against the Microsoft Vulnerable
+        # Driver Blocklist before staging (the list the Defender ASR rule
+        # "Block abuse of in-the-wild exploited vulnerable signed drivers"
+        # enforces). Advisory: matches are logged loudly with the exact
+        # exclusion to add, but the DUP still ships until the admin excludes
+        # it. Verdicts are cached per DUP, so only new/changed DUPs and
+        # blocklist updates cost extraction time.
+        [bool]$ScreenVulnerableDrivers = $true,
+
         [switch]$VerifyDownloadHash,
 
         # Only used when DeploymentPlatform = 'ConfigMgr - Application'. BIOS-only.
@@ -161,6 +170,13 @@ function Invoke-DATSync {
     $StartTime = Get-Date
     $SyncResults = [System.Collections.Generic.List[PSCustomObject]]::new()
     $ErrorCount = 0
+
+    # Vulnerable-driver screening state. The blocklist loads lazily on the
+    # first DriverUpdates DUP so non-DriverUpdates syncs never pay for it;
+    # vulnerable findings accumulate here for the end-of-sync summary.
+    $VulnBlocklist = $null
+    $VulnBlocklistLoaded = $false
+    $VulnerableFound = [System.Collections.Generic.List[string]]::new()
 
     # Load config from file if specified
     if ($PSCmdlet.ParameterSetName -eq 'ConfigFile') {
@@ -190,6 +206,7 @@ function Invoke-DATSync {
         if ($null -ne $Config.options.wimExcludeFiles) { $WimExcludeFiles = @($Config.options.wimExcludeFiles) }
         if ($null -ne $Config.options.wimExcludeDirs)  { $WimExcludeDirs  = @($Config.options.wimExcludeDirs) }
         if ($null -ne $Config.options.excludeDrivers)  { $ExcludeDrivers  = @($Config.options.excludeDrivers) }
+        if ($null -ne $Config.options.screenVulnerableDrivers) { $ScreenVulnerableDrivers = [bool]$Config.options.screenVulnerableDrivers }
         $WimOptimizeExport = [switch]$Config.options.wimOptimizeExport
         $WebhookUrl = $Config.logging.webhookUrl
 
@@ -409,6 +426,10 @@ function Invoke-DATSync {
     $SuccessCount = ($SyncResults | Where-Object { $_.Status -eq 'Success' }).Count
     $SkipCount = ($SyncResults | Where-Object { $_.Status -eq 'Skipped' }).Count
 
+    if ($VulnerableFound.Count -gt 0) {
+        Write-DATLog -Message ("VULNERABLE-DRIVER SUMMARY: $($VulnerableFound.Count) packaged DUP(s) match Microsoft's vulnerable-driver blocklist and will trip Defender ASR fleet-wide: " +
+            ($VulnerableFound -join '; ') + ". Add these to Driver exclusions and re-sync to stop the alerts at the source.") -Severity 3
+    }
     Write-DATLog -Message "======== Sync Complete ========" -Severity 1
     Write-DATLog -Message "Duration: $([math]::Round($Duration.TotalMinutes, 1)) minutes" -Severity 1
     Write-DATLog -Message "Success: $SuccessCount | Skipped: $SkipCount | Errors: $ErrorCount" -Severity 1
@@ -1520,6 +1541,33 @@ function Invoke-DATSyncSinglePackage {
                                 # vendor-tested install path that DCU uses) instead of trying to
                                 # feed extracted INFs through pnputil.
                                 if ($Type -eq 'DriverUpdates') {
+                                    # Vulnerable-driver screening: warn BEFORE the DUP ships if its
+                                    # payload matches the Microsoft blocklist that Defender's ASR
+                                    # vulnerable-driver rule enforces - those installs get blocked
+                                    # on every device and page the security team. Advisory only:
+                                    # the DUP still stages; the admin decides via Driver exclusions.
+                                    if ($ScreenVulnerableDrivers) {
+                                        if (-not $VulnBlocklistLoaded) {
+                                            $VulnBlocklistLoaded = $true
+                                            $VulnBlocklist = Update-DATVulnerableDriverBlocklist
+                                            if (-not $VulnBlocklist) {
+                                                Write-DATLog -Message "Vulnerable-driver screening unavailable this run (no blocklist) - DUPs stage unscreened" -Severity 2
+                                            }
+                                        }
+                                        if ($VulnBlocklist) {
+                                            $Verdict = Get-DATDupScreenVerdict -DupPath $DriverExePath -FileName $IndvDriver.FileName -HashMD5 $IndvDriver.HashMD5 -Blocklist $VulnBlocklist
+                                            if ($Verdict.Status -eq 'Vulnerable') {
+                                                Write-DATLog -Message ("VULNERABLE DRIVER: '$($IndvDriver.Name)' ($($IndvDriver.FileName)) - $(@($Verdict.Matches) -join '; '). " +
+                                                    "Defender's ASR vulnerable-driver rule will block this on every enforcing device. The DUP is still being packaged - " +
+                                                    "add '$($IndvDriver.Name)' to Driver exclusions (Models tab > Options, or -ExcludeDrivers) and re-sync to stop deploying it.") -Severity 3
+                                                $Entry = "$($IndvDriver.Name) [$ModelName]"
+                                                if (-not $VulnerableFound.Contains($Entry)) { $VulnerableFound.Add($Entry) }
+                                            } elseif ($Verdict.Status -eq 'Unscreenable') {
+                                                Write-DATLog -Message "  Could not screen $($IndvDriver.FileName) for vulnerable drivers: $($Verdict.Detail)" -Severity 2
+                                            }
+                                        }
+                                    }
+
                                     $StagedExe = Join-Path $PackageSourceDir $IndvDriver.FileName
                                     Copy-Item -Path $DriverExePath -Destination $StagedExe -Force
                                     $StagedSize = (Get-Item $StagedExe -ErrorAction SilentlyContinue).Length
