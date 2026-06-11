@@ -602,6 +602,17 @@ function Get-DellIndividualDrivers {
         # base driver pack when it's actually relevant.
         [switch]$ExcludeStorageFirmware,
 
+        # Admin-configured exclusion patterns matched against each component's
+        # display name AND filename (wildcards; a pattern without * or ? is
+        # treated as a substring). Matched drivers never enter the package,
+        # the manifest, or the DCU catalog - the fleet never receives them.
+        # Field driver for the feature: the Realtek Card Reader DUP carries a
+        # driver version on Microsoft's vulnerable-driver blocklist, so every
+        # install attempt trips the Defender ASR rule "Block abuse of
+        # in-the-wild exploited vulnerable signed drivers" and pages Cyber.
+        # Excluding it at sync stops that at the source.
+        [string[]]$ExcludeDrivers = @(),
+
         # Force re-download of the per-model catalog before scanning. Without
         # this, the cached XML from up to 6h ago is used and any
         # SoftwareComponent Dell published since then (e.g. an A05 graphics
@@ -722,6 +733,14 @@ function Get-DellIndividualDrivers {
     # firmware components (e.g., "Intel Thunderbolt Controller Firmware").
     $ExcludePattern = '\bBIOS\b|SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Digital Delivery|\bApplication\b|\bUtility\b'
 
+    # Normalize the admin exclusion patterns once: bare strings become
+    # substring matches so 'Realtek Card Reader' works without the admin
+    # having to know wildcard syntax.
+    $NormalizedExcludes = @($ExcludeDrivers | Where-Object { $_ -and $_.Trim() } | ForEach-Object {
+        $P = $_.Trim()
+        if ($P -match '[\*\?]') { $P } else { "*$P*" }
+    })
+
     # Storage firmware exclusion (opt-in via -ExcludeStorageFirmware).
     # Matches DUP display names like "Kioxia BG5 Solid State Drive Firmware Update"
     # or "WDC WD20EZBX Hard Drive Firmware Update". The "Firmware Update" anchor
@@ -775,6 +794,7 @@ function Get-DellIndividualDrivers {
         $SkippedPkgType = 0
         $SkippedNoName = 0
         $SkippedExcluded = 0
+        $SkippedUserExcluded = 0
         $SkippedNoSysMatch = 0
         $SkippedWrongOS = 0
         $SkippedDate = 0
@@ -872,6 +892,23 @@ function Get-DellIndividualDrivers {
             if ($ExcludeStorageFirmware -and $DisplayName -match $StorageFirmwarePattern) {
                 $SkippedExcluded++
                 continue
+            }
+
+            # Admin-configured exclusions (-ExcludeDrivers). Checked against the
+            # display name and the DUP filename so either form works in the GUI.
+            # Matching here (catalog level) keeps the fingerprint, the staged
+            # DUPs, manifest.json, and the DCU catalog all in agreement.
+            if ($NormalizedExcludes.Count -gt 0) {
+                $PathLeaf = if ($Component.path) { ([string]$Component.path -split '[\\/]')[-1] } else { '' }
+                $UserExcluded = $false
+                foreach ($Pat in $NormalizedExcludes) {
+                    if ($DisplayName -like $Pat -or ($PathLeaf -and $PathLeaf -like $Pat)) {
+                        Write-DATLog -Message "  Admin exclusion: '$DisplayName' matched pattern '$Pat' - skipping" -Severity 1
+                        $UserExcluded = $true
+                        break
+                    }
+                }
+                if ($UserExcluded) { $SkippedUserExcluded++; continue }
             }
 
             # Check SystemID match (case-insensitive)
@@ -1009,7 +1046,7 @@ function Get-DellIndividualDrivers {
         # Log diagnostic summary for this catalog
         $CatalogSource = if ($UsingModelCatalog) { 'per-model' } else { 'CatalogPC (legacy)' }
         Write-DATLog -Message ("Catalog scan [$CatalogFileName] ($CatalogSource): $TotalScanned scanned, " +
-            "$SkippedPkgType non-driver, $SkippedExcluded excluded, " +
+            "$SkippedPkgType non-driver, $SkippedExcluded excluded, $SkippedUserExcluded admin-excluded, " +
             "$SkippedNoSysMatch wrong SystemID, $SkippedWrongOS wrong OS, " +
             "$SkippedDate older than baseline, $CatalogMatched matched") -Severity 1
     }

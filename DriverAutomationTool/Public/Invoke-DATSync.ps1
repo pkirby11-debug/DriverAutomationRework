@@ -138,6 +138,14 @@ function Invoke-DATSync {
         [string[]]$WimExcludeDirs  = @('Documentation', 'Docs', 'Samples', 'Sample', 'Help', 'HelpFiles'),
         [bool]$WimOptimizeExport   = $true,
 
+        # Driver name/filename patterns excluded from every package (Drivers
+        # overlay and DriverUpdates). Wildcards supported; a pattern without
+        # them matches as a substring (e.g. 'Realtek Card Reader'). Applied
+        # inside Get-DellIndividualDrivers so the overlay fingerprint, staged
+        # DUPs, manifest.json and the DCU catalog all agree - an excluded
+        # driver never reaches a client by any engine.
+        [string[]]$ExcludeDrivers = @(),
+
         [switch]$VerifyDownloadHash,
 
         # Only used when DeploymentPlatform = 'ConfigMgr - Application'. BIOS-only.
@@ -181,6 +189,7 @@ function Invoke-DATSync {
         $VerifyDownloadHash = [switch]$Config.options.verifyDownloadHash
         if ($null -ne $Config.options.wimExcludeFiles) { $WimExcludeFiles = @($Config.options.wimExcludeFiles) }
         if ($null -ne $Config.options.wimExcludeDirs)  { $WimExcludeDirs  = @($Config.options.wimExcludeDirs) }
+        if ($null -ne $Config.options.excludeDrivers)  { $ExcludeDrivers  = @($Config.options.excludeDrivers) }
         $WimOptimizeExport = [switch]$Config.options.wimOptimizeExport
         $WebhookUrl = $Config.logging.webhookUrl
 
@@ -192,6 +201,9 @@ function Invoke-DATSync {
     Write-DATLog -Message "Manufacturers: $($Manufacturer -join ', ')" -Severity 1
     Write-DATLog -Message "OS: $OperatingSystem ($Architecture)" -Severity 1
     Write-DATLog -Message "Models: $(if ($Models) { $Models -join ', ' } else { 'All available' })" -Severity 1
+    if ($ExcludeDrivers.Count -gt 0) {
+        Write-DATLog -Message "Driver exclusions active: $($ExcludeDrivers -join '; ')" -Severity 1
+    }
 
     # Validate paths
     foreach ($Path in @($DownloadPath, $PackagePath)) {
@@ -731,6 +743,12 @@ function Invoke-DATSyncSinglePackage {
             if ($Type -eq 'DriverUpdates') {
                 $GetDriverParams['ExcludeStorageFirmware'] = $true
             }
+            # Admin exclusions are part of the filter set for the same reason:
+            # adding/removing one intentionally changes the fingerprint so the
+            # package rebuilds without the excluded driver.
+            if ($ExcludeDrivers.Count -gt 0) {
+                $GetDriverParams['ExcludeDrivers'] = $ExcludeDrivers
+            }
             # Propagate ForceRefresh so the per-model catalog is re-pulled and the
             # fingerprint is computed against the SAME catalog the post-download
             # phase will use - otherwise the smart-check could match a stale
@@ -1230,6 +1248,11 @@ function Invoke-DATSyncSinglePackage {
                     # size manageable. Base 'Drivers' overlay keeps current behavior.
                     if ($Type -eq 'DriverUpdates') {
                         $GetDriverParams['ExcludeStorageFirmware'] = $true
+                    }
+                    # Must mirror the smart-check call exactly or the fingerprints
+                    # computed by the two passes diverge and packages churn.
+                    if ($ExcludeDrivers.Count -gt 0) {
+                        $GetDriverParams['ExcludeDrivers'] = $ExcludeDrivers
                     }
                     if ($ForceRefresh) {
                         $GetDriverParams['ForceRefresh'] = $true
