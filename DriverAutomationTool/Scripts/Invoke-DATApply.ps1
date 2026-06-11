@@ -1039,30 +1039,58 @@ function Invoke-DCUDriverUpdates {
         }
 
         # Scan exit 0 = updates found. Verify every one against the allowlist.
-        # The report schema isn't documented, so matching is content-based: a
-        # proposed update belongs to our catalog if its serialized node
-        # mentions one of the package's staged DUP filenames (primary) or one
-        # of their Dell package-ID tokens (secondary - the segment before
-        # WIN64/WIN32 in Dell's filename convention, e.g. 34HGT / P766C).
-        # The gate's first field run proved attribute-name guesses
-        # ('file'/'name') don't survive contact with the real report (all 14
-        # items came back "unnamed (no file attr)"), so when the gate trips it
-        # now dumps the first nodes' raw XML - the next log self-documents the
-        # actual schema and items.
-        $ScanUpdates = @()
-        $ReportFile = Get-ChildItem -Path $ReportDir -Filter '*.xml' -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($ReportFile) {
-            try {
-                $RepDoc = New-Object System.Xml.XmlDocument
-                $RepDoc.Load($ReportFile.FullName)
-                $ScanUpdates = @($RepDoc.SelectNodes("//*[translate(local-name(),'U','u')='update']"))
-            } catch {
-                Write-Log "Could not parse scan report $($ReportFile.FullName): $($_.Exception.Message)" -Severity 2
-            }
+        # Field-established report schema (2.2.7's diagnostics dump): update
+        # nodes carry CHILD ELEMENTS, not attributes -
+        #   <update><release>86GCF</release><name>...</name><version>...</version>
+        #   <type>Firmware</type><file>FOLDER.../x.exe</file>...</update>
+        # Items from OUR catalog have <file> = the bare staged filename (the
+        # sync rewrites paths); Dell-sourced items keep cloud FOLDER paths.
+        $GetNodeField = {
+            param($Node, $Field)
+            $C = $Node[$Field]
+            if (-not $C) { $C = $Node[($Field.Substring(0, 1).ToUpper() + $Field.Substring(1))] }
+            if ($C -and $C.InnerText) { return $C.InnerText.Trim() }
+            $A = [string]$Node.GetAttribute($Field)
+            if ($A) { return $A.Trim() }
+            return ''
         }
-        if ($ScanUpdates.Count -eq 0) {
-            Write-Log "DCU scan reported updates (exit 0) but the scan report is missing/empty - cannot verify provenance; falling back to built-in DUP engine" -Severity 2
-            return $null
+        $ParseScanReport = {
+            param([string]$Dir)
+            $Items = @()
+            $Rf = Get-ChildItem -Path $Dir -Filter '*.xml' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $Rf) { return ,$Items }
+            try {
+                $Doc = New-Object System.Xml.XmlDocument
+                $Doc.Load($Rf.FullName)
+                foreach ($U in @($Doc.SelectNodes("//*[translate(local-name(),'U','u')='update']"))) {
+                    $NodeXml = [string]$U.OuterXml
+                    $FileVal = & $GetNodeField $U 'file'
+                    $FileBase = if ($FileVal) { ($FileVal -split '[\\/]')[-1] } else { '' }
+                    # Ours when the file is one of our staged DUPs; OuterXml
+                    # filename/package-token fallbacks keep 2.2.7 behavior in
+                    # case Dell shifts the report shape again.
+                    $IsOurs = ($FileBase -and $ManifestNames.Contains($FileBase))
+                    if (-not $IsOurs) {
+                        foreach ($MfName in $ManifestNames) {
+                            if ($NodeXml.IndexOf($MfName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $IsOurs = $true; break }
+                        }
+                    }
+                    if (-not $IsOurs) {
+                        foreach ($Tok in $PkgTokens) {
+                            if ($NodeXml.IndexOf($Tok, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $IsOurs = $true; break }
+                        }
+                    }
+                    $Items += [PSCustomObject]@{
+                        Name    = & $GetNodeField $U 'name'
+                        Type    = (& $GetNodeField $U 'type').ToLowerInvariant()
+                        File    = $FileVal
+                        Release = & $GetNodeField $U 'release'
+                        IsOurs  = $IsOurs
+                        NodeXml = $NodeXml
+                    }
+                }
+            } catch { }
+            return ,$Items
         }
 
         # Dell package-ID tokens from the staged filenames (segment before the
@@ -1077,48 +1105,77 @@ function Invoke-DCUDriverUpdates {
             }
         }
 
-        $Foreign = [System.Collections.Generic.List[string]]::new()
-        $ForeignNodes = [System.Collections.Generic.List[string]]::new()
-        foreach ($U in $ScanUpdates) {
-            $NodeXml = [string]$U.OuterXml
-            $IsOurs = $false
-            foreach ($MfName in $ManifestNames) {
-                if ($NodeXml.IndexOf($MfName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $IsOurs = $true; break }
-            }
-            if (-not $IsOurs) {
-                foreach ($Tok in $PkgTokens) {
-                    if ($NodeXml.IndexOf($Tok, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $IsOurs = $true; break }
-                }
-            }
-            if (-not $IsOurs) {
-                $Label = ''
-                foreach ($AttrName in @('name', 'title', 'file', 'release')) {
-                    $V = [string]$U.GetAttribute($AttrName)
-                    if ($V) { $Label = $V; break }
-                }
-                if (-not $Label) {
-                    $Label = $NodeXml.Substring(0, [Math]::Min(120, $NodeXml.Length))
-                }
-                $Foreign.Add($Label)
-                if ($ForeignNodes.Count -lt 2) {
-                    $ForeignNodes.Add($NodeXml.Substring(0, [Math]::Min(300, $NodeXml.Length)))
-                }
-            }
-        }
-        if ($Foreign.Count -gt 0) {
-            Write-Log ("DCU's scan proposed $($Foreign.Count) of $($ScanUpdates.Count) update(s) with no match to this package's catalog - either DCU consulted its cloud catalog, or the report references our updates in a form the matcher doesn't know yet. Installing NOTHING via DCU; falling back to built-in DUP engine. Items: " + (($Foreign | Select-Object -First 5) -join '; ')) -Severity 3
-            $FirstAttrs = @($ScanUpdates[0].Attributes | ForEach-Object { $_.Name }) -join ', '
-            Write-Log "  scan-report diagnostics: file=$($ReportFile.FullName); update-node attributes: [$FirstAttrs]; sample node(s): $($ForeignNodes -join ' ||| ')" -Severity 2
+        $ScanItems = @(& $ParseScanReport $ReportDir)
+        if ($ScanItems.Count -eq 0) {
+            Write-Log "DCU scan reported updates (exit 0) but the scan report is missing/empty - cannot verify provenance; falling back to built-in DUP engine" -Severity 2
             return $null
         }
-        Write-Log "Scan gate passed: $($ScanUpdates.Count) update(s), every one matched to the package catalog"
+        $OursProposed = @($ScanItems | Where-Object { $_.IsOurs })
+        $ForeignProposed = @($ScanItems | Where-Object { -not $_.IsOurs })
 
-        # The catalog scopes the run to exactly the synced driver set, so no
-        # -updateType filter is needed. -reboot=disable: SCCM owns reboots via
-        # our exit code + the DT's BasedOnExitCode behavior.
-        Write-Log "dcu-cli /applyUpdates starting (repository: $Path)"
+        # dcu-cli cannot select individual updates, so a mixed result can only
+        # be applied safely if Dell's add-on items (its system-update channel:
+        # TPM firmware, BIOS, DCU self-update - field run showed these ride
+        # along even with a custom catalog) can be fenced out wholesale with
+        # the documented -updateType filter. That works exactly when the
+        # foreign types and our types are disjoint; computed per run, never
+        # hardcoded, so a run where they overlap stays gated and falls back.
+        $TypeFilter = $null
+        if ($ForeignProposed.Count -gt 0) {
+            $ValidTokens = @('bios', 'firmware', 'driver', 'application', 'utility', 'others')
+            $OurTypes = @($OursProposed | ForEach-Object { $_.Type } | Where-Object { $_ } | Select-Object -Unique)
+            $ForeignTypes = @($ForeignProposed | ForEach-Object { $_.Type } | Where-Object { $_ } | Select-Object -Unique)
+            $TypesUsable = ($OursProposed.Count -gt 0) -and
+                ($OurTypes.Count -gt 0) -and
+                (@($OursProposed | Where-Object { -not $_.Type }).Count -eq 0) -and
+                (@($ForeignProposed | Where-Object { -not $_.Type }).Count -eq 0) -and
+                (@($OurTypes | Where-Object { $ValidTokens -notcontains $_ }).Count -eq 0) -and
+                (@($OurTypes | Where-Object { $ForeignTypes -contains $_ }).Count -eq 0)
+
+            $ForeignDesc = @($ForeignProposed | Select-Object -First 5 | ForEach-Object { "$($_.Name) [$($_.Type)] ($($_.File))" }) -join '; '
+            if (-not $TypesUsable) {
+                Write-Log ("DCU's scan proposed $($ForeignProposed.Count) of $($ScanItems.Count) update(s) from outside this package's catalog and they cannot be fenced out by update type (our types: $($OurTypes -join ',') vs foreign: $($ForeignTypes -join ',')). Installing NOTHING via DCU; falling back to built-in DUP engine. Foreign: " + $ForeignDesc) -Severity 3
+                return $null
+            }
+
+            $TypeFilter = ($OurTypes | Sort-Object) -join ','
+            Write-Log "DCU's scan included $($ForeignProposed.Count) Dell system update(s) outside this package's catalog ($ForeignDesc) - fencing them out with -updateType=$TypeFilter and re-verifying"
+
+            $ReportDir2 = Join-Path $SessionDir 'scan-report-2'
+            try { New-Item -Path $ReportDir2 -ItemType Directory -Force | Out-Null } catch { }
+            $ScanLog2 = Join-Path $SessionDir 'dcu-scan2.log'
+            $ScanCode2 = & $RunDcu @('/scan', "-updateType=$TypeFilter", "-report=$ReportDir2", "-outputLog=$ScanLog2") 1800000 'scan2'
+
+            if (& $TestCatalogRejected @($ScanLog2, (Join-Path $SessionDir 'scan2.out.log'), (Join-Path $SessionDir 'scan2.err.log'))) {
+                Write-Log "Filtered re-scan shows the custom catalog was rejected - installing NOTHING via DCU; falling back to built-in DUP engine" -Severity 3
+                return $null
+            }
+            if ($ScanCode2 -ne 0) {
+                Write-Log "Filtered re-scan exited $(if ($null -eq $ScanCode2) { 'timeout/launch' } else { $ScanCode2 }) (expected updates) - cannot verify; falling back to built-in DUP engine" -Severity 2
+                & $TailConsole 'scan2'
+                return $null
+            }
+            $ScanItems2 = @(& $ParseScanReport $ReportDir2)
+            $Foreign2 = @($ScanItems2 | Where-Object { -not $_.IsOurs })
+            if ($ScanItems2.Count -eq 0 -or $Foreign2.Count -gt 0) {
+                $F2Desc = @($Foreign2 | Select-Object -First 3 | ForEach-Object { "$($_.Name) [$($_.Type)]" }) -join '; '
+                Write-Log "Filtered re-scan still unverifiable ($($ScanItems2.Count) item(s), $($Foreign2.Count) foreign: $F2Desc) - installing NOTHING via DCU; falling back to built-in DUP engine" -Severity 3
+                return $null
+            }
+            Write-Log "Scan gate passed after type fencing: $($ScanItems2.Count) update(s), every one from the package catalog"
+        } else {
+            Write-Log "Scan gate passed: $($ScanItems.Count) update(s), every one matched to the package catalog"
+        }
+
+        # -reboot=disable: SCCM owns reboots via our exit code + the DT's
+        # BasedOnExitCode behavior. The -updateType fence (when computed above)
+        # must ride along or applyUpdates' internal re-scan re-admits the
+        # foreign items the gate just excluded.
+        Write-Log "dcu-cli /applyUpdates starting (repository: $Path$(if ($TypeFilter) { "; -updateType=$TypeFilter" }))"
         $ApplyLog = Join-Path $SessionDir 'dcu-apply.log'
-        $ApplyCode = & $RunDcu @('/applyUpdates', '-reboot=disable', "-outputLog=$ApplyLog") 6000000 'applyUpdates'
+        $ApplyArgs = @('/applyUpdates', '-reboot=disable', "-outputLog=$ApplyLog")
+        if ($TypeFilter) { $ApplyArgs = @('/applyUpdates', "-updateType=$TypeFilter", '-reboot=disable', "-outputLog=$ApplyLog") }
+        $ApplyCode = & $RunDcu $ApplyArgs 6000000 'applyUpdates'
 
         if ($null -eq $ApplyCode) {
             # Timeout/launch failure mid-apply: DCU may have installed a subset.
