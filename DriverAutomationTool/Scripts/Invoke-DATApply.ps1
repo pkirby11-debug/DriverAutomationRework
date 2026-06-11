@@ -1039,6 +1039,16 @@ function Invoke-DCUDriverUpdates {
         }
 
         # Scan exit 0 = updates found. Verify every one against the allowlist.
+        # The report schema isn't documented, so matching is content-based: a
+        # proposed update belongs to our catalog if its serialized node
+        # mentions one of the package's staged DUP filenames (primary) or one
+        # of their Dell package-ID tokens (secondary - the segment before
+        # WIN64/WIN32 in Dell's filename convention, e.g. 34HGT / P766C).
+        # The gate's first field run proved attribute-name guesses
+        # ('file'/'name') don't survive contact with the real report (all 14
+        # items came back "unnamed (no file attr)"), so when the gate trips it
+        # now dumps the first nodes' raw XML - the next log self-documents the
+        # actual schema and items.
         $ScanUpdates = @()
         $ReportFile = Get-ChildItem -Path $ReportDir -Filter '*.xml' -File -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($ReportFile) {
@@ -1054,20 +1064,54 @@ function Invoke-DCUDriverUpdates {
             Write-Log "DCU scan reported updates (exit 0) but the scan report is missing/empty - cannot verify provenance; falling back to built-in DUP engine" -Severity 2
             return $null
         }
+
+        # Dell package-ID tokens from the staged filenames (segment before the
+        # WIN64/WIN32 marker: Intel-Dynamic-Tuning-Driver_34HGT_WIN64_... -> 34HGT).
+        $PkgTokens = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($MfName in $ManifestNames) {
+            $Parts = $MfName -split '_'
+            for ($i = 1; $i -lt $Parts.Length; $i++) {
+                if ($Parts[$i] -match '^WIN(32|64)?$' -and $Parts[$i - 1] -match '^[A-Za-z0-9]{4,7}$') {
+                    [void]$PkgTokens.Add($Parts[$i - 1])
+                }
+            }
+        }
+
         $Foreign = [System.Collections.Generic.List[string]]::new()
+        $ForeignNodes = [System.Collections.Generic.List[string]]::new()
         foreach ($U in $ScanUpdates) {
-            $UFile = [string]$U.GetAttribute('file')
-            $UBase = if ($UFile) { ($UFile -split '[\\/]')[-1] } else { '' }
-            if (-not $UBase -or -not $ManifestNames.Contains($UBase)) {
-                $UName = [string]$U.GetAttribute('name')
-                $Foreign.Add(("{0} ({1})" -f $(if ($UName) { $UName } else { 'unnamed' }), $(if ($UFile) { $UFile } else { 'no file attr' })))
+            $NodeXml = [string]$U.OuterXml
+            $IsOurs = $false
+            foreach ($MfName in $ManifestNames) {
+                if ($NodeXml.IndexOf($MfName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $IsOurs = $true; break }
+            }
+            if (-not $IsOurs) {
+                foreach ($Tok in $PkgTokens) {
+                    if ($NodeXml.IndexOf($Tok, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $IsOurs = $true; break }
+                }
+            }
+            if (-not $IsOurs) {
+                $Label = ''
+                foreach ($AttrName in @('name', 'title', 'file', 'release')) {
+                    $V = [string]$U.GetAttribute($AttrName)
+                    if ($V) { $Label = $V; break }
+                }
+                if (-not $Label) {
+                    $Label = $NodeXml.Substring(0, [Math]::Min(120, $NodeXml.Length))
+                }
+                $Foreign.Add($Label)
+                if ($ForeignNodes.Count -lt 2) {
+                    $ForeignNodes.Add($NodeXml.Substring(0, [Math]::Min(300, $NodeXml.Length)))
+                }
             }
         }
         if ($Foreign.Count -gt 0) {
-            Write-Log ("DCU's scan proposed $($Foreign.Count) update(s) NOT in this package's catalog - proof it consulted Dell's cloud catalog. Installing NOTHING via DCU; falling back to built-in DUP engine. Foreign items: " + (($Foreign | Select-Object -First 5) -join '; ')) -Severity 3
+            Write-Log ("DCU's scan proposed $($Foreign.Count) of $($ScanUpdates.Count) update(s) with no match to this package's catalog - either DCU consulted its cloud catalog, or the report references our updates in a form the matcher doesn't know yet. Installing NOTHING via DCU; falling back to built-in DUP engine. Items: " + (($Foreign | Select-Object -First 5) -join '; ')) -Severity 3
+            $FirstAttrs = @($ScanUpdates[0].Attributes | ForEach-Object { $_.Name }) -join ', '
+            Write-Log "  scan-report diagnostics: file=$($ReportFile.FullName); update-node attributes: [$FirstAttrs]; sample node(s): $($ForeignNodes -join ' ||| ')" -Severity 2
             return $null
         }
-        Write-Log "Scan gate passed: $($ScanUpdates.Count) update(s), every one from the package catalog"
+        Write-Log "Scan gate passed: $($ScanUpdates.Count) update(s), every one matched to the package catalog"
 
         # The catalog scopes the run to exactly the synced driver set, so no
         # -updateType filter is needed. -reboot=disable: SCCM owns reboots via
