@@ -1003,6 +1003,23 @@ function Invoke-DCUDriverUpdates {
         }
         $CatalogConfigured = $true
 
+        # Cut DCU's dell.com merge for the duration of the run. The GUI's
+        # "Default Source Location (dell.com)" toggle is what made scans blend
+        # cloud content (TPM firmware, BIOS, DCU self-update) into custom-
+        # catalog results - and what lets resident DCU run cloud passes on its
+        # own schedule. Disable it for our run via the documented setting;
+        # the settings restore in finally puts the box back exactly as found.
+        # Same graceful pattern as -allowXML: builds that don't know the
+        # option reject it and we continue, relying on the scan gate + type
+        # fence instead.
+        $NoDefCode = & $RunDcu @("/configure", "-defaultSourceLocation=disable", "-outputLog=$SessionDir\dcu-nodefaultsrc.log") 300000 'configure-nodefaultsrc'
+        if ($NoDefCode -eq 0) {
+            Write-Log "DCU default dell.com source disabled for this run - scans are restricted to the package catalog"
+        } else {
+            Write-Log "Could not disable DCU's default dell.com source (exit $(if ($null -eq $NoDefCode) { 'timeout/launch' } else { $NoDefCode })) - this build may not support -defaultSourceLocation; relying on the scan gate and type fence" -Severity 2
+            & $TailConsole 'configure-nodefaultsrc'
+        }
+
         # ------------------------------------------------------------------
         # FAIL-CLOSED GATE. /scan is read-only; nothing installs unless the
         # scan provably ran from OUR catalog alone:
@@ -1230,15 +1247,20 @@ function Invoke-DCUDriverUpdates {
             if ($RestoreSource) {
                 # DCU's self-update can hold the config lock right after
                 # applyUpdates (field: exit 3004 "currently performing a self
-                # update") - retry before giving up. Exit 5 (reboot pending)
-                # cannot clear without a restart, so don't retry that.
+                # update" persisted through 2x30s retries - a self-update
+                # takes minutes). Retry 3004 with 60s waits for up to ~6
+                # minutes; other failures get two quick retries. Exit 5
+                # (reboot pending) cannot clear without a restart - no retry.
                 $RestoreCode = $null
-                for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+                for ($Attempt = 1; $Attempt -le 6; $Attempt++) {
                     $RestoreCode = & $RunDcu @("/configure", "-importSettings=$RestoreSource", "-outputLog=$SessionDir\dcu-restore.log") 300000 'settings-restore'
                     if ($RestoreCode -eq 0 -or $RestoreCode -eq 5) { break }
-                    if ($Attempt -lt 3) {
-                        Write-Log "DCU settings restore attempt $Attempt failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - retrying in 30s (DCU may be mid self-update)" -Severity 2
-                        Start-Sleep -Seconds 30
+                    $IsSelfUpdate = ($RestoreCode -eq 3004)
+                    if (-not $IsSelfUpdate -and $Attempt -ge 3) { break }
+                    if ($Attempt -lt 6) {
+                        $Delay = if ($IsSelfUpdate) { 60 } else { 30 }
+                        Write-Log "DCU settings restore attempt $Attempt failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - retrying in ${Delay}s$(if ($IsSelfUpdate) { ' (DCU self-update in progress)' })" -Severity 2
+                        Start-Sleep -Seconds $Delay
                     }
                 }
                 if ($RestoreCode -eq 0) {
