@@ -1720,6 +1720,29 @@ function Install-DriverUpdates {
         Write-Log "Could not create DUP extract directory '$DupExtractRoot' ($($_.Exception.Message)) - DUPs will inherit parent TMP/TEMP" -Severity 2
         $DupExtractRoot = $null
     }
+
+    # Dell DUP frameworks resolve a DEFAULT extract path independent of both
+    # TMP/TEMP and the working directory: legacy DUPs default to
+    # C:\dell\drivers, DCH-era DUPs to C:\ProgramData\Dell\Drivers. When that
+    # root can't be created/written, the framework dies in ~0.1-1s with
+    # 'Error locating default extractpath' (the fleet plague: DP33667 until a
+    # DCU reinstall repaired ProgramData\Dell; DP82132's 2019-2021-era DUPs).
+    # Pre-create and write-probe both roots so the default resolution
+    # succeeds; the per-DUP /e= fallback below covers anything that still
+    # refuses.
+    foreach ($DellDefRoot in @((Join-Path $env:SystemDrive 'dell\drivers'), (Join-Path $env:ProgramData 'Dell\Drivers'))) {
+        try {
+            if (-not (Test-Path $DellDefRoot)) {
+                New-Item -Path $DellDefRoot -ItemType Directory -Force | Out-Null
+                Write-Log "Created Dell default extract root: $DellDefRoot"
+            }
+            $ProbeFile = Join-Path $DellDefRoot ('.dat-probe-{0}.tmp' -f $PID)
+            Set-Content -Path $ProbeFile -Value 'probe' -ErrorAction Stop
+            Remove-Item -Path $ProbeFile -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Log "Dell default extract root '$DellDefRoot' is not writable ($($_.Exception.Message)) - DUPs defaulting there will hit 'Error locating default extractpath'; the per-DUP extract+pnputil fallback covers them" -Severity 2
+        }
+    }
     $InstantFailed = 0
 
     $Index = 0
@@ -1882,6 +1905,49 @@ function Install-DriverUpdates {
                     if (-not $VulnExclusionAdvice.Contains([string]$Drv.Name)) { $VulnExclusionAdvice.Add([string]$Drv.Name) }
                 } else {
                     Write-Log "$DriverLabel - Defender event $($Flag.Id) during this DUP's run window (path: $($Flag.Path)) - possible AV interference with this install" -Severity 2
+                }
+            }
+        }
+
+        # Extractpath fallback. Some DUP-framework builds resolve a DEFAULT
+        # extract location independent of TMP and WorkingDirectory and die
+        # with 'Error locating default extractpath' when it can't be created.
+        # The documented /e= extract-only switch BYPASSES that resolution -
+        # we name the destination - so: extract the payload ourselves and
+        # install any INF-based drivers via the existing pnputil machinery.
+        # Firmware/app payloads without INFs keep the original failure. On
+        # fallback success $DupCode is rewritten to 0 so every downstream
+        # bookkeeping path (marker, counters, summary) just works; pnputil
+        # reboot signaling goes through $script:RebootRequired inside
+        # Install-InfTree.
+        if ($DupCode -eq 1 -and $DupTempDir -and $DupFwLog -and (Test-Path $DupFwLog)) {
+            $FwRaw = ''
+            try { $FwRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction Stop } catch { }
+            if ($FwRaw -and $FwRaw -match 'Error locating default extractpath') {
+                Write-Log "$DriverLabel - framework could not resolve its default extract path; retrying as extract (/e=) + pnputil" -Severity 2
+                $FbExtract = Join-Path $DupTempDir 'fallback-extract'
+                try {
+                    New-Item -Path $FbExtract -ItemType Directory -Force | Out-Null
+                    $FbProc = Start-Process -FilePath $DriverExe -ArgumentList '/s', "/e=$FbExtract" -WorkingDirectory $Path -NoNewWindow -PassThru -ErrorAction Stop
+                    $null = $FbProc.Handle
+                    if (-not $FbProc.WaitForExit(300000)) {
+                        try { $FbProc.Kill() } catch { }
+                        throw 'extraction timed out after 5 minutes'
+                    }
+                    $FbInfs = @(Get-ChildItem -Path $FbExtract -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+                    if ($FbInfs.Count -eq 0) {
+                        Write-Log "$DriverLabel - fallback extraction produced no .inf files (extract exit $($FbProc.ExitCode)) - payload is not INF-installable; keeping original failure" -Severity 2
+                    } else {
+                        $FbCode = Install-InfTree -Path $FbExtract
+                        if ($FbCode -eq 0) {
+                            Write-Log "$DriverLabel - extract+pnputil fallback SUCCEEDED ($($FbInfs.Count) INF(s) processed)"
+                            $DupCode = 0
+                        } else {
+                            Write-Log "$DriverLabel - extract+pnputil fallback failed (pnputil exit $FbCode) - keeping original failure" -Severity 2
+                        }
+                    }
+                } catch {
+                    Write-Log "$DriverLabel - extractpath fallback errored: $($_.Exception.Message) - keeping original failure" -Severity 2
                 }
             }
         }
