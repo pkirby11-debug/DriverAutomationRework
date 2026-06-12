@@ -1,0 +1,173 @@
+function Set-DATDellCommandUpdateMode {
+    <#
+    .SYNOPSIS
+        Configures Dell Command Update on the local machine so it never auto-
+        scans, auto-installs, or pulls from Dell's cloud catalog. Use when this
+        tool is the sole driver-update source.
+    .DESCRIPTION
+        Field driver: at default DCU settings (Default Source Location =
+        dell.com, automatic schedule enabled), resident DCU runs autonomous
+        cloud passes on its own - applying BIOS, TPM firmware, and cloud-
+        version drivers without the tool's curation. Confirmed on DP33669
+        when DCU executed an autonomous 3:13 PM Update History entry of
+        cloud-version drivers (UHD 32.0.101.7084 vs the tool's curated
+        32.0.101.8509) following a clean tool-driven run at 2:36 PM.
+
+        DAT-Managed mode flips the dcu-cli knobs that govern autonomous
+        behavior so DCU stays a passive execution engine, acting only when
+        the apply script's DCU engine explicitly drives it:
+
+          defaultSourceLocation = disable     no Dell cloud catalog
+          scheduleAuto          = disable     no scheduled scans
+          scheduleAction        = DoNothing   belt + braces
+          updatesNotification   = disable     no toast notifications
+          userConsent           = disable     no user-initiated actions
+          systemRestartDeferral = enable      no auto-restart
+          installationDeferral  = enable      no auto-install
+          autoSuspendBitLocker  = disable     don't touch BL
+
+        The per-run /configure -catalogLocation + /applyUpdates path the
+        engine uses is unaffected - those run on top of these settings.
+
+        Sets a marker registry value the apply script reads on every run so
+        the engine can re-apply this configuration defensively (e.g. after a
+        DCU self-update or a Group Policy refresh resets the values):
+            HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode
+
+        Deploy via a one-time SCCM script / Intune script targeted at Dell
+        endpoints, or invoke locally. The standalone, module-free equivalent
+        is Scripts\Set-DATDcuManaged.ps1.
+    .PARAMETER Mode
+        DATManaged (default): passive mode, DCU acts only when driven.
+        Default: revert to the Dell out-of-box behavior.
+    .EXAMPLE
+        Set-DATDellCommandUpdateMode
+    .EXAMPLE
+        Set-DATDellCommandUpdateMode -Mode Default
+    .OUTPUTS
+        PSCustomObject: Mode, DcuPath, DcuVersion, AppliedSettings,
+        FailedSettings, MarkerWritten, Success.
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('DATManaged', 'Default')]
+        [string]$Mode = 'DATManaged',
+
+        [int]$PerCommandTimeoutSec = 120
+    )
+
+    $DcuCli = $null
+    foreach ($Root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $Root) { continue }
+        $Candidate = Join-Path $Root 'Dell\CommandUpdate\dcu-cli.exe'
+        if (Test-Path $Candidate) { $DcuCli = $Candidate; break }
+    }
+    if (-not $DcuCli) {
+        throw "Dell Command Update (dcu-cli.exe) not installed on this device. Install DCU 4.0 or newer first."
+    }
+
+    $DcuVersion = $null
+    try { $DcuVersion = (Get-Item $DcuCli -ErrorAction Stop).VersionInfo.FileVersion } catch { }
+    if ($DcuVersion) {
+        $ParsedVer = $null
+        if ([version]::TryParse(($DcuVersion -replace '[^\d\.].*$', ''), [ref]$ParsedVer) -and $ParsedVer.Major -lt 4) {
+            throw "DCU $DcuVersion is too old for this CLI grammar (needs 4.0+). Update DCU first."
+        }
+    }
+
+    Write-DATLog -Message "Configuring Dell Command Update on $env:COMPUTERNAME ($DcuCli, version $(if ($DcuVersion) { $DcuVersion } else { 'unknown' })) -> '$Mode' mode" -Severity 1
+
+    # Each setting is one /configure call (a single bulk call with multiple
+    # options exists on some builds but per-key gives per-key fallback if a
+    # build doesn't know an option - same graceful pattern as -allowXML).
+    $Settings = if ($Mode -eq 'DATManaged') {
+        [ordered]@{
+            'defaultSourceLocation' = 'disable'
+            'scheduleAuto'          = 'disable'
+            'scheduleAction'        = 'DoNothing'
+            'updatesNotification'   = 'disable'
+            'userConsent'           = 'disable'
+            'systemRestartDeferral' = 'enable'
+            'installationDeferral'  = 'enable'
+            'autoSuspendBitLocker'  = 'disable'
+        }
+    } else {
+        # Dell out-of-box behavior. scheduleAction value picks DownloadInstall
+        # Notify - the most common Dell-default fleet behavior.
+        [ordered]@{
+            'defaultSourceLocation' = 'enable'
+            'scheduleAuto'          = 'enable'
+            'scheduleAction'        = 'DownloadInstallNotify'
+            'updatesNotification'   = 'enable'
+            'userConsent'           = 'enable'
+            'systemRestartDeferral' = 'disable'
+            'installationDeferral'  = 'disable'
+            'autoSuspendBitLocker'  = 'enable'
+        }
+    }
+
+    # C:\Temp - the path family DCU 5.x accepts (per 2.2.3 ledger).
+    $WorkDir = Join-Path $env:SystemDrive ('Temp\DriverAutomationTool\DCU-modecfg\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null
+
+    $Applied = [System.Collections.Generic.List[string]]::new()
+    $Failed = [System.Collections.Generic.List[string]]::new()
+    $TimeoutMs = [int]([Math]::Max(10, $PerCommandTimeoutSec) * 1000)
+    foreach ($K in $Settings.Keys) {
+        $V = $Settings[$K]
+        $Pair = "-$K=$V"
+        $LogPath = Join-Path $WorkDir ("$K.log")
+        $OutPath = Join-Path $WorkDir ("$K.out.log")
+        $ErrPath = Join-Path $WorkDir ("$K.err.log")
+        Write-DATLog -Message "  $Pair" -Severity 1
+        try {
+            $Proc = Start-Process -FilePath $DcuCli -ArgumentList @('/configure', $Pair, "-outputLog=$LogPath") `
+                -NoNewWindow -PassThru -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath -ErrorAction Stop
+            $null = $Proc.Handle
+            if (-not $Proc.WaitForExit($TimeoutMs)) {
+                try { $Proc.Kill() } catch { }
+                $Failed.Add("$Pair (timeout)")
+                Write-DATLog -Message "    timed out after $PerCommandTimeoutSec s" -Severity 2
+                continue
+            }
+            if ($Proc.ExitCode -eq 0) {
+                $Applied.Add($Pair)
+            } else {
+                $Failed.Add(("{0} (exit {1})" -f $Pair, $Proc.ExitCode))
+                Write-DATLog -Message "    exit $($Proc.ExitCode) - this build may not support -$K; continuing with others" -Severity 2
+            }
+        } catch {
+            $Failed.Add(("{0} (launch error: {1})" -f $Pair, $_.Exception.Message))
+            Write-DATLog -Message "    launch failed: $($_.Exception.Message)" -Severity 2
+        }
+    }
+
+    # Marker the apply-side DCU engine reads on every run so it can re-apply
+    # managed mode defensively. Writing it is idempotent.
+    $MarkerWritten = $false
+    try {
+        $MarkerKey = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation'
+        if (-not (Test-Path $MarkerKey)) {
+            New-Item -Path $MarkerKey -Force | Out-Null
+        }
+        Set-ItemProperty -Path $MarkerKey -Name 'DcuManagedMode' -Value $Mode -Type String -Force
+        Set-ItemProperty -Path $MarkerKey -Name 'DcuManagedModeSetAt' -Value (Get-Date).ToString('o') -Type String -Force
+        $MarkerWritten = $true
+    } catch {
+        Write-DATLog -Message "Could not write the DcuManagedMode marker: $($_.Exception.Message)" -Severity 2
+    }
+
+    $Success = ($Failed.Count -eq 0) -and $MarkerWritten
+    Write-DATLog -Message "Dell Command Update configuration complete: $($Applied.Count) applied, $($Failed.Count) failed, marker $(if ($MarkerWritten) { 'written' } else { 'NOT written' })" -Severity $(if ($Success) { 1 } else { 2 })
+
+    return [PSCustomObject]@{
+        Mode             = $Mode
+        DcuPath          = $DcuCli
+        DcuVersion       = $DcuVersion
+        AppliedSettings  = $Applied.ToArray()
+        FailedSettings   = $Failed.ToArray()
+        MarkerWritten    = $MarkerWritten
+        Success          = $Success
+        ConfigLogDir     = $WorkDir
+    }
+}

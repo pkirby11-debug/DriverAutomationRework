@@ -943,6 +943,35 @@ function Invoke-DCUDriverUpdates {
     $SettingsBackupDir = Join-Path $SessionDir 'settings-backup'
     $SettingsBackupFile = $null
     $BackupHijacked = $false
+
+    # DAT-managed mode (set by Set-DATDellCommandUpdateMode or Scripts\
+    # Set-DATDcuManaged.ps1 - or by GPO writing the marker directly): re-
+    # assert the passive-mode settings BEFORE the pristine snapshot, so the
+    # snapshot captures the managed state and the post-run restore lands the
+    # box back in managed mode. Belt-and-braces against DCU self-updates,
+    # GPO refreshes, or anything else that flipped a value back since the
+    # last run. Idempotent - DCU accepts unchanged settings as no-ops.
+    $DcuManagedMode = $null
+    try { $DcuManagedMode = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation' -Name 'DcuManagedMode' -ErrorAction Stop).DcuManagedMode } catch { }
+    if ($DcuManagedMode -eq 'DATManaged') {
+        $ManagedSequence = [ordered]@{
+            'defaultSourceLocation' = 'disable'
+            'scheduleAuto'          = 'disable'
+            'scheduleAction'        = 'DoNothing'
+            'updatesNotification'   = 'disable'
+            'userConsent'           = 'disable'
+            'systemRestartDeferral' = 'enable'
+            'installationDeferral'  = 'enable'
+            'autoSuspendBitLocker'  = 'disable'
+        }
+        $MgRe = 0; $MgFail = 0
+        foreach ($K in $ManagedSequence.Keys) {
+            $V = $ManagedSequence[$K]
+            $RC = & $RunDcu @('/configure', "-$K=$V", "-outputLog=$SessionDir\dcu-managed-$K.log") 120000 "managed-$K"
+            if ($RC -eq 0) { $MgRe++ } else { $MgFail++ }
+        }
+        Write-Log "DCU re-asserted to DAT-managed mode ($MgRe applied, $MgFail not supported on this build - graceful)"
+    }
     try {
         New-Item -Path $SettingsBackupDir -ItemType Directory -Force | Out-Null
         $ExportCode = & $RunDcu @("/configure", "-exportSettings=$SettingsBackupDir", "-outputLog=$SessionDir\dcu-export.log") 300000 'settings-export'
