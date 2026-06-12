@@ -944,16 +944,29 @@ function Invoke-DCUDriverUpdates {
     $SettingsBackupFile = $null
     $BackupHijacked = $false
 
-    # DAT-managed mode (set by Set-DATDellCommandUpdateMode or Scripts\
-    # Set-DATDcuManaged.ps1 - or by GPO writing the marker directly): re-
-    # assert the passive-mode settings BEFORE the pristine snapshot, so the
-    # snapshot captures the managed state and the post-run restore lands the
-    # box back in managed mode. Belt-and-braces against DCU self-updates,
-    # GPO refreshes, or anything else that flipped a value back since the
-    # last run. Idempotent - DCU accepts unchanged settings as no-ops.
+    # DAT-managed DCU mode - DEFAULT-ON for every DriverUpdates run. This tool
+    # is the sole update channel, so DCU's autonomy (dell.com source, scheduled
+    # scans, auto-installs) is disabled on every device this application runs
+    # on; DCU stays installed purely as the execution engine we drive. Field
+    # driver: resident DCU's autonomous 3:13 PM cloud pass on DP33669 applied
+    # BIOS/TPM/cloud drivers an hour after a clean gated run.
+    #
+    # Runs BEFORE the pristine snapshot so the snapshot captures the managed
+    # state and the post-run restore lands back in managed mode - including on
+    # boxes whose pristine predates managed mode (the snapshot refresh below
+    # overwrites it). Idempotent (unchanged settings are no-ops) and graceful
+    # per key (builds that don't know an option warn and continue).
+    #
+    # Opt-out: Set-DATDellCommandUpdateMode -Mode Default writes
+    # HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode = 'Default',
+    # which this block respects (per-run scan purity via the later
+    # -defaultSourceLocation=disable still applies; only the persistent
+    # lockdown is skipped).
     $DcuManagedMode = $null
     try { $DcuManagedMode = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation' -Name 'DcuManagedMode' -ErrorAction Stop).DcuManagedMode } catch { }
-    if ($DcuManagedMode -eq 'DATManaged') {
+    if ($DcuManagedMode -eq 'Default') {
+        Write-Log "DCU managed mode: device is explicitly opted out (DcuManagedMode=Default) - leaving DCU autonomy settings as-is" -Severity 2
+    } else {
         $ManagedSequence = [ordered]@{
             'defaultSourceLocation' = 'disable'
             'scheduleAuto'          = 'disable'
@@ -970,7 +983,15 @@ function Invoke-DCUDriverUpdates {
             $RC = & $RunDcu @('/configure', "-$K=$V", "-outputLog=$SessionDir\dcu-managed-$K.log") 120000 "managed-$K"
             if ($RC -eq 0) { $MgRe++ } else { $MgFail++ }
         }
-        Write-Log "DCU re-asserted to DAT-managed mode ($MgRe applied, $MgFail not supported on this build - graceful)"
+        Write-Log "DCU locked to DAT-managed mode: no dell.com source, no scheduled scans, no auto-installs ($MgRe applied, $MgFail not supported on this build - graceful)"
+        # Marker for inventory/visibility and so the cmdlet/standalone script
+        # see a consistent state. Idempotent.
+        try {
+            $MgKey = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation'
+            if (-not (Test-Path $MgKey)) { New-Item -Path $MgKey -Force | Out-Null }
+            Set-ItemProperty -Path $MgKey -Name 'DcuManagedMode' -Value 'DATManaged' -Type String -Force
+            Set-ItemProperty -Path $MgKey -Name 'DcuManagedModeSetAt' -Value (Get-Date).ToString('o') -Type String -Force
+        } catch { }
     }
     try {
         New-Item -Path $SettingsBackupDir -ItemType Directory -Force | Out-Null

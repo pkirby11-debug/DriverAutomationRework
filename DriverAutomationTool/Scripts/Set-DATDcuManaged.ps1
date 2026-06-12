@@ -11,8 +11,13 @@
     DAT-Managed mode (default) disables Dell's cloud source, scheduled scans,
     notifications, consent prompts, auto-restarts, auto-installs, and BL
     auto-suspend - DCU acts only when the apply-side DCU engine explicitly
-    drives it. The apply script reads the HKLM\...\DcuManagedMode marker
-    written here and re-applies these settings each run defensively.
+    drives it.
+
+    NOTE: as of 2.6.0 the DriverUpdates application applies DAT-managed mode
+    automatically on every Dell device it runs on - deploying this script is
+    only needed to pre-stage devices BEFORE their first deployment, or to opt
+    a device OUT (-Mode Default writes the marker value 'Default', which the
+    apply engine respects and skips the lockdown on that device).
 
     Logs to:  C:\Temp\DriverAutomationTool\DCU-modecfg\<timestamp>\
     Marker:   HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode

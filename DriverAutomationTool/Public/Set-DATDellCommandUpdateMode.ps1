@@ -29,17 +29,22 @@ function Set-DATDellCommandUpdateMode {
         The per-run /configure -catalogLocation + /applyUpdates path the
         engine uses is unaffected - those run on top of these settings.
 
-        Sets a marker registry value the apply script reads on every run so
-        the engine can re-apply this configuration defensively (e.g. after a
-        DCU self-update or a Group Policy refresh resets the values):
-            HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode
+        NOTE: as of 2.6.0 the DriverUpdates application applies DAT-managed
+        mode automatically on every Dell device it runs on - no separate
+        deployment of this cmdlet is required. It remains useful for:
+          - pre-staging devices before their first deployment,
+          - re-asserting outside a deployment window,
+          - OPTING A DEVICE OUT: -Mode Default writes the marker value
+            'Default', which the apply engine respects (it then leaves DCU's
+            autonomy settings alone on that device).
+        Marker: HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode
 
-        Deploy via a one-time SCCM script / Intune script targeted at Dell
-        endpoints, or invoke locally. The standalone, module-free equivalent
-        is Scripts\Set-DATDcuManaged.ps1.
+        The standalone, module-free equivalent is
+        Scripts\Set-DATDcuManaged.ps1.
     .PARAMETER Mode
         DATManaged (default): passive mode, DCU acts only when driven.
-        Default: revert to the Dell out-of-box behavior.
+        Default: revert to Dell out-of-box behavior AND opt the device out of
+        the apply engine's automatic lockdown.
     .EXAMPLE
         Set-DATDellCommandUpdateMode
     .EXAMPLE
