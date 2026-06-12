@@ -178,6 +178,32 @@ function Invoke-DATSync {
     $VulnBlocklistLoaded = $false
     $VulnerableFound = [System.Collections.Generic.List[string]]::new()
 
+    # Stages Dell's Inventory Collector (invcol) into a DriverUpdates package
+    # and returns the catalog reference for Write-DATDCUCatalog. DCU downloads
+    # the collector FROM ITS CATALOG SOURCE to run the system-inventory phase
+    # of every scan; with dell.com disabled on clients, the package catalog
+    # must carry it or scans fail "Unable to retrieve system inventory
+    # information" and return a meaningless 500 (field: DP82132 reported
+    # "everything current" while a year behind). Best-effort: $null means the
+    # catalog ships without it and the apply engine falls back to the
+    # built-in DUP engine on inventory failure.
+    $AddDellInventoryToPackage = {
+        param([string]$PkgDir, [string]$SysID)
+        $Inv = Get-DellInventoryComponent -SystemID $SysID
+        if (-not $Inv) { return $null }
+        $Target = Join-Path $PkgDir $Inv.FileName
+        if (-not (Test-Path $Target)) {
+            try {
+                Write-DATLog -Message "Staging Dell Inventory Collector for offline DCU scans: $($Inv.FileName)" -Severity 1
+                Invoke-DATDownload -Url $Inv.Url -DestinationPath $Target
+            } catch {
+                Write-DATLog -Message "Could not download the Inventory Collector ($($_.Exception.Message)) - DCU scans will fail system inventory offline and fall back to the built-in engine" -Severity 2
+                return $null
+            }
+        }
+        return $Inv
+    }
+
     # Load config from file if specified
     if ($PSCmdlet.ParameterSetName -eq 'ConfigFile') {
         $Config = Get-Content $ConfigFile -Raw | ConvertFrom-Json | ConvertTo-DATHashtable
@@ -814,7 +840,13 @@ function Invoke-DATSyncSinglePackage {
                             $_.FileName -and (Test-Path (Join-Path $ExistingToCheck.SourcePath $_.FileName))
                         })
                         if ($OnDisk.Count -gt 0) {
-                            [void](Write-DATDCUCatalog -PackageSourceDir $ExistingToCheck.SourcePath -Drivers $OnDisk)
+                            $DcuCatParams = @{ PackageSourceDir = $ExistingToCheck.SourcePath; Drivers = $OnDisk }
+                            $InvComp = & $AddDellInventoryToPackage $ExistingToCheck.SourcePath $PackageInfo.SystemID
+                            if ($InvComp) {
+                                $DcuCatParams['InventoryComponentXml'] = $InvComp.Xml
+                                $DcuCatParams['InventoryFileName'] = $InvComp.FileName
+                            }
+                            [void](Write-DATDCUCatalog @DcuCatParams)
                         }
                     }
 
@@ -1742,7 +1774,13 @@ function Invoke-DATSyncSinglePackage {
                             # report a download failure.
                             $StagedNames = @($ManifestEntries | ForEach-Object { $_.FileName })
                             $StagedForCatalog = @($IndividualDrivers | Where-Object { $StagedNames -contains $_.FileName })
-                            [void](Write-DATDCUCatalog -PackageSourceDir $PackageSourceDir -Drivers $StagedForCatalog)
+                            $DcuCatParams = @{ PackageSourceDir = $PackageSourceDir; Drivers = $StagedForCatalog }
+                            $InvComp = & $AddDellInventoryToPackage $PackageSourceDir $PackageInfo.SystemID
+                            if ($InvComp) {
+                                $DcuCatParams['InventoryComponentXml'] = $InvComp.Xml
+                                $DcuCatParams['InventoryFileName'] = $InvComp.FileName
+                            }
+                            [void](Write-DATDCUCatalog @DcuCatParams)
                         }
 
                         # Bump the package version to reflect the overlay so the TS apply

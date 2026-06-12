@@ -835,6 +835,26 @@ function Invoke-DCUDriverUpdates {
         return $false
     }
 
+    # DCU's scan inventories the system FIRST, using an Inventory Collector it
+    # downloads from its catalog source. Catalogs built before 2.7.0 don't
+    # carry one, and with dell.com disabled there is no fallback source - the
+    # scan then logs this exact line and returns 500 without having evaluated
+    # anything (field: DP82132 reported "everything current" while a year
+    # behind on drivers). An inventory failure makes ANY scan verdict
+    # unusable.
+    $TestInventoryFailed = {
+        param([string[]]$Files)
+        foreach ($F in $Files) {
+            try {
+                if ($F -and (Test-Path $F)) {
+                    $Txt = Get-Content -Path $F -Raw -ErrorAction Stop
+                    if ($Txt -and $Txt -match 'Unable to retrieve system inventory') { return $true }
+                }
+            } catch { }
+        }
+        return $false
+    }
+
     # Quotes the last lines of a dcu output log into our log so failures are
     # diagnosable from DATApply.log alone.
     $TailLog = {
@@ -1195,6 +1215,10 @@ function Invoke-DCUDriverUpdates {
             & $TailLog $ScanLog
             return $null
         }
+        if (& $TestInventoryFailed @($ScanLog, (Join-Path $SessionDir 'scan.out.log'), (Join-Path $SessionDir 'scan.err.log'))) {
+            Write-Log "DCU could not inventory the system ('Unable to retrieve system inventory information') - the catalog lacks Dell's Inventory Collector and dell.com is disabled. Re-sync with 2.7.0+ to embed the collector in the package. Scan verdict unusable; falling back to built-in DUP engine." -Severity 2
+            return $null
+        }
         if ($ScanCode -eq 500) {
             Write-Log "DCU scan: no applicable updates from the package catalog - everything current"
             # Diagnostic dump when the verdict is "nothing applicable" but the
@@ -1359,11 +1383,54 @@ function Invoke-DCUDriverUpdates {
                 try {
                     $PersistDir = Join-Path $WorkRoot 'DCU-persistent'
                     if (-not (Test-Path $PersistDir)) { New-Item -Path $PersistDir -ItemType Directory -Force | Out-Null }
-                    $PersistTarget = Join-Path $PersistDir (Split-Path $CatalogInUse -Leaf)
-                    Copy-Item -Path $CatalogInUse -Destination $PersistTarget -Force
-                    $PersistArgs = @('/configure', "-catalogLocation=$PersistTarget", "-outputLog=$SessionDir\dcu-persist-catalog.log")
+
+                    # Persistent REPO: the catalog's baseLocation must point at
+                    # payloads that outlive the 7-day session prune, or GUI
+                    # CHECK / scans between deployments break once the session
+                    # repo is gone. Hardlinks = no extra disk; the data stays
+                    # alive even if ccmcache later purges its own link. Rebuilt
+                    # every run so content updates flow through. Also carries
+                    # the Inventory Collector for fully-offline scans.
+                    $PersistRepo = Join-Path $PersistDir 'repo'
+                    try {
+                        if (Test-Path $PersistRepo) { Remove-Item -Path $PersistRepo -Recurse -Force -ErrorAction SilentlyContinue }
+                        New-Item -Path $PersistRepo -ItemType Directory -Force | Out-Null
+                        foreach ($PDup in @(Get-ChildItem -Path $Path -Filter '*.exe' -File -ErrorAction Stop)) {
+                            $PLink = Join-Path $PersistRepo $PDup.Name
+                            try {
+                                New-Item -ItemType HardLink -Path $PLink -Value $PDup.FullName -ErrorAction Stop | Out-Null
+                            } catch {
+                                Copy-Item -Path $PDup.FullName -Destination $PLink -Force
+                            }
+                        }
+                    } catch {
+                        Write-Log "Persistent repo staging failed ($($_.Exception.Message)) - persistent catalog will reference the session repo (pruned after 7 days)" -Severity 2
+                        $PersistRepo = $BaseLocation
+                    }
+
+                    # Persistent catalog: same content as the run's catalog but
+                    # baseLocation rewritten to the persistent repo. Always
+                    # rebuilt from the localized XML (rewriting inside a CAB
+                    # isn't possible); re-CAB only when the run used the CAB
+                    # form.
+                    $PersistXml = Join-Path $PersistDir 'CatalogPC.xml'
+                    $PXText = [System.IO.File]::ReadAllText($LocalCatalogXml, [System.Text.Encoding]::Unicode)
+                    $PXText = $PXText -replace 'baseLocation\s*=\s*"[^"]*"', ('baseLocation="{0}"' -f ($PersistRepo -replace '"', '&quot;'))
+                    [System.IO.File]::WriteAllText($PersistXml, $PXText, [System.Text.Encoding]::Unicode)
+
                     if ($CatalogInUse -eq $LocalCatalogXml) {
+                        $PersistTarget = $PersistXml
                         $PersistArgs = @('/configure', "-catalogLocation=$PersistTarget", '-allowXML=enable', "-outputLog=$SessionDir\dcu-persist-catalog.log")
+                    } else {
+                        $PersistTarget = Join-Path $PersistDir 'DCUCatalog.cab'
+                        $PCabProc = Start-Process -FilePath $MakeCab -ArgumentList "`"$PersistXml`"", "`"$PersistTarget`"" `
+                            -NoNewWindow -PassThru -Wait `
+                            -RedirectStandardOutput (Join-Path $SessionDir 'persist-makecab.out.log') `
+                            -RedirectStandardError (Join-Path $SessionDir 'persist-makecab.err.log') -ErrorAction Stop
+                        if ($PCabProc.ExitCode -ne 0 -or -not (Test-Path $PersistTarget)) {
+                            throw "makecab exited $($PCabProc.ExitCode) building the persistent catalog CAB"
+                        }
+                        $PersistArgs = @('/configure', "-catalogLocation=$PersistTarget", "-outputLog=$SessionDir\dcu-persist-catalog.log")
                     }
                     $PCode = & $RunDcu $PersistArgs 300000 'persist-catalog'
                     if ($PCode -eq 0) {

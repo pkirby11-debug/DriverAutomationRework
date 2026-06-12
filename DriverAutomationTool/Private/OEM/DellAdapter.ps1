@@ -1388,7 +1388,15 @@ function Write-DATDCUCatalog {
         [string]$PackageSourceDir,
 
         [Parameter(Mandatory)]
-        [object[]]$Drivers
+        [object[]]$Drivers,
+
+        # Raw <InventoryComponent> OuterXml from Dell's catalog + the staged
+        # collector filename. DCU downloads the Inventory Collector FROM THE
+        # CATALOG SOURCE to run its system-inventory phase; without this entry
+        # (and with dell.com disabled) every scan fails "Unable to retrieve
+        # system inventory information" and returns a meaningless 500.
+        [string]$InventoryComponentXml,
+        [string]$InventoryFileName
     )
 
     $Usable = @($Drivers | Where-Object { $_.ComponentXml -and $_.FileName })
@@ -1411,10 +1419,15 @@ function Write-DATDCUCatalog {
             ($_.ComponentXml -replace '\bpath\s*=\s*"[^"]*"', ('path="{0}"' -f $_.FileName))
         }) -join "`r`n"
 
+        $InventoryXml = ''
+        if ($InventoryComponentXml -and $InventoryFileName) {
+            $InventoryXml = ($InventoryComponentXml -replace '\bpath\s*=\s*"[^"]*"', ('path="{0}"' -f $InventoryFileName)) + "`r`n"
+        }
+
         $NewContent = @"
 <?xml version="1.0" encoding="utf-16"?>
 <Manifest xmlns="openmanifest" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" baseLocation="" baseLocationAccessProtocols="" identifier="DAT-DriverUpdates" releaseID="DAT" version="1.0" predecessorID="">
-$ComponentsXml
+$InventoryXml$ComponentsXml
 </Manifest>
 "@
 
@@ -1436,5 +1449,83 @@ $ComponentsXml
     } catch {
         Write-DATLog -Message "Failed to write DCU catalog ($($_.Exception.Message)) - package remains usable via the built-in DUP engine" -Severity 2
         return $false
+    }
+}
+
+function Get-DellInventoryComponent {
+    <#
+    .SYNOPSIS
+        Finds Dell's <InventoryComponent> (the invcol Inventory Collector
+        reference) in the per-model catalogs, falling back to the master
+        CatalogPC.
+    .DESCRIPTION
+        DCU's scan runs in two phases: a SYSTEM INVENTORY using an Inventory
+        Collector binary it downloads FROM ITS CATALOG SOURCE, then the
+        catalog comparison. A catalog without an <InventoryComponent> plus
+        dell.com disabled leaves DCU unable to inventory at all - field
+        signature on DP82132: "Unable to retrieve system inventory
+        information" followed by a meaningless exit-500 "no applicable
+        updates" on a device a year behind on drivers. Embedding the
+        collector in the package catalog makes scans fully offline.
+    .OUTPUTS
+        Hashtable @{ Xml; FileName; Url; HashMD5 } or $null when no
+        InventoryComponent exists in any reachable catalog (logged).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SystemID,
+
+        [switch]$ForceRefresh
+    )
+
+    $Sources = Get-DATOEMSources
+    $Found = $null
+    $FoundBase = $null
+
+    # Per-model catalogs first (same precedence as the driver scan).
+    try {
+        $ModelCatalogPaths = @(Update-DellModelCatalog -SystemID $SystemID -ForceRefresh:$ForceRefresh)
+        foreach ($P in $ModelCatalogPaths) {
+            $Xml = Read-DATXml -Path $P
+            $Node = @($Xml.Manifest.InventoryComponent) | Where-Object { $_ -and $_.path } | Select-Object -First 1
+            if ($Node) {
+                $Found = $Node
+                $FoundBase = if ($Sources.dell.dlBaseUrl) { $Sources.dell.dlBaseUrl } else { $Sources.dell.baseUrl }
+                break
+            }
+        }
+    } catch { }
+
+    # Master CatalogPC fallback (its baseLocation is downloads.dell.com).
+    if (-not $Found) {
+        try {
+            $FallbackPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
+            if (-not $FallbackPath) {
+                Update-DellCatalogCache
+                $FallbackPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
+            }
+            if ($FallbackPath) {
+                $Xml = Read-DATXml -Path $FallbackPath
+                $Node = @($Xml.Manifest.InventoryComponent) | Where-Object { $_ -and $_.path } | Select-Object -First 1
+                if ($Node) {
+                    $Found = $Node
+                    $FoundBase = $Sources.dell.baseUrl
+                }
+            }
+        } catch { }
+    }
+
+    if (-not $Found) {
+        Write-DATLog -Message "No <InventoryComponent> found in Dell catalogs for SystemID $SystemID - DCU scans against the package catalog will fail system inventory while dell.com is disabled" -Severity 2
+        return $null
+    }
+
+    $RelPath = ([string]$Found.path) -replace '^/', ''
+    return @{
+        Xml      = $Found.OuterXml
+        FileName = ($RelPath -split '[\\/]')[-1]
+        Url      = '{0}/{1}' -f ([string]$FoundBase).TrimEnd('/'), $RelPath
+        HashMD5  = [string]$Found.hashMD5
     }
 }
