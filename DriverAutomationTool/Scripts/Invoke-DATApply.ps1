@@ -695,6 +695,28 @@ function Invoke-DCUDriverUpdates {
         return $null
     }
 
+    # Content-completeness check: every file the catalog references must be
+    # present in the content. Catches stale/partial manual test copies (field:
+    # a refreshed local folder carried the new apply script but not the
+    # newly-staged InvColPC_*.exe, so inventory kept failing while the share
+    # was complete the whole time) and equally catches a DP/client content
+    # refresh that hasn't finished. Warning-only - the engine's own gates
+    # handle the consequences.
+    try {
+        $CatDocCheck = New-Object System.Xml.XmlDocument
+        $CatDocCheck.Load($CatalogPath)
+        $MissingRefs = @()
+        foreach ($RefNode in @($CatDocCheck.SelectNodes("//*[local-name()='SoftwareComponent' or local-name()='InventoryComponent']"))) {
+            $RefPath = [string]$RefNode.GetAttribute('path')
+            if (-not $RefPath) { continue }
+            $RefLeaf = ($RefPath -split '[\\/]')[-1]
+            if ($RefLeaf -and -not (Test-Path (Join-Path $Path $RefLeaf))) { $MissingRefs += $RefLeaf }
+        }
+        if ($MissingRefs.Count -gt 0) {
+            Write-Log ("Package catalog references $($MissingRefs.Count) file(s) MISSING from this content: " + (($MissingRefs | Select-Object -First 5) -join '; ') + "$(if ($MissingRefs.Count -gt 5) { ' ...' }). The content copy is incomplete or stale - if testing from a manual folder, re-copy the ENTIRE share (e.g. robocopy /MIR); under CM, let the content refresh finish. DCU will fail on the missing pieces (inventory included, if the Inventory Collector is among them)." ) -Severity 2
+        }
+    } catch { }
+
     # Allowlist for the fail-closed scan gate: every update DCU proposes must
     # be one of the package's staged DUPs. Field evidence made this mandatory:
     # when DCU 5.6 rejected the custom catalog (SYSTEM_SECURITY_ERROR), it
