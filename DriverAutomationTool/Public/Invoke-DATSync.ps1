@@ -200,6 +200,8 @@ function Invoke-DATSync {
                 Write-DATLog -Message "Could not download the Inventory Collector ($($_.Exception.Message)) - DCU scans will fail system inventory offline and fall back to the built-in engine" -Severity 3
                 return $null
             }
+        } else {
+            Write-DATLog -Message "Inventory Collector already staged in package: $($Inv.FileName)" -Severity 1
         }
         return $Inv
     }

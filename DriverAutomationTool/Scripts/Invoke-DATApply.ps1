@@ -882,7 +882,13 @@ function Invoke-DCUDriverUpdates {
         New-Item -Path $RepoDir -ItemType Directory -Force | Out-Null
         $UseCopy = $false
         $Staged = 0
-        foreach ($Dup in @(Get-ChildItem -Path $Path -Filter '*.exe' -File -ErrorAction Stop)) {
+        # ALL payload files, not just *.exe: the Inventory Collector the sync
+        # embeds may ship with another extension (.cab is common for Dell
+        # inventory components). A *.exe-only glob left it out of the repo -
+        # the catalog referenced it, DCU couldn't fetch it from baseLocation,
+        # and every scan failed inventory despite a correctly-built package.
+        $NonPayload = @('manifest.json', 'DCUCatalog.xml')
+        foreach ($Dup in @(Get-ChildItem -Path $Path -File -ErrorAction Stop | Where-Object { $NonPayload -notcontains $_.Name -and $_.Extension -ne '.ps1' })) {
             $LinkPath = Join-Path $RepoDir $Dup.Name
             if (-not $UseCopy) {
                 try {
@@ -898,7 +904,7 @@ function Invoke-DCUDriverUpdates {
             $Staged++
         }
         $BaseLocation = $RepoDir
-        Write-Log "DCU repository staged: $Staged DUP(s) -> $RepoDir ($(if ($UseCopy) { 'copied' } else { 'hardlinked' }))"
+        Write-Log "DCU repository staged: $Staged payload file(s) -> $RepoDir ($(if ($UseCopy) { 'copied' } else { 'hardlinked' }))"
     } catch {
         Write-Log "Could not stage DCU repository outside ccmcache ($($_.Exception.Message)) - using ccmcache path directly (DCU may reject it as a reserved folder)" -Severity 2
         $BaseLocation = $Path
@@ -1402,7 +1408,10 @@ function Invoke-DCUDriverUpdates {
                     try {
                         if (Test-Path $PersistRepo) { Remove-Item -Path $PersistRepo -Recurse -Force -ErrorAction SilentlyContinue }
                         New-Item -Path $PersistRepo -ItemType Directory -Force | Out-Null
-                        foreach ($PDup in @(Get-ChildItem -Path $Path -Filter '*.exe' -File -ErrorAction Stop)) {
+                        # Same all-payload filter as the session repo - the
+                        # Inventory Collector may not be a .exe.
+                        $PNonPayload = @('manifest.json', 'DCUCatalog.xml')
+                        foreach ($PDup in @(Get-ChildItem -Path $Path -File -ErrorAction Stop | Where-Object { $PNonPayload -notcontains $_.Name -and $_.Extension -ne '.ps1' })) {
                             $PLink = Join-Path $PersistRepo $PDup.Name
                             try {
                                 New-Item -ItemType HardLink -Path $PLink -Value $PDup.FullName -ErrorAction Stop | Out-Null

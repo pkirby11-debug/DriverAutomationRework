@@ -1538,9 +1538,14 @@ function Get-DellInventoryComponent {
     }
 
     $RelPath = ([string]$Found.GetAttribute('path')) -replace '^/', ''
+    $InvFileName = ($RelPath -split '[\\/]')[-1]
+    # Log the FOUND case too - a field sync completed with no collector line
+    # at all because found+already-staged was entirely silent, leaving "did
+    # the embed work?" unanswerable from the log.
+    Write-DATLog -Message "InventoryComponent found: $InvFileName (catalog path '$RelPath')" -Severity 1
     return @{
         Xml      = $Found.OuterXml
-        FileName = ($RelPath -split '[\\/]')[-1]
+        FileName = $InvFileName
         Url      = '{0}/{1}' -f ([string]$FoundBase).TrimEnd('/'), $RelPath
         HashMD5  = [string]$Found.GetAttribute('hashMD5')
     }
