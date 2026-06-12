@@ -947,43 +947,52 @@ function Invoke-DCUDriverUpdates {
     # DAT-managed DCU mode - DEFAULT-ON for every DriverUpdates run. This tool
     # is the sole update channel, so DCU's autonomy (dell.com source, scheduled
     # scans, auto-installs) is disabled on every device this application runs
-    # on; DCU stays installed purely as the execution engine we drive. Field
-    # driver: resident DCU's autonomous 3:13 PM cloud pass on DP33669 applied
-    # BIOS/TPM/cloud drivers an hour after a clean gated run.
+    # on; DCU stays installed purely as the execution engine we drive.
     #
-    # Runs BEFORE the pristine snapshot so the snapshot captures the managed
-    # state and the post-run restore lands back in managed mode - including on
-    # boxes whose pristine predates managed mode (the snapshot refresh below
-    # overwrites it). Idempotent (unchanged settings are no-ops) and graceful
-    # per key (builds that don't know an option warn and continue).
+    # Option names corrected after the first 2.6.0 field run reported
+    # "2 applied, 6 not supported" on 5.6.0.17: the real no-schedule knob is
+    # scheduleManual=enable (not scheduleAuto=disable), and scheduleAction
+    # only accepts NotifyAvailableUpdates/DownloadAndNotify/
+    # DownloadInstallAndNotify - the least-action value is set as belt and
+    # braces should a schedule ever return. Failed keys are now NAMED in the
+    # log so unsupported options are visible per build.
+    #
+    # Asserted twice per run: here (pre-run, so the pristine snapshot trends
+    # managed) and again post-restore in finally (so the box ALWAYS ends
+    # locked even when an old pre-managed pristine was the restore source -
+    # the field case where the restore re-enabled dell.com).
     #
     # Opt-out: Set-DATDellCommandUpdateMode -Mode Default writes
     # HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode = 'Default',
-    # which this block respects (per-run scan purity via the later
-    # -defaultSourceLocation=disable still applies; only the persistent
-    # lockdown is skipped).
+    # which skips both assertions (per-run scan purity via
+    # -defaultSourceLocation=disable still applies).
     $DcuManagedMode = $null
     try { $DcuManagedMode = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation' -Name 'DcuManagedMode' -ErrorAction Stop).DcuManagedMode } catch { }
+    $DcuManagedSequence = [ordered]@{
+        'defaultSourceLocation' = 'disable'
+        'scheduleManual'        = 'enable'
+        'scheduleAction'        = 'NotifyAvailableUpdates'
+        'updatesNotification'   = 'disable'
+        'userConsent'           = 'disable'
+        'systemRestartDeferral' = 'enable'
+        'installationDeferral'  = 'enable'
+        'autoSuspendBitLocker'  = 'disable'
+    }
+    $AssertDcuManaged = {
+        param([string]$Phase)
+        $OkKeys = @()
+        $BadKeys = @()
+        foreach ($K in $DcuManagedSequence.Keys) {
+            $V = $DcuManagedSequence[$K]
+            $RC = & $RunDcu @('/configure', "-$K=$V", "-outputLog=$SessionDir\dcu-managed-$Phase-$K.log") 120000 "managed-$Phase-$K"
+            if ($RC -eq 0) { $OkKeys += $K } else { $BadKeys += ("{0}(exit {1})" -f $K, $(if ($null -eq $RC) { 'timeout' } else { $RC })) }
+        }
+        Write-Log "DCU locked to DAT-managed mode [$Phase]: applied $($OkKeys -join ', '); not supported: $(if ($BadKeys.Count -gt 0) { $BadKeys -join ', ' } else { 'none' })"
+    }
     if ($DcuManagedMode -eq 'Default') {
         Write-Log "DCU managed mode: device is explicitly opted out (DcuManagedMode=Default) - leaving DCU autonomy settings as-is" -Severity 2
     } else {
-        $ManagedSequence = [ordered]@{
-            'defaultSourceLocation' = 'disable'
-            'scheduleAuto'          = 'disable'
-            'scheduleAction'        = 'DoNothing'
-            'updatesNotification'   = 'disable'
-            'userConsent'           = 'disable'
-            'systemRestartDeferral' = 'enable'
-            'installationDeferral'  = 'enable'
-            'autoSuspendBitLocker'  = 'disable'
-        }
-        $MgRe = 0; $MgFail = 0
-        foreach ($K in $ManagedSequence.Keys) {
-            $V = $ManagedSequence[$K]
-            $RC = & $RunDcu @('/configure', "-$K=$V", "-outputLog=$SessionDir\dcu-managed-$K.log") 120000 "managed-$K"
-            if ($RC -eq 0) { $MgRe++ } else { $MgFail++ }
-        }
-        Write-Log "DCU locked to DAT-managed mode: no dell.com source, no scheduled scans, no auto-installs ($MgRe applied, $MgFail not supported on this build - graceful)"
+        & $AssertDcuManaged 'pre-run'
         # Marker for inventory/visibility and so the cmdlet/standalone script
         # see a consistent state. Idempotent.
         try {
@@ -1322,6 +1331,17 @@ function Invoke-DCUDriverUpdates {
                 }
             } else {
                 Write-Log "No trustworthy DCU settings source to restore (no pristine copy, and the current settings already pointed at a session catalog) - reconfigure the catalog in the DCU GUI or import an older settings-backup from $WorkRoot\DCU\<session>\settings-backup manually" -Severity 2
+            }
+
+            # The restore's job is un-hijacking catalogLocation - NOT undoing
+            # the lockdown. A pristine captured before managed mode (field
+            # case: restore re-enabled dell.com and DCU's autonomy) would do
+            # exactly that, so the managed sequence is re-asserted AFTER the
+            # restore: whatever vintage of settings just landed, the box ends
+            # locked down. Idempotent when the restore already carried the
+            # managed state.
+            if ($DcuManagedMode -ne 'Default') {
+                & $AssertDcuManaged 'post-restore'
             }
         }
         # Drop the staged repo (hardlinks cost nothing, but a copy fallback

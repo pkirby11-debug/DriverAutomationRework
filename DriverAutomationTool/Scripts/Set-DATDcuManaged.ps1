@@ -72,8 +72,8 @@ Write-Out "Configuring Dell Command Update -> '$Mode' mode on $env:COMPUTERNAME 
 $Settings = if ($Mode -eq 'DATManaged') {
     [ordered]@{
         'defaultSourceLocation' = 'disable'
-        'scheduleAuto'          = 'disable'
-        'scheduleAction'        = 'DoNothing'
+        'scheduleManual'        = 'enable'
+        'scheduleAction'        = 'NotifyAvailableUpdates'
         'updatesNotification'   = 'disable'
         'userConsent'           = 'disable'
         'systemRestartDeferral' = 'enable'
@@ -84,7 +84,7 @@ $Settings = if ($Mode -eq 'DATManaged') {
     [ordered]@{
         'defaultSourceLocation' = 'enable'
         'scheduleAuto'          = 'enable'
-        'scheduleAction'        = 'DownloadInstallNotify'
+        'scheduleAction'        = 'DownloadInstallAndNotify'
         'updatesNotification'   = 'enable'
         'userConsent'           = 'enable'
         'systemRestartDeferral' = 'disable'

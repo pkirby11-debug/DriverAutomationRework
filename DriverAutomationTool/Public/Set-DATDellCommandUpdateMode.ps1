@@ -18,8 +18,8 @@ function Set-DATDellCommandUpdateMode {
         the apply script's DCU engine explicitly drives it:
 
           defaultSourceLocation = disable     no Dell cloud catalog
-          scheduleAuto          = disable     no scheduled scans
-          scheduleAction        = DoNothing   belt + braces
+          scheduleManual        = enable      no scheduled scans
+          scheduleAction        = NotifyAvailableUpdates  least-action value
           updatesNotification   = disable     no toast notifications
           userConsent           = disable     no user-initiated actions
           systemRestartDeferral = enable      no auto-restart
@@ -88,8 +88,8 @@ function Set-DATDellCommandUpdateMode {
     $Settings = if ($Mode -eq 'DATManaged') {
         [ordered]@{
             'defaultSourceLocation' = 'disable'
-            'scheduleAuto'          = 'disable'
-            'scheduleAction'        = 'DoNothing'
+            'scheduleManual'        = 'enable'
+            'scheduleAction'        = 'NotifyAvailableUpdates'
             'updatesNotification'   = 'disable'
             'userConsent'           = 'disable'
             'systemRestartDeferral' = 'enable'
@@ -97,12 +97,12 @@ function Set-DATDellCommandUpdateMode {
             'autoSuspendBitLocker'  = 'disable'
         }
     } else {
-        # Dell out-of-box behavior. scheduleAction value picks DownloadInstall
-        # Notify - the most common Dell-default fleet behavior.
+        # Dell out-of-box behavior. scheduleAction value picks
+        # DownloadInstallAndNotify - the most common Dell-default fleet behavior.
         [ordered]@{
             'defaultSourceLocation' = 'enable'
             'scheduleAuto'          = 'enable'
-            'scheduleAction'        = 'DownloadInstallNotify'
+            'scheduleAction'        = 'DownloadInstallAndNotify'
             'updatesNotification'   = 'enable'
             'userConsent'           = 'enable'
             'systemRestartDeferral' = 'disable'
