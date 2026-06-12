@@ -188,11 +188,24 @@ trap {
 $ErrorActionPreference = 'Stop'
 $script:RebootRequired = $false
 
+# Self-identification: short SHA-256 of THIS file, logged in the startup
+# lines. Names the exact bytes that executed - the sync logs the same rev
+# when staging (Copy-DATApplyScript), so "which script version actually ran
+# on the client?" is answered by matching the two, never by guessing from
+# message formats. (Field case: a client ran a stale local copy minutes
+# after a sync staged a newer one; both sides looked plausibly current.)
+$script:ScriptRev = 'unknown'
+try {
+    if ($PSCommandPath) {
+        $script:ScriptRev = (Get-FileHash -Path $PSCommandPath -Algorithm SHA256 -ErrorAction Stop).Hash.Substring(0, 8).ToLower()
+    }
+} catch { }
+
 # Startup marker - writes before any other logic runs so we can confirm the
 # script survived param binding and attribute processing.
 try {
-    $StartupMsg = '[START] PID={0} PS={1} Mode={2} Version={3} Package=''{4}''' -f `
-        $PID, $PSVersionTable.PSVersion, $Mode, $Version, $PackageName
+    $StartupMsg = '[START] PID={0} PS={1} Rev={2} Mode={3} Version={4} Package=''{5}''' -f `
+        $PID, $PSVersionTable.PSVersion, $script:ScriptRev, $Mode, $Version, $PackageName
     Add-Content -Path $script:FailsafeLogPath -Value (Format-CMTraceLine -Message $StartupMsg -Severity 1) -ErrorAction SilentlyContinue
 } catch { }
 
@@ -2079,7 +2092,7 @@ function Invoke-LenovoBIOSFlash {
 # -------------------------------------------------------------------------
 try {
     Write-Log '==================================================================='
-    Write-Log "DATApply starting - Mode=$Mode, Package='$PackageName', Version=$Version"
+    Write-Log "DATApply starting - ScriptRev=$($script:ScriptRev), Mode=$Mode, Package='$PackageName', Version=$Version"
 
     # Resolve ContentPath with a fallback chain. $PSScriptRoot as a param default
     # has been seen to be empty under CCMExec when the script is launched with
