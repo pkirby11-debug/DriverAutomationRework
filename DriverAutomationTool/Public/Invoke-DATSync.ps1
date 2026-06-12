@@ -841,7 +841,12 @@ function Invoke-DATSyncSinglePackage {
                         })
                         if ($OnDisk.Count -gt 0) {
                             $DcuCatParams = @{ PackageSourceDir = $ExistingToCheck.SourcePath; Drivers = $OnDisk }
-                            $InvComp = & $AddDellInventoryToPackage $ExistingToCheck.SourcePath $PackageInfo.SystemID
+                            $InvComp = $null
+                            try {
+                                $InvComp = & $AddDellInventoryToPackage $ExistingToCheck.SourcePath $PackageInfo.SystemID
+                            } catch {
+                                Write-DATLog -Message "Inventory Collector embed failed: $($_.Exception.Message) - catalog ships without it; clients fall back to the built-in DUP engine" -Severity 3
+                            }
                             if ($InvComp) {
                                 $DcuCatParams['InventoryComponentXml'] = $InvComp.Xml
                                 $DcuCatParams['InventoryFileName'] = $InvComp.FileName
@@ -1775,7 +1780,12 @@ function Invoke-DATSyncSinglePackage {
                             $StagedNames = @($ManifestEntries | ForEach-Object { $_.FileName })
                             $StagedForCatalog = @($IndividualDrivers | Where-Object { $StagedNames -contains $_.FileName })
                             $DcuCatParams = @{ PackageSourceDir = $PackageSourceDir; Drivers = $StagedForCatalog }
-                            $InvComp = & $AddDellInventoryToPackage $PackageSourceDir $PackageInfo.SystemID
+                            $InvComp = $null
+                            try {
+                                $InvComp = & $AddDellInventoryToPackage $PackageSourceDir $PackageInfo.SystemID
+                            } catch {
+                                Write-DATLog -Message "Inventory Collector embed failed: $($_.Exception.Message) - catalog ships without it; clients fall back to the built-in DUP engine" -Severity 3
+                            }
                             if ($InvComp) {
                                 $DcuCatParams['InventoryComponentXml'] = $InvComp.Xml
                                 $DcuCatParams['InventoryFileName'] = $InvComp.FileName

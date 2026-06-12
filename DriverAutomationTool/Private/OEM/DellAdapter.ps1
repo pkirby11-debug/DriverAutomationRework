@@ -1482,20 +1482,30 @@ function Get-DellInventoryComponent {
     $Sources = Get-DATOEMSources
     $Found = $null
     $FoundBase = $null
+    # Per-source findings, logged when nothing is found so the sync log
+    # itself proves which catalogs were inspected and what they contained
+    # (instead of a bare "not found" that invites guessing).
+    $Inspected = [System.Collections.Generic.List[string]]::new()
 
-    # Per-model catalogs first (same precedence as the driver scan).
+    # Per-model catalogs first (same precedence as the driver scan). XPath by
+    # local-name() is namespace- and nesting-agnostic - safer than dot-walking
+    # $Xml.Manifest.InventoryComponent if Dell shifts the document shape.
     try {
         $ModelCatalogPaths = @(Update-DellModelCatalog -SystemID $SystemID -ForceRefresh:$ForceRefresh)
         foreach ($P in $ModelCatalogPaths) {
             $Xml = Read-DATXml -Path $P
-            $Node = @($Xml.Manifest.InventoryComponent) | Where-Object { $_ -and $_.path } | Select-Object -First 1
+            $Nodes = @($Xml.SelectNodes("//*[local-name()='InventoryComponent']"))
+            $Inspected.Add(("{0}: root=<{1}>, InventoryComponent nodes={2}" -f (Split-Path $P -Leaf), $Xml.DocumentElement.LocalName, $Nodes.Count))
+            $Node = $Nodes | Where-Object { $_.GetAttribute('path') } | Select-Object -First 1
             if ($Node) {
                 $Found = $Node
                 $FoundBase = if ($Sources.dell.dlBaseUrl) { $Sources.dell.dlBaseUrl } else { $Sources.dell.baseUrl }
                 break
             }
         }
-    } catch { }
+    } catch {
+        $Inspected.Add("per-model catalogs: error - $($_.Exception.Message)")
+    }
 
     # Master CatalogPC fallback (its baseLocation is downloads.dell.com).
     if (-not $Found) {
@@ -1507,25 +1517,31 @@ function Get-DellInventoryComponent {
             }
             if ($FallbackPath) {
                 $Xml = Read-DATXml -Path $FallbackPath
-                $Node = @($Xml.Manifest.InventoryComponent) | Where-Object { $_ -and $_.path } | Select-Object -First 1
+                $Nodes = @($Xml.SelectNodes("//*[local-name()='InventoryComponent']"))
+                $Inspected.Add(("CatalogPC.xml (master): root=<{0}>, InventoryComponent nodes={1}" -f $Xml.DocumentElement.LocalName, $Nodes.Count))
+                $Node = $Nodes | Where-Object { $_.GetAttribute('path') } | Select-Object -First 1
                 if ($Node) {
                     $Found = $Node
                     $FoundBase = $Sources.dell.baseUrl
                 }
+            } else {
+                $Inspected.Add('CatalogPC.xml (master): not available in cache and re-download failed')
             }
-        } catch { }
+        } catch {
+            $Inspected.Add("CatalogPC.xml (master): error - $($_.Exception.Message)")
+        }
     }
 
     if (-not $Found) {
-        Write-DATLog -Message "No <InventoryComponent> found in Dell catalogs for SystemID $SystemID - DCU scans against the package catalog will fail system inventory while dell.com is disabled" -Severity 2
+        Write-DATLog -Message ("No usable <InventoryComponent> found for SystemID $SystemID - DCU scans against the package catalog will fail system inventory while dell.com is disabled. Sources inspected: " + ($Inspected -join ' | ')) -Severity 2
         return $null
     }
 
-    $RelPath = ([string]$Found.path) -replace '^/', ''
+    $RelPath = ([string]$Found.GetAttribute('path')) -replace '^/', ''
     return @{
         Xml      = $Found.OuterXml
         FileName = ($RelPath -split '[\\/]')[-1]
         Url      = '{0}/{1}' -f ([string]$FoundBase).TrimEnd('/'), $RelPath
-        HashMD5  = [string]$Found.hashMD5
+        HashMD5  = [string]$Found.GetAttribute('hashMD5')
     }
 }

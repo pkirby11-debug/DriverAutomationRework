@@ -1053,7 +1053,14 @@ function Invoke-DCUDriverUpdates {
         }
         if ($SettingsBackupFile) {
             $BackupText = Get-Content -Path $SettingsBackupFile -Raw -ErrorAction SilentlyContinue
-            $BackupHijacked = [bool]($BackupText -and $BackupText -match [regex]::Escape($WorkRoot))
+            # Hijack = catalogLocation pointing into a SESSION dir
+            # (WorkRoot\DCU\<timestamp>\...). The persistent catalog
+            # (WorkRoot\DCU-persistent\) is the legitimate managed end state -
+            # matching the whole WorkRoot flagged it as a hijack on every run
+            # after 2.6.4 (field red line on DP82132). The trailing separator
+            # keeps "\DCU\" from matching "\DCU-persistent\".
+            $SessionMarker = [regex]::Escape((Join-Path $WorkRoot 'DCU') + '\')
+            $BackupHijacked = [bool]($BackupText -and $BackupText -match $SessionMarker)
             if ($BackupHijacked) {
                 Write-Log "Exported DCU settings still point at a previous run's session catalog (an earlier restore failed) - the pristine copy stays the restore source" -Severity 2
             } else {
