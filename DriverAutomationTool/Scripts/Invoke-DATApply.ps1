@@ -1105,6 +1105,22 @@ function Invoke-DCUDriverUpdates {
         }
         if ($ScanCode -eq 500) {
             Write-Log "DCU scan: no applicable updates from the package catalog - everything current"
+            # Diagnostic dump when the verdict is "nothing applicable" but the
+            # admin has reason to expect updates (field case: a manifest entry
+            # is newer than the installed driver, e.g. UHD Graphics 2140 in
+            # the package vs 2135 installed, yet DCU returns 500). Quotes
+            # DCU's own per-component reasoning from its scan log + a manifest
+            # summary, so the next run's log either vindicates DCU's verdict
+            # or proves the catalog isn't being evaluated as expected. Cheap
+            # because we already have the files - no extra dcu-cli calls.
+            $ManifestSample = @($Drivers | Select-Object -First 5 |
+                ForEach-Object { "$($_.Name) v$($_.Version)" }) -join '; '
+            Write-Log "  Diagnostic: manifest contains $($Drivers.Count) driver(s); first 5: $ManifestSample" -Severity 2
+            $ScanReportItems = @(& $ParseScanReport $ReportDir)
+            Write-Log "  Diagnostic: scan report contains $($ScanReportItems.Count) <Update> node(s) (0 confirms DCU's verdict was 'nothing applicable')" -Severity 2
+            & $TailConsole 'scan'
+            & $TailLog $ScanLog
+            Write-Log "  If a manifest driver IS newer than what is installed and you expected DCU to apply it, paste a sample SoftwareComponent from $LocalCatalogXml back - applicability evaluation depends on <SupportedDevices> PCI VEN/DEV matching the device, and catalog metadata can target a specific hardware config within a model line." -Severity 2
             return 0
         }
         if ($ScanCode -ne 0) {
