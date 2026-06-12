@@ -538,6 +538,8 @@ function Initialize-DATMainWindow {
         }
         if ($Controls['UpdateIndividualCheckBox'].IsChecked) { $SyncParams['UpdateIndividualDrivers'] = $true }
         if ($Controls['VerifyHashCheckBox'].IsChecked) { $SyncParams['VerifyDownloadHash'] = $true }
+        $ExclPatterns = @(($Controls['ExcludeDriversInput'].Text -split ';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($ExclPatterns.Count -gt 0) { $SyncParams['ExcludeDrivers'] = $ExclPatterns }
 
         # Run sync in a background runspace so the GUI stays responsive
         $Controls['StatusLabel'].Text = 'Sync in progress...'
@@ -696,6 +698,7 @@ function Initialize-DATMainWindow {
                     cleanDownloads = [bool]$Controls['CleanDownloadsCheckBox'].IsChecked
                     updateIndividualDrivers = [bool]$Controls['UpdateIndividualCheckBox'].IsChecked
                     verifyDownloadHash = [bool]$Controls['VerifyHashCheckBox'].IsChecked
+                    excludeDrivers = @(($Controls['ExcludeDriversInput'].Text -split ';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
                     deploymentPlatform = (Get-DATComboText $Controls['DeployPlatformCombo'])
                     compressPackage = [bool]$Controls['CompressPackageCheckBox'].IsChecked
                     compressionType = (Get-DATComboText $Controls['CompressionTypeCombo'])
@@ -1462,6 +1465,7 @@ function Initialize-DATMainWindow {
                 if ($Config.options.cleanDownloads) { $Controls['CleanDownloadsCheckBox'].IsChecked = $true }
                 if ($Config.options.updateIndividualDrivers) { $Controls['UpdateIndividualCheckBox'].IsChecked = $true }
                 if ($Config.options.verifyDownloadHash) { $Controls['VerifyHashCheckBox'].IsChecked = $true }
+                if ($Config.options.excludeDrivers) { $Controls['ExcludeDriversInput'].Text = (@($Config.options.excludeDrivers) -join '; ') }
 
                 if ($Config.options.deploymentPlatform) {
                     [void](Set-DATComboText -Combo $Controls['DeployPlatformCombo'] -Value $Config.options.deploymentPlatform)
