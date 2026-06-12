@@ -197,7 +197,7 @@ function Invoke-DATSync {
                 Write-DATLog -Message "Staging Dell Inventory Collector for offline DCU scans: $($Inv.FileName)" -Severity 1
                 Invoke-DATDownload -Url $Inv.Url -DestinationPath $Target
             } catch {
-                Write-DATLog -Message "Could not download the Inventory Collector ($($_.Exception.Message)) - DCU scans will fail system inventory offline and fall back to the built-in engine" -Severity 2
+                Write-DATLog -Message "Could not download the Inventory Collector ($($_.Exception.Message)) - DCU scans will fail system inventory offline and fall back to the built-in engine" -Severity 3
                 return $null
             }
         }

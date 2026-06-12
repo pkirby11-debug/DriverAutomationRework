@@ -1533,7 +1533,7 @@ function Get-DellInventoryComponent {
     }
 
     if (-not $Found) {
-        Write-DATLog -Message ("No usable <InventoryComponent> found for SystemID $SystemID - DCU scans against the package catalog will fail system inventory while dell.com is disabled. Sources inspected: " + ($Inspected -join ' | ')) -Severity 2
+        Write-DATLog -Message ("No usable <InventoryComponent> found for SystemID $SystemID - DCU scans against the package catalog will fail system inventory while dell.com is disabled. Sources inspected: " + ($Inspected -join ' | ')) -Severity 3
         return $null
     }
 
