@@ -17,14 +17,19 @@ function Set-DATDellCommandUpdateMode {
         behavior so DCU stays a passive execution engine, acting only when
         the apply script's DCU engine explicitly drives it:
 
-          defaultSourceLocation = disable     no Dell cloud catalog
-          scheduleManual        = enable      no scheduled scans
-          scheduleAction        = NotifyAvailableUpdates  least-action value
+          scheduleManual                      no scheduled scans (bare flag)
+          scheduleAction        = NotifyAvailableUpdates  notify-only if a
+                                              schedule ever fires
           updatesNotification   = disable     no toast notifications
-          userConsent           = disable     no user-initiated actions
-          systemRestartDeferral = enable      no auto-restart
-          installationDeferral  = enable      no auto-install
           autoSuspendBitLocker  = disable     don't touch BL
+
+        NOTE: defaultSourceLocation (dell.com off) is NOT set here - DCU
+        rejects disabling its default source while no custom catalog is
+        configured (exit 107). The DriverUpdates application enforces it at
+        deploy time, where it also leaves resident DCU pointed at a
+        persistent copy of the package catalog. userConsent and the deferral
+        options were dropped: build-dependent grammars (exit 106/109) and
+        redundant under manual schedule + notify-only + no dell.com.
 
         The per-run /configure -catalogLocation + /applyUpdates path the
         engine uses is unaffected - those run on top of these settings.
@@ -87,13 +92,9 @@ function Set-DATDellCommandUpdateMode {
     # build doesn't know an option - same graceful pattern as -allowXML).
     $Settings = if ($Mode -eq 'DATManaged') {
         [ordered]@{
-            'defaultSourceLocation' = 'disable'
-            'scheduleManual'        = 'enable'
+            'scheduleManual'        = ''
             'scheduleAction'        = 'NotifyAvailableUpdates'
             'updatesNotification'   = 'disable'
-            'userConsent'           = 'disable'
-            'systemRestartDeferral' = 'enable'
-            'installationDeferral'  = 'enable'
             'autoSuspendBitLocker'  = 'disable'
         }
     } else {
@@ -120,7 +121,7 @@ function Set-DATDellCommandUpdateMode {
     $TimeoutMs = [int]([Math]::Max(10, $PerCommandTimeoutSec) * 1000)
     foreach ($K in $Settings.Keys) {
         $V = $Settings[$K]
-        $Pair = "-$K=$V"
+        $Pair = if ($V) { "-$K=$V" } else { "-$K" }
         $LogPath = Join-Path $WorkDir ("$K.log")
         $OutPath = Join-Path $WorkDir ("$K.out.log")
         $ErrPath = Join-Path $WorkDir ("$K.err.log")

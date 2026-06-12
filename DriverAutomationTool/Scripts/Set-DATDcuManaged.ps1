@@ -71,13 +71,9 @@ Write-Out "Configuring Dell Command Update -> '$Mode' mode on $env:COMPUTERNAME 
 # entry points stay equivalent.
 $Settings = if ($Mode -eq 'DATManaged') {
     [ordered]@{
-        'defaultSourceLocation' = 'disable'
-        'scheduleManual'        = 'enable'
+        'scheduleManual'        = ''
         'scheduleAction'        = 'NotifyAvailableUpdates'
         'updatesNotification'   = 'disable'
-        'userConsent'           = 'disable'
-        'systemRestartDeferral' = 'enable'
-        'installationDeferral'  = 'enable'
         'autoSuspendBitLocker'  = 'disable'
     }
 } else {
@@ -102,7 +98,7 @@ $Failed = @()
 $TimeoutMs = [int]([Math]::Max(10, $PerCommandTimeoutSec) * 1000)
 foreach ($K in $Settings.Keys) {
     $V = $Settings[$K]
-    $Pair = "-$K=$V"
+    $Pair = if ($V) { "-$K=$V" } else { "-$K" }
     $LogPath = Join-Path $WorkDir ("$K.log")
     $OutPath = Join-Path $WorkDir ("$K.out.log")
     $ErrPath = Join-Path $WorkDir ("$K.err.log")

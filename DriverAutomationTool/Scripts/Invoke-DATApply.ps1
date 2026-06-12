@@ -981,14 +981,22 @@ function Invoke-DCUDriverUpdates {
     # -defaultSourceLocation=disable still applies).
     $DcuManagedMode = $null
     try { $DcuManagedMode = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation' -Name 'DcuManagedMode' -ErrorAction Stop).DcuManagedMode } catch { }
+    # Sequence trimmed to what 5.6.0.17's named-key results proved viable:
+    # - defaultSourceLocation is NOT here: DCU rejects disabling its default
+    #   source while no custom catalog is configured (field exit 107 on every
+    #   pre-catalog/post-restore attempt - the root cause of "dell.com keeps
+    #   coming back"). It is disabled only where a catalog exists: per-run
+    #   after -catalogLocation, and persistently in the end-state block.
+    # - scheduleManual is a bare flag (=enable drew exit 107).
+    # - userConsent (106) and the deferral pair (109) are dropped: their
+    #   grammars are build-dependent and they're redundant once the schedule
+    #   is manual, the action is notify-only, and dell.com is off.
+    # - scheduleAction=NotifyAvailableUpdates DID apply in the field: even if
+    #   a schedule ever fires, DCU can only notify - never download/install.
     $DcuManagedSequence = [ordered]@{
-        'defaultSourceLocation' = 'disable'
-        'scheduleManual'        = 'enable'
+        'scheduleManual'        = ''
         'scheduleAction'        = 'NotifyAvailableUpdates'
         'updatesNotification'   = 'disable'
-        'userConsent'           = 'disable'
-        'systemRestartDeferral' = 'enable'
-        'installationDeferral'  = 'enable'
         'autoSuspendBitLocker'  = 'disable'
     }
     $AssertDcuManaged = {
@@ -997,7 +1005,8 @@ function Invoke-DCUDriverUpdates {
         $BadKeys = @()
         foreach ($K in $DcuManagedSequence.Keys) {
             $V = $DcuManagedSequence[$K]
-            $RC = & $RunDcu @('/configure', "-$K=$V", "-outputLog=$SessionDir\dcu-managed-$Phase-$K.log") 120000 "managed-$Phase-$K"
+            $OptArg = if ($V) { "-$K=$V" } else { "-$K" }
+            $RC = & $RunDcu @('/configure', $OptArg, "-outputLog=$SessionDir\dcu-managed-$Phase-$K.log") 120000 "managed-$Phase-$K"
             if ($RC -eq 0) { $OkKeys += $K } else { $BadKeys += ("{0}(exit {1})" -f $K, $(if ($null -eq $RC) { 'timeout' } else { $RC })) }
         }
         Write-Log "DCU locked to DAT-managed mode [$Phase]: applied $($OkKeys -join ', '); not supported: $(if ($BadKeys.Count -gt 0) { $BadKeys -join ', ' } else { 'none' })"
@@ -1105,45 +1114,11 @@ function Invoke-DCUDriverUpdates {
         # silently selected 12 cloud updates including a BIOS flash and TPM
         # firmware. That must never install under this deployment.
         # ------------------------------------------------------------------
-        $ReportDir = Join-Path $SessionDir 'scan-report'
-        try { New-Item -Path $ReportDir -ItemType Directory -Force | Out-Null } catch { }
-        $ScanLog = Join-Path $SessionDir 'dcu-scan.log'
-        $ScanCode = & $RunDcu @('/scan', "-report=$ReportDir", "-outputLog=$ScanLog") 1800000 'scan'
-
-        if (& $TestCatalogRejected @($ScanLog, (Join-Path $SessionDir 'scan.out.log'), (Join-Path $SessionDir 'scan.err.log'))) {
-            Write-Log "DCU did NOT honor the custom catalog (security rejection / no result from catalog) - it would source updates from Dell's cloud. Installing NOTHING via DCU; falling back to built-in DUP engine." -Severity 3
-            & $TailConsole 'scan'
-            & $TailLog $ScanLog
-            return $null
-        }
-        if ($ScanCode -eq 500) {
-            Write-Log "DCU scan: no applicable updates from the package catalog - everything current"
-            # Diagnostic dump when the verdict is "nothing applicable" but the
-            # admin has reason to expect updates (field case: a manifest entry
-            # is newer than the installed driver, e.g. UHD Graphics 2140 in
-            # the package vs 2135 installed, yet DCU returns 500). Quotes
-            # DCU's own per-component reasoning from its scan log + a manifest
-            # summary, so the next run's log either vindicates DCU's verdict
-            # or proves the catalog isn't being evaluated as expected. Cheap
-            # because we already have the files - no extra dcu-cli calls.
-            $ManifestSample = @($Drivers | Select-Object -First 5 |
-                ForEach-Object { "$($_.Name) v$($_.Version)" }) -join '; '
-            Write-Log "  Diagnostic: manifest contains $($Drivers.Count) driver(s); first 5: $ManifestSample" -Severity 2
-            $ScanReportItems = @(& $ParseScanReport $ReportDir)
-            Write-Log "  Diagnostic: scan report contains $($ScanReportItems.Count) <Update> node(s) (0 confirms DCU's verdict was 'nothing applicable')" -Severity 2
-            & $TailConsole 'scan'
-            & $TailLog $ScanLog
-            Write-Log "  If a manifest driver IS newer than what is installed and you expected DCU to apply it, paste a sample SoftwareComponent from $LocalCatalogXml back - applicability evaluation depends on <SupportedDevices> PCI VEN/DEV matching the device, and catalog metadata can target a specific hardware config within a model line." -Severity 2
-            return 0
-        }
-        if ($ScanCode -ne 0) {
-            if ($ScanCode -eq 5) { $script:RebootRequired = $true }
-            Write-Log "dcu-cli /scan exited $(if ($null -eq $ScanCode) { 'timeout/launch' } else { $ScanCode }) - cannot verify catalog provenance; falling back to built-in DUP engine" -Severity 2
-            & $TailConsole 'scan'
-            return $null
-        }
-
-        # Scan exit 0 = updates found. Verify every one against the allowlist.
+        # Report-parsing helpers - defined BEFORE the scan call because the
+        # exit-500 diagnostics path uses $ParseScanReport too (2.6.3 field
+        # crash: "expression after '&' ... not valid" = invoking it before
+        # its definition further down).
+        #
         # Field-established report schema (2.2.7's diagnostics dump): update
         # nodes carry CHILD ELEMENTS, not attributes -
         #   <update><release>86GCF</release><name>...</name><version>...</version>
@@ -1158,6 +1133,17 @@ function Invoke-DCUDriverUpdates {
             $A = [string]$Node.GetAttribute($Field)
             if ($A) { return $A.Trim() }
             return ''
+        }
+        # Dell package-ID tokens from the staged filenames (segment before the
+        # WIN64/WIN32 marker: Intel-Dynamic-Tuning-Driver_34HGT_WIN64_... -> 34HGT).
+        $PkgTokens = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($MfName in $ManifestNames) {
+            $Parts = $MfName -split '_'
+            for ($i = 1; $i -lt $Parts.Length; $i++) {
+                if ($Parts[$i] -match '^WIN(32|64)?$' -and $Parts[$i - 1] -match '^[A-Za-z0-9]{4,7}$') {
+                    [void]$PkgTokens.Add($Parts[$i - 1])
+                }
+            }
         }
         $ParseScanReport = {
             param([string]$Dir)
@@ -1198,18 +1184,47 @@ function Invoke-DCUDriverUpdates {
             return ,$Items
         }
 
-        # Dell package-ID tokens from the staged filenames (segment before the
-        # WIN64/WIN32 marker: Intel-Dynamic-Tuning-Driver_34HGT_WIN64_... -> 34HGT).
-        $PkgTokens = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($MfName in $ManifestNames) {
-            $Parts = $MfName -split '_'
-            for ($i = 1; $i -lt $Parts.Length; $i++) {
-                if ($Parts[$i] -match '^WIN(32|64)?$' -and $Parts[$i - 1] -match '^[A-Za-z0-9]{4,7}$') {
-                    [void]$PkgTokens.Add($Parts[$i - 1])
-                }
-            }
+        $ReportDir = Join-Path $SessionDir 'scan-report'
+        try { New-Item -Path $ReportDir -ItemType Directory -Force | Out-Null } catch { }
+        $ScanLog = Join-Path $SessionDir 'dcu-scan.log'
+        $ScanCode = & $RunDcu @('/scan', "-report=$ReportDir", "-outputLog=$ScanLog") 1800000 'scan'
+
+        if (& $TestCatalogRejected @($ScanLog, (Join-Path $SessionDir 'scan.out.log'), (Join-Path $SessionDir 'scan.err.log'))) {
+            Write-Log "DCU did NOT honor the custom catalog (security rejection / no result from catalog) - it would source updates from Dell's cloud. Installing NOTHING via DCU; falling back to built-in DUP engine." -Severity 3
+            & $TailConsole 'scan'
+            & $TailLog $ScanLog
+            return $null
+        }
+        if ($ScanCode -eq 500) {
+            Write-Log "DCU scan: no applicable updates from the package catalog - everything current"
+            # Diagnostic dump when the verdict is "nothing applicable" but the
+            # admin has reason to expect updates (field case: a manifest entry
+            # is newer than the installed driver, e.g. UHD Graphics 2140 in
+            # the package vs 2135 installed, yet DCU returns 500). Quotes
+            # DCU's own per-component reasoning from its scan log + a manifest
+            # summary, so the next run's log either vindicates DCU's verdict
+            # or proves the catalog isn't being evaluated as expected. Cheap
+            # because we already have the files - no extra dcu-cli calls.
+            $ManifestSample = @($Drivers | Select-Object -First 5 |
+                ForEach-Object { "$($_.Name) v$($_.Version)" }) -join '; '
+            Write-Log "  Diagnostic: manifest contains $($Drivers.Count) driver(s); first 5: $ManifestSample" -Severity 2
+            $ScanReportItems = @(& $ParseScanReport $ReportDir)
+            Write-Log "  Diagnostic: scan report contains $($ScanReportItems.Count) <Update> node(s) (0 confirms DCU's verdict was 'nothing applicable')" -Severity 2
+            & $TailConsole 'scan'
+            & $TailLog $ScanLog
+            Write-Log "  If a manifest driver IS newer than what is installed and you expected DCU to apply it, paste a sample SoftwareComponent from $LocalCatalogXml back - applicability evaluation depends on <SupportedDevices> PCI VEN/DEV matching the device, and catalog metadata can target a specific hardware config within a model line." -Severity 2
+            return 0
+        }
+        if ($ScanCode -ne 0) {
+            if ($ScanCode -eq 5) { $script:RebootRequired = $true }
+            Write-Log "dcu-cli /scan exited $(if ($null -eq $ScanCode) { 'timeout/launch' } else { $ScanCode }) - cannot verify catalog provenance; falling back to built-in DUP engine" -Severity 2
+            & $TailConsole 'scan'
+            return $null
         }
 
+        # Scan exit 0 = updates found. Verify every one against the allowlist
+        # ($ParseScanReport defined above, before the scan call, so the
+        # exit-500 diagnostics share it).
         $ScanItems = @(& $ParseScanReport $ReportDir)
         if ($ScanItems.Count -eq 0) {
             Write-Log "DCU scan reported updates (exit 0) but the scan report is missing/empty - cannot verify provenance; falling back to built-in DUP engine" -Severity 2
@@ -1328,49 +1343,83 @@ function Invoke-DCUDriverUpdates {
         # this run's backup unless it was already hijacked by a failed prior
         # restore.
         if ($CatalogConfigured) {
-            $RestoreSource = $null
-            if (Test-Path $PristineSettings) { $RestoreSource = $PristineSettings }
-            elseif ($SettingsBackupFile -and -not $BackupHijacked) { $RestoreSource = $SettingsBackupFile }
-
-            if ($RestoreSource) {
-                # DCU's self-update can hold the config lock right after
-                # applyUpdates (field: exit 3004 "currently performing a self
-                # update" persisted through 2x30s retries - a self-update
-                # takes minutes). Retry 3004 with 60s waits for up to ~6
-                # minutes; other failures get two quick retries. Exit 5
-                # (reboot pending) cannot clear without a restart - no retry.
-                $RestoreCode = $null
-                for ($Attempt = 1; $Attempt -le 6; $Attempt++) {
-                    $RestoreCode = & $RunDcu @("/configure", "-importSettings=$RestoreSource", "-outputLog=$SessionDir\dcu-restore.log") 300000 'settings-restore'
-                    if ($RestoreCode -eq 0 -or $RestoreCode -eq 5) { break }
-                    $IsSelfUpdate = ($RestoreCode -eq 3004)
-                    if (-not $IsSelfUpdate -and $Attempt -ge 3) { break }
-                    if ($Attempt -lt 6) {
-                        $Delay = if ($IsSelfUpdate) { 60 } else { 30 }
-                        Write-Log "DCU settings restore attempt $Attempt failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - retrying in ${Delay}s$(if ($IsSelfUpdate) { ' (DCU self-update in progress)' })" -Severity 2
-                        Start-Sleep -Seconds $Delay
-                    }
-                }
-                if ($RestoreCode -eq 0) {
-                    Write-Log "DCU settings restored from $RestoreSource"
-                } else {
-                    if ($RestoreCode -eq 5) { $script:RebootRequired = $true }
-                    Write-Log "DCU settings restore failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - DCU is still pointed at $CatalogInUse; after the next restart run: dcu-cli /configure -importSettings=$RestoreSource (the next engine run also retries automatically)" -Severity 2
-                    & $TailConsole 'settings-restore'
-                }
-            } else {
-                Write-Log "No trustworthy DCU settings source to restore (no pristine copy, and the current settings already pointed at a session catalog) - reconfigure the catalog in the DCU GUI or import an older settings-backup from $WorkRoot\DCU\<session>\settings-backup manually" -Severity 2
-            }
-
-            # The restore's job is un-hijacking catalogLocation - NOT undoing
-            # the lockdown. A pristine captured before managed mode (field
-            # case: restore re-enabled dell.com and DCU's autonomy) would do
-            # exactly that, so the managed sequence is re-asserted AFTER the
-            # restore: whatever vintage of settings just landed, the box ends
-            # locked down. Idempotent when the restore already carried the
-            # managed state.
             if ($DcuManagedMode -ne 'Default') {
-                & $AssertDcuManaged 'post-restore'
+                # MANAGED END STATE (sole-update-source design). The pristine
+                # restore is deliberately NOT performed here - importing
+                # pre-managed settings is exactly what kept re-enabling
+                # dell.com in the field. Instead, resident DCU is left pointed
+                # at a PERSISTENT copy of this package's catalog (work root,
+                # outside the 7-day session prune), which makes
+                # -defaultSourceLocation=disable VALID and durable: DCU
+                # rejects disabling its default source whenever no custom
+                # catalog is configured (field exit 107), so the persistent
+                # catalog is the prerequisite for keeping dell.com off.
+                # Side benefit: a tech pressing CHECK in the DCU GUI scans the
+                # curated package set, not Dell's cloud.
+                try {
+                    $PersistDir = Join-Path $WorkRoot 'DCU-persistent'
+                    if (-not (Test-Path $PersistDir)) { New-Item -Path $PersistDir -ItemType Directory -Force | Out-Null }
+                    $PersistTarget = Join-Path $PersistDir (Split-Path $CatalogInUse -Leaf)
+                    Copy-Item -Path $CatalogInUse -Destination $PersistTarget -Force
+                    $PersistArgs = @('/configure', "-catalogLocation=$PersistTarget", "-outputLog=$SessionDir\dcu-persist-catalog.log")
+                    if ($CatalogInUse -eq $LocalCatalogXml) {
+                        $PersistArgs = @('/configure', "-catalogLocation=$PersistTarget", '-allowXML=enable', "-outputLog=$SessionDir\dcu-persist-catalog.log")
+                    }
+                    $PCode = & $RunDcu $PersistArgs 300000 'persist-catalog'
+                    if ($PCode -eq 0) {
+                        $PDef = & $RunDcu @('/configure', '-defaultSourceLocation=disable', "-outputLog=$SessionDir\dcu-persist-nodefault.log") 300000 'persist-nodefaultsrc'
+                        if ($PDef -eq 0) {
+                            Write-Log "Resident DCU end state: pointed at the persistent package catalog ($PersistTarget) with dell.com DISABLED - GUI CHECK now scans the curated set"
+                        } else {
+                            Write-Log "Persistent catalog set, but disabling dell.com failed (exit $(if ($null -eq $PDef) { 'timeout/launch' } else { $PDef })) - next run retries" -Severity 2
+                            & $TailConsole 'persist-nodefaultsrc'
+                        }
+                    } else {
+                        if ($PCode -eq 5) { $script:RebootRequired = $true }
+                        Write-Log "Could not point resident DCU at the persistent catalog (exit $(if ($null -eq $PCode) { 'timeout/launch' } else { $PCode })) - dell.com may remain enabled until the next run" -Severity 2
+                        & $TailConsole 'persist-catalog'
+                    }
+                } catch {
+                    Write-Log "Persistent DCU end-state failed: $($_.Exception.Message) - next run retries" -Severity 2
+                }
+                & $AssertDcuManaged 'post-run'
+            } else {
+                # OPTED-OUT devices get the polite behavior: restore whatever
+                # the box had. Source: pristine (true original) when
+                # available, else this run's backup unless hijacked.
+                $RestoreSource = $null
+                if (Test-Path $PristineSettings) { $RestoreSource = $PristineSettings }
+                elseif ($SettingsBackupFile -and -not $BackupHijacked) { $RestoreSource = $SettingsBackupFile }
+
+                if ($RestoreSource) {
+                    # DCU's self-update can hold the config lock right after
+                    # applyUpdates (field: exit 3004 "currently performing a
+                    # self update" persisted through 2x30s retries - a
+                    # self-update takes minutes). Retry 3004 with 60s waits up
+                    # to ~6 minutes; other failures get two quick retries.
+                    # Exit 5 (reboot pending) cannot clear without a restart.
+                    $RestoreCode = $null
+                    for ($Attempt = 1; $Attempt -le 6; $Attempt++) {
+                        $RestoreCode = & $RunDcu @("/configure", "-importSettings=$RestoreSource", "-outputLog=$SessionDir\dcu-restore.log") 300000 'settings-restore'
+                        if ($RestoreCode -eq 0 -or $RestoreCode -eq 5) { break }
+                        $IsSelfUpdate = ($RestoreCode -eq 3004)
+                        if (-not $IsSelfUpdate -and $Attempt -ge 3) { break }
+                        if ($Attempt -lt 6) {
+                            $Delay = if ($IsSelfUpdate) { 60 } else { 30 }
+                            Write-Log "DCU settings restore attempt $Attempt failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - retrying in ${Delay}s$(if ($IsSelfUpdate) { ' (DCU self-update in progress)' })" -Severity 2
+                            Start-Sleep -Seconds $Delay
+                        }
+                    }
+                    if ($RestoreCode -eq 0) {
+                        Write-Log "DCU settings restored from $RestoreSource"
+                    } else {
+                        if ($RestoreCode -eq 5) { $script:RebootRequired = $true }
+                        Write-Log "DCU settings restore failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - DCU is still pointed at $CatalogInUse; after the next restart run: dcu-cli /configure -importSettings=$RestoreSource (the next engine run also retries automatically)" -Severity 2
+                        & $TailConsole 'settings-restore'
+                    }
+                } else {
+                    Write-Log "No trustworthy DCU settings source to restore (no pristine copy, and the current settings already pointed at a session catalog) - reconfigure the catalog in the DCU GUI or import an older settings-backup from $WorkRoot\DCU\<session>\settings-backup manually" -Severity 2
+                }
             }
         }
         # Drop the staged repo (hardlinks cost nothing, but a copy fallback
