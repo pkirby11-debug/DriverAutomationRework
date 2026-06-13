@@ -54,11 +54,11 @@ function Get-DATIntuneWin32ReturnCodes {
     param()
 
     return @(
-        [ordered]@{ returnCode = 0;    type = 'success' }
-        [ordered]@{ returnCode = 1707; type = 'success' }
-        [ordered]@{ returnCode = 3010; type = 'softReboot' }
-        [ordered]@{ returnCode = 1641; type = 'hardReboot' }
-        [ordered]@{ returnCode = 1618; type = 'retry' }
+        [ordered]@{ '@odata.type' = '#microsoft.graph.win32LobAppReturnCode'; returnCode = 0;    type = 'success' }
+        [ordered]@{ '@odata.type' = '#microsoft.graph.win32LobAppReturnCode'; returnCode = 1707; type = 'success' }
+        [ordered]@{ '@odata.type' = '#microsoft.graph.win32LobAppReturnCode'; returnCode = 3010; type = 'softReboot' }
+        [ordered]@{ '@odata.type' = '#microsoft.graph.win32LobAppReturnCode'; returnCode = 1641; type = 'hardReboot' }
+        [ordered]@{ '@odata.type' = '#microsoft.graph.win32LobAppReturnCode'; returnCode = 1618; type = 'retry' }
     )
 }
 
@@ -257,7 +257,11 @@ function Publish-DATIntuneWin32Content {
         Wait-DATIntuneFileState -FilesUri $FilesUri -FileId $FileId -TargetState 'azureStorageUriRenewalSuccess'
     }
 
-    Invoke-DATGraphRequest -RelativeUri "$FilesUri/$FileId/commit" -Method POST -Body @{ fileEncryptionInfo = $Content.EncryptionInfo } | Out-Null
+    # The commit action's fileEncryptionInfo carries its @odata.type (matches the
+    # Graph example); copy the package's encryption info under it.
+    $CommitEnc = [ordered]@{ '@odata.type' = '#microsoft.graph.fileEncryptionInfo' }
+    foreach ($K in $Content.EncryptionInfo.Keys) { $CommitEnc[$K] = $Content.EncryptionInfo[$K] }
+    Invoke-DATGraphRequest -RelativeUri "$FilesUri/$FileId/commit" -Method POST -Body @{ fileEncryptionInfo = $CommitEnc } | Out-Null
     [void](Wait-DATIntuneFileState -FilesUri $FilesUri -FileId $FileId -TargetState 'commitFileSuccess')
 
     Invoke-DATGraphRequest -RelativeUri "/deviceAppManagement/mobileApps/$AppId" -Method PATCH -Body @{
