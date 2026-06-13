@@ -349,8 +349,7 @@
                 </StackPanel>
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
                     <TextBlock Text="Theme:" Foreground="White" VerticalAlignment="Center" Margin="0,0,8,0" />
-                    <ComboBox x:Name="ThemeCombo" Width="110" SelectedIndex="0" ToolTip="Window colour theme">
-                        <sys:String>System</sys:String>
+                    <ComboBox x:Name="ThemeCombo" Width="100" SelectedIndex="0" ToolTip="Window colour theme">
                         <sys:String>Dark</sys:String>
                         <sys:String>Light</sys:String>
                     </ComboBox>

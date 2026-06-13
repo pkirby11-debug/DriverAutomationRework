@@ -45,7 +45,7 @@ function New-DATMainWindow {
 
     # --- Version labels ---
     $ModVer = (Get-Module DriverAutomationTool).Version
-    if (-not $ModVer) { $ModVer = '2.9.1' }
+    if (-not $ModVer) { $ModVer = '2.9.2' }
     $Window.Title = "Driver Automation Tool v$ModVer"
     $Controls['VersionLabel'].Text = "v$ModVer"
 
@@ -83,12 +83,12 @@ function New-DATMainWindow {
     [void](Set-DATComboText -Combo $Controls['DeployMWDayCombo'] -Value 'Sunday')
 
     # Apply the saved theme preference before the window is shown (avoids a
-    # light->dark flash on launch). Default to 'System', which Set-DATWindowTheme
-    # resolves dark-first when the Windows preference is unreadable.
-    $ThemeMode = 'System'
+    # light->dark flash on launch). Manual Dark/Light toggle, default Dark; a
+    # previously saved 'System' preference (the removed option) falls back to Dark.
+    $ThemeMode = 'Dark'
     try {
         $SavedMode = (Get-DATConfig).options.themeMode
-        if ($SavedMode -in @('System', 'Light', 'Dark')) { $ThemeMode = $SavedMode }
+        if ($SavedMode -in @('Light', 'Dark')) { $ThemeMode = $SavedMode }
     } catch { }
     [void](Set-DATComboText -Combo $Controls['ThemeCombo'] -Value $ThemeMode)
     Set-DATWindowTheme -Window $Window -Mode $ThemeMode
@@ -374,7 +374,7 @@ function Initialize-DATMainWindow {
         $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window; $G = $gui.G
         if ($G.Initializing) { return }
         $Mode = Get-DATComboText $Controls['ThemeCombo']
-        if ($Mode -notin @('System', 'Light', 'Dark')) { $Mode = 'System' }
+        if ($Mode -notin @('Light', 'Dark')) { $Mode = 'Dark' }
         Set-DATWindowTheme -Window $Window -Mode $Mode
     })
 
@@ -1538,7 +1538,7 @@ function Initialize-DATMainWindow {
         # New-DATMainWindow); honour whatever it shows.
         try {
             $ThemeMode = Get-DATComboText $Controls['ThemeCombo']
-            if ($ThemeMode -notin @('System', 'Light', 'Dark')) { $ThemeMode = 'System' }
+            if ($ThemeMode -notin @('Light', 'Dark')) { $ThemeMode = 'Dark' }
             Set-DATWindowTheme -Window $Window -Mode $ThemeMode
         } catch { }
 
