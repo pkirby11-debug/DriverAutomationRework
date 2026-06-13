@@ -14,6 +14,7 @@ $PrivatePaths = @(
     'Private\Platform\SCCMPlatform.ps1'
     'Private\Platform\IntunePlatform.ps1'
     'Private\Platform\IntuneWinPackage.ps1'
+    'Private\Platform\IntuneWin32App.ps1'
 )
 
 foreach ($Path in $PrivatePaths) {
