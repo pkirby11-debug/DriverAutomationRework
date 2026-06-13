@@ -45,7 +45,7 @@ function New-DATMainWindow {
 
     # --- Version labels ---
     $ModVer = (Get-Module DriverAutomationTool).Version
-    if (-not $ModVer) { $ModVer = '2.10.3' }
+    if (-not $ModVer) { $ModVer = '2.11.0' }
     $Window.Title = "Driver Automation Tool v$ModVer"
     $Controls['VersionLabel'].Text = "v$ModVer"
 
@@ -138,6 +138,10 @@ function Initialize-DATMainWindow {
         ModelHandle              = $null
         ModelTimer               = $null
         ModelManufacturers       = @()
+        IntunePublishRunspace    = $null
+        IntunePublishHandle      = $null
+        IntunePublishTimer       = $null
+        IntuneGroupMap           = @{}
         SyncRunspace             = $null
         SyncHandle               = $null
         SyncTimer                = $null
@@ -1527,6 +1531,251 @@ function Initialize-DATMainWindow {
         })
 
         $G.DeployTimer.Start()
+    })
+
+    # ===================== Intune tab =====================
+
+    # --- Connect (app-only: certificate or client secret) ---
+    $Controls['IntuneConnectButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+
+        $Tenant   = $Controls['IntuneTenantInput'].Text
+        $ClientId = $Controls['IntuneClientIdInput'].Text
+        if ([string]::IsNullOrWhiteSpace($Tenant) -or [string]::IsNullOrWhiteSpace($ClientId)) {
+            Show-DATWindowMessage -Message 'Enter the Tenant ID/domain and the Client (app) ID.' -Type Warning
+            return
+        }
+        $UseCert = (Get-DATComboText $Controls['IntuneAuthCombo']) -like '*certificate*'
+
+        $Controls['IntuneConnStatusLabel'].Text = 'Connecting...'
+        $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Orange
+        $Window.Cursor = $WaitCursor
+        try {
+            $Params = @{ AuthMode = 'ClientCredentials'; TenantId = $Tenant; ClientId = $ClientId }
+            if ($UseCert) {
+                $Thumb = $Controls['IntuneCertThumbInput'].Text
+                if ([string]::IsNullOrWhiteSpace($Thumb)) { throw "Enter the certificate thumbprint (or switch to client secret)." }
+                $Params['CertificateThumbprint'] = $Thumb
+            } else {
+                $Secret = $Controls['IntuneSecretBox'].SecurePassword
+                if (-not $Secret -or $Secret.Length -eq 0) { throw "Enter the client secret (or switch to certificate)." }
+                $Params['ClientSecret'] = $Secret
+            }
+            $Info = Connect-DATIntune @Params
+            $Controls['IntuneConnStatusLabel'].Text = "Connected - tenant $($Info.TenantId), token expires $($Info.ExpiresOn.ToString('HH:mm'))"
+            $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Green
+            $Controls['StatusStripLabel'].Text = 'Connected to Intune'
+        } catch {
+            $Controls['IntuneConnStatusLabel'].Text = 'Connection failed'
+            $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Red
+            Show-DATWindowMessage -Message "Intune connect failed: $($_.Exception.Message)" -Type Error
+        } finally {
+            $Window.Cursor = $DefaultCursor
+        }
+    })
+
+    # --- Test connection ---
+    $Controls['IntuneTestButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+        $Window.Cursor = $WaitCursor
+        try {
+            $R = Test-DATIntuneConnection
+            if ($R.Connected) {
+                $Controls['IntuneConnStatusLabel'].Text = "Connected - tenant $($R.TenantId) ($($R.Message))"
+                $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Green
+            } else {
+                $Controls['IntuneConnStatusLabel'].Text = "Not connected - $($R.Message)"
+                $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Red
+            }
+        } catch {
+            Show-DATWindowMessage -Message "Test failed: $($_.Exception.Message)" -Type Error
+        } finally {
+            $Window.Cursor = $DefaultCursor
+        }
+    })
+
+    # --- Disconnect ---
+    $Controls['IntuneDisconnectButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        Disconnect-DATIntune
+        $Controls['IntuneConnStatusLabel'].Text = 'Not connected'
+        $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Gray
+    })
+
+    # --- Required permissions (info) ---
+    $Controls['IntunePermsButton'].Add_Click({
+        $Lines = Get-DATIntuneRequiredPermission | ForEach-Object {
+            "{0}  [{1}]`n    {2}" -f $_.Permission, $(if ($_.Required) { 'required' } else { 'optional' }), $_.Reason
+        }
+        Show-DATWindowMessage -Message ("Grant these Microsoft Graph APPLICATION permissions on the app registration, with admin consent:`n`n" +
+            ($Lines -join "`n`n") + "`n`nFull steps: docs/Intune-Setup.md") -Type Information
+    })
+
+    # --- Package folder browse ---
+    $Controls['IntunePkgBrowseButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        $Path = Show-DATFolderDialog -Description 'Select the staged package folder' -InitialPath $Controls['IntunePkgFolderInput'].Text
+        if ($Path) { $Controls['IntunePkgFolderInput'].Text = $Path }
+    })
+
+    # --- Group search (shared by publish + profile) ---
+    $Controls['IntuneGroupSearchButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+        $Search = $Controls['IntuneGroupSearchInput'].Text
+        if ([string]::IsNullOrWhiteSpace($Search)) {
+            Show-DATWindowMessage -Message 'Enter a group-name prefix to search.' -Type Warning
+            return
+        }
+        $Window.Cursor = $WaitCursor
+        try {
+            $Groups = @(Find-DATIntuneEntraGroup -SearchString $Search -Top 50)
+            $Controls['IntuneGroupCombo'].Items.Clear()
+            $G.IntuneGroupMap = @{}
+            foreach ($Grp in $Groups) {
+                $Disp = [string]$Grp.displayName
+                [void]$Controls['IntuneGroupCombo'].Items.Add($Disp)
+                $G.IntuneGroupMap[$Disp] = [string]$Grp.id
+            }
+            if ($Controls['IntuneGroupCombo'].Items.Count -gt 0) { $Controls['IntuneGroupCombo'].SelectedIndex = 0 }
+            $Controls['IntuneStatusLabel'].Text = "Found $($Groups.Count) group(s)."
+        } catch {
+            Show-DATWindowMessage -Message "Group search failed: $($_.Exception.Message)" -Type Error
+        } finally {
+            $Window.Cursor = $DefaultCursor
+        }
+    })
+
+    # --- Create driver-update profile (synchronous; single Graph call) ---
+    $Controls['IntuneCreateProfileButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+
+        $Name = $Controls['IntuneProfileNameInput'].Text
+        if ([string]::IsNullOrWhiteSpace($Name)) { Show-DATWindowMessage -Message 'Enter a profile name.' -Type Warning; return }
+
+        $Approval = Get-DATComboText $Controls['IntuneProfileApprovalCombo']
+        $Defer = 0; [void][int]::TryParse($Controls['IntuneProfileDeferralInput'].Text, [ref]$Defer)
+
+        $Params = @{ DisplayName = $Name; ApprovalType = $Approval }
+        if ($Approval -eq 'Automatic') { $Params['DeploymentDeferralInDays'] = $Defer }
+
+        $GroupDisplay = Get-DATComboText $Controls['IntuneGroupCombo']
+        if ($GroupDisplay -and $G.IntuneGroupMap.ContainsKey($GroupDisplay)) {
+            $Params['Assignment'] = @{ GroupId = $G.IntuneGroupMap[$GroupDisplay]; Mode = 'include' }
+        }
+
+        $Window.Cursor = $WaitCursor
+        try {
+            $Prof = New-DATIntuneDriverUpdateProfile @Params
+            $Controls['IntuneStatusLabel'].Text = "Created driver-update profile '$Name' (id $($Prof.id))."
+            Show-DATWindowMessage -Message "Driver-update profile '$Name' created$(if ($Params.ContainsKey('Assignment')) { ' and assigned' } else { '' })." -Type Information
+        } catch {
+            Show-DATWindowMessage -Message "Create profile failed: $($_.Exception.Message)" -Type Error
+        } finally {
+            $Window.Cursor = $DefaultCursor
+        }
+    })
+
+    # --- Publish Win32 app (background runspace; the upload can be slow) ---
+    $Controls['IntunePublishButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+        if ($G.IntunePublishHandle) { return }   # already publishing
+
+        $Folder  = $Controls['IntunePkgFolderInput'].Text
+        $Name    = $Controls['IntunePkgNameInput'].Text
+        $Version = $Controls['IntunePkgVersionInput'].Text
+        if ([string]::IsNullOrWhiteSpace($Folder) -or -not (Test-Path -LiteralPath $Folder)) {
+            Show-DATWindowMessage -Message 'Choose a valid staged package folder.' -Type Warning; return
+        }
+        if ([string]::IsNullOrWhiteSpace($Name) -or [string]::IsNullOrWhiteSpace($Version)) {
+            Show-DATWindowMessage -Message 'Enter a display name and a version.' -Type Warning; return
+        }
+
+        # Capture the live token for the worker runspace (fails fast if not connected).
+        try { $Session = Export-DATIntuneSession } catch {
+            Show-DATWindowMessage -Message 'Connect to Intune first.' -Type Warning; return
+        }
+
+        $PublishParams = @{
+            SourceFolder = $Folder
+            DisplayName  = $Name
+            Version      = $Version
+            Manufacturer = (Get-DATComboText $Controls['IntunePkgMfrCombo'])
+            Mode         = (Get-DATComboText $Controls['IntunePkgModeCombo'])
+        }
+        $GroupDisplay = Get-DATComboText $Controls['IntuneGroupCombo']
+        if ($GroupDisplay -and $G.IntuneGroupMap.ContainsKey($GroupDisplay)) {
+            $PublishParams['Assignment'] = @{
+                GroupId = $G.IntuneGroupMap[$GroupDisplay]
+                Intent  = (Get-DATComboText $Controls['IntuneIntentCombo']).ToLowerInvariant()
+                Mode    = 'include'
+            }
+        }
+
+        $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
+        $Controls['LogListBox'].Items.Clear()
+        $Controls['StatusLabel'].Text = "Publishing '$Name' to Intune..."
+        $Controls['ProgressBar'].IsIndeterminate = $true
+        $Controls['IntunePublishButton'].IsEnabled = $false
+        $Controls['StatusStripLabel'].Text = "Publishing '$Name' to Intune..."
+
+        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+        $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+        $PublishScript = {
+            param($ModulePath, $Session, $PublishParams, $LogQueue)
+            $Mod = Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force -PassThru
+            Register-DATQueueLogSubscriber -LogQueue $LogQueue
+            # Adopt the parent's Intune token in this runspace's module scope.
+            & $Mod { param($S) Import-DATIntuneSession -Session $S } $Session
+            return New-DATIntuneWin32App @PublishParams
+        }
+
+        $G.IntunePublishRunspace = [System.Management.Automation.PowerShell]::Create()
+        $G.IntunePublishRunspace.AddScript($PublishScript).
+            AddArgument($ModulePath).AddArgument($Session).AddArgument($PublishParams).AddArgument($G.LogQueue) | Out-Null
+        $G.IntunePublishHandle = $G.IntunePublishRunspace.BeginInvoke()
+
+        if ($G.IntunePublishTimer) { $G.IntunePublishTimer.Stop() }
+        $G.IntunePublishTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $G.IntunePublishTimer.Interval = [timespan]::FromMilliseconds(500)
+        $G.IntunePublishTimer.Add_Tick({
+            $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
+
+            if ($null -eq $G.IntunePublishHandle -or -not $G.IntunePublishHandle.IsCompleted) { return }
+            $G.IntunePublishTimer.Stop()
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
+
+            try {
+                $Result   = $G.IntunePublishRunspace.EndInvoke($G.IntunePublishHandle)
+                $RsErrors = @($G.IntunePublishRunspace.Streams.Error)
+                $App = @($Result)[0]
+                if ($App -and $App.Id) {
+                    $Controls['StatusLabel'].Text = "Published '$($App.DisplayName)' (app id $($App.Id))"
+                    $Controls['StatusStripLabel'].Text = "Intune publish complete - app id $($App.Id)"
+                    Show-DATWindowMessage -Message "Published to Intune.`n`nApp: $($App.DisplayName)`nId: $($App.Id)`nAssigned: $($App.Assigned)" -Type Information
+                } elseif ($RsErrors.Count -gt 0) {
+                    $Controls['StatusLabel'].Text = 'Intune publish failed'
+                    Show-DATWindowMessage -Message "Intune publish failed: $($RsErrors[0].Exception.Message)" -Type Error
+                } else {
+                    $Controls['StatusLabel'].Text = 'Intune publish finished (no app returned)'
+                }
+            } catch {
+                $Controls['StatusLabel'].Text = 'Intune publish failed'
+                Show-DATWindowMessage -Message "Intune publish failed: $($_.Exception.Message)" -Type Error
+            } finally {
+                if ($G.IntunePublishRunspace) { $G.IntunePublishRunspace.Dispose(); $G.IntunePublishRunspace = $null }
+                $G.IntunePublishHandle = $null
+                $G.LogQueue = $null
+                $Controls['ProgressBar'].IsIndeterminate = $false
+                $Controls['IntunePublishButton'].IsEnabled = $true
+            }
+        })
+        $G.IntunePublishTimer.Start()
     })
 
     # --- Load saved settings on window load ---

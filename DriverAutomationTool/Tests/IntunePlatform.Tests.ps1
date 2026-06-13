@@ -264,6 +264,41 @@ Describe 'Test-DATIntuneConnection' {
     }
 }
 
+Describe 'Export/Import-DATIntuneSession' {
+    It 'Round-trips token state (including the client secret) into a fresh state' {
+        $script:IntuneConnected    = $true
+        $script:IntuneAccessToken  = 'tok-abc'
+        $script:IntuneRefreshToken = 'refresh-xyz'
+        $script:IntuneTokenExpiry  = (Get-Date).AddMinutes(30)
+        $script:IntuneTenantId     = 'tenant-1'
+        $script:IntuneClientId     = 'client-1'
+        $script:IntuneAuthMode     = 'ClientCredentials'
+        $script:IntuneScopes       = @('https://graph.microsoft.com/.default')
+        $script:IntuneClientSecret = ConvertTo-SecureString 'super-secret' -AsPlainText -Force
+
+        $session = Export-DATIntuneSession
+        $session.AccessToken       | Should -Be 'tok-abc'
+        $session.ClientSecretPlain | Should -Be 'super-secret'
+
+        Disconnect-DATIntune
+        $script:IntuneConnected | Should -Be $false
+
+        Import-DATIntuneSession -Session $session
+        $script:IntuneConnected   | Should -Be $true
+        $script:IntuneAccessToken | Should -Be 'tok-abc'
+        $script:IntuneTenantId    | Should -Be 'tenant-1'
+        $script:IntuneAuthMode    | Should -Be 'ClientCredentials'
+        $script:IntuneClientSecret | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Export throws when not connected' {
+        Disconnect-DATIntune
+        { Export-DATIntuneSession } | Should -Throw '*Not connected*'
+    }
+
+    AfterAll { Disconnect-DATIntune }
+}
+
 Describe 'Get-DATIntuneRequiredPermission' {
     It 'Includes the two write permissions the core flows need' {
         $perms = Get-DATIntuneRequiredPermission

@@ -423,6 +423,70 @@ function Get-DATIntuneConnectionInfo {
     }
 }
 
+function Export-DATIntuneSession {
+    <#
+    .SYNOPSIS
+        Captures the current Intune token state as a portable hashtable so a
+        background runspace can adopt it (the GUI publishes on a worker thread).
+    .DESCRIPTION
+        Includes enough to refresh during a long upload: the refresh token
+        (device code), the secret (client credentials), or the certificate
+        thumbprint (the worker re-resolves it from the local store). In-memory and
+        same-process only - never written to disk.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:IntuneConnected) { throw "Not connected to Intune. Run Connect-DATIntune first." }
+
+    $SecretPlain = $null
+    if ($script:IntuneClientSecret) {
+        $Bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($script:IntuneClientSecret)
+        # PtrToStringBSTR honors the BSTR length prefix and UTF-16 on every platform
+        # (PtrToStringAuto picks the wrong encoding off-Windows).
+        try { $SecretPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($Bstr) }
+        finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Bstr) }
+    }
+
+    return @{
+        AccessToken       = $script:IntuneAccessToken
+        RefreshToken      = $script:IntuneRefreshToken
+        Expiry            = $script:IntuneTokenExpiry
+        TenantId          = $script:IntuneTenantId
+        ClientId          = $script:IntuneClientId
+        AuthMode          = $script:IntuneAuthMode
+        Scopes            = $script:IntuneScopes
+        ClientSecretPlain = $SecretPlain
+        CertThumbprint    = if ($script:IntuneClientCertificate) { $script:IntuneClientCertificate.Thumbprint } else { $null }
+    }
+}
+
+function Import-DATIntuneSession {
+    <#
+    .SYNOPSIS
+        Restores an Intune session captured by Export-DATIntuneSession into this
+        runspace's module scope.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Session)
+
+    $script:IntuneAccessToken  = $Session.AccessToken
+    $script:IntuneRefreshToken = $Session.RefreshToken
+    $script:IntuneTokenExpiry  = $Session.Expiry
+    $script:IntuneTenantId     = $Session.TenantId
+    $script:IntuneClientId     = $Session.ClientId
+    $script:IntuneAuthMode     = $Session.AuthMode
+    $script:IntuneScopes       = $Session.Scopes
+    $script:IntuneConnected    = $true
+
+    if ($Session.ClientSecretPlain) {
+        $script:IntuneClientSecret = ConvertTo-SecureString $Session.ClientSecretPlain -AsPlainText -Force
+    }
+    if ($Session.CertThumbprint) {
+        try { $script:IntuneClientCertificate = Resolve-DATIntuneCertificate -Thumbprint $Session.CertThumbprint } catch { }
+    }
+}
+
 function Invoke-DATGraphRequest {
     <#
     .SYNOPSIS

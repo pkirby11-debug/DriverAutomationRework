@@ -193,6 +193,16 @@
             <Setter Property="CaretBrush" Value="{DynamicResource Fg}" />
         </Style>
 
+        <Style TargetType="PasswordBox">
+            <Setter Property="Padding" Value="4,3" />
+            <Setter Property="MinHeight" Value="26" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
+            <Setter Property="CaretBrush" Value="{DynamicResource Fg}" />
+        </Style>
+
         <!-- ===== Themed ComboBox (the default chrome renders dark-on-dark and is
              unreadable in dark mode; this template colours the closed selection,
              the editable text box, and the drop-down with the theme brushes). ===== -->
@@ -668,6 +678,125 @@
                         </DataGrid.Columns>
                     </DataGrid>
                 </DockPanel>
+            </TabItem>
+
+            <!-- ============ Intune ============ -->
+            <TabItem Header="Intune">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="16">
+                    <StackPanel>
+                        <GroupBox Header="Microsoft Intune Connection">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="150" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <Label Grid.Row="0" Grid.Column="0" Content="Tenant ID / domain:" />
+                                <TextBox x:Name="IntuneTenantInput" Grid.Row="0" Grid.Column="1" Margin="0,3" />
+                                <Label Grid.Row="1" Grid.Column="0" Content="Authentication:" />
+                                <ComboBox x:Name="IntuneAuthCombo" Grid.Row="1" Grid.Column="1" Margin="0,3" SelectedIndex="0">
+                                    <sys:String>App registration - certificate</sys:String>
+                                    <sys:String>App registration - client secret</sys:String>
+                                </ComboBox>
+                                <Label Grid.Row="2" Grid.Column="0" Content="Client (app) ID:" />
+                                <TextBox x:Name="IntuneClientIdInput" Grid.Row="2" Grid.Column="1" Margin="0,3" />
+                                <Label Grid.Row="3" Grid.Column="0" Content="Certificate thumbprint:" />
+                                <TextBox x:Name="IntuneCertThumbInput" Grid.Row="3" Grid.Column="1" Margin="0,3"
+                                         ToolTip="Thumbprint of a cert (with private key) in CurrentUser\My or LocalMachine\My." />
+                                <Label Grid.Row="4" Grid.Column="0" Content="Client secret:" />
+                                <PasswordBox x:Name="IntuneSecretBox" Grid.Row="4" Grid.Column="1" Margin="0,3" />
+                                <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,8,0,0">
+                                    <Button x:Name="IntuneConnectButton" Content="Connect" Style="{StaticResource StandardButton}" Width="100" Margin="0,0,8,0" />
+                                    <Button x:Name="IntuneTestButton" Content="Test" Style="{StaticResource StandardButton}" Width="80" Margin="0,0,8,0" />
+                                    <Button x:Name="IntuneDisconnectButton" Content="Disconnect" Style="{StaticResource StandardButton}" Width="100" Margin="0,0,8,0" />
+                                    <Button x:Name="IntunePermsButton" Content="Required permissions..." Style="{StaticResource StandardButton}" Width="170" />
+                                </StackPanel>
+                            </Grid>
+                        </GroupBox>
+
+                        <TextBlock x:Name="IntuneConnStatusLabel" Text="Not connected" Foreground="{DynamicResource SubtleFg}" Margin="2,0,0,10" />
+
+                        <GroupBox Header="Target group (shared by publish and profile)">
+                            <StackPanel Orientation="Horizontal">
+                                <Label Content="Find Entra group:" Width="120" />
+                                <TextBox x:Name="IntuneGroupSearchInput" Width="240" Margin="0,0,8,0" />
+                                <Button x:Name="IntuneGroupSearchButton" Content="Search" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,12,0" />
+                                <Label Content="Group:" />
+                                <ComboBox x:Name="IntuneGroupCombo" Width="300" />
+                            </StackPanel>
+                        </GroupBox>
+
+                        <GroupBox Header="Publish Driver Package as a Win32 App">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="150" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <Label Grid.Row="0" Grid.Column="0" Content="Package folder:" />
+                                <TextBox x:Name="IntunePkgFolderInput" Grid.Row="0" Grid.Column="1" Margin="0,3" />
+                                <Button x:Name="IntunePkgBrowseButton" Grid.Row="0" Grid.Column="2" Content="..." Width="36" Margin="6,3,0,3" Style="{StaticResource StandardButton}" />
+                                <Label Grid.Row="1" Grid.Column="0" Content="Display name:" />
+                                <TextBox x:Name="IntunePkgNameInput" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,3" />
+                                <StackPanel Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,3,0,0">
+                                    <Label Content="Version:" />
+                                    <TextBox x:Name="IntunePkgVersionInput" Width="110" Margin="0,0,12,0" />
+                                    <Label Content="Manufacturer:" />
+                                    <ComboBox x:Name="IntunePkgMfrCombo" Width="110" Margin="0,0,12,0" SelectedIndex="0">
+                                        <sys:String>Dell</sys:String>
+                                        <sys:String>Lenovo</sys:String>
+                                        <sys:String>Microsoft</sys:String>
+                                    </ComboBox>
+                                    <Label Content="Mode:" />
+                                    <ComboBox x:Name="IntunePkgModeCombo" Width="130" Margin="0,0,12,0" SelectedIndex="0">
+                                        <sys:String>Driver</sys:String>
+                                        <sys:String>BIOS</sys:String>
+                                        <sys:String>DriverUpdates</sys:String>
+                                    </ComboBox>
+                                    <Label Content="Intent:" />
+                                    <ComboBox x:Name="IntuneIntentCombo" Width="110" SelectedIndex="0">
+                                        <sys:String>Available</sys:String>
+                                        <sys:String>Required</sys:String>
+                                        <sys:String>Uninstall</sys:String>
+                                    </ComboBox>
+                                </StackPanel>
+                            </Grid>
+                        </GroupBox>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                            <Button x:Name="IntunePublishButton" Content="Publish to Intune" Style="{StaticResource AccentButton}" Width="170" Height="32" Margin="0,0,12,0" />
+                            <TextBlock Text="Packages the folder and uploads it as a Win32 app (assigns to the selected group if one is chosen)." VerticalAlignment="Center" Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <GroupBox Header="Windows Driver-Update Profile">
+                            <StackPanel Orientation="Horizontal">
+                                <Label Content="Name:" Width="60" />
+                                <TextBox x:Name="IntuneProfileNameInput" Width="240" Margin="0,0,12,0" />
+                                <Label Content="Approval:" />
+                                <ComboBox x:Name="IntuneProfileApprovalCombo" Width="120" Margin="0,0,12,0" SelectedIndex="0">
+                                    <sys:String>Manual</sys:String>
+                                    <sys:String>Automatic</sys:String>
+                                </ComboBox>
+                                <Label Content="Defer (days):" />
+                                <TextBox x:Name="IntuneProfileDeferralInput" Width="60" Text="0" Margin="0,0,12,0" />
+                                <Button x:Name="IntuneCreateProfileButton" Content="Create Profile" Style="{StaticResource StandardButton}" Width="130" />
+                            </StackPanel>
+                        </GroupBox>
+
+                        <TextBlock x:Name="IntuneStatusLabel" Text="" Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" Margin="2,4,0,0" />
+                    </StackPanel>
+                </ScrollViewer>
             </TabItem>
 
             <!-- ============ Progress ============ -->

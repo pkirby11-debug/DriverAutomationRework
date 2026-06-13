@@ -74,7 +74,7 @@ Describe 'Set-DATIntuneDriverApproval' {
 
         Set-DATIntuneDriverApproval -ProfileId 'prof-3' -DriverId @('d1', 'd2') -Action Approve
 
-        $script:Body.actionName | Should -Be 'Approve'
+        $script:Body.actionName | Should -Be 'approve'
         @($script:Body.driverIds).Count | Should -Be 2
         $script:Body.deploymentDate | Should -Match '^\d{4}-\d{2}-\d{2}T'
     }
@@ -85,7 +85,7 @@ Describe 'Set-DATIntuneDriverApproval' {
 
         Set-DATIntuneDriverApproval -ProfileId 'prof-3' -DriverId @('d1') -Action Decline
 
-        $script:Body.actionName | Should -Be 'Decline'
+        $script:Body.actionName | Should -Be 'decline'
         $script:Body.Contains('deploymentDate') | Should -Be $false
     }
 }

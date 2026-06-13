@@ -34,8 +34,9 @@ function Set-DATIntuneDriverApproval {
         return
     }
 
+    # Graph action enums are lowercase (driverUpdateProfileActionType: approve/decline/suspend).
     $Body = [ordered]@{
-        actionName = $Action
+        actionName = $Action.ToLowerInvariant()
         driverIds  = @($DriverId)
     }
     if ($Action -eq 'Approve') {
