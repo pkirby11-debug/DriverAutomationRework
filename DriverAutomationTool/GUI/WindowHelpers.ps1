@@ -287,6 +287,13 @@ function Get-DATGridSelectedRows {
     .SYNOPSIS
         Returns the DataRows whose 'Selected' checkbox is ticked (all rows, not
         just the filtered view - matching the old WinForms behaviour).
+    .NOTES
+        Returns the List object itself (the ,$Rows wrap stops PowerShell from
+        enumerating it on output). Callers must consume it DIRECTLY -
+        $rows = Get-DATGridSelectedRows ... ; $rows.Count ; foreach ($r in $rows).
+        Do NOT wrap the call in @(...): @() would box the whole List as a single
+        element, so $rows[0] would be the List (not a DataRow) and $rows.Count
+        would always be 1.
     #>
     param($Table)
 

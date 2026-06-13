@@ -45,7 +45,7 @@ function New-DATMainWindow {
 
     # --- Version labels ---
     $ModVer = (Get-Module DriverAutomationTool).Version
-    if (-not $ModVer) { $ModVer = '2.9.0' }
+    if (-not $ModVer) { $ModVer = '2.9.1' }
     $Window.Title = "Driver Automation Tool v$ModVer"
     $Controls['VersionLabel'].Text = "v$ModVer"
 
@@ -871,7 +871,7 @@ function Initialize-DATMainWindow {
     $Controls['PkgDeleteButton'].Add_Click({
         $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
         Complete-DATGridEdit $Controls['PkgGrid']
-        $SelectedRows = @(Get-DATGridSelectedRows -Table $Controls['PkgGridData'])
+        $SelectedRows = Get-DATGridSelectedRows -Table $Controls['PkgGridData']
         if ($SelectedRows.Count -eq 0) {
             Show-DATWindowMessage -Message 'Select packages to remove.' -Type Warning
             return
@@ -1120,7 +1120,7 @@ function Initialize-DATMainWindow {
         }
 
         Complete-DATGridEdit $Controls['PkgGrid']
-        $SelectedRows = @(Get-DATGridSelectedRows -Table $Controls['PkgGridData'])
+        $SelectedRows = Get-DATGridSelectedRows -Table $Controls['PkgGridData']
         if ($SelectedRows.Count -eq 0) {
             Show-DATWindowMessage -Message 'Select at least one package to apply the action.' -Type Warning
             return
@@ -1339,7 +1339,7 @@ function Initialize-DATMainWindow {
         }
 
         Complete-DATGridEdit $Controls['DeployAppsGrid']
-        $SelectedRows = @(Get-DATGridSelectedRows -Table $Controls['DeployAppsGridData'])
+        $SelectedRows = Get-DATGridSelectedRows -Table $Controls['DeployAppsGridData']
         if ($SelectedRows.Count -eq 0) {
             Show-DATWindowMessage -Message 'Select at least one application to deploy.' -Type Warning
             return
