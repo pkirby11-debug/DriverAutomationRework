@@ -15,6 +15,7 @@ $PrivatePaths = @(
     'Private\Platform\IntunePlatform.ps1'
     'Private\Platform\IntuneWinPackage.ps1'
     'Private\Platform\IntuneWin32App.ps1'
+    'Private\Platform\IntuneDriverUpdateProfile.ps1'
 )
 
 foreach ($Path in $PrivatePaths) {
