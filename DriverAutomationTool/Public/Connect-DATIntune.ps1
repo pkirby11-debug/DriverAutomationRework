@@ -42,6 +42,10 @@ function Connect-DATIntune {
 
         [System.Security.SecureString]$ClientSecret,
 
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$ClientCertificate,
+
+        [string]$CertificateThumbprint,
+
         [string[]]$Scope
     )
 
@@ -58,11 +62,20 @@ function Connect-DATIntune {
             return Connect-DATIntuneDeviceCode -TenantId $TenantId -ClientId $ClientId -Scope $Scope
         }
         'ClientCredentials' {
-            if (-not $ClientId)     { throw "ClientId is required for ClientCredentials authentication." }
-            if (-not $ClientSecret) { throw "ClientSecret is required for ClientCredentials authentication." }
-            if (-not $Scope)        { $Scope = @('https://graph.microsoft.com/.default') }
+            if (-not $ClientId) { throw "ClientId is required for ClientCredentials authentication." }
+            if (-not $Scope)    { $Scope = @('https://graph.microsoft.com/.default') }
 
-            return Connect-DATIntuneClientCredentials -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -Scope $Scope
+            # A certificate (preferred; many tenants disable client secrets) wins if supplied.
+            if ($CertificateThumbprint -and -not $ClientCertificate) {
+                $ClientCertificate = Resolve-DATIntuneCertificate -Thumbprint $CertificateThumbprint
+            }
+            if ($ClientCertificate) {
+                return Connect-DATIntuneClientCertificate -TenantId $TenantId -ClientId $ClientId -Certificate $ClientCertificate -Scope $Scope
+            }
+            if ($ClientSecret) {
+                return Connect-DATIntuneClientCredentials -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -Scope $Scope
+            }
+            throw "ClientCredentials requires -ClientSecret, -ClientCertificate, or -CertificateThumbprint."
         }
     }
 }

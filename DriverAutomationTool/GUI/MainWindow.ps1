@@ -45,7 +45,7 @@ function New-DATMainWindow {
 
     # --- Version labels ---
     $ModVer = (Get-Module DriverAutomationTool).Version
-    if (-not $ModVer) { $ModVer = '2.10.1' }
+    if (-not $ModVer) { $ModVer = '2.10.2' }
     $Window.Title = "Driver Automation Tool v$ModVer"
     $Controls['VersionLabel'].Text = "v$ModVer"
 
