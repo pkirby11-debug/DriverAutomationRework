@@ -188,11 +188,24 @@ trap {
 $ErrorActionPreference = 'Stop'
 $script:RebootRequired = $false
 
+# Self-identification: short SHA-256 of THIS file, logged in the startup
+# lines. Names the exact bytes that executed - the sync logs the same rev
+# when staging (Copy-DATApplyScript), so "which script version actually ran
+# on the client?" is answered by matching the two, never by guessing from
+# message formats. (Field case: a client ran a stale local copy minutes
+# after a sync staged a newer one; both sides looked plausibly current.)
+$script:ScriptRev = 'unknown'
+try {
+    if ($PSCommandPath) {
+        $script:ScriptRev = (Get-FileHash -Path $PSCommandPath -Algorithm SHA256 -ErrorAction Stop).Hash.Substring(0, 8).ToLower()
+    }
+} catch { }
+
 # Startup marker - writes before any other logic runs so we can confirm the
 # script survived param binding and attribute processing.
 try {
-    $StartupMsg = '[START] PID={0} PS={1} Mode={2} Version={3} Package=''{4}''' -f `
-        $PID, $PSVersionTable.PSVersion, $Mode, $Version, $PackageName
+    $StartupMsg = '[START] PID={0} PS={1} Rev={2} Mode={3} Version={4} Package=''{5}''' -f `
+        $PID, $PSVersionTable.PSVersion, $script:ScriptRev, $Mode, $Version, $PackageName
     Add-Content -Path $script:FailsafeLogPath -Value (Format-CMTraceLine -Message $StartupMsg -Severity 1) -ErrorAction SilentlyContinue
 } catch { }
 
@@ -638,6 +651,889 @@ function Install-DriverContentFromWim {
     }
 }
 
+function Invoke-DCUDriverUpdates {
+    <#
+        Dell Command Update engine for DriverUpdates packages.
+
+        Hands the whole driver install to dcu-cli.exe against a LOCAL repository:
+        the package's staged DUPs + the DCUCatalog.xml the sync wrote (same
+        layout Dell Repository Manager produces). Wins over the built-in DUP
+        loop: DCU inventories the actual device (real PnP IDs + installed
+        versions) so applicability filtering is Dell's own logic, not catalog
+        PCIInfo guesswork; DUP children are spawned by the Dell-signed DCU
+        service (the execution context AV/EDR already trusts); and DCU manages
+        its own extraction paths (no TMP/extractpath games).
+
+        Returns:
+          $null  -> engine NOT attempted (not Dell / no catalog / no dcu-cli /
+                    configure failed). Caller falls back to the built-in DUP
+                    loop. Falling back is always safe here because nothing was
+                    installed yet.
+          0/1    -> authoritative result; /applyUpdates ran. We deliberately do
+                    NOT fall back after a failed apply - DCU may have installed
+                    a subset, and re-running every DUP through the legacy loop
+                    would double-install and double-reboot.
+
+        IMPORTANT exit-code note: dcu-cli's own return codes (0=success,
+        1=reboot required, 5=reboot pending, 500=no applicable updates, others=
+        error) must NEVER be propagated raw - the deployment type's custom
+        return-code map treats 3/4/5 as Success and 2/6 as SoftReboot per the
+        Dell DUP convention, so a raw dcu-cli error 3 would record as Installed.
+        Success here returns 0 (reboot signaled via $script:RebootRequired,
+        same as the DUP loop); failures return 1 with the real code in the log.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    # Dell-only engine - the built-in DUP loop covers everything else.
+    try {
+        if ((Get-DeviceManufacturer) -ne 'Dell') { return $null }
+    } catch { return $null }
+
+    $CatalogPath = Join-Path $Path 'DCUCatalog.xml'
+    if (-not (Test-Path $CatalogPath)) {
+        Write-Log "No DCUCatalog.xml in package (built before 2.2.0) - using built-in DUP engine"
+        return $null
+    }
+
+    # Content-completeness check: every file the catalog references must be
+    # present in the content. Catches stale/partial manual test copies (field:
+    # a refreshed local folder carried the new apply script but not the
+    # newly-staged InvColPC_*.exe, so inventory kept failing while the share
+    # was complete the whole time) and equally catches a DP/client content
+    # refresh that hasn't finished. Warning-only - the engine's own gates
+    # handle the consequences.
+    try {
+        $CatDocCheck = New-Object System.Xml.XmlDocument
+        $CatDocCheck.Load($CatalogPath)
+        $MissingRefs = @()
+        foreach ($RefNode in @($CatDocCheck.SelectNodes("//*[local-name()='SoftwareComponent' or local-name()='InventoryComponent']"))) {
+            $RefPath = [string]$RefNode.GetAttribute('path')
+            if (-not $RefPath) { continue }
+            $RefLeaf = ($RefPath -split '[\\/]')[-1]
+            if ($RefLeaf -and -not (Test-Path (Join-Path $Path $RefLeaf))) { $MissingRefs += $RefLeaf }
+        }
+        if ($MissingRefs.Count -gt 0) {
+            Write-Log ("Package catalog references $($MissingRefs.Count) file(s) MISSING from this content: " + (($MissingRefs | Select-Object -First 5) -join '; ') + "$(if ($MissingRefs.Count -gt 5) { ' ...' }). The content copy is incomplete or stale - if testing from a manual folder, re-copy the ENTIRE share (e.g. robocopy /MIR); under CM, let the content refresh finish. DCU will fail on the missing pieces (inventory included, if the Inventory Collector is among them)." ) -Severity 2
+        }
+    } catch { }
+
+    # Allowlist for the fail-closed scan gate: every update DCU proposes must
+    # be one of the package's staged DUPs. Field evidence made this mandatory:
+    # when DCU 5.6 rejected the custom catalog (SYSTEM_SECURITY_ERROR), it
+    # silently fell back to Dell's CLOUD catalog and selected 12 updates
+    # including a BIOS flash and TPM firmware - content we never approved.
+    # If the allowlist can't be built, the engine refuses to run DCU at all.
+    $ManifestNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    try {
+        $MfDoc = Get-Content -Path (Join-Path $Path 'manifest.json') -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        foreach ($N in @($MfDoc.drivers | ForEach-Object { $_.FileName })) {
+            if ($N) { [void]$ManifestNames.Add([string]$N) }
+        }
+    } catch { }
+    if ($ManifestNames.Count -eq 0) {
+        Write-Log "Could not build the update allowlist from manifest.json - cannot verify DCU scan results, using built-in DUP engine" -Severity 2
+        return $null
+    }
+
+    $DcuCli = $null
+    foreach ($Root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $Root) { continue }
+        $Candidate = Join-Path $Root 'Dell\CommandUpdate\dcu-cli.exe'
+        if (Test-Path $Candidate) { $DcuCli = $Candidate; break }
+    }
+    if (-not $DcuCli) {
+        Write-Log "Dell Command Update (dcu-cli.exe) not installed on this device - using built-in DUP engine" -Severity 2
+        return $null
+    }
+
+    # DCU 5.x path-option hardening rejects "reserved folders" for
+    # -exportSettings/-catalogLocation/etc. with exit 107. Field-confirmed on
+    # 5.6.0.17: BOTH the Windows tree (C:\Windows\Temp) and ProgramData are
+    # reserved. C:\Temp is the path family Dell's own dcu-cli documentation
+    # uses in its examples and sits outside every reserved tree, so the whole
+    # session (catalog, settings backup, logs, repo) lives there.
+    $WorkRoot = Join-Path $env:SystemDrive 'Temp\DriverAutomationTool'
+    $SessionDir = Join-Path $WorkRoot ('DCU\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    try {
+        New-Item -Path $SessionDir -ItemType Directory -Force | Out-Null
+        # C:\Temp has no automatic cleanup - prune sessions older than 7 days
+        # so repeated runs don't accumulate logs/catalog copies forever.
+        Get-ChildItem -Path (Join-Path $WorkRoot 'DCU') -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $SessionDir -and $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Log "Could not create DCU session dir '$SessionDir' ($($_.Exception.Message)) - using built-in DUP engine" -Severity 2
+        return $null
+    }
+
+    # DCU 3.x has an entirely different CLI grammar (no /configure -option=value
+    # commands) - every call would fail input validation. Gate on 4.0+.
+    $DcuVersion = $null
+    try { $DcuVersion = (Get-Item $DcuCli -ErrorAction Stop).VersionInfo.FileVersion } catch { }
+    if ($DcuVersion) {
+        $ParsedVer = $null
+        if ([version]::TryParse(($DcuVersion -replace '[^\d\.].*$', ''), [ref]$ParsedVer) -and $ParsedVer.Major -lt 4) {
+            Write-Log "Dell Command Update $DcuVersion is too old for the repository CLI (needs 4.0+) - update DCU on this device; using built-in DUP engine" -Severity 2
+            return $null
+        }
+    }
+
+    Write-Log "Using Dell Command Update engine: $DcuCli (version $(if ($DcuVersion) { $DcuVersion } else { 'unknown' }))"
+
+    # dcu-cli enforces a single-instance lock - a scheduled DCU scan or an open
+    # DCU GUI makes every CLI call fail input-validation-style. If DCU is busy,
+    # wait a bounded time for it to finish before giving up the engine.
+    $DcuProcs = @(Get-Process -Name 'dcu-cli', 'DellCommandUpdate' -ErrorAction SilentlyContinue)
+    if ($DcuProcs.Count -gt 0) {
+        Write-Log "DCU already running ($(($DcuProcs | ForEach-Object { '{0} (PID {1})' -f $_.ProcessName, $_.Id }) -join ', ')) - waiting up to 2 minutes for it to finish (dcu-cli is single-instance)" -Severity 2
+        $WaitUntil = (Get-Date).AddSeconds(120)
+        while ((Get-Date) -lt $WaitUntil) {
+            Start-Sleep -Seconds 10
+            $DcuProcs = @(Get-Process -Name 'dcu-cli', 'DellCommandUpdate' -ErrorAction SilentlyContinue)
+            if ($DcuProcs.Count -eq 0) { break }
+        }
+        if ($DcuProcs.Count -gt 0) {
+            Write-Log "DCU still busy after 2 minutes - its single-instance lock would fail our commands; using built-in DUP engine this run" -Severity 2
+            return $null
+        }
+    }
+
+    # Runs dcu-cli with args, waits up to the timeout, returns the exit code or
+    # $null on launch failure/timeout. dcu-cli is a CONSOLE app (unlike DUPs) -
+    # its input-validation errors are printed to stdout/stderr in plain text,
+    # so both streams are captured per-call for failure diagnostics.
+    $RunDcu = {
+        param([string[]]$DcuArgs, [int]$TimeoutMs, [string]$Label)
+        $OutFile = Join-Path $SessionDir ($Label + '.out.log')
+        $ErrFile = Join-Path $SessionDir ($Label + '.err.log')
+        try {
+            $P = Start-Process -FilePath $DcuCli -ArgumentList $DcuArgs -NoNewWindow -PassThru `
+                -RedirectStandardOutput $OutFile -RedirectStandardError $ErrFile -ErrorAction Stop
+            $null = $P.Handle
+            if (-not $P.WaitForExit($TimeoutMs)) {
+                Write-Log "dcu-cli $Label timed out after $([int]($TimeoutMs/60000)) minutes - killing" -Severity 2
+                try { $P.Kill() } catch { }
+                return $null
+            }
+            return $P.ExitCode
+        } catch {
+            Write-Log "dcu-cli $Label failed to launch: $($_.Exception.Message)" -Severity 2
+            return $null
+        }
+    }
+
+    # Quotes the captured console output for a $RunDcu call into our log.
+    $TailConsole = {
+        param([string]$Label)
+        foreach ($Suffix in @('.out.log', '.err.log')) {
+            $F = Join-Path $SessionDir ($Label + $Suffix)
+            try {
+                if (Test-Path $F) {
+                    $Lines = @(Get-Content -Path $F -ErrorAction Stop | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 5)
+                    if ($Lines.Count -gt 0) {
+                        Write-Log ("  dcu-cli $Label console: " + (($Lines | ForEach-Object { $_.Trim() }) -join ' / ')) -Severity 2
+                    }
+                }
+            } catch { }
+        }
+    }
+
+    # DCU's catalog-rejection signature (field log, 5.6.0.17):
+    #   "SYSTEM_SECURITY_ERROR is flagged in the scan results"
+    #   "The catalog <path> failed to provide any result"
+    # When these appear, DCU has IGNORED the custom catalog and is operating
+    # from Dell's cloud catalog - the run must not be allowed to install.
+    $CatalogFailurePattern = 'SYSTEM_SECURITY_ERROR|failed to provide any result'
+    $TestCatalogRejected = {
+        param([string[]]$Files)
+        foreach ($F in $Files) {
+            try {
+                if ($F -and (Test-Path $F)) {
+                    $Txt = Get-Content -Path $F -Raw -ErrorAction Stop
+                    if ($Txt -and $Txt -match $CatalogFailurePattern) { return $true }
+                }
+            } catch { }
+        }
+        return $false
+    }
+
+    # DCU's scan inventories the system FIRST, using an Inventory Collector it
+    # downloads from its catalog source. Catalogs built before 2.7.0 don't
+    # carry one, and with dell.com disabled there is no fallback source - the
+    # scan then logs this exact line and returns 500 without having evaluated
+    # anything (field: DP82132 reported "everything current" while a year
+    # behind on drivers). An inventory failure makes ANY scan verdict
+    # unusable.
+    $TestInventoryFailed = {
+        param([string[]]$Files)
+        foreach ($F in $Files) {
+            try {
+                if ($F -and (Test-Path $F)) {
+                    $Txt = Get-Content -Path $F -Raw -ErrorAction Stop
+                    if ($Txt -and $Txt -match 'Unable to retrieve system inventory') { return $true }
+                }
+            } catch { }
+        }
+        return $false
+    }
+
+    # Quotes the last lines of a dcu output log into our log so failures are
+    # diagnosable from DATApply.log alone.
+    $TailLog = {
+        param([string]$LogFilePath)
+        try {
+            if ($LogFilePath -and (Test-Path $LogFilePath)) {
+                $Lines = @(Get-Content -Path $LogFilePath -ErrorAction Stop | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 5)
+                if ($Lines.Count -gt 0) {
+                    Write-Log ("  dcu log tail: " + (($Lines | ForEach-Object { $_.Trim() }) -join ' / ')) -Severity 2
+                }
+            }
+        } catch { }
+    }
+
+    # Build the local repository OUTSIDE the Windows tree. ccmcache lives under
+    # C:\Windows, and the same DCU 5.x reserved-folder rule that rejected
+    # C:\Windows\Temp for CLI options is likely to reject it as a repository
+    # source. Hardlink each staged DUP into the session repo (same volume ->
+    # zero bytes copied, instant, originals untouched so the CM content hash
+    # stays clean); fall back to copying, and to ccmcache directly if even
+    # that fails. Links/copies are removed in finally.
+    $RepoDir = Join-Path $SessionDir 'repo'
+    $BaseLocation = $Path
+    try {
+        New-Item -Path $RepoDir -ItemType Directory -Force | Out-Null
+        $UseCopy = $false
+        $Staged = 0
+        # ALL payload files, not just *.exe: the Inventory Collector the sync
+        # embeds may ship with another extension (.cab is common for Dell
+        # inventory components). A *.exe-only glob left it out of the repo -
+        # the catalog referenced it, DCU couldn't fetch it from baseLocation,
+        # and every scan failed inventory despite a correctly-built package.
+        $NonPayload = @('manifest.json', 'DCUCatalog.xml')
+        foreach ($Dup in @(Get-ChildItem -Path $Path -File -ErrorAction Stop | Where-Object { $NonPayload -notcontains $_.Name -and $_.Extension -ne '.ps1' })) {
+            $LinkPath = Join-Path $RepoDir $Dup.Name
+            if (-not $UseCopy) {
+                try {
+                    New-Item -ItemType HardLink -Path $LinkPath -Value $Dup.FullName -ErrorAction Stop | Out-Null
+                    $Staged++
+                    continue
+                } catch {
+                    Write-Log "Hardlink failed for $($Dup.Name) ($($_.Exception.Message)) - copying instead" -Severity 2
+                    $UseCopy = $true
+                }
+            }
+            Copy-Item -Path $Dup.FullName -Destination $LinkPath -Force -ErrorAction Stop
+            $Staged++
+        }
+        $BaseLocation = $RepoDir
+        Write-Log "DCU repository staged: $Staged payload file(s) -> $RepoDir ($(if ($UseCopy) { 'copied' } else { 'hardlinked' }))"
+    } catch {
+        Write-Log "Could not stage DCU repository outside ccmcache ($($_.Exception.Message)) - using ccmcache path directly (DCU may reject it as a reserved folder)" -Severity 2
+        $BaseLocation = $Path
+    }
+
+    # Build the catalog DCU consumes. Two transforms from the package-side
+    # DCUCatalog.xml:
+    #
+    #  1. Patch baseLocation -> $BaseLocation. The sync writes it empty
+    #     because the local path differs per client; DCU appends each
+    #     component's path (bare filename) to baseLocation when it resolves
+    #     a DUP. Writing inside ccmcache would dirty the CM content hash,
+    #     so the patched copy goes in the session dir as CatalogPC.xml
+    #     (Dell's standard internal name).
+    #
+    #  2. Wrap into a CAB. DCU 5.x rejects raw .xml for -catalogLocation
+    #     with "incorrect file type" (field-confirmed on 5.6.0.17); .cab
+    #     is what Dell Repository Manager outputs and what DCU validates.
+    #     The CAB just contains CatalogPC.xml - DCU extracts and reads it.
+    $LocalCatalogXml = Join-Path $SessionDir 'CatalogPC.xml'
+    $LocalCatalog    = Join-Path $SessionDir 'DCUCatalog.cab'
+    try {
+        # XML mutation goes through a raw string read+write (not XmlDocument)
+        # so the document doesn't get re-serialized through a parser that
+        # could shift the xmlns declarations or whitespace and trip DCU's
+        # strict-mode schema check.
+        $CatXml = [System.IO.File]::ReadAllText($CatalogPath, [System.Text.Encoding]::Unicode)
+        $CatXml = $CatXml -replace 'baseLocation\s*=\s*"[^"]*"', ('baseLocation="{0}"' -f ($BaseLocation -replace '"', '&quot;'))
+        [System.IO.File]::WriteAllText($LocalCatalogXml, $CatXml, [System.Text.Encoding]::Unicode)
+    } catch {
+        Write-Log "Could not localize DCU catalog ($($_.Exception.Message)) - using built-in DUP engine" -Severity 2
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        return $null
+    }
+
+    $MakeCab = Join-Path $env:WINDIR 'System32\makecab.exe'
+    if (-not (Test-Path $MakeCab)) {
+        Write-Log "makecab.exe not found at $MakeCab (needed to package the catalog as .cab for DCU 5.x) - using built-in DUP engine" -Severity 2
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        return $null
+    }
+    try {
+        $CabOut = Join-Path $SessionDir 'makecab.out.log'
+        $CabErr = Join-Path $SessionDir 'makecab.err.log'
+        # Passing source and dest positionally gives a single-file CAB whose
+        # internal name matches the source filename (CatalogPC.xml) - exactly
+        # the layout Dell Repository Manager produces and DCU expects.
+        $CabProc = Start-Process -FilePath $MakeCab `
+            -ArgumentList "`"$LocalCatalogXml`"", "`"$LocalCatalog`"" `
+            -NoNewWindow -PassThru -Wait `
+            -RedirectStandardOutput $CabOut -RedirectStandardError $CabErr -ErrorAction Stop
+        if ($CabProc.ExitCode -ne 0 -or -not (Test-Path $LocalCatalog)) {
+            Write-Log "makecab.exe exited $($CabProc.ExitCode) packaging the catalog (output: $CabOut) - using built-in DUP engine" -Severity 2
+            try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+            return $null
+        }
+        Write-Log "Packaged DCU catalog: $LocalCatalog (CAB with CatalogPC.xml; baseLocation=$BaseLocation)"
+    } catch {
+        Write-Log "makecab.exe launch failed: $($_.Exception.Message) - using built-in DUP engine" -Severity 2
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        return $null
+    }
+
+    # Snapshot the machine's DCU settings so pointing catalogLocation at our
+    # repository doesn't permanently hijack a tech's/GUI's Dell-cloud config.
+    # Restore happens in finally - even on timeout or throw.
+    #
+    # Pristine copy: if a previous run's restore failed (field case: DCU was
+    # mid self-update, exit 3004), the CURRENT settings still point at that
+    # run's session catalog - backing THEM up would launder the hijack into
+    # the "original". A backup whose catalogLocation references our work root
+    # is therefore never promoted to pristine, and restore prefers the
+    # pristine copy (kept at the work root, outside the 7-day session prune).
+    $PristineSettings = Join-Path $WorkRoot 'DCU-pristine-settings.xml'
+    $SettingsBackupDir = Join-Path $SessionDir 'settings-backup'
+    $SettingsBackupFile = $null
+    $BackupHijacked = $false
+
+    # DAT-managed DCU mode - DEFAULT-ON for every DriverUpdates run. This tool
+    # is the sole update channel, so DCU's autonomy (dell.com source, scheduled
+    # scans, auto-installs) is disabled on every device this application runs
+    # on; DCU stays installed purely as the execution engine we drive.
+    #
+    # Option names corrected after the first 2.6.0 field run reported
+    # "2 applied, 6 not supported" on 5.6.0.17: the real no-schedule knob is
+    # scheduleManual=enable (not scheduleAuto=disable), and scheduleAction
+    # only accepts NotifyAvailableUpdates/DownloadAndNotify/
+    # DownloadInstallAndNotify - the least-action value is set as belt and
+    # braces should a schedule ever return. Failed keys are now NAMED in the
+    # log so unsupported options are visible per build.
+    #
+    # Asserted twice per run: here (pre-run, so the pristine snapshot trends
+    # managed) and again post-restore in finally (so the box ALWAYS ends
+    # locked even when an old pre-managed pristine was the restore source -
+    # the field case where the restore re-enabled dell.com).
+    #
+    # Opt-out: Set-DATDellCommandUpdateMode -Mode Default writes
+    # HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode = 'Default',
+    # which skips both assertions (per-run scan purity via
+    # -defaultSourceLocation=disable still applies).
+    $DcuManagedMode = $null
+    try { $DcuManagedMode = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation' -Name 'DcuManagedMode' -ErrorAction Stop).DcuManagedMode } catch { }
+    # Sequence trimmed to what 5.6.0.17's named-key results proved viable:
+    # - defaultSourceLocation is NOT here: DCU rejects disabling its default
+    #   source while no custom catalog is configured (field exit 107 on every
+    #   pre-catalog/post-restore attempt - the root cause of "dell.com keeps
+    #   coming back"). It is disabled only where a catalog exists: per-run
+    #   after -catalogLocation, and persistently in the end-state block.
+    # - scheduleManual is a bare flag (=enable drew exit 107).
+    # - userConsent (106) and the deferral pair (109) are dropped: their
+    #   grammars are build-dependent and they're redundant once the schedule
+    #   is manual, the action is notify-only, and dell.com is off.
+    # - scheduleAction=NotifyAvailableUpdates DID apply in the field: even if
+    #   a schedule ever fires, DCU can only notify - never download/install.
+    $DcuManagedSequence = [ordered]@{
+        'scheduleManual'        = ''
+        'scheduleAction'        = 'NotifyAvailableUpdates'
+        'updatesNotification'   = 'disable'
+        'autoSuspendBitLocker'  = 'disable'
+    }
+    $AssertDcuManaged = {
+        param([string]$Phase)
+        $OkKeys = @()
+        $BadKeys = @()
+        foreach ($K in $DcuManagedSequence.Keys) {
+            $V = $DcuManagedSequence[$K]
+            $OptArg = if ($V) { "-$K=$V" } else { "-$K" }
+            $RC = & $RunDcu @('/configure', $OptArg, "-outputLog=$SessionDir\dcu-managed-$Phase-$K.log") 120000 "managed-$Phase-$K"
+            if ($RC -eq 0) { $OkKeys += $K } else { $BadKeys += ("{0}(exit {1})" -f $K, $(if ($null -eq $RC) { 'timeout' } else { $RC })) }
+        }
+        Write-Log "DCU locked to DAT-managed mode [$Phase]: applied $($OkKeys -join ', '); not supported: $(if ($BadKeys.Count -gt 0) { $BadKeys -join ', ' } else { 'none' })"
+    }
+    if ($DcuManagedMode -eq 'Default') {
+        Write-Log "DCU managed mode: device is explicitly opted out (DcuManagedMode=Default) - leaving DCU autonomy settings as-is" -Severity 2
+    } else {
+        & $AssertDcuManaged 'pre-run'
+        # Marker for inventory/visibility and so the cmdlet/standalone script
+        # see a consistent state. Idempotent.
+        try {
+            $MgKey = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation'
+            if (-not (Test-Path $MgKey)) { New-Item -Path $MgKey -Force | Out-Null }
+            Set-ItemProperty -Path $MgKey -Name 'DcuManagedMode' -Value 'DATManaged' -Type String -Force
+            Set-ItemProperty -Path $MgKey -Name 'DcuManagedModeSetAt' -Value (Get-Date).ToString('o') -Type String -Force
+        } catch { }
+    }
+    try {
+        New-Item -Path $SettingsBackupDir -ItemType Directory -Force | Out-Null
+        $ExportCode = & $RunDcu @("/configure", "-exportSettings=$SettingsBackupDir", "-outputLog=$SessionDir\dcu-export.log") 300000 'settings-export'
+        if ($ExportCode -eq 0) {
+            $SettingsBackupFile = Get-ChildItem -Path $SettingsBackupDir -Filter '*.xml' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+        }
+        if ($SettingsBackupFile) {
+            $BackupText = Get-Content -Path $SettingsBackupFile -Raw -ErrorAction SilentlyContinue
+            # Hijack = catalogLocation pointing into a SESSION dir
+            # (WorkRoot\DCU\<timestamp>\...). The persistent catalog
+            # (WorkRoot\DCU-persistent\) is the legitimate managed end state -
+            # matching the whole WorkRoot flagged it as a hijack on every run
+            # after 2.6.4 (field red line on DP82132). The trailing separator
+            # keeps "\DCU\" from matching "\DCU-persistent\".
+            $SessionMarker = [regex]::Escape((Join-Path $WorkRoot 'DCU') + '\')
+            $BackupHijacked = [bool]($BackupText -and $BackupText -match $SessionMarker)
+            if ($BackupHijacked) {
+                Write-Log "Exported DCU settings still point at a previous run's session catalog (an earlier restore failed) - the pristine copy stays the restore source" -Severity 2
+            } else {
+                try { Copy-Item -Path $SettingsBackupFile -Destination $PristineSettings -Force } catch { }
+            }
+        } else {
+            if ($ExportCode -eq 5) {
+                # dcu-cli 5 = a previous operation needs a restart (e.g. DCU's
+                # own self-update). Signal the reboot so the next run can use
+                # DCU cleanly.
+                Write-Log "DCU reports a pending reboot (exit 5) - signaling reboot so DCU works again after restart" -Severity 2
+                $script:RebootRequired = $true
+            }
+            Write-Log "DCU settings export did not produce a backup (exit $ExportCode) - proceeding; existing DCU config will not be restored after this run" -Severity 2
+            & $TailConsole 'settings-export'
+        }
+    } catch {
+        Write-Log "DCU settings export failed ($($_.Exception.Message)) - proceeding without restore" -Severity 2
+    }
+    $CatalogConfigured = $false
+
+    try {
+        # Configure attempt 1: raw XML with -allowXML=enable, dcu-cli's switch
+        # for accepting plain XML catalogs. If this DCU build supports it, the
+        # unsigned-XML path is sanctioned and may clear the SYSTEM_SECURITY_ERROR
+        # rejection seen against the hand-built CAB. An unknown-option or
+        # file-type rejection exits non-zero -> fall through to the CAB
+        # configure that 5.6.0.17 is known to accept.
+        $CatalogInUse = $null
+        $CfgCode = & $RunDcu @("/configure", "-catalogLocation=$LocalCatalogXml", "-allowXML=enable", "-outputLog=$SessionDir\dcu-configure-xml.log") 300000 'configure-xml'
+        if ($CfgCode -eq 0) {
+            $CatalogInUse = $LocalCatalogXml
+            Write-Log "DCU accepted the XML catalog via -allowXML=enable"
+        } else {
+            Write-Log "XML + -allowXML configure attempt exited $(if ($null -eq $CfgCode) { 'timeout/launch' } else { $CfgCode }) - using the CAB catalog"
+            $CfgCode = & $RunDcu @("/configure", "-catalogLocation=$LocalCatalog", "-outputLog=$SessionDir\dcu-configure.log") 300000 'configure'
+            if ($CfgCode -ne 0) {
+                if ($CfgCode -eq 5) {
+                    Write-Log "DCU reports a pending reboot (exit 5) - signaling reboot; DCU works again after restart" -Severity 2
+                    $script:RebootRequired = $true
+                }
+                Write-Log "dcu-cli /configure -catalogLocation failed (exit $(if ($null -eq $CfgCode) { 'timeout/launch' } else { $CfgCode })) - falling back to built-in DUP engine" -Severity 2
+                & $TailConsole 'configure'
+                & $TailLog "$SessionDir\dcu-configure.log"
+                return $null
+            }
+            $CatalogInUse = $LocalCatalog
+        }
+        $CatalogConfigured = $true
+
+        # Cut DCU's dell.com merge for the duration of the run. The GUI's
+        # "Default Source Location (dell.com)" toggle is what made scans blend
+        # cloud content (TPM firmware, BIOS, DCU self-update) into custom-
+        # catalog results - and what lets resident DCU run cloud passes on its
+        # own schedule. Disable it for our run via the documented setting;
+        # the settings restore in finally puts the box back exactly as found.
+        # Same graceful pattern as -allowXML: builds that don't know the
+        # option reject it and we continue, relying on the scan gate + type
+        # fence instead.
+        $NoDefCode = & $RunDcu @("/configure", "-defaultSourceLocation=disable", "-outputLog=$SessionDir\dcu-nodefaultsrc.log") 300000 'configure-nodefaultsrc'
+        if ($NoDefCode -eq 0) {
+            Write-Log "DCU default dell.com source disabled for this run - scans are restricted to the package catalog"
+        } else {
+            Write-Log "Could not disable DCU's default dell.com source (exit $(if ($null -eq $NoDefCode) { 'timeout/launch' } else { $NoDefCode })) - this build may not support -defaultSourceLocation; relying on the scan gate and type fence" -Severity 2
+            & $TailConsole 'configure-nodefaultsrc'
+        }
+
+        # ------------------------------------------------------------------
+        # FAIL-CLOSED GATE. /scan is read-only; nothing installs unless the
+        # scan provably ran from OUR catalog alone:
+        #   1. No catalog-rejection markers in the scan log/console.
+        #   2. A scan report exists and every proposed update's file is one
+        #      of the package's staged DUPs (allowlist) - a single foreign
+        #      item proves DCU consulted its cloud catalog.
+        #   3. Anything ambiguous (no report, unparseable, unexpected exit)
+        #      counts as a failure.
+        # Field justification: when 5.6 rejected the custom catalog it
+        # silently selected 12 cloud updates including a BIOS flash and TPM
+        # firmware. That must never install under this deployment.
+        # ------------------------------------------------------------------
+        # Report-parsing helpers - defined BEFORE the scan call because the
+        # exit-500 diagnostics path uses $ParseScanReport too (2.6.3 field
+        # crash: "expression after '&' ... not valid" = invoking it before
+        # its definition further down).
+        #
+        # Field-established report schema (2.2.7's diagnostics dump): update
+        # nodes carry CHILD ELEMENTS, not attributes -
+        #   <update><release>86GCF</release><name>...</name><version>...</version>
+        #   <type>Firmware</type><file>FOLDER.../x.exe</file>...</update>
+        # Items from OUR catalog have <file> = the bare staged filename (the
+        # sync rewrites paths); Dell-sourced items keep cloud FOLDER paths.
+        $GetNodeField = {
+            param($Node, $Field)
+            $C = $Node[$Field]
+            if (-not $C) { $C = $Node[($Field.Substring(0, 1).ToUpper() + $Field.Substring(1))] }
+            if ($C -and $C.InnerText) { return $C.InnerText.Trim() }
+            $A = [string]$Node.GetAttribute($Field)
+            if ($A) { return $A.Trim() }
+            return ''
+        }
+        # Dell package-ID tokens from the staged filenames (segment before the
+        # WIN64/WIN32 marker: Intel-Dynamic-Tuning-Driver_34HGT_WIN64_... -> 34HGT).
+        $PkgTokens = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($MfName in $ManifestNames) {
+            $Parts = $MfName -split '_'
+            for ($i = 1; $i -lt $Parts.Length; $i++) {
+                if ($Parts[$i] -match '^WIN(32|64)?$' -and $Parts[$i - 1] -match '^[A-Za-z0-9]{4,7}$') {
+                    [void]$PkgTokens.Add($Parts[$i - 1])
+                }
+            }
+        }
+        $ParseScanReport = {
+            param([string]$Dir)
+            $Items = @()
+            $Rf = Get-ChildItem -Path $Dir -Filter '*.xml' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $Rf) { return ,$Items }
+            try {
+                $Doc = New-Object System.Xml.XmlDocument
+                $Doc.Load($Rf.FullName)
+                foreach ($U in @($Doc.SelectNodes("//*[translate(local-name(),'U','u')='update']"))) {
+                    $NodeXml = [string]$U.OuterXml
+                    $FileVal = & $GetNodeField $U 'file'
+                    $FileBase = if ($FileVal) { ($FileVal -split '[\\/]')[-1] } else { '' }
+                    # Ours when the file is one of our staged DUPs; OuterXml
+                    # filename/package-token fallbacks keep 2.2.7 behavior in
+                    # case Dell shifts the report shape again.
+                    $IsOurs = ($FileBase -and $ManifestNames.Contains($FileBase))
+                    if (-not $IsOurs) {
+                        foreach ($MfName in $ManifestNames) {
+                            if ($NodeXml.IndexOf($MfName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $IsOurs = $true; break }
+                        }
+                    }
+                    if (-not $IsOurs) {
+                        foreach ($Tok in $PkgTokens) {
+                            if ($NodeXml.IndexOf($Tok, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $IsOurs = $true; break }
+                        }
+                    }
+                    $Items += [PSCustomObject]@{
+                        Name    = & $GetNodeField $U 'name'
+                        Type    = (& $GetNodeField $U 'type').ToLowerInvariant()
+                        File    = $FileVal
+                        Release = & $GetNodeField $U 'release'
+                        IsOurs  = $IsOurs
+                        NodeXml = $NodeXml
+                    }
+                }
+            } catch { }
+            return ,$Items
+        }
+
+        $ReportDir = Join-Path $SessionDir 'scan-report'
+        try { New-Item -Path $ReportDir -ItemType Directory -Force | Out-Null } catch { }
+        $ScanLog = Join-Path $SessionDir 'dcu-scan.log'
+        $ScanCode = & $RunDcu @('/scan', "-report=$ReportDir", "-outputLog=$ScanLog") 1800000 'scan'
+
+        if (& $TestCatalogRejected @($ScanLog, (Join-Path $SessionDir 'scan.out.log'), (Join-Path $SessionDir 'scan.err.log'))) {
+            Write-Log "DCU did NOT honor the custom catalog (security rejection / no result from catalog) - it would source updates from Dell's cloud. Installing NOTHING via DCU; falling back to built-in DUP engine." -Severity 3
+            & $TailConsole 'scan'
+            & $TailLog $ScanLog
+            return $null
+        }
+        if (& $TestInventoryFailed @($ScanLog, (Join-Path $SessionDir 'scan.out.log'), (Join-Path $SessionDir 'scan.err.log'))) {
+            Write-Log "DCU could not inventory the system ('Unable to retrieve system inventory information') - the catalog lacks Dell's Inventory Collector and dell.com is disabled. Re-sync with 2.7.0+ to embed the collector in the package. Scan verdict unusable; falling back to built-in DUP engine." -Severity 2
+            return $null
+        }
+        if ($ScanCode -eq 500) {
+            Write-Log "DCU scan: no applicable updates from the package catalog - everything current"
+            # Diagnostic dump when the verdict is "nothing applicable" but the
+            # admin has reason to expect updates (field case: a manifest entry
+            # is newer than the installed driver, e.g. UHD Graphics 2140 in
+            # the package vs 2135 installed, yet DCU returns 500). Quotes
+            # DCU's own per-component reasoning from its scan log + a manifest
+            # summary, so the next run's log either vindicates DCU's verdict
+            # or proves the catalog isn't being evaluated as expected. Cheap
+            # because we already have the files - no extra dcu-cli calls.
+            $ManifestSample = @($Drivers | Select-Object -First 5 |
+                ForEach-Object { "$($_.Name) v$($_.Version)" }) -join '; '
+            Write-Log "  Diagnostic: manifest contains $($Drivers.Count) driver(s); first 5: $ManifestSample" -Severity 2
+            $ScanReportItems = @(& $ParseScanReport $ReportDir)
+            Write-Log "  Diagnostic: scan report contains $($ScanReportItems.Count) <Update> node(s) (0 confirms DCU's verdict was 'nothing applicable')" -Severity 2
+            & $TailConsole 'scan'
+            & $TailLog $ScanLog
+            Write-Log "  If a manifest driver IS newer than what is installed and you expected DCU to apply it, paste a sample SoftwareComponent from $LocalCatalogXml back - applicability evaluation depends on <SupportedDevices> PCI VEN/DEV matching the device, and catalog metadata can target a specific hardware config within a model line." -Severity 2
+            return 0
+        }
+        if ($ScanCode -ne 0) {
+            if ($ScanCode -eq 5) { $script:RebootRequired = $true }
+            Write-Log "dcu-cli /scan exited $(if ($null -eq $ScanCode) { 'timeout/launch' } else { $ScanCode }) - cannot verify catalog provenance; falling back to built-in DUP engine" -Severity 2
+            & $TailConsole 'scan'
+            return $null
+        }
+
+        # Scan exit 0 = updates found. Verify every one against the allowlist
+        # ($ParseScanReport defined above, before the scan call, so the
+        # exit-500 diagnostics share it).
+        $ScanItems = @(& $ParseScanReport $ReportDir)
+        if ($ScanItems.Count -eq 0) {
+            Write-Log "DCU scan reported updates (exit 0) but the scan report is missing/empty - cannot verify provenance; falling back to built-in DUP engine" -Severity 2
+            return $null
+        }
+        $OursProposed = @($ScanItems | Where-Object { $_.IsOurs })
+        $ForeignProposed = @($ScanItems | Where-Object { -not $_.IsOurs })
+
+        # dcu-cli cannot select individual updates, so a mixed result can only
+        # be applied safely if Dell's add-on items (its system-update channel:
+        # TPM firmware, BIOS, DCU self-update - field run showed these ride
+        # along even with a custom catalog) can be fenced out wholesale with
+        # the documented -updateType filter. That works exactly when the
+        # foreign types and our types are disjoint; computed per run, never
+        # hardcoded, so a run where they overlap stays gated and falls back.
+        $TypeFilter = $null
+        if ($ForeignProposed.Count -gt 0) {
+            $ValidTokens = @('bios', 'firmware', 'driver', 'application', 'utility', 'others')
+            $OurTypes = @($OursProposed | ForEach-Object { $_.Type } | Where-Object { $_ } | Select-Object -Unique)
+            $ForeignTypes = @($ForeignProposed | ForEach-Object { $_.Type } | Where-Object { $_ } | Select-Object -Unique)
+            $TypesUsable = ($OursProposed.Count -gt 0) -and
+                ($OurTypes.Count -gt 0) -and
+                (@($OursProposed | Where-Object { -not $_.Type }).Count -eq 0) -and
+                (@($ForeignProposed | Where-Object { -not $_.Type }).Count -eq 0) -and
+                (@($OurTypes | Where-Object { $ValidTokens -notcontains $_ }).Count -eq 0) -and
+                (@($OurTypes | Where-Object { $ForeignTypes -contains $_ }).Count -eq 0)
+
+            $ForeignDesc = @($ForeignProposed | Select-Object -First 5 | ForEach-Object { "$($_.Name) [$($_.Type)] ($($_.File))" }) -join '; '
+            if (-not $TypesUsable) {
+                Write-Log ("DCU's scan proposed $($ForeignProposed.Count) of $($ScanItems.Count) update(s) from outside this package's catalog and they cannot be fenced out by update type (our types: $($OurTypes -join ',') vs foreign: $($ForeignTypes -join ',')). Installing NOTHING via DCU; falling back to built-in DUP engine. Foreign: " + $ForeignDesc) -Severity 3
+                return $null
+            }
+
+            $TypeFilter = ($OurTypes | Sort-Object) -join ','
+            Write-Log "DCU's scan included $($ForeignProposed.Count) Dell system update(s) outside this package's catalog ($ForeignDesc) - fencing them out with -updateType=$TypeFilter and re-verifying"
+
+            $ReportDir2 = Join-Path $SessionDir 'scan-report-2'
+            try { New-Item -Path $ReportDir2 -ItemType Directory -Force | Out-Null } catch { }
+            $ScanLog2 = Join-Path $SessionDir 'dcu-scan2.log'
+            $ScanCode2 = & $RunDcu @('/scan', "-updateType=$TypeFilter", "-report=$ReportDir2", "-outputLog=$ScanLog2") 1800000 'scan2'
+
+            if (& $TestCatalogRejected @($ScanLog2, (Join-Path $SessionDir 'scan2.out.log'), (Join-Path $SessionDir 'scan2.err.log'))) {
+                Write-Log "Filtered re-scan shows the custom catalog was rejected - installing NOTHING via DCU; falling back to built-in DUP engine" -Severity 3
+                return $null
+            }
+            if ($ScanCode2 -ne 0) {
+                Write-Log "Filtered re-scan exited $(if ($null -eq $ScanCode2) { 'timeout/launch' } else { $ScanCode2 }) (expected updates) - cannot verify; falling back to built-in DUP engine" -Severity 2
+                & $TailConsole 'scan2'
+                return $null
+            }
+            $ScanItems2 = @(& $ParseScanReport $ReportDir2)
+            $Foreign2 = @($ScanItems2 | Where-Object { -not $_.IsOurs })
+            if ($ScanItems2.Count -eq 0 -or $Foreign2.Count -gt 0) {
+                $F2Desc = @($Foreign2 | Select-Object -First 3 | ForEach-Object { "$($_.Name) [$($_.Type)]" }) -join '; '
+                Write-Log "Filtered re-scan still unverifiable ($($ScanItems2.Count) item(s), $($Foreign2.Count) foreign: $F2Desc) - installing NOTHING via DCU; falling back to built-in DUP engine" -Severity 3
+                return $null
+            }
+            Write-Log "Scan gate passed after type fencing: $($ScanItems2.Count) update(s), every one from the package catalog"
+        } else {
+            Write-Log "Scan gate passed: $($ScanItems.Count) update(s), every one matched to the package catalog"
+        }
+
+        # -reboot=disable: SCCM owns reboots via our exit code + the DT's
+        # BasedOnExitCode behavior. The -updateType fence (when computed above)
+        # must ride along or applyUpdates' internal re-scan re-admits the
+        # foreign items the gate just excluded.
+        Write-Log "dcu-cli /applyUpdates starting (repository: $Path$(if ($TypeFilter) { "; -updateType=$TypeFilter" }))"
+        $ApplyLog = Join-Path $SessionDir 'dcu-apply.log'
+        $ApplyArgs = @('/applyUpdates', '-reboot=disable', "-outputLog=$ApplyLog")
+        if ($TypeFilter) { $ApplyArgs = @('/applyUpdates', "-updateType=$TypeFilter", '-reboot=disable', "-outputLog=$ApplyLog") }
+        $ApplyCode = & $RunDcu $ApplyArgs 6000000 'applyUpdates'
+
+        if ($null -eq $ApplyCode) {
+            # Timeout/launch failure mid-apply: DCU may have installed a subset.
+            # Authoritative failure - do NOT fall back (double-install risk).
+            & $TailConsole 'applyUpdates'
+            & $TailLog $ApplyLog
+            return 1
+        }
+
+        $ApplyResult = 1
+        switch ($ApplyCode) {
+            0   { Write-Log "DCU applyUpdates: success (exit 0)"; $ApplyResult = 0 }
+            1   {
+                    Write-Log "DCU applyUpdates: success, reboot required (exit 1)"
+                    $script:RebootRequired = $true
+                    $ApplyResult = 0
+                }
+            5   {
+                    # Reboot pending from a previous operation blocked the run;
+                    # surface the reboot so SCCM clears the pend and retries.
+                    Write-Log "DCU applyUpdates: reboot pending from a previous operation (exit 5) - signaling reboot" -Severity 2
+                    $script:RebootRequired = $true
+                    $ApplyResult = 0
+                }
+            500 { Write-Log "DCU applyUpdates: no applicable updates (exit 500) - everything current"; $ApplyResult = 0 }
+            default {
+                Write-Log "DCU applyUpdates FAILED (dcu-cli exit $ApplyCode)" -Severity 3
+                & $TailConsole 'applyUpdates'
+                & $TailLog $ApplyLog
+                $ApplyResult = 1
+            }
+        }
+
+        # Belt-and-braces: applyUpdates re-scans internally. If the catalog
+        # got rejected during THAT pass, updates may have come from Dell's
+        # cloud - never report success on unverified provenance.
+        if ($ApplyResult -eq 0 -and (& $TestCatalogRejected @($ApplyLog, (Join-Path $SessionDir 'applyUpdates.out.log'), (Join-Path $SessionDir 'applyUpdates.err.log')))) {
+            Write-Log "DCU reported success BUT the apply log shows the custom catalog was rejected mid-run - updates may have come from Dell's cloud catalog. Treating as FAILURE; review $ApplyLog." -Severity 3
+            $ApplyResult = 1
+        }
+        return $ApplyResult
+    } finally {
+        # Only restore when we actually changed the config (configure succeeded).
+        # Restore source: pristine copy (the true original) when available, else
+        # this run's backup unless it was already hijacked by a failed prior
+        # restore.
+        if ($CatalogConfigured) {
+            if ($DcuManagedMode -ne 'Default') {
+                # MANAGED END STATE (sole-update-source design). The pristine
+                # restore is deliberately NOT performed here - importing
+                # pre-managed settings is exactly what kept re-enabling
+                # dell.com in the field. Instead, resident DCU is left pointed
+                # at a PERSISTENT copy of this package's catalog (work root,
+                # outside the 7-day session prune), which makes
+                # -defaultSourceLocation=disable VALID and durable: DCU
+                # rejects disabling its default source whenever no custom
+                # catalog is configured (field exit 107), so the persistent
+                # catalog is the prerequisite for keeping dell.com off.
+                # Side benefit: a tech pressing CHECK in the DCU GUI scans the
+                # curated package set, not Dell's cloud.
+                try {
+                    $PersistDir = Join-Path $WorkRoot 'DCU-persistent'
+                    if (-not (Test-Path $PersistDir)) { New-Item -Path $PersistDir -ItemType Directory -Force | Out-Null }
+
+                    # Persistent REPO: the catalog's baseLocation must point at
+                    # payloads that outlive the 7-day session prune, or GUI
+                    # CHECK / scans between deployments break once the session
+                    # repo is gone. Hardlinks = no extra disk; the data stays
+                    # alive even if ccmcache later purges its own link. Rebuilt
+                    # every run so content updates flow through. Also carries
+                    # the Inventory Collector for fully-offline scans.
+                    $PersistRepo = Join-Path $PersistDir 'repo'
+                    try {
+                        if (Test-Path $PersistRepo) { Remove-Item -Path $PersistRepo -Recurse -Force -ErrorAction SilentlyContinue }
+                        New-Item -Path $PersistRepo -ItemType Directory -Force | Out-Null
+                        # Same all-payload filter as the session repo - the
+                        # Inventory Collector may not be a .exe.
+                        $PNonPayload = @('manifest.json', 'DCUCatalog.xml')
+                        foreach ($PDup in @(Get-ChildItem -Path $Path -File -ErrorAction Stop | Where-Object { $PNonPayload -notcontains $_.Name -and $_.Extension -ne '.ps1' })) {
+                            $PLink = Join-Path $PersistRepo $PDup.Name
+                            try {
+                                New-Item -ItemType HardLink -Path $PLink -Value $PDup.FullName -ErrorAction Stop | Out-Null
+                            } catch {
+                                Copy-Item -Path $PDup.FullName -Destination $PLink -Force
+                            }
+                        }
+                    } catch {
+                        Write-Log "Persistent repo staging failed ($($_.Exception.Message)) - persistent catalog will reference the session repo (pruned after 7 days)" -Severity 2
+                        $PersistRepo = $BaseLocation
+                    }
+
+                    # Persistent catalog: same content as the run's catalog but
+                    # baseLocation rewritten to the persistent repo. Always
+                    # rebuilt from the localized XML (rewriting inside a CAB
+                    # isn't possible); re-CAB only when the run used the CAB
+                    # form.
+                    $PersistXml = Join-Path $PersistDir 'CatalogPC.xml'
+                    $PXText = [System.IO.File]::ReadAllText($LocalCatalogXml, [System.Text.Encoding]::Unicode)
+                    $PXText = $PXText -replace 'baseLocation\s*=\s*"[^"]*"', ('baseLocation="{0}"' -f ($PersistRepo -replace '"', '&quot;'))
+                    [System.IO.File]::WriteAllText($PersistXml, $PXText, [System.Text.Encoding]::Unicode)
+
+                    if ($CatalogInUse -eq $LocalCatalogXml) {
+                        $PersistTarget = $PersistXml
+                        $PersistArgs = @('/configure', "-catalogLocation=$PersistTarget", '-allowXML=enable', "-outputLog=$SessionDir\dcu-persist-catalog.log")
+                    } else {
+                        $PersistTarget = Join-Path $PersistDir 'DCUCatalog.cab'
+                        $PCabProc = Start-Process -FilePath $MakeCab -ArgumentList "`"$PersistXml`"", "`"$PersistTarget`"" `
+                            -NoNewWindow -PassThru -Wait `
+                            -RedirectStandardOutput (Join-Path $SessionDir 'persist-makecab.out.log') `
+                            -RedirectStandardError (Join-Path $SessionDir 'persist-makecab.err.log') -ErrorAction Stop
+                        if ($PCabProc.ExitCode -ne 0 -or -not (Test-Path $PersistTarget)) {
+                            throw "makecab exited $($PCabProc.ExitCode) building the persistent catalog CAB"
+                        }
+                        $PersistArgs = @('/configure', "-catalogLocation=$PersistTarget", "-outputLog=$SessionDir\dcu-persist-catalog.log")
+                    }
+                    $PCode = & $RunDcu $PersistArgs 300000 'persist-catalog'
+                    if ($PCode -eq 0) {
+                        $PDef = & $RunDcu @('/configure', '-defaultSourceLocation=disable', "-outputLog=$SessionDir\dcu-persist-nodefault.log") 300000 'persist-nodefaultsrc'
+                        if ($PDef -eq 0) {
+                            Write-Log "Resident DCU end state: pointed at the persistent package catalog ($PersistTarget) with dell.com DISABLED - GUI CHECK now scans the curated set"
+                        } else {
+                            Write-Log "Persistent catalog set, but disabling dell.com failed (exit $(if ($null -eq $PDef) { 'timeout/launch' } else { $PDef })) - next run retries" -Severity 2
+                            & $TailConsole 'persist-nodefaultsrc'
+                        }
+                    } else {
+                        if ($PCode -eq 5) { $script:RebootRequired = $true }
+                        Write-Log "Could not point resident DCU at the persistent catalog (exit $(if ($null -eq $PCode) { 'timeout/launch' } else { $PCode })) - dell.com may remain enabled until the next run" -Severity 2
+                        & $TailConsole 'persist-catalog'
+                    }
+                } catch {
+                    Write-Log "Persistent DCU end-state failed: $($_.Exception.Message) - next run retries" -Severity 2
+                }
+                & $AssertDcuManaged 'post-run'
+            } else {
+                # OPTED-OUT devices get the polite behavior: restore whatever
+                # the box had. Source: pristine (true original) when
+                # available, else this run's backup unless hijacked.
+                $RestoreSource = $null
+                if (Test-Path $PristineSettings) { $RestoreSource = $PristineSettings }
+                elseif ($SettingsBackupFile -and -not $BackupHijacked) { $RestoreSource = $SettingsBackupFile }
+
+                if ($RestoreSource) {
+                    # DCU's self-update can hold the config lock right after
+                    # applyUpdates (field: exit 3004 "currently performing a
+                    # self update" persisted through 2x30s retries - a
+                    # self-update takes minutes). Retry 3004 with 60s waits up
+                    # to ~6 minutes; other failures get two quick retries.
+                    # Exit 5 (reboot pending) cannot clear without a restart.
+                    $RestoreCode = $null
+                    for ($Attempt = 1; $Attempt -le 6; $Attempt++) {
+                        $RestoreCode = & $RunDcu @("/configure", "-importSettings=$RestoreSource", "-outputLog=$SessionDir\dcu-restore.log") 300000 'settings-restore'
+                        if ($RestoreCode -eq 0 -or $RestoreCode -eq 5) { break }
+                        $IsSelfUpdate = ($RestoreCode -eq 3004)
+                        if (-not $IsSelfUpdate -and $Attempt -ge 3) { break }
+                        if ($Attempt -lt 6) {
+                            $Delay = if ($IsSelfUpdate) { 60 } else { 30 }
+                            Write-Log "DCU settings restore attempt $Attempt failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - retrying in ${Delay}s$(if ($IsSelfUpdate) { ' (DCU self-update in progress)' })" -Severity 2
+                            Start-Sleep -Seconds $Delay
+                        }
+                    }
+                    if ($RestoreCode -eq 0) {
+                        Write-Log "DCU settings restored from $RestoreSource"
+                    } else {
+                        if ($RestoreCode -eq 5) { $script:RebootRequired = $true }
+                        Write-Log "DCU settings restore failed (exit $(if ($null -eq $RestoreCode) { 'timeout/launch' } else { $RestoreCode })) - DCU is still pointed at $CatalogInUse; after the next restart run: dcu-cli /configure -importSettings=$RestoreSource (the next engine run also retries automatically)" -Severity 2
+                        & $TailConsole 'settings-restore'
+                    }
+                } else {
+                    Write-Log "No trustworthy DCU settings source to restore (no pristine copy, and the current settings already pointed at a session catalog) - reconfigure the catalog in the DCU GUI or import an older settings-backup from $WorkRoot\DCU\<session>\settings-backup manually" -Severity 2
+                }
+            }
+        }
+        # Drop the staged repo (hardlinks cost nothing, but a copy fallback
+        # would otherwise leave GBs on disk; originals in ccmcache are
+        # untouched either way).
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
 function Install-DriverUpdates {
     <#
         Catalog-only Driver Updates apply path. The package source is a flat folder
@@ -685,6 +1581,14 @@ function Install-DriverUpdates {
 
     Write-Log "DriverUpdates manifest: $($Drivers.Count) DUP(s) for $($Manifest.manufacturer) $($Manifest.model) ($($Manifest.operatingSystem))"
     if ($Manifest.generatedAt) { Write-Log "  Manifest generated: $($Manifest.generatedAt)" }
+
+    # Preferred engine: Dell Command Update against the package as a local
+    # repository (see Invoke-DCUDriverUpdates). $null = DCU wasn't attempted
+    # (non-Dell, no catalog, no dcu-cli, or configure failed) -> fall through
+    # to the built-in DUP loop below. A non-null result is authoritative.
+    $DcuExit = Invoke-DCUDriverUpdates -Path $Path
+    if ($null -ne $DcuExit) { return $DcuExit }
+    Write-Log "Continuing with built-in DUP engine"
 
     # Dell DUP success/not-applicable codes (these never count as failure).
     $SuccessCodes    = @(0, 2, 6)
@@ -744,14 +1648,18 @@ function Install-DriverUpdates {
         }
     }
 
-    # Enumerate the PCI hardware present on this device once, up front. Used to
-    # skip DUPs whose target hardware isn't installed (e.g. a Qualcomm NIC DUP
-    # on an Intel-NIC SKU). Conservative: a DUP is only skipped when it declares
-    # hardware tokens AND none are present. DUPs with no tokens (firmware, apps,
-    # chipset INF bundles) always run and self-check as before.
+    # Enumerate the PCI hardware present on this device, used to advise on each
+    # DUP's catalog-declared target hardware. The filter is ADVISORY ONLY: a
+    # mismatch is logged but the DUP still runs. Field evidence (Precision 3660:
+    # Intel UHD and I219 NIC DUPs skipped despite the hardware being present)
+    # showed Dell's per-driver PCIInfo metadata does not reliably enumerate
+    # every device ID a DUP actually supports, so enforcing the filter caused
+    # false-negative skips. We keep the enumeration and log the catalog/device
+    # mismatch as a diagnostic, but defer to the DUP's own applicability self-
+    # check (Dell DUP exit codes 3/4/5 = not-applicable) for the actual decision.
     $PresentHw = Get-PresentHardwareTokens
-    Write-Log "Enumerated $($PresentHw.Count) present PCI hardware token(s) for applicability filtering"
-    $SkippedHw = 0
+    Write-Log "Enumerated $($PresentHw.Count) present PCI hardware token(s) for applicability advisory"
+    $HwAdvisories = 0
 
     # GPU brands actually present, for vendor-aware filtering of graphics DUPs that
     # carry no PCIInfo (Dell ships every GPU option's DUP per model). A graphics DUP
@@ -766,6 +1674,108 @@ function Install-DriverUpdates {
     }
     $SkippedGpu = 0
 
+    # Defender correlation. DUPs run serially, so any Defender ASR/quarantine
+    # event raised between a DUP's start and its exit belongs to that DUP's
+    # window. The vulnerable-driver ASR rule
+    # (56a863a9-875e-4185-98a7-b882c64b5ce5) is called out by name because its
+    # verdict is deterministic - a blocklisted driver fails on EVERY enforcing
+    # device - and the fix is a one-line sync exclusion this log can name
+    # directly, instead of the security team forwarding alerts.
+    $AsrVulnDriverGuid = '56a863a9-875e-4185-98a7-b882c64b5ce5'
+    $GetDefenderFlags = {
+        param([datetime]$Since)
+        $Flags = @()
+        try {
+            # 1121 = ASR rule blocked an action; 1117 = threat action taken
+            # (quarantine). Get-WinEvent throws when zero events match - the
+            # catch turns that (and missing log/3rd-party AV) into "no flags".
+            $Events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = @(1121, 1117); StartTime = $Since } -ErrorAction Stop)
+            foreach ($Ev in $Events) {
+                $X = ''
+                try { $X = $Ev.ToXml() } catch { }
+                $EvPath = if ($X -match "Name='Path'>([^<]+)") { $Matches[1] } else { '' }
+                $Flags += [PSCustomObject]@{
+                    Id                    = $Ev.Id
+                    Path                  = $EvPath
+                    VulnerableDriverRule  = [bool]($X -match $AsrVulnDriverGuid)
+                }
+            }
+        } catch { }
+        return ,$Flags
+    }
+    $DefenderFlagged = 0
+    $VulnExclusionAdvice = [System.Collections.Generic.List[string]]::new()
+
+    # Per-DUP framework-log capture. The Dell framework log (.dup.log) is the
+    # only place a DUP records why it failed - requested per-DUP via Dell's
+    # documented /l= switch. (DUPs are GUI apps and never write to stdout/stderr,
+    # so we don't redirect those.) Absent .dup.log after a failure means the
+    # process was killed before Dell's framework initialized (AV/EDR pattern);
+    # a written .dup.log with a Result: FAILURE means the framework ran and
+    # the failure is whatever the log says. One subdir per apply-script run.
+    $DupLogDir = Join-Path $env:WINDIR ('Temp\DATDupLogs\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    try {
+        if (-not (Test-Path $DupLogDir)) {
+            New-Item -Path $DupLogDir -ItemType Directory -Force | Out-Null
+        }
+        Write-Log "Per-DUP framework logs captured to: $DupLogDir (Dell-side .dup.log files; failure lines below quote the last lines)"
+    } catch {
+        Write-Log "Could not create DUP log directory '$DupLogDir' ($($_.Exception.Message)) - DUP framework logs will not be captured this run" -Severity 2
+        $DupLogDir = $null
+    }
+
+    # Per-DUP TMP/TEMP root. Dell DUPs unpack their payload to %TEMP% before
+    # running the install. Under CCMExec/SYSTEM the inherited TEMP is sometimes
+    # unusable for that purpose, producing the framework-log signature "Error
+    # locating default extractpath" and an immediate exit 1. We create a known-
+    # writable subdir per DUP and override TMP/TEMP for the child process so
+    # Dell's framework finds a valid extract destination.
+    # C:\Temp, not ProgramData or C:\Windows\Temp: the framework still logged
+    # "Error locating default extractpath" with TMP pointed at ProgramData,
+    # and DCU 5.x (same Dell path-hardening lineage) field-rejects BOTH the
+    # Windows tree and ProgramData as "reserved folders". C:\Temp is the path
+    # family Dell's own documentation uses and the remaining non-reserved
+    # candidate for the framework's temp resolution.
+    $DupExtractParent = Join-Path $env:SystemDrive 'Temp\DriverAutomationTool\DupExtract'
+    $DupExtractRoot = Join-Path $DupExtractParent (Get-Date -Format 'yyyyMMdd-HHmmss')
+    try {
+        if (-not (Test-Path $DupExtractRoot)) {
+            New-Item -Path $DupExtractRoot -ItemType Directory -Force | Out-Null
+        }
+        # C:\Temp has no automatic cleanup - prune extract dirs older than 7 days.
+        Get-ChildItem -Path $DupExtractParent -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $DupExtractRoot -and $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "Per-DUP TMP/TEMP root: $DupExtractRoot (Dell DUPs extract their payload here)"
+    } catch {
+        Write-Log "Could not create DUP extract directory '$DupExtractRoot' ($($_.Exception.Message)) - DUPs will inherit parent TMP/TEMP" -Severity 2
+        $DupExtractRoot = $null
+    }
+
+    # Dell DUP frameworks resolve a DEFAULT extract path independent of both
+    # TMP/TEMP and the working directory: legacy DUPs default to
+    # C:\dell\drivers, DCH-era DUPs to C:\ProgramData\Dell\Drivers. When that
+    # root can't be created/written, the framework dies in ~0.1-1s with
+    # 'Error locating default extractpath' (the fleet plague: DP33667 until a
+    # DCU reinstall repaired ProgramData\Dell; DP82132's 2019-2021-era DUPs).
+    # Pre-create and write-probe both roots so the default resolution
+    # succeeds; the per-DUP /e= fallback below covers anything that still
+    # refuses.
+    foreach ($DellDefRoot in @((Join-Path $env:SystemDrive 'dell\drivers'), (Join-Path $env:ProgramData 'Dell\Drivers'))) {
+        try {
+            if (-not (Test-Path $DellDefRoot)) {
+                New-Item -Path $DellDefRoot -ItemType Directory -Force | Out-Null
+                Write-Log "Created Dell default extract root: $DellDefRoot"
+            }
+            $ProbeFile = Join-Path $DellDefRoot ('.dat-probe-{0}.tmp' -f $PID)
+            Set-Content -Path $ProbeFile -Value 'probe' -ErrorAction Stop
+            Remove-Item -Path $ProbeFile -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Log "Dell default extract root '$DellDefRoot' is not writable ($($_.Exception.Message)) - DUPs defaulting there will hit 'Error locating default extractpath'; the per-DUP extract+pnputil fallback covers them" -Severity 2
+        }
+    }
+    $InstantFailed = 0
+
     $Index = 0
     foreach ($Drv in $Drivers) {
         $Index++
@@ -778,22 +1788,22 @@ function Install-DriverUpdates {
         # vendor pre-skip just below and the failure-forgive in the exit-code handler.
         $DupVendor = if ($Drv.Category -eq 'Video') { & $GetDupGpuVendor $Drv.Name } else { $null }
 
-        # Hardware applicability filter. If the manifest lists target hardware
-        # for this DUP and the enumeration succeeded, only run it when at least
-        # one target device is present. This runs BEFORE the file-existence
-        # check so a non-applicable DUP whose .EXE was quarantined by AV doesn't
-        # get counted as a failure - it's simply not for this device.
-        $DupHwIds = @($Drv.HardwareIds)
-        $HwApplicable = $true
+        # Hardware applicability advisory. The DUP runs regardless - we just log
+        # when the catalog's declared target hardware isn't seen on the device,
+        # so a catalog/device-ID mismatch is visible without causing the DUP to
+        # be skipped. Dell's PCIInfo doesn't reliably list every device ID a DUP
+        # supports (Intel UHD and I219 NIC variants in the field), so enforcing
+        # this filter produced false-negative skips; the DUP's own exit code is
+        # the source of truth instead.
+        $DupHwIds = @($Drv.HardwareIds | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace($_) })
         if ($DupHwIds.Count -gt 0 -and $PresentHw.Count -gt 0) {
-            $HwApplicable = $false
+            $HwMatched = $false
             foreach ($Token in $DupHwIds) {
-                if ($PresentHw.Contains([string]$Token)) { $HwApplicable = $true; break }
+                if ($PresentHw.Contains([string]$Token)) { $HwMatched = $true; break }
             }
-            if (-not $HwApplicable) {
-                Write-Log "$DriverLabel - target hardware not present (DUP targets: $($DupHwIds -join ', ')) - skipping"
-                $SkippedHw++
-                continue
+            if (-not $HwMatched) {
+                Write-Log "$DriverLabel - hardware advisory: catalog targets ($($DupHwIds -join ', ')) not matched against present devices (running anyway; DUP will self-check)" -Severity 2
+                $HwAdvisories++
             }
         }
 
@@ -824,12 +1834,13 @@ function Install-DriverUpdates {
         }
 
         if (-not (Test-Path $DriverExe)) {
-            # Reaching here means the DUP IS applicable to this device's hardware
-            # (or declared none), so a missing file is a real problem - most often
-            # AV/Defender quarantined the .EXE in the CM cache. Surface it loudly
-            # and recommend the exclusion; non-applicable DUPs were already skipped
-            # above and never trip this.
-            Write-Log "$DriverLabel - DUP not found at $DriverExe (applicable to this device). Most likely AV/Defender quarantined it - exclude the CCM cache (e.g. %WINDIR%\ccmcache) from real-time scanning." -Severity 2
+            # A missing DUP .EXE is most often AV/Defender quarantining it in the
+            # CM cache. Surface it loudly and recommend the exclusion. (Hardware
+            # applicability is advisory now, so even DUPs whose target hardware
+            # appears absent reach this check and are counted as failures if their
+            # file is missing - the DUP's own exit code is what decides absent vs.
+            # error when the file is present.)
+            Write-Log "$DriverLabel - DUP not found at $DriverExe. Most likely AV/Defender quarantined it - exclude the CCM cache (e.g. %WINDIR%\ccmcache) from real-time scanning." -Severity 2
             $Failed++
             $FailureLines.Add(("{0} (missing file - possible AV quarantine)" -f $Drv.FileName))
             continue
@@ -841,9 +1852,53 @@ function Install-DriverUpdates {
         # /s alone is the documented silent switch for modern Dell driver DUPs.
         # /r=0 is BIOS-DUP syntax and driver DUPs reject it (instant exit) - do NOT pass it.
         # If a DUP returns code 2 we map it to 3010 at the end so SCCM handles reboot.
+        #
+        # WorkingDirectory: Dell DUPs extract their payload to the current working
+        # directory and fail immediately if it isn't writable - which is what the
+        # BIOS-flash code below has always set explicitly. Without it the DUPs
+        # inherited PowerShell's CWD (typically C:\Windows\System32 under
+        # CCMExec/SYSTEM), where the extract was refused and the DUP exited 1 in
+        # ~0.1s before doing any real work.
+        #
+        # RedirectStandard{Output,Error}: capture each DUP's console output to a
+        # per-DUP log so a "exit 1 in 0.1s" failure is diagnosable from the file
+        # the DUP actually wrote to - no more guessing.
+        $SafeName = $Drv.FileName -replace '[^\w\.\-]', '_'
+        # /l=<file> is Dell's documented universal DUP switch for the framework
+        # log - the only place a DUP records WHY it failed.
+        $DupFwLog = if ($DupLogDir) { Join-Path $DupLogDir ($SafeName + '.dup.log') } else { $null }
+        $DupArgs = if ($DupFwLog) { @('/s', "/l=$DupFwLog") } else { @('/s') }
+
+        # Per-DUP extract dir. The DUP's framework calls GetTempPath() at startup
+        # and uses that to unpack its payload before installing - if it can't, the
+        # framework log says "Error locating default extractpath" and the DUP
+        # exits 1 in ~0.1s. We swap %TMP%/%TEMP% to a known-writable dir we just
+        # created, and restore the original values in finally{} so this can't
+        # leak even if Start-Process throws or the loop continues.
+        $DupTempDir = $null
+        if ($DupExtractRoot) {
+            $Candidate = Join-Path $DupExtractRoot ('dup-{0}' -f $Index)
+            try {
+                if (-not (Test-Path $Candidate)) { New-Item -Path $Candidate -ItemType Directory -Force | Out-Null }
+                $DupTempDir = $Candidate
+            } catch { $DupTempDir = $null }
+        }
+        $OldTmp  = $env:TMP
+        $OldTemp = $env:TEMP
         try {
-            $Proc = Start-Process -FilePath $DriverExe -ArgumentList '/s' `
-                -NoNewWindow -PassThru -ErrorAction Stop
+            if ($DupTempDir) {
+                $env:TMP  = $DupTempDir
+                $env:TEMP = $DupTempDir
+            }
+            $SpParams = @{
+                FilePath         = $DriverExe
+                ArgumentList     = $DupArgs
+                WorkingDirectory = $Path
+                NoNewWindow      = $true
+                PassThru         = $true
+                ErrorAction      = 'Stop'
+            }
+            $Proc = Start-Process @SpParams
             # Touching .Handle forces PS 5.1's Start-Process to retain the OS handle.
             # Without this, $Proc.ExitCode reads as $null after WaitForExit on PS 5.1
             # and every DUP looks like a failure even when it succeeded.
@@ -862,9 +1917,71 @@ function Install-DriverUpdates {
             $Failed++
             $FailureLines.Add(("{0} (launch error: {1})" -f $Drv.FileName, $_.Exception.Message))
             continue
+        } finally {
+            $env:TMP  = $OldTmp
+            $env:TEMP = $OldTemp
         }
 
         $Elapsed = [math]::Round(((Get-Date) - $DupStart).TotalSeconds, 1)
+
+        # Checked on success AND failure: a DUP can exit 0 while Defender
+        # silently blocked its driver write (the field Realtek case) - that
+        # silent partial install is exactly what must surface.
+        $DupFlags = & $GetDefenderFlags $DupStart
+        if ($DupFlags.Count -gt 0) {
+            $DefenderFlagged++
+            foreach ($Flag in $DupFlags) {
+                if ($Flag.VulnerableDriverRule) {
+                    Write-Log "$DriverLabel - Defender's ASR vulnerable-driver rule fired during this DUP's run window (event $($Flag.Id), blocked path: $($Flag.Path)). This driver is on Microsoft's vulnerable-driver blocklist and will be blocked on every enforcing device - add '$($Drv.Name)' to the sync's Driver exclusions to stop deploying it." -Severity 3
+                    if (-not $VulnExclusionAdvice.Contains([string]$Drv.Name)) { $VulnExclusionAdvice.Add([string]$Drv.Name) }
+                } else {
+                    Write-Log "$DriverLabel - Defender event $($Flag.Id) during this DUP's run window (path: $($Flag.Path)) - possible AV interference with this install" -Severity 2
+                }
+            }
+        }
+
+        # Extractpath fallback. Some DUP-framework builds resolve a DEFAULT
+        # extract location independent of TMP and WorkingDirectory and die
+        # with 'Error locating default extractpath' when it can't be created.
+        # The documented /e= extract-only switch BYPASSES that resolution -
+        # we name the destination - so: extract the payload ourselves and
+        # install any INF-based drivers via the existing pnputil machinery.
+        # Firmware/app payloads without INFs keep the original failure. On
+        # fallback success $DupCode is rewritten to 0 so every downstream
+        # bookkeeping path (marker, counters, summary) just works; pnputil
+        # reboot signaling goes through $script:RebootRequired inside
+        # Install-InfTree.
+        if ($DupCode -eq 1 -and $DupTempDir -and $DupFwLog -and (Test-Path $DupFwLog)) {
+            $FwRaw = ''
+            try { $FwRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction Stop } catch { }
+            if ($FwRaw -and $FwRaw -match 'Error locating default extractpath') {
+                Write-Log "$DriverLabel - framework could not resolve its default extract path; retrying as extract (/e=) + pnputil" -Severity 2
+                $FbExtract = Join-Path $DupTempDir 'fallback-extract'
+                try {
+                    New-Item -Path $FbExtract -ItemType Directory -Force | Out-Null
+                    $FbProc = Start-Process -FilePath $DriverExe -ArgumentList '/s', "/e=$FbExtract" -WorkingDirectory $Path -NoNewWindow -PassThru -ErrorAction Stop
+                    $null = $FbProc.Handle
+                    if (-not $FbProc.WaitForExit(300000)) {
+                        try { $FbProc.Kill() } catch { }
+                        throw 'extraction timed out after 5 minutes'
+                    }
+                    $FbInfs = @(Get-ChildItem -Path $FbExtract -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+                    if ($FbInfs.Count -eq 0) {
+                        Write-Log "$DriverLabel - fallback extraction produced no .inf files (extract exit $($FbProc.ExitCode)) - payload is not INF-installable; keeping original failure" -Severity 2
+                    } else {
+                        $FbCode = Install-InfTree -Path $FbExtract
+                        if ($FbCode -eq 0) {
+                            Write-Log "$DriverLabel - extract+pnputil fallback SUCCEEDED ($($FbInfs.Count) INF(s) processed)"
+                            $DupCode = 0
+                        } else {
+                            Write-Log "$DriverLabel - extract+pnputil fallback failed (pnputil exit $FbCode) - keeping original failure" -Severity 2
+                        }
+                    }
+                } catch {
+                    Write-Log "$DriverLabel - extractpath fallback errored: $($_.Exception.Message) - keeping original failure" -Severity 2
+                }
+            }
+        }
 
         if ($DupCode -in $SuccessCodes) {
             $Successful++
@@ -910,7 +2027,37 @@ function Install-DriverUpdates {
             } else {
                 $Failed++
                 $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
-                Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s" -Severity 2
+                if ($Elapsed -lt 2) { $InstantFailed++ }
+                # Pull the verdict out of Dell's framework log so the apply log
+                # itself says why. No framework log after a failure = the process
+                # was killed before Dell's framework initialized (AV/EDR pattern).
+                $FwHint = 'no log capture this run'
+                if ($DupFwLog) {
+                    if ((Test-Path $DupFwLog) -and ((Get-Item $DupFwLog -ErrorAction SilentlyContinue).Length -gt 0)) {
+                        $FwHint = "framework log: $DupFwLog"
+                        try {
+                            # The framework log ends with a fixed footer (Name of
+                            # Exit Code / Exit Code set to / Result / Execution
+                            # terminated / ######) that buries the actual error
+                            # line just above it. Strip per-line timestamps and
+                            # the footer so the REAL reason is what gets quoted.
+                            $Boilerplate = 'Name of Exit Code|Exit Code set to|^Result:|Execution terminated|^#+$'
+                            $Tail = @(Get-Content -Path $DupFwLog -ErrorAction Stop |
+                                ForEach-Object { ($_ -replace '^\[[^\]]*\]\s*', '').Trim() } |
+                                Where-Object { $_ -and $_ -notmatch $Boilerplate } |
+                                Select-Object -Last 4)
+                            if ($Tail.Count -eq 0) {
+                                $Tail = @(Get-Content -Path $DupFwLog -ErrorAction Stop | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3 | ForEach-Object { $_.Trim() })
+                            }
+                            if ($Tail.Count -gt 0) {
+                                $FwHint += ' | last lines: ' + ($Tail -join ' / ')
+                            }
+                        } catch { }
+                    } else {
+                        $FwHint = "no framework log written - the process died before Dell's DUP framework initialized (typical when AV/EDR terminates the installer at launch)"
+                    }
+                }
+                Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s ($FwHint)" -Severity 2
             }
         }
     }
@@ -944,9 +2091,30 @@ function Install-DriverUpdates {
         Write-Log "Component marker GC failed: $($_.Exception.Message)" -Severity 2
     }
 
-    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $SkippedHw skipped (hardware not present), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Failed failed"
+    if ($Failed -gt 0 -and $InstantFailed -eq $Failed) {
+        $WrittenFwLogs = @()
+        if ($DupLogDir -and (Test-Path $DupLogDir)) {
+            $WrittenFwLogs = @(Get-ChildItem -Path $DupLogDir -Filter '*.dup.log' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Length -gt 0 })
+        }
+        if ($WrittenFwLogs.Count -gt 0) {
+            Write-Log ("All $Failed failed DUP(s) exited within ~2s of launch BUT produced Dell framework logs - Dell's framework ran and reported an installer-side error. " +
+                "The failure lines above quote each DUP's last log lines; the most common signature is 'Error locating default extractpath' (TMP/TEMP issue, addressed by this build's per-DUP TMP override). " +
+                "If the framework logs name a different error, paste one back and I'll target the next fix.") -Severity 3
+        } else {
+            Write-Log ("All $Failed failed DUP(s) exited within ~2s of launch and NONE produced a Dell framework log - the processes were terminated before Dell's framework initialized. " +
+                "On a managed endpoint this almost always means an AV/EDR product terminating installers spawned from the CM cache. Check the AV/EDR console for block/terminate events on '$Path' at this timestamp " +
+                "and consider a publisher-based allow rule for Dell-signed installers or an exclusion for the CM cache. Dell-side default logs (if any) land in C:\ProgramData\Dell\UpdatePackage\Log. " +
+                "Manual differential (elevated cmd): run any failed DUP as '<name>.EXE /s /l=C:\Windows\Temp\duptest.log' - if it installs by hand, the block is specific to the CCMExec-spawned context.") -Severity 3
+        }
+    }
+    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Failed failed$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
+    }
+    if ($VulnExclusionAdvice.Count -gt 0) {
+        Write-Log ("VULNERABLE-DRIVER ADVICE: Defender's vulnerable-driver rule fired for: " + ($VulnExclusionAdvice -join '; ') +
+            ". Add these names to the sync's Driver exclusions (Models tab > Options, or -ExcludeDrivers) and re-sync - the package rebuilds without them and the alerts stop fleet-wide.") -Severity 3
     }
 
     if ($Rebooted) {
@@ -1144,7 +2312,7 @@ function Invoke-LenovoBIOSFlash {
 # -------------------------------------------------------------------------
 try {
     Write-Log '==================================================================='
-    Write-Log "DATApply starting - Mode=$Mode, Package='$PackageName', Version=$Version"
+    Write-Log "DATApply starting - ScriptRev=$($script:ScriptRev), Mode=$Mode, Package='$PackageName', Version=$Version"
 
     # Resolve ContentPath with a fallback chain. $PSScriptRoot as a param default
     # has been seen to be empty under CCMExec when the script is launched with

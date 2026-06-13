@@ -138,6 +138,23 @@ function Invoke-DATSync {
         [string[]]$WimExcludeDirs  = @('Documentation', 'Docs', 'Samples', 'Sample', 'Help', 'HelpFiles'),
         [bool]$WimOptimizeExport   = $true,
 
+        # Driver name/filename patterns excluded from every package (Drivers
+        # overlay and DriverUpdates). Wildcards supported; a pattern without
+        # them matches as a substring (e.g. 'Realtek Card Reader'). Applied
+        # inside Get-DellIndividualDrivers so the overlay fingerprint, staged
+        # DUPs, manifest.json and the DCU catalog all agree - an excluded
+        # driver never reaches a client by any engine.
+        [string[]]$ExcludeDrivers = @(),
+
+        # Screen each DriverUpdates DUP against the Microsoft Vulnerable
+        # Driver Blocklist before staging (the list the Defender ASR rule
+        # "Block abuse of in-the-wild exploited vulnerable signed drivers"
+        # enforces). Advisory: matches are logged loudly with the exact
+        # exclusion to add, but the DUP still ships until the admin excludes
+        # it. Verdicts are cached per DUP, so only new/changed DUPs and
+        # blocklist updates cost extraction time.
+        [bool]$ScreenVulnerableDrivers = $true,
+
         [switch]$VerifyDownloadHash,
 
         # Only used when DeploymentPlatform = 'ConfigMgr - Application'. BIOS-only.
@@ -153,6 +170,41 @@ function Invoke-DATSync {
     $StartTime = Get-Date
     $SyncResults = [System.Collections.Generic.List[PSCustomObject]]::new()
     $ErrorCount = 0
+
+    # Vulnerable-driver screening state. The blocklist loads lazily on the
+    # first DriverUpdates DUP so non-DriverUpdates syncs never pay for it;
+    # vulnerable findings accumulate here for the end-of-sync summary.
+    $VulnBlocklist = $null
+    $VulnBlocklistLoaded = $false
+    $VulnerableFound = [System.Collections.Generic.List[string]]::new()
+
+    # Stages Dell's Inventory Collector (invcol) into a DriverUpdates package
+    # and returns the catalog reference for Write-DATDCUCatalog. DCU downloads
+    # the collector FROM ITS CATALOG SOURCE to run the system-inventory phase
+    # of every scan; with dell.com disabled on clients, the package catalog
+    # must carry it or scans fail "Unable to retrieve system inventory
+    # information" and return a meaningless 500 (field: DP82132 reported
+    # "everything current" while a year behind). Best-effort: $null means the
+    # catalog ships without it and the apply engine falls back to the
+    # built-in DUP engine on inventory failure.
+    $AddDellInventoryToPackage = {
+        param([string]$PkgDir, [string]$SysID)
+        $Inv = Get-DellInventoryComponent -SystemID $SysID
+        if (-not $Inv) { return $null }
+        $Target = Join-Path $PkgDir $Inv.FileName
+        if (-not (Test-Path $Target)) {
+            try {
+                Write-DATLog -Message "Staging Dell Inventory Collector for offline DCU scans: $($Inv.FileName)" -Severity 1
+                Invoke-DATDownload -Url $Inv.Url -DestinationPath $Target
+            } catch {
+                Write-DATLog -Message "Could not download the Inventory Collector ($($_.Exception.Message)) - DCU scans will fail system inventory offline and fall back to the built-in engine" -Severity 3
+                return $null
+            }
+        } else {
+            Write-DATLog -Message "Inventory Collector already staged in package: $($Inv.FileName)" -Severity 1
+        }
+        return $Inv
+    }
 
     # Load config from file if specified
     if ($PSCmdlet.ParameterSetName -eq 'ConfigFile') {
@@ -181,6 +233,8 @@ function Invoke-DATSync {
         $VerifyDownloadHash = [switch]$Config.options.verifyDownloadHash
         if ($null -ne $Config.options.wimExcludeFiles) { $WimExcludeFiles = @($Config.options.wimExcludeFiles) }
         if ($null -ne $Config.options.wimExcludeDirs)  { $WimExcludeDirs  = @($Config.options.wimExcludeDirs) }
+        if ($null -ne $Config.options.excludeDrivers)  { $ExcludeDrivers  = @($Config.options.excludeDrivers) }
+        if ($null -ne $Config.options.screenVulnerableDrivers) { $ScreenVulnerableDrivers = [bool]$Config.options.screenVulnerableDrivers }
         $WimOptimizeExport = [switch]$Config.options.wimOptimizeExport
         $WebhookUrl = $Config.logging.webhookUrl
 
@@ -192,6 +246,9 @@ function Invoke-DATSync {
     Write-DATLog -Message "Manufacturers: $($Manufacturer -join ', ')" -Severity 1
     Write-DATLog -Message "OS: $OperatingSystem ($Architecture)" -Severity 1
     Write-DATLog -Message "Models: $(if ($Models) { $Models -join ', ' } else { 'All available' })" -Severity 1
+    if ($ExcludeDrivers.Count -gt 0) {
+        Write-DATLog -Message "Driver exclusions active: $($ExcludeDrivers -join '; ')" -Severity 1
+    }
 
     # Validate paths
     foreach ($Path in @($DownloadPath, $PackagePath)) {
@@ -397,6 +454,10 @@ function Invoke-DATSync {
     $SuccessCount = ($SyncResults | Where-Object { $_.Status -eq 'Success' }).Count
     $SkipCount = ($SyncResults | Where-Object { $_.Status -eq 'Skipped' }).Count
 
+    if ($VulnerableFound.Count -gt 0) {
+        Write-DATLog -Message ("VULNERABLE-DRIVER SUMMARY: $($VulnerableFound.Count) packaged DUP(s) match Microsoft's vulnerable-driver blocklist and will trip Defender ASR fleet-wide: " +
+            ($VulnerableFound -join '; ') + ". Add these to Driver exclusions and re-sync to stop the alerts at the source.") -Severity 3
+    }
     Write-DATLog -Message "======== Sync Complete ========" -Severity 1
     Write-DATLog -Message "Duration: $([math]::Round($Duration.TotalMinutes, 1)) minutes" -Severity 1
     Write-DATLog -Message "Success: $SuccessCount | Skipped: $SkipCount | Errors: $ErrorCount" -Severity 1
@@ -731,6 +792,12 @@ function Invoke-DATSyncSinglePackage {
             if ($Type -eq 'DriverUpdates') {
                 $GetDriverParams['ExcludeStorageFirmware'] = $true
             }
+            # Admin exclusions are part of the filter set for the same reason:
+            # adding/removing one intentionally changes the fingerprint so the
+            # package rebuilds without the excluded driver.
+            if ($ExcludeDrivers.Count -gt 0) {
+                $GetDriverParams['ExcludeDrivers'] = $ExcludeDrivers
+            }
             # Propagate ForceRefresh so the per-model catalog is re-pulled and the
             # fingerprint is computed against the SAME catalog the post-download
             # phase will use - otherwise the smart-check could match a stale
@@ -763,6 +830,32 @@ function Invoke-DATSyncSinglePackage {
                 $FpMatchPattern = if ($Type -eq 'DriverUpdates') { "Cat.$OverlayFingerprint" } else { "*OVL.$OverlayFingerprint" }
                 if ($ExistingToCheck -and $ExistingToCheck.Version -like $FpMatchPattern) {
                     Write-DATLog -Message "Package already contains latest individual drivers (v$($ExistingToCheck.Version))" -Severity 1
+
+                    # Backfill the DCU repository catalog into packages built before
+                    # 2.2.0 (fingerprint-current, so the staging path that normally
+                    # writes it never runs). Only DUPs actually present in the
+                    # existing source go in. The refresh below distributes the
+                    # updated content; if the catalog was already current this is
+                    # a no-op and the content hash doesn't churn.
+                    if ($Type -eq 'DriverUpdates' -and $ExistingToCheck.SourcePath -and (Test-Path $ExistingToCheck.SourcePath)) {
+                        $OnDisk = @($CachedIndividualDrivers | Where-Object {
+                            $_.FileName -and (Test-Path (Join-Path $ExistingToCheck.SourcePath $_.FileName))
+                        })
+                        if ($OnDisk.Count -gt 0) {
+                            $DcuCatParams = @{ PackageSourceDir = $ExistingToCheck.SourcePath; Drivers = $OnDisk }
+                            $InvComp = $null
+                            try {
+                                $InvComp = & $AddDellInventoryToPackage $ExistingToCheck.SourcePath $PackageInfo.SystemID
+                            } catch {
+                                Write-DATLog -Message "Inventory Collector embed failed: $($_.Exception.Message) - catalog ships without it; clients fall back to the built-in DUP engine" -Severity 3
+                            }
+                            if ($InvComp) {
+                                $DcuCatParams['InventoryComponentXml'] = $InvComp.Xml
+                                $DcuCatParams['InventoryFileName'] = $InvComp.FileName
+                            }
+                            [void](Write-DATDCUCatalog @DcuCatParams)
+                        }
+                    }
 
                     $Refresh = & $TryApplicationRefresh $ExistingToCheck $ExistingToCheck.Version
                     if ($Refresh) { return $Refresh }
@@ -1216,6 +1309,11 @@ function Invoke-DATSyncSinglePackage {
                     if ($Type -eq 'DriverUpdates') {
                         $GetDriverParams['ExcludeStorageFirmware'] = $true
                     }
+                    # Must mirror the smart-check call exactly or the fingerprints
+                    # computed by the two passes diverge and packages churn.
+                    if ($ExcludeDrivers.Count -gt 0) {
+                        $GetDriverParams['ExcludeDrivers'] = $ExcludeDrivers
+                    }
                     if ($ForceRefresh) {
                         $GetDriverParams['ForceRefresh'] = $true
                     }
@@ -1482,6 +1580,33 @@ function Invoke-DATSyncSinglePackage {
                                 # vendor-tested install path that DCU uses) instead of trying to
                                 # feed extracted INFs through pnputil.
                                 if ($Type -eq 'DriverUpdates') {
+                                    # Vulnerable-driver screening: warn BEFORE the DUP ships if its
+                                    # payload matches the Microsoft blocklist that Defender's ASR
+                                    # vulnerable-driver rule enforces - those installs get blocked
+                                    # on every device and page the security team. Advisory only:
+                                    # the DUP still stages; the admin decides via Driver exclusions.
+                                    if ($ScreenVulnerableDrivers) {
+                                        if (-not $VulnBlocklistLoaded) {
+                                            $VulnBlocklistLoaded = $true
+                                            $VulnBlocklist = Update-DATVulnerableDriverBlocklist
+                                            if (-not $VulnBlocklist) {
+                                                Write-DATLog -Message "Vulnerable-driver screening unavailable this run (no blocklist) - DUPs stage unscreened" -Severity 2
+                                            }
+                                        }
+                                        if ($VulnBlocklist) {
+                                            $Verdict = Get-DATDupScreenVerdict -DupPath $DriverExePath -FileName $IndvDriver.FileName -HashMD5 $IndvDriver.HashMD5 -Blocklist $VulnBlocklist
+                                            if ($Verdict.Status -eq 'Vulnerable') {
+                                                Write-DATLog -Message ("VULNERABLE DRIVER: '$($IndvDriver.Name)' ($($IndvDriver.FileName)) - $(@($Verdict.Matches) -join '; '). " +
+                                                    "Defender's ASR vulnerable-driver rule will block this on every enforcing device. The DUP is still being packaged - " +
+                                                    "add '$($IndvDriver.Name)' to Driver exclusions (Models tab > Options, or -ExcludeDrivers) and re-sync to stop deploying it.") -Severity 3
+                                                $Entry = "$($IndvDriver.Name) [$ModelName]"
+                                                if (-not $VulnerableFound.Contains($Entry)) { $VulnerableFound.Add($Entry) }
+                                            } elseif ($Verdict.Status -eq 'Unscreenable') {
+                                                Write-DATLog -Message "  Could not screen $($IndvDriver.FileName) for vulnerable drivers: $($Verdict.Detail)" -Severity 2
+                                            }
+                                        }
+                                    }
+
                                     $StagedExe = Join-Path $PackageSourceDir $IndvDriver.FileName
                                     Copy-Item -Path $DriverExePath -Destination $StagedExe -Force
                                     $StagedSize = (Get-Item $StagedExe -ErrorAction SilentlyContinue).Length
@@ -1647,6 +1772,27 @@ function Invoke-DATSyncSinglePackage {
                             # Depth 5: manifest -> drivers[] -> driver -> HardwareIds[] -> values
                             $ManifestObj | ConvertTo-Json -Depth 5 | Set-Content -Path $ManifestPath -Encoding UTF8
                             Write-DATLog -Message "Wrote DriverUpdates manifest: $($ManifestEntries.Count) DUP(s) -> $ManifestPath" -Severity 1
+
+                            # DCU repository catalog: lets the apply script hand the
+                            # whole install to dcu-cli (Dell-trusted execution +
+                            # device-accurate applicability) using these same staged
+                            # DUPs as a local repository. Only the staged subset goes
+                            # in - a catalog entry without its payload would make DCU
+                            # report a download failure.
+                            $StagedNames = @($ManifestEntries | ForEach-Object { $_.FileName })
+                            $StagedForCatalog = @($IndividualDrivers | Where-Object { $StagedNames -contains $_.FileName })
+                            $DcuCatParams = @{ PackageSourceDir = $PackageSourceDir; Drivers = $StagedForCatalog }
+                            $InvComp = $null
+                            try {
+                                $InvComp = & $AddDellInventoryToPackage $PackageSourceDir $PackageInfo.SystemID
+                            } catch {
+                                Write-DATLog -Message "Inventory Collector embed failed: $($_.Exception.Message) - catalog ships without it; clients fall back to the built-in DUP engine" -Severity 3
+                            }
+                            if ($InvComp) {
+                                $DcuCatParams['InventoryComponentXml'] = $InvComp.Xml
+                                $DcuCatParams['InventoryFileName'] = $InvComp.FileName
+                            }
+                            [void](Write-DATDCUCatalog @DcuCatParams)
                         }
 
                         # Bump the package version to reflect the overlay so the TS apply

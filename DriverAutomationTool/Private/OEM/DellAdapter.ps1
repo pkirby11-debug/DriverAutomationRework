@@ -602,6 +602,17 @@ function Get-DellIndividualDrivers {
         # base driver pack when it's actually relevant.
         [switch]$ExcludeStorageFirmware,
 
+        # Admin-configured exclusion patterns matched against each component's
+        # display name AND filename (wildcards; a pattern without * or ? is
+        # treated as a substring). Matched drivers never enter the package,
+        # the manifest, or the DCU catalog - the fleet never receives them.
+        # Field driver for the feature: the Realtek Card Reader DUP carries a
+        # driver version on Microsoft's vulnerable-driver blocklist, so every
+        # install attempt trips the Defender ASR rule "Block abuse of
+        # in-the-wild exploited vulnerable signed drivers" and pages Cyber.
+        # Excluding it at sync stops that at the source.
+        [string[]]$ExcludeDrivers = @(),
+
         # Force re-download of the per-model catalog before scanning. Without
         # this, the cached XML from up to 6h ago is used and any
         # SoftwareComponent Dell published since then (e.g. an A05 graphics
@@ -722,6 +733,14 @@ function Get-DellIndividualDrivers {
     # firmware components (e.g., "Intel Thunderbolt Controller Firmware").
     $ExcludePattern = '\bBIOS\b|SecurityAdvisory|Dell Command|SupportAssist|Purchased Apps|Trusted Device|Watchdog|Recovery Plugin|Integration Suite|Digital Delivery|\bApplication\b|\bUtility\b'
 
+    # Normalize the admin exclusion patterns once: bare strings become
+    # substring matches so 'Realtek Card Reader' works without the admin
+    # having to know wildcard syntax.
+    $NormalizedExcludes = @($ExcludeDrivers | Where-Object { $_ -and $_.Trim() } | ForEach-Object {
+        $P = $_.Trim()
+        if ($P -match '[\*\?]') { $P } else { "*$P*" }
+    })
+
     # Storage firmware exclusion (opt-in via -ExcludeStorageFirmware).
     # Matches DUP display names like "Kioxia BG5 Solid State Drive Firmware Update"
     # or "WDC WD20EZBX Hard Drive Firmware Update". The "Firmware Update" anchor
@@ -775,6 +794,7 @@ function Get-DellIndividualDrivers {
         $SkippedPkgType = 0
         $SkippedNoName = 0
         $SkippedExcluded = 0
+        $SkippedUserExcluded = 0
         $SkippedNoSysMatch = 0
         $SkippedWrongOS = 0
         $SkippedDate = 0
@@ -872,6 +892,23 @@ function Get-DellIndividualDrivers {
             if ($ExcludeStorageFirmware -and $DisplayName -match $StorageFirmwarePattern) {
                 $SkippedExcluded++
                 continue
+            }
+
+            # Admin-configured exclusions (-ExcludeDrivers). Checked against the
+            # display name and the DUP filename so either form works in the GUI.
+            # Matching here (catalog level) keeps the fingerprint, the staged
+            # DUPs, manifest.json, and the DCU catalog all in agreement.
+            if ($NormalizedExcludes.Count -gt 0) {
+                $PathLeaf = if ($Component.path) { ([string]$Component.path -split '[\\/]')[-1] } else { '' }
+                $UserExcluded = $false
+                foreach ($Pat in $NormalizedExcludes) {
+                    if ($DisplayName -like $Pat -or ($PathLeaf -and $PathLeaf -like $Pat)) {
+                        Write-DATLog -Message "  Admin exclusion: '$DisplayName' matched pattern '$Pat' - skipping" -Severity 1
+                        $UserExcluded = $true
+                        break
+                    }
+                }
+                if ($UserExcluded) { $SkippedUserExcluded++; continue }
             }
 
             # Check SystemID match (case-insensitive)
@@ -998,6 +1035,10 @@ function Get-DellIndividualDrivers {
                 Size        = $Component.size
                 IsMissing   = $IsMissing
                 HardwareIds = @($HardwareIds)
+                # Raw SoftwareComponent XML from Dell's catalog, carried so the
+                # sync can emit a DCU-compatible repository catalog into the
+                # package (Write-DATDCUCatalog) without re-parsing the source.
+                ComponentXml = $Component.OuterXml
             })
             $CatalogMatched++
         }
@@ -1005,7 +1046,7 @@ function Get-DellIndividualDrivers {
         # Log diagnostic summary for this catalog
         $CatalogSource = if ($UsingModelCatalog) { 'per-model' } else { 'CatalogPC (legacy)' }
         Write-DATLog -Message ("Catalog scan [$CatalogFileName] ($CatalogSource): $TotalScanned scanned, " +
-            "$SkippedPkgType non-driver, $SkippedExcluded excluded, " +
+            "$SkippedPkgType non-driver, $SkippedExcluded excluded, $SkippedUserExcluded admin-excluded, " +
             "$SkippedNoSysMatch wrong SystemID, $SkippedWrongOS wrong OS, " +
             "$SkippedDate older than baseline, $CatalogMatched matched") -Severity 1
     }
@@ -1307,4 +1348,205 @@ function Test-DellCatalogConnectivity {
     }
 
     return $Results
+}
+
+function Write-DATDCUCatalog {
+    <#
+    .SYNOPSIS
+        Writes a Dell Command Update-compatible repository catalog into a
+        DriverUpdates package source directory.
+    .DESCRIPTION
+        DCU consumes a repository = catalog + DUP payloads. The package already
+        holds the DUPs; this emits DCUCatalog.xml describing them by cloning
+        each driver's original SoftwareComponent node from Dell's per-model
+        catalog (ComponentXml, captured by Get-DellIndividualDrivers) and
+        rewriting its path attribute to the staged flat filename.
+
+        The root element gets xmlns="openmanifest" - that's the namespace
+        Dell's own catalog schema is validated against, and DCU 5.x rejects
+        catalogs missing it. The cloned <SoftwareComponent> fragments have no
+        namespace prefix and inherit openmanifest as the default namespace
+        from this parent (their OuterXml didn't re-declare a namespace
+        because they inherited the same default in their source document).
+
+        baseLocation stays EMPTY here - the client-side apply script patches
+        it to the local repo path at run time and wraps the XML in a CAB
+        (DCU 5.x rejects raw .xml for -catalogLocation with "incorrect file
+        type"; .cab is required, matching Dell Repository Manager output).
+
+        Output is deterministic for a given driver set (components sorted by
+        FileName, no timestamps), so an unchanged driver set produces a
+        byte-identical file and the existing-content comparison below prevents
+        package-content churn (which would otherwise re-trigger DP refresh).
+    .OUTPUTS
+        Boolean. $true if the catalog file was written/updated, $false if it
+        was already current or could not be built (logged).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$PackageSourceDir,
+
+        [Parameter(Mandatory)]
+        [object[]]$Drivers,
+
+        # Raw <InventoryComponent> OuterXml from Dell's catalog + the staged
+        # collector filename. DCU downloads the Inventory Collector FROM THE
+        # CATALOG SOURCE to run its system-inventory phase; without this entry
+        # (and with dell.com disabled) every scan fails "Unable to retrieve
+        # system inventory information" and returns a meaningless 500.
+        [string]$InventoryComponentXml,
+        [string]$InventoryFileName
+    )
+
+    $Usable = @($Drivers | Where-Object { $_.ComponentXml -and $_.FileName })
+    if ($Usable.Count -eq 0) {
+        Write-DATLog -Message "DCU catalog skipped: no drivers carry ComponentXml (objects predate 2.2.0 resolver?)" -Severity 2
+        return $false
+    }
+
+    $CatalogPath = Join-Path $PackageSourceDir 'DCUCatalog.xml'
+    try {
+        # Each component's ComponentXml is the OuterXml of a <SoftwareComponent>
+        # from Dell's per-model catalog (no xmlns prefix - it inherited the
+        # default from its parent). Rewrite the path attribute to the bare
+        # staged filename, then drop the bodies inside a Manifest element that
+        # declares xmlns="openmanifest" so they inherit the right default
+        # namespace. Built as a string template because XmlDocument fragment
+        # insertion would strip the inherited namespace context.
+        $Sorted = @($Usable | Sort-Object FileName)
+        $ComponentsXml = ($Sorted | ForEach-Object {
+            ($_.ComponentXml -replace '\bpath\s*=\s*"[^"]*"', ('path="{0}"' -f $_.FileName))
+        }) -join "`r`n"
+
+        $InventoryXml = ''
+        if ($InventoryComponentXml -and $InventoryFileName) {
+            $InventoryXml = ($InventoryComponentXml -replace '\bpath\s*=\s*"[^"]*"', ('path="{0}"' -f $InventoryFileName)) + "`r`n"
+        }
+
+        $NewContent = @"
+<?xml version="1.0" encoding="utf-16"?>
+<Manifest xmlns="openmanifest" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" baseLocation="" baseLocationAccessProtocols="" identifier="DAT-DriverUpdates" releaseID="DAT" version="1.0" predecessorID="">
+$InventoryXml$ComponentsXml
+</Manifest>
+"@
+
+        # Skip the write when nothing changed - rewriting an identical catalog
+        # would dirty the package content hash and churn DP refreshes.
+        if (Test-Path $CatalogPath) {
+            $OldContent = Get-Content -Path $CatalogPath -Raw -ErrorAction SilentlyContinue
+            if ($OldContent -eq $NewContent) {
+                Write-DATLog -Message "DCU catalog already current: $CatalogPath" -Severity 1
+                return $false
+            }
+        }
+
+        # Write as UTF-16 to match the declaration (Dell catalogs are utf-16;
+        # DCU honors the declared encoding).
+        [System.IO.File]::WriteAllText($CatalogPath, $NewContent, [System.Text.Encoding]::Unicode)
+        Write-DATLog -Message "Wrote DCU repository catalog: $($Usable.Count) component(s) -> $CatalogPath" -Severity 1
+        return $true
+    } catch {
+        Write-DATLog -Message "Failed to write DCU catalog ($($_.Exception.Message)) - package remains usable via the built-in DUP engine" -Severity 2
+        return $false
+    }
+}
+
+function Get-DellInventoryComponent {
+    <#
+    .SYNOPSIS
+        Finds Dell's <InventoryComponent> (the invcol Inventory Collector
+        reference) in the per-model catalogs, falling back to the master
+        CatalogPC.
+    .DESCRIPTION
+        DCU's scan runs in two phases: a SYSTEM INVENTORY using an Inventory
+        Collector binary it downloads FROM ITS CATALOG SOURCE, then the
+        catalog comparison. A catalog without an <InventoryComponent> plus
+        dell.com disabled leaves DCU unable to inventory at all - field
+        signature on DP82132: "Unable to retrieve system inventory
+        information" followed by a meaningless exit-500 "no applicable
+        updates" on a device a year behind on drivers. Embedding the
+        collector in the package catalog makes scans fully offline.
+    .OUTPUTS
+        Hashtable @{ Xml; FileName; Url; HashMD5 } or $null when no
+        InventoryComponent exists in any reachable catalog (logged).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SystemID,
+
+        [switch]$ForceRefresh
+    )
+
+    $Sources = Get-DATOEMSources
+    $Found = $null
+    $FoundBase = $null
+    # Per-source findings, logged when nothing is found so the sync log
+    # itself proves which catalogs were inspected and what they contained
+    # (instead of a bare "not found" that invites guessing).
+    $Inspected = [System.Collections.Generic.List[string]]::new()
+
+    # Per-model catalogs first (same precedence as the driver scan). XPath by
+    # local-name() is namespace- and nesting-agnostic - safer than dot-walking
+    # $Xml.Manifest.InventoryComponent if Dell shifts the document shape.
+    try {
+        $ModelCatalogPaths = @(Update-DellModelCatalog -SystemID $SystemID -ForceRefresh:$ForceRefresh)
+        foreach ($P in $ModelCatalogPaths) {
+            $Xml = Read-DATXml -Path $P
+            $Nodes = @($Xml.SelectNodes("//*[local-name()='InventoryComponent']"))
+            $Inspected.Add(("{0}: root=<{1}>, InventoryComponent nodes={2}" -f (Split-Path $P -Leaf), $Xml.DocumentElement.LocalName, $Nodes.Count))
+            $Node = $Nodes | Where-Object { $_.GetAttribute('path') } | Select-Object -First 1
+            if ($Node) {
+                $Found = $Node
+                $FoundBase = if ($Sources.dell.dlBaseUrl) { $Sources.dell.dlBaseUrl } else { $Sources.dell.baseUrl }
+                break
+            }
+        }
+    } catch {
+        $Inspected.Add("per-model catalogs: error - $($_.Exception.Message)")
+    }
+
+    # Master CatalogPC fallback (its baseLocation is downloads.dell.com).
+    if (-not $Found) {
+        try {
+            $FallbackPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
+            if (-not $FallbackPath) {
+                Update-DellCatalogCache
+                $FallbackPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
+            }
+            if ($FallbackPath) {
+                $Xml = Read-DATXml -Path $FallbackPath
+                $Nodes = @($Xml.SelectNodes("//*[local-name()='InventoryComponent']"))
+                $Inspected.Add(("CatalogPC.xml (master): root=<{0}>, InventoryComponent nodes={1}" -f $Xml.DocumentElement.LocalName, $Nodes.Count))
+                $Node = $Nodes | Where-Object { $_.GetAttribute('path') } | Select-Object -First 1
+                if ($Node) {
+                    $Found = $Node
+                    $FoundBase = $Sources.dell.baseUrl
+                }
+            } else {
+                $Inspected.Add('CatalogPC.xml (master): not available in cache and re-download failed')
+            }
+        } catch {
+            $Inspected.Add("CatalogPC.xml (master): error - $($_.Exception.Message)")
+        }
+    }
+
+    if (-not $Found) {
+        Write-DATLog -Message ("No usable <InventoryComponent> found for SystemID $SystemID - DCU scans against the package catalog will fail system inventory while dell.com is disabled. Sources inspected: " + ($Inspected -join ' | ')) -Severity 3
+        return $null
+    }
+
+    $RelPath = ([string]$Found.GetAttribute('path')) -replace '^/', ''
+    $InvFileName = ($RelPath -split '[\\/]')[-1]
+    # Log the FOUND case too - a field sync completed with no collector line
+    # at all because found+already-staged was entirely silent, leaving "did
+    # the embed work?" unanswerable from the log.
+    Write-DATLog -Message "InventoryComponent found: $InvFileName (catalog path '$RelPath')" -Severity 1
+    return @{
+        Xml      = $Found.OuterXml
+        FileName = $InvFileName
+        Url      = '{0}/{1}' -f ([string]$FoundBase).TrimEnd('/'), $RelPath
+        HashMD5  = [string]$Found.GetAttribute('hashMD5')
+    }
 }

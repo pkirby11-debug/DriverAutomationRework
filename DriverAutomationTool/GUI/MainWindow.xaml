@@ -1,4 +1,4 @@
-<Window
+﻿<Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:sys="clr-namespace:System;assembly=mscorlib"
@@ -752,6 +752,11 @@
                                     <CheckBox x:Name="UpdateIndividualCheckBox" Content="Update individual drivers (Dell)" IsEnabled="False" Width="290" />
                                     <CheckBox x:Name="VerifyHashCheckBox" Content="Verify download hash (Dell)" Width="250" />
                                 </WrapPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                    <Label Content="Driver exclusions:" Width="150" />
+                                    <TextBox x:Name="ExcludeDriversInput" Width="380"
+                                             ToolTip="Semicolon-separated driver name or filename patterns to exclude from every package (Dell). Wildcards supported; plain text matches as a substring. Example: Realtek Card Reader; *Killer*Performance*" />
+                                </StackPanel>
                                 <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                                     <Label Content="Deployment Platform:" Width="150" />
                                     <ComboBox x:Name="DeployPlatformCombo" Width="240" SelectedIndex="0">

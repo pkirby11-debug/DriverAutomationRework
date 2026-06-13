@@ -7,6 +7,7 @@ $PrivatePaths = @(
     'Private\Core\CacheManager.ps1'
     'Private\Core\CatalogParser.ps1'
     'Private\Core\DownloadManager.ps1'
+    'Private\Core\VulnerableDriverScreen.ps1'
     'Private\OEM\DellAdapter.ps1'
     'Private\OEM\LenovoAdapter.ps1'
     'Private\OEM\SurfaceAdapter.ps1'

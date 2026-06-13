@@ -2314,16 +2314,21 @@ function Copy-DATApplyScript {
         throw "Content destination does not exist: $DestinationPath"
     }
     $DestFile = Join-Path $DestinationPath 'Invoke-DATApply.ps1'
+    # The short rev here matches the ScriptRev the apply script logs about
+    # itself at run time (SHA-256 first 8) - lets anyone confirm whether the
+    # script a client executed is the one this sync staged.
+    $SrcHash = (Get-FileHash -Path $SourceScript -Algorithm SHA256).Hash
+    $SrcRev = $SrcHash.Substring(0, 8).ToLower()
     if (Test-Path $DestFile) {
-        $SrcHash  = (Get-FileHash -Path $SourceScript -Algorithm SHA256).Hash
-        $DestHash = (Get-FileHash -Path $DestFile     -Algorithm SHA256).Hash
+        $DestHash = (Get-FileHash -Path $DestFile -Algorithm SHA256).Hash
         if ($SrcHash -eq $DestHash) {
-            Write-DATLog -Message "Invoke-DATApply.ps1 in $DestinationPath already current - skipping copy" -Severity 1
+            Write-DATLog -Message "Invoke-DATApply.ps1 in $DestinationPath already current (rev $SrcRev) - skipping copy" -Severity 1
             return $false
         }
+        Write-DATLog -Message "Invoke-DATApply.ps1 in $DestinationPath is rev $($DestHash.Substring(0, 8).ToLower()) - replacing with rev $SrcRev" -Severity 1
     }
     Copy-Item -Path $SourceScript -Destination $DestFile -Force
-    Write-DATLog -Message "Staged Invoke-DATApply.ps1 into $DestinationPath" -Severity 1
+    Write-DATLog -Message "Staged Invoke-DATApply.ps1 (rev $SrcRev) into $DestinationPath" -Severity 1
     return $true
 }
 
@@ -2511,9 +2516,19 @@ function Set-DATInstallerReturnCodes {
     )
 
     $InstallerType = $Installer.GetType()
-    $RcProp = $InstallerType.GetProperty('CustomReturnCodes')
+    # Field (ScriptInstaller on a 2.6.x console): GetProperty('CustomReturnCodes')
+    # came back null - the property name differs on some SDK builds. Probe the
+    # known candidates; if none match, the error names every code-related
+    # property the type DOES expose, so the next log identifies the real name
+    # instead of inviting another guess.
+    $RcProp = $null
+    foreach ($RcPropName in @('CustomReturnCodes', 'ReturnCodes', 'ExitCodes')) {
+        $RcProp = $InstallerType.GetProperty($RcPropName)
+        if ($RcProp) { break }
+    }
     if (-not $RcProp) {
-        throw "Installer type '$($InstallerType.FullName)' exposes no CustomReturnCodes property."
+        $CodeProps = @($InstallerType.GetProperties() | Where-Object { $_.Name -match 'Code|Exit|Return' } | ForEach-Object { $_.Name })
+        throw "Installer type '$($InstallerType.FullName)' exposes none of CustomReturnCodes/ReturnCodes/ExitCodes. Code-related properties it DOES expose: $(if ($CodeProps.Count -gt 0) { $CodeProps -join ', ' } else { 'none' })."
     }
     $RcCollectionType = $RcProp.PropertyType
 
@@ -2909,8 +2924,13 @@ function New-DATConfigMgrApplication {
 
             # Ensure the DAT-standard custom return codes (Dell DUP / Flash64W /
             # Lenovo SRSETUP) are attached to the DT. Idempotent - safe on both
-            # the create and update branches above.
-            Set-DATDeploymentTypeReturnCodes -ApplicationName $Name -DeploymentTypeName $DTName
+            # the create and update branches above. DriverUpdates is exempt:
+            # its apply script normalizes every engine outcome to 0/1/3010
+            # (which SCCM maps natively), so vendor-code mapping is only needed
+            # where raw vendor exit codes can still surface (BIOS flash).
+            if ($Mode -ne 'DriverUpdates') {
+                Set-DATDeploymentTypeReturnCodes -ApplicationName $Name -DeploymentTypeName $DTName
+            }
         }
 
         if ($FolderPath) {
