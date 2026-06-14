@@ -69,13 +69,34 @@ if (-not (Test-Path $OutputDir)) {
 $msiName = "DriverAutomationTool-$version.msi"
 $msiPath = Join-Path $OutputDir $msiName
 
+# ---- Completeness check: every runtime module file must be in Product.wxs ----
+# This is the guard against the installer silently going stale as the module grows.
+Write-Host "`nVerifying Product.wxs covers every module file..." -ForegroundColor Yellow
+$wxsText = Get-Content -Raw -LiteralPath $wxsFile
+$runtimeFiles = Get-ChildItem -Path $sourceDir -Recurse -File -Include '*.ps1', '*.psm1', '*.psd1', '*.json', '*.xaml' |
+    Where-Object { $_.FullName -notmatch '[\\/]Tests[\\/]' }
+$missing = foreach ($f in $runtimeFiles) {
+    $rel = ($f.FullName.Substring($sourceDir.Length).TrimStart('\', '/')) -replace '/', '\'
+    if (-not $wxsText.Contains("\$rel`"")) { $rel }
+}
+if ($missing) {
+    Write-Host "  Product.wxs is missing $(@($missing).Count) module file(s):" -ForegroundColor Red
+    $missing | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+    Write-Error "Product.wxs is out of date - add the file(s) listed above as <Component> entries before building."
+    exit 1
+}
+Write-Host "  OK - all $(@($runtimeFiles).Count) module file(s) are referenced." -ForegroundColor Green
+
 Write-Host "`nBuilding MSI..." -ForegroundColor Yellow
 Write-Host "  Source:  $sourceDir" -ForegroundColor Gray
 Write-Host "  Output:  $msiPath" -ForegroundColor Gray
 
-# Build the MSI using WiX v4 CLI
+# Build the MSI using the WiX v4+ CLI. ProductVersion is passed through so the MSI
+# version always matches the module manifest.
 wix build $wxsFile `
+    -arch x64 `
     -d "SourceDir=$sourceDir" `
+    -d "ProductVersion=$version" `
     -o $msiPath
 
 if ($LASTEXITCODE -ne 0) {
@@ -88,6 +109,8 @@ Write-Host "  MSI built successfully!" -ForegroundColor Green
 Write-Host "  $msiPath" -ForegroundColor Green
 Write-Host "  Size: $([math]::Round((Get-Item $msiPath).Length / 1KB)) KB" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
+Write-Host "`nPrerequisite: target machines need PowerShell 7.4+ (the Start Menu" -ForegroundColor Yellow
+Write-Host "shortcut launches C:\Program Files\PowerShell\7\pwsh.exe)." -ForegroundColor Yellow
 Write-Host "`nDeploy via:" -ForegroundColor Cyan
 Write-Host "  SCCM/Software Center: Import as Application with MSI deployment type" -ForegroundColor White
 Write-Host "  Silent install:       msiexec /i `"$msiName`" /qn" -ForegroundColor White
