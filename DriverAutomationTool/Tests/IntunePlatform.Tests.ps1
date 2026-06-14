@@ -57,9 +57,9 @@ Describe 'Connect-DATIntune - ClientCredentials validation' {
             Should -Throw '*ClientId is required*'
     }
 
-    It 'Requires ClientSecret' {
+    It 'Requires a secret or a certificate' {
         { Connect-DATIntune -TenantId 'contoso' -AuthMode ClientCredentials -ClientId 'app-id' } |
-            Should -Throw '*ClientSecret is required*'
+            Should -Throw '*requires -ClientSecret*'
     }
 }
 
@@ -261,5 +261,103 @@ Describe 'Test-DATIntuneConnection' {
 
     AfterAll {
         Disconnect-DATIntune
+    }
+}
+
+Describe 'Export/Import-DATIntuneSession' {
+    It 'Round-trips token state (including the client secret) into a fresh state' {
+        $script:IntuneConnected    = $true
+        $script:IntuneAccessToken  = 'tok-abc'
+        $script:IntuneRefreshToken = 'refresh-xyz'
+        $script:IntuneTokenExpiry  = (Get-Date).AddMinutes(30)
+        $script:IntuneTenantId     = 'tenant-1'
+        $script:IntuneClientId     = 'client-1'
+        $script:IntuneAuthMode     = 'ClientCredentials'
+        $script:IntuneScopes       = @('https://graph.microsoft.com/.default')
+        $script:IntuneClientSecret = ConvertTo-SecureString 'super-secret' -AsPlainText -Force
+
+        $session = Export-DATIntuneSession
+        $session.AccessToken       | Should -Be 'tok-abc'
+        $session.ClientSecretPlain | Should -Be 'super-secret'
+
+        Disconnect-DATIntune
+        $script:IntuneConnected | Should -Be $false
+
+        Import-DATIntuneSession -Session $session
+        $script:IntuneConnected   | Should -Be $true
+        $script:IntuneAccessToken | Should -Be 'tok-abc'
+        $script:IntuneTenantId    | Should -Be 'tenant-1'
+        $script:IntuneAuthMode    | Should -Be 'ClientCredentials'
+        $script:IntuneClientSecret | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Export throws when not connected' {
+        Disconnect-DATIntune
+        { Export-DATIntuneSession } | Should -Throw '*Not connected*'
+    }
+
+    AfterAll { Disconnect-DATIntune }
+}
+
+Describe 'Get-DATIntuneRequiredPermission' {
+    It 'Includes the two write permissions the core flows need' {
+        $perms = Get-DATIntuneRequiredPermission
+        $required = @($perms | Where-Object { $_.Required }).Permission
+        $required | Should -Contain 'DeviceManagementApps.ReadWrite.All'
+        $required | Should -Contain 'DeviceManagementConfiguration.ReadWrite.All'
+        $required | Should -Contain 'Group.Read.All'
+    }
+}
+
+Describe 'ConvertTo-DATBase64Url' {
+    It 'Produces URL-safe, unpadded base64' {
+        $b = [byte[]](251, 255, 191, 254)   # forces + and / in standard base64
+        $enc = ConvertTo-DATBase64Url -Bytes $b
+        $enc | Should -Not -Match '[+/=]'
+    }
+}
+
+Describe 'Get-DATIntuneClientAssertion' {
+    BeforeAll {
+        $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+        $req = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            'CN=DAT Intune Test', $rsa,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $script:TestCert = $req.CreateSelfSigned([System.DateTimeOffset]::UtcNow.AddDays(-1), [System.DateTimeOffset]::UtcNow.AddDays(1))
+
+        function ConvertFrom-DATBase64UrlTest {
+            param([string]$Text)
+            $s = $Text.Replace('-', '+').Replace('_', '/')
+            switch ($s.Length % 4) { 2 { $s += '==' } 3 { $s += '=' } }
+            return [Convert]::FromBase64String($s)
+        }
+    }
+
+    It 'Builds a three-segment RS256 JWT with the expected claims' {
+        $jwt = Get-DATIntuneClientAssertion -TenantId 'contoso.onmicrosoft.com' -ClientId 'app-123' -Certificate $script:TestCert
+        $parts = $jwt -split '\.'
+        $parts.Count | Should -Be 3
+
+        $header  = [System.Text.Encoding]::UTF8.GetString((ConvertFrom-DATBase64UrlTest $parts[0])) | ConvertFrom-Json
+        $payload = [System.Text.Encoding]::UTF8.GetString((ConvertFrom-DATBase64UrlTest $parts[1])) | ConvertFrom-Json
+
+        $header.alg | Should -Be 'RS256'
+        $header.typ | Should -Be 'JWT'
+        $header.x5t | Should -Not -BeNullOrEmpty
+        $payload.iss | Should -Be 'app-123'
+        $payload.sub | Should -Be 'app-123'
+        $payload.aud | Should -Be 'https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token'
+    }
+
+    It 'Signs the assertion with the certificate private key (verifies with the public key)' {
+        $jwt = Get-DATIntuneClientAssertion -TenantId 'contoso.onmicrosoft.com' -ClientId 'app-123' -Certificate $script:TestCert
+        $parts = $jwt -split '\.'
+        $signed = [System.Text.Encoding]::UTF8.GetBytes("$($parts[0]).$($parts[1])")
+        $sig = ConvertFrom-DATBase64UrlTest $parts[2]
+
+        $pub = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($script:TestCert)
+        $ok = $pub.VerifyData($signed, $sig, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $ok | Should -Be $true
     }
 }

@@ -5,20 +5,43 @@
 function Get-DATSystemUsesLightTheme {
     <#
     .SYNOPSIS
-        Returns $true when Windows is set to the light app theme, $false for dark.
-        Defaults to light if the preference cannot be read.
+        Reads the Windows theme preference (app mode + system mode).
+    .OUTPUTS
+        $true  -> Windows is fully LIGHT (both app and system modes are light)
+        $false -> Windows is DARK (either app OR system mode is dark)
+        $null  -> the preference could not be read (caller decides the default)
+    .DESCRIPTION
+        Windows exposes TWO settings under Personalize: AppsUseLightTheme ("app
+        mode", which governs app chrome) and SystemUsesLightTheme ("Windows mode",
+        the taskbar/Start surface). A user who set "Windows mode = Dark" but left
+        "app mode = Light" was getting a light window from System even though their
+        desktop reads as dark - which is what "it will not follow the system theme"
+        was. Dark-mode-first, this returns light only when BOTH modes are light and
+        dark if EITHER is dark, so a dark Windows desktop yields a dark window.
+
+        The key is opened with OpenSubKey off the CurrentUser hive; the static
+        Registry.GetValue helper returned $null in the child STA runspace. $null is
+        returned (not a hard guess) when neither value is present, so
+        Set-DATWindowTheme can apply its dark-first default.
     #>
     try {
-        # Use the .NET registry API directly - it does not depend on the HKCU:
-        # PSDrive being mounted in the (child STA) runspace.
-        $Value = [Microsoft.Win32.Registry]::GetValue(
-            'HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize',
-            'AppsUseLightTheme', $null)
-        if ($null -eq $Value) { return $true }
-        return ([int]$Value -ne 0)
-    } catch {
-        return $true
-    }
+        $Key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
+            'SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize')
+        if ($null -ne $Key) {
+            try {
+                $AppsLight   = $Key.GetValue('AppsUseLightTheme', $null)
+                $SystemLight = $Key.GetValue('SystemUsesLightTheme', $null)
+            } finally {
+                $Key.Dispose()
+            }
+            $Present = @($AppsLight, $SystemLight) | Where-Object { $null -ne $_ }
+            if ($Present.Count -gt 0) {
+                foreach ($V in $Present) { if ([int]$V -eq 0) { return $false } }
+                return $true
+            }
+        }
+    } catch { }
+    return $null
 }
 
 function Get-DATCMState {
@@ -73,7 +96,8 @@ function Set-DATWindowTheme {
         (ComboBox popups, CheckBox glyphs) only partially follows dark mode without
         a dedicated theming library.
     .PARAMETER Mode
-        'System' (default) follows the Windows app theme; 'Light' / 'Dark' force it.
+        'System' (default) follows the Windows app theme, defaulting to DARK when
+        the preference cannot be read (dark-mode-first); 'Light' / 'Dark' force it.
     #>
     param(
         $Window,
@@ -86,20 +110,26 @@ function Set-DATWindowTheme {
     $UseLight = switch ($Mode) {
         'Light' { $true }
         'Dark'  { $false }
-        default { Get-DATSystemUsesLightTheme }
+        default {
+            $Detected = Get-DATSystemUsesLightTheme
+            # Dark-first: when the Windows preference is unreadable, prefer dark.
+            if ($null -eq $Detected) { $false } else { $Detected }
+        }
     }
 
     $Palette = if ($UseLight) {
         @{
-            WinBg = '#FFF3F3F3'; PanelBg = '#FFFFFFFF'; CtrlBg = '#FFFFFFFF'; GridBg = '#FFFFFFFF'
-            GridAltBg = '#FFF7F9FB'; GridHeaderBg = '#FFEFEFEF'; Fg = '#FF1B1B1B'; SubtleFg = '#FF6E6E6E'
-            BorderClr = '#FFD0D0D0'; StatusBg = '#FFE8E8E8'
+            WinBg = '#FFF3F3F3'; PanelBg = '#FFFFFFFF'; CtrlBg = '#FFFFFFFF'; CtrlHoverBg = '#FFEAEAEA'
+            GridBg = '#FFFFFFFF'; GridAltBg = '#FFF7F9FB'; GridHeaderBg = '#FFEFEFEF'
+            Fg = '#FF1B1B1B'; SubtleFg = '#FF6E6E6E'; BorderClr = '#FFD0D0D0'; StatusBg = '#FFE8E8E8'
+            NavBg = '#FFFFFFFF'; NavHoverBg = '#FFEDF3F8'; NavSelBg = '#FFE5F1FB'; NavSelFg = '#FF004C87'
         }
     } else {
         @{
-            WinBg = '#FF1F1F1F'; PanelBg = '#FF2B2B2B'; CtrlBg = '#FF2D2D2D'; GridBg = '#FF252526'
-            GridAltBg = '#FF2D2D30'; GridHeaderBg = '#FF3A3A3D'; Fg = '#FFF0F0F0'; SubtleFg = '#FFB0B0B0'
-            BorderClr = '#FF3F3F3F'; StatusBg = '#FF2B2B2B'
+            WinBg = '#FF1F1F1F'; PanelBg = '#FF2B2B2B'; CtrlBg = '#FF2D2D2D'; CtrlHoverBg = '#FF3A3A3D'
+            GridBg = '#FF252526'; GridAltBg = '#FF2D2D30'; GridHeaderBg = '#FF3A3A3D'
+            Fg = '#FFF0F0F0'; SubtleFg = '#FFB0B0B0'; BorderClr = '#FF3F3F3F'; StatusBg = '#FF2B2B2B'
+            NavBg = '#FF252526'; NavHoverBg = '#FF2F2F30'; NavSelBg = '#FF0E2A3F'; NavSelFg = '#FFFFFFFF'
         }
     }
 
@@ -257,6 +287,13 @@ function Get-DATGridSelectedRows {
     .SYNOPSIS
         Returns the DataRows whose 'Selected' checkbox is ticked (all rows, not
         just the filtered view - matching the old WinForms behaviour).
+    .NOTES
+        Returns the List object itself (the ,$Rows wrap stops PowerShell from
+        enumerating it on output). Callers must consume it DIRECTLY -
+        $rows = Get-DATGridSelectedRows ... ; $rows.Count ; foreach ($r in $rows).
+        Do NOT wrap the call in @(...): @() would box the whole List as a single
+        element, so $rows[0] would be the List (not a DataRow) and $rows.Count
+        would always be 1.
     #>
     param($Table)
 

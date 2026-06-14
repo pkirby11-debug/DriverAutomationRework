@@ -14,6 +14,7 @@ function Disconnect-DATIntune {
     $script:IntuneAccessToken  = $null
     $script:IntuneRefreshToken = $null
     $script:IntuneClientSecret = $null
+    $script:IntuneClientCertificate = $null
     $script:IntuneTokenExpiry  = $null
     $script:IntuneTenantId     = $null
     $script:IntuneClientId     = $null

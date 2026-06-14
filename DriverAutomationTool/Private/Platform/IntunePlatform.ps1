@@ -12,10 +12,45 @@ $script:IntuneDefaultDeviceCodeClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
 $script:IntuneGraphBaseUrl = 'https://graph.microsoft.com/beta'
 $script:IntuneDelegatedScopes = @(
     'DeviceManagementApps.ReadWrite.All'
+    'DeviceManagementConfiguration.ReadWrite.All'
     'DeviceManagementManagedDevices.Read.All'
     'Group.Read.All'
     'offline_access'
 )
+
+function Get-DATIntuneRequiredPermission {
+    <#
+    .SYNOPSIS
+        The Microsoft Graph permissions the tool needs, as a single source of truth
+        for the setup guide, the GUI, and connection diagnostics.
+    .DESCRIPTION
+        For app-only (client secret / certificate) these are granted as APPLICATION
+        permissions with admin consent on the app registration. For interactive
+        device-code sign-in they are the DELEGATED permissions (and the signing-in
+        user also needs an Intune-capable directory role).
+    .OUTPUTS
+        Objects with Permission, Reason, and Required (a write permission the core
+        flows need) vs optional.
+    #>
+    [CmdletBinding()]
+    param()
+
+    return @(
+        [PSCustomObject]@{ Permission = 'DeviceManagementApps.ReadWrite.All';          Required = $true;  Reason = 'Create, upload, and assign Win32 LOB driver apps.' }
+        [PSCustomObject]@{ Permission = 'DeviceManagementConfiguration.ReadWrite.All'; Required = $true;  Reason = 'Create and assign Windows driver-update profiles.' }
+        [PSCustomObject]@{ Permission = 'Group.Read.All';                              Required = $true;  Reason = 'Resolve Entra ID groups for assignment.' }
+        [PSCustomObject]@{ Permission = 'DeviceManagementManagedDevices.Read.All';     Required = $false; Reason = 'Optional: read managed-device inventory for targeting.' }
+    )
+}
+
+function ConvertTo-DATBase64Url {
+    <#
+    .SYNOPSIS
+        Base64url-encodes a byte array (RFC 7515) for JWT segments.
+    #>
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    return [Convert]::ToBase64String($Bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
 
 function Connect-DATIntuneDeviceCode {
     <#
@@ -137,6 +172,123 @@ function Connect-DATIntuneClientCredentials {
     return Get-DATIntuneConnectionInfo
 }
 
+function Resolve-DATIntuneCertificate {
+    <#
+    .SYNOPSIS
+        Loads a certificate (with private key) from the Windows cert store by thumbprint.
+    .DESCRIPTION
+        Searches Cert:\CurrentUser\My then Cert:\LocalMachine\My. For a headless /
+        scheduled app-only run on a server, the cert typically lives in LocalMachine\My.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Thumbprint)
+
+    $Clean = ($Thumbprint -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    foreach ($Location in @('CurrentUser', 'LocalMachine')) {
+        try {
+            $Store = [System.Security.Cryptography.X509Certificates.X509Store]::new('My', $Location)
+            $Store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+            try {
+                foreach ($Cert in $Store.Certificates) {
+                    if ($Cert.Thumbprint -eq $Clean) { return $Cert }
+                }
+            } finally { $Store.Close() }
+        } catch { }
+    }
+    throw "Certificate with thumbprint '$Thumbprint' not found in Cert:\CurrentUser\My or Cert:\LocalMachine\My (it must have a private key)."
+}
+
+function Get-DATIntuneClientAssertion {
+    <#
+    .SYNOPSIS
+        Builds a signed JWT client assertion (RS256) for certificate-based app-only auth.
+    .DESCRIPTION
+        Entra verifies the assertion against the public key uploaded to the app
+        registration (identified by the x5t SHA-1 thumbprint), proving possession of
+        the private key without ever transmitting a secret.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [string]$Audience
+    )
+
+    if (-not $Certificate.HasPrivateKey) {
+        throw "The supplied certificate has no private key; certificate auth needs the private key."
+    }
+    if (-not $Audience) { $Audience = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" }
+
+    $Now = [System.DateTimeOffset]::UtcNow
+    $X5t = ConvertTo-DATBase64Url -Bytes $Certificate.GetCertHash()   # SHA-1 cert hash
+
+    $Header  = [ordered]@{ alg = 'RS256'; typ = 'JWT'; x5t = $X5t }
+    $Payload = [ordered]@{
+        aud = $Audience
+        iss = $ClientId
+        sub = $ClientId
+        jti = [Guid]::NewGuid().ToString()
+        nbf = $Now.ToUnixTimeSeconds()
+        exp = $Now.AddMinutes(10).ToUnixTimeSeconds()
+    }
+
+    $HeaderB  = ConvertTo-DATBase64Url -Bytes ([System.Text.Encoding]::UTF8.GetBytes(($Header  | ConvertTo-Json -Compress)))
+    $PayloadB = ConvertTo-DATBase64Url -Bytes ([System.Text.Encoding]::UTF8.GetBytes(($Payload | ConvertTo-Json -Compress)))
+    $Unsigned = "$HeaderB.$PayloadB"
+
+    $Rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Certificate)
+    if (-not $Rsa) { throw "Could not access the certificate's RSA private key." }
+    try {
+        $Signature = $Rsa.SignData(
+            [System.Text.Encoding]::UTF8.GetBytes($Unsigned),
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    } finally {
+        $Rsa.Dispose()
+    }
+    return "$Unsigned." + (ConvertTo-DATBase64Url -Bytes $Signature)
+}
+
+function Connect-DATIntuneClientCertificate {
+    <#
+    .SYNOPSIS
+        OAuth2 client credentials via a signed certificate assertion (app-only).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [Parameter(Mandatory)][string[]]$Scope
+    )
+
+    $TokenUrl  = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+    $Assertion = Get-DATIntuneClientAssertion -TenantId $TenantId -ClientId $ClientId -Certificate $Certificate -Audience $TokenUrl
+
+    $Body = @{
+        grant_type            = 'client_credentials'
+        client_id             = $ClientId
+        scope                 = ($Scope -join ' ')
+        client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+        client_assertion      = $Assertion
+    }
+
+    try {
+        $TokenResp = Invoke-RestMethod -Uri $TokenUrl -Method Post -Body $Body -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop
+    } catch {
+        throw "Certificate client-credentials token request failed: $($_.Exception.Message)"
+    }
+
+    # Stash the cert so token refresh can re-acquire silently (no refresh_token in app-only).
+    $script:IntuneClientCertificate = $Certificate
+
+    Set-DATIntuneTokenState -TokenResponse $TokenResp -TenantId $TenantId -ClientId $ClientId -AuthMode 'ClientCertificate' -Scope $Scope
+    Write-DATLog -Message "Intune sign-in successful (certificate). Token expires $($script:IntuneTokenExpiry.ToString('s'))" -Severity 1 -Component 'Intune'
+
+    return Get-DATIntuneConnectionInfo
+}
+
 function Set-DATIntuneTokenState {
     <#
     .SYNOPSIS
@@ -220,6 +372,19 @@ function Invoke-DATIntuneTokenRefresh {
                 scope         = ($script:IntuneScopes -join ' ')
             }
         }
+        'ClientCertificate' {
+            if (-not $script:IntuneClientCertificate) {
+                throw "No stored certificate; re-run Connect-DATIntune."
+            }
+            $Assertion = Get-DATIntuneClientAssertion -TenantId $script:IntuneTenantId -ClientId $script:IntuneClientId -Certificate $script:IntuneClientCertificate
+            $Body = @{
+                grant_type            = 'client_credentials'
+                client_id             = $script:IntuneClientId
+                scope                 = ($script:IntuneScopes -join ' ')
+                client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+                client_assertion      = $Assertion
+            }
+        }
         default { throw "Unknown auth mode: $($script:IntuneAuthMode)" }
     }
 
@@ -255,6 +420,70 @@ function Get-DATIntuneConnectionInfo {
         AuthMode  = $script:IntuneAuthMode
         Scopes    = $script:IntuneScopes
         ExpiresOn = $script:IntuneTokenExpiry
+    }
+}
+
+function Export-DATIntuneSession {
+    <#
+    .SYNOPSIS
+        Captures the current Intune token state as a portable hashtable so a
+        background runspace can adopt it (the GUI publishes on a worker thread).
+    .DESCRIPTION
+        Includes enough to refresh during a long upload: the refresh token
+        (device code), the secret (client credentials), or the certificate
+        thumbprint (the worker re-resolves it from the local store). In-memory and
+        same-process only - never written to disk.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:IntuneConnected) { throw "Not connected to Intune. Run Connect-DATIntune first." }
+
+    $SecretPlain = $null
+    if ($script:IntuneClientSecret) {
+        $Bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($script:IntuneClientSecret)
+        # PtrToStringBSTR honors the BSTR length prefix and UTF-16 on every platform
+        # (PtrToStringAuto picks the wrong encoding off-Windows).
+        try { $SecretPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($Bstr) }
+        finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Bstr) }
+    }
+
+    return @{
+        AccessToken       = $script:IntuneAccessToken
+        RefreshToken      = $script:IntuneRefreshToken
+        Expiry            = $script:IntuneTokenExpiry
+        TenantId          = $script:IntuneTenantId
+        ClientId          = $script:IntuneClientId
+        AuthMode          = $script:IntuneAuthMode
+        Scopes            = $script:IntuneScopes
+        ClientSecretPlain = $SecretPlain
+        CertThumbprint    = if ($script:IntuneClientCertificate) { $script:IntuneClientCertificate.Thumbprint } else { $null }
+    }
+}
+
+function Import-DATIntuneSession {
+    <#
+    .SYNOPSIS
+        Restores an Intune session captured by Export-DATIntuneSession into this
+        runspace's module scope.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Session)
+
+    $script:IntuneAccessToken  = $Session.AccessToken
+    $script:IntuneRefreshToken = $Session.RefreshToken
+    $script:IntuneTokenExpiry  = $Session.Expiry
+    $script:IntuneTenantId     = $Session.TenantId
+    $script:IntuneClientId     = $Session.ClientId
+    $script:IntuneAuthMode     = $Session.AuthMode
+    $script:IntuneScopes       = $Session.Scopes
+    $script:IntuneConnected    = $true
+
+    if ($Session.ClientSecretPlain) {
+        $script:IntuneClientSecret = ConvertTo-SecureString $Session.ClientSecretPlain -AsPlainText -Force
+    }
+    if ($Session.CertThumbprint) {
+        try { $script:IntuneClientCertificate = Resolve-DATIntuneCertificate -Thumbprint $Session.CertThumbprint } catch { }
     }
 }
 

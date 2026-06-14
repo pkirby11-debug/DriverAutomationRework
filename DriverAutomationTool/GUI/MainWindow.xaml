@@ -3,8 +3,8 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:sys="clr-namespace:System;assembly=mscorlib"
     Title="Driver Automation Tool"
-    Height="720" Width="1050"
-    MinHeight="600" MinWidth="900"
+    Height="760" Width="1120"
+    MinHeight="620" MinWidth="960"
     WindowStartupLocation="CenterScreen"
     FontFamily="Segoe UI" FontSize="12"
     Background="{DynamicResource WinBg}"
@@ -14,23 +14,32 @@
         DriverAutomationTool main window (WPF).
         Pure layout: every interactive control carries an x:Name that the event
         layer (MainWindow.ps1) resolves into the $Controls hashtable. Colours come
-        from the theme brush resources below (light defaults); Set-DATWindowTheme
-        swaps them at runtime to follow the Windows light/dark app setting. Layout
-        uses Grid/DockPanel star-sizing so it scales with the window.
+        from the theme brush resources below (dark-mode-first defaults);
+        Set-DATWindowTheme swaps them at runtime to follow the header Theme picker
+        (System / Dark / Light). Navigation is a left sidebar (a templated
+        TabControl with TabStripPlacement="Left"); the Progress tab carries an
+        x:Name so handlers switch to it by reference, not a hard-coded index, so the
+        nav order can change freely. Layout uses Grid/DockPanel star-sizing so it
+        scales with the window.
     -->
 
     <Window.Resources>
-        <!-- ===== Theme brushes (light defaults; replaced at runtime for dark) ===== -->
-        <SolidColorBrush x:Key="WinBg" Color="#FFF3F3F3" />
-        <SolidColorBrush x:Key="PanelBg" Color="#FFFFFFFF" />
-        <SolidColorBrush x:Key="CtrlBg" Color="#FFFFFFFF" />
-        <SolidColorBrush x:Key="GridBg" Color="#FFFFFFFF" />
-        <SolidColorBrush x:Key="GridAltBg" Color="#FFF7F9FB" />
-        <SolidColorBrush x:Key="GridHeaderBg" Color="#FFEFEFEF" />
-        <SolidColorBrush x:Key="Fg" Color="#FF1B1B1B" />
-        <SolidColorBrush x:Key="SubtleFg" Color="#FF6E6E6E" />
-        <SolidColorBrush x:Key="BorderClr" Color="#FFD0D0D0" />
-        <SolidColorBrush x:Key="StatusBg" Color="#FFE8E8E8" />
+        <!-- ===== Theme brushes (dark-mode-first defaults; replaced at runtime) ===== -->
+        <SolidColorBrush x:Key="WinBg" Color="#FF1F1F1F" />
+        <SolidColorBrush x:Key="PanelBg" Color="#FF2B2B2B" />
+        <SolidColorBrush x:Key="CtrlBg" Color="#FF2D2D2D" />
+        <SolidColorBrush x:Key="CtrlHoverBg" Color="#FF3A3A3D" />
+        <SolidColorBrush x:Key="GridBg" Color="#FF252526" />
+        <SolidColorBrush x:Key="GridAltBg" Color="#FF2D2D30" />
+        <SolidColorBrush x:Key="GridHeaderBg" Color="#FF3A3A3D" />
+        <SolidColorBrush x:Key="Fg" Color="#FFF0F0F0" />
+        <SolidColorBrush x:Key="SubtleFg" Color="#FFB0B0B0" />
+        <SolidColorBrush x:Key="BorderClr" Color="#FF3F3F3F" />
+        <SolidColorBrush x:Key="StatusBg" Color="#FF2B2B2B" />
+        <SolidColorBrush x:Key="NavBg" Color="#FF252526" />
+        <SolidColorBrush x:Key="NavHoverBg" Color="#FF2F2F30" />
+        <SolidColorBrush x:Key="NavSelBg" Color="#FF0E2A3F" />
+        <SolidColorBrush x:Key="NavSelFg" Color="#FFFFFFFF" />
 
         <!-- Accent is theme-independent -->
         <SolidColorBrush x:Key="AccentBg" Color="#FF0078D4" />
@@ -47,7 +56,7 @@
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
                         <Border x:Name="Bd" Background="{TemplateBinding Background}"
-                                CornerRadius="3" Padding="{TemplateBinding Padding}">
+                                CornerRadius="4" Padding="{TemplateBinding Padding}">
                             <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
                         </Border>
                         <ControlTemplate.Triggers>
@@ -63,14 +72,101 @@
             </Setter>
         </Style>
 
-        <!-- Standard (secondary) button -->
+        <!-- Standard (secondary) button - fully templated so it follows the dark
+             palette (the default WPF button chrome stays light in dark mode). -->
         <Style x:Key="StandardButton" TargetType="Button">
-            <Setter Property="Padding" Value="12,5" />
+            <Setter Property="Padding" Value="10,6" />
             <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
             <Setter Property="Foreground" Value="{DynamicResource Fg}" />
             <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="4" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource CtrlHoverBg}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ===== Sidebar navigation: templated TabControl + TabItem ===== -->
+        <Style TargetType="TabControl">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabControl">
+                        <Grid Background="{DynamicResource WinBg}">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Border Grid.Column="0" Background="{DynamicResource NavBg}"
+                                    BorderBrush="{DynamicResource BorderClr}" BorderThickness="0,0,1,0">
+                                <StackPanel Width="196">
+                                    <TextBlock Text="NAVIGATION" Foreground="{DynamicResource SubtleFg}"
+                                               FontSize="10" FontWeight="SemiBold" Margin="20,18,0,8" />
+                                    <TabPanel IsItemsHost="True" />
+                                </StackPanel>
+                            </Border>
+                            <Border Grid.Column="1" Background="{DynamicResource WinBg}">
+                                <ContentPresenter ContentSource="SelectedContent" />
+                            </Border>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style TargetType="TabItem">
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border x:Name="NavBd" Background="Transparent" BorderBrush="Transparent"
+                                BorderThickness="3,0,0,0" Padding="17,11" SnapsToDevicePixels="True">
+                            <ContentPresenter ContentSource="Header" VerticalAlignment="Center"
+                                              HorizontalAlignment="Left" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="NavBd" Property="Background" Value="{DynamicResource NavHoverBg}" />
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="NavBd" Property="Background" Value="{DynamicResource NavSelBg}" />
+                                <Setter TargetName="NavBd" Property="BorderBrush" Value="{DynamicResource AccentBg}" />
+                                <Setter Property="Foreground" Value="{DynamicResource NavSelFg}" />
+                                <Setter Property="FontWeight" Value="SemiBold" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Single-click, full-cell checkbox for the grids (replaces
+             DataGridCheckBoxColumn, which needed a click to enter edit mode and
+             a second to toggle, and only registered a hit dead-centre). -->
+        <Style x:Key="GridCheckCell" TargetType="CheckBox">
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="VerticalAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Margin" Value="0" />
         </Style>
 
         <Style TargetType="GroupBox">
@@ -88,7 +184,8 @@
         </Style>
 
         <Style TargetType="TextBox">
-            <Setter Property="Padding" Value="3,2" />
+            <Setter Property="Padding" Value="4,3" />
+            <Setter Property="MinHeight" Value="26" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
             <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
             <Setter Property="Foreground" Value="{DynamicResource Fg}" />
@@ -96,12 +193,107 @@
             <Setter Property="CaretBrush" Value="{DynamicResource Fg}" />
         </Style>
 
-        <Style TargetType="ComboBox">
-            <Setter Property="Height" Value="24" />
+        <Style TargetType="PasswordBox">
+            <Setter Property="Padding" Value="4,3" />
+            <Setter Property="MinHeight" Value="26" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
             <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
             <Setter Property="Foreground" Value="{DynamicResource Fg}" />
             <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
+            <Setter Property="CaretBrush" Value="{DynamicResource Fg}" />
+        </Style>
+
+        <!-- ===== Themed ComboBox (the default chrome renders dark-on-dark and is
+             unreadable in dark mode; this template colours the closed selection,
+             the editable text box, and the drop-down with the theme brushes). ===== -->
+        <ControlTemplate x:Key="DATComboToggle" TargetType="ToggleButton">
+            <Border x:Name="tb" Background="{DynamicResource CtrlBg}" BorderBrush="{DynamicResource BorderClr}"
+                    BorderThickness="1" CornerRadius="3">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="20" />
+                    </Grid.ColumnDefinitions>
+                    <Path Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center"
+                          Data="M 0 0 L 4 4 L 8 0 Z" Fill="{DynamicResource Fg}" />
+                </Grid>
+            </Border>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="tb" Property="Background" Value="{DynamicResource CtrlHoverBg}" />
+                </Trigger>
+            </ControlTemplate.Triggers>
+        </ControlTemplate>
+
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Padding" Value="6,4" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBoxItem">
+                        <Border x:Name="ib" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="ib" Property="Background" Value="{DynamicResource NavSelBg}" />
+                                <Setter Property="Foreground" Value="{DynamicResource NavSelFg}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style TargetType="ComboBox">
+            <Setter Property="Height" Value="26" />
+            <Setter Property="Foreground" Value="{DynamicResource Fg}" />
+            <Setter Property="Background" Value="{DynamicResource CtrlBg}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="SnapsToDevicePixels" Value="True" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton Template="{StaticResource DATComboToggle}" Focusable="False"
+                                          ClickMode="Press"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}" />
+                            <ContentPresenter x:Name="ContentSite" IsHitTestVisible="False"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"
+                                              Margin="8,0,26,0" VerticalAlignment="Center" HorizontalAlignment="Left"
+                                              TextElement.Foreground="{DynamicResource Fg}" />
+                            <TextBox x:Name="PART_EditableTextBox" Visibility="Hidden"
+                                     Margin="5,0,26,0" VerticalAlignment="Center"
+                                     Background="Transparent" Foreground="{DynamicResource Fg}"
+                                     CaretBrush="{DynamicResource Fg}" BorderThickness="0" Focusable="True"
+                                     IsReadOnly="{TemplateBinding IsReadOnly}" />
+                            <Popup x:Name="Popup" Placement="Bottom" Focusable="False" AllowsTransparency="True"
+                                   IsOpen="{TemplateBinding IsDropDownOpen}" PopupAnimation="Slide">
+                                <Border MinWidth="{TemplateBinding ActualWidth}" MaxHeight="{TemplateBinding MaxDropDownHeight}"
+                                        Background="{DynamicResource CtrlBg}" BorderBrush="{DynamicResource BorderClr}"
+                                        BorderThickness="1">
+                                    <ScrollViewer>
+                                        <ItemsPresenter SnapsToDevicePixels="True" />
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsEditable" Value="True">
+                                <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible" />
+                                <Setter TargetName="ContentSite" Property="Visibility" Value="Hidden" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.5" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
 
         <Style TargetType="CheckBox">
@@ -133,6 +325,7 @@
             <Setter Property="Foreground" Value="{DynamicResource Fg}" />
             <Setter Property="BorderBrush" Value="{DynamicResource BorderClr}" />
             <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource BorderClr}" />
+            <Setter Property="RowHeight" Value="26" />
             <Setter Property="SelectionMode" Value="Extended" />
             <Setter Property="SelectionUnit" Value="FullRow" />
         </Style>
@@ -155,14 +348,23 @@
     <DockPanel LastChildFill="True">
 
         <!-- ===================== HEADER ===================== -->
-        <Border DockPanel.Dock="Top" Height="50" Background="{DynamicResource AccentBg}">
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="15,0">
-                <TextBlock Text="Driver Automation Tool" Foreground="White"
-                           FontSize="20" FontWeight="Bold" VerticalAlignment="Center" />
-                <TextBlock x:Name="VersionLabel" Text="" Foreground="#FFE6F1FB"
-                           FontSize="12" Margin="12,0,0,0" VerticalAlignment="Bottom"
-                           Padding="0,0,0,4" />
-            </StackPanel>
+        <Border DockPanel.Dock="Top" Height="54" Background="{DynamicResource AccentBg}">
+            <DockPanel LastChildFill="False" Margin="16,0">
+                <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="Driver Automation Tool" Foreground="White"
+                               FontSize="20" FontWeight="Bold" VerticalAlignment="Center" />
+                    <TextBlock x:Name="VersionLabel" Text="" Foreground="#FFE6F1FB"
+                               FontSize="12" Margin="12,0,0,0" VerticalAlignment="Bottom"
+                               Padding="0,0,0,4" />
+                </StackPanel>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="Theme:" Foreground="White" VerticalAlignment="Center" Margin="0,0,8,0" />
+                    <ComboBox x:Name="ThemeCombo" Width="100" SelectedIndex="0" ToolTip="Window colour theme">
+                        <sys:String>Dark</sys:String>
+                        <sys:String>Light</sys:String>
+                    </ComboBox>
+                </StackPanel>
+            </DockPanel>
         </Border>
 
         <!-- ===================== STATUS BAR (very bottom) ===================== -->
@@ -173,9 +375,9 @@
         </StatusBar>
 
         <!-- ===================== BOTTOM ACTION BAR ===================== -->
-        <Border DockPanel.Dock="Bottom" Height="56" Background="{DynamicResource StatusBg}"
+        <Border DockPanel.Dock="Bottom" Height="58" Background="{DynamicResource StatusBg}"
                 BorderBrush="{DynamicResource BorderClr}" BorderThickness="0,1,0,0">
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0">
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0">
                 <Button x:Name="StartButton" Content="Start Sync" Style="{StaticResource AccentButton}"
                         Width="170" Height="38" FontSize="14" Margin="0,0,10,0" />
                 <Button x:Name="StopButton" Content="Stop" Style="{StaticResource StandardButton}"
@@ -187,24 +389,24 @@
             </StackPanel>
         </Border>
 
-        <!-- ===================== TABS ===================== -->
-        <TabControl x:Name="TabControl" Margin="6" Padding="0" Background="{DynamicResource WinBg}"
+        <!-- ===================== SIDEBAR NAV + CONTENT ===================== -->
+        <TabControl x:Name="TabControl" TabStripPlacement="Left" Background="{DynamicResource WinBg}"
                     BorderBrush="{DynamicResource BorderClr}">
 
-            <!-- ============ Tab 1: Models ============ -->
+            <!-- ============ Models ============ -->
             <TabItem Header="Models">
-                <DockPanel Margin="10" LastChildFill="True">
+                <DockPanel Margin="16" LastChildFill="True">
                     <StackPanel DockPanel.Dock="Top">
                         <!-- Manufacturers -->
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
-                            <Label Content="Manufacturers:" Width="110" />
+                            <Label Content="Manufacturers:" Width="125" />
                             <CheckBox x:Name="DellCheckBox" Content="Dell" IsChecked="True" Margin="0,0,16,0" />
                             <CheckBox x:Name="LenovoCheckBox" Content="Lenovo" IsChecked="True" Margin="0,0,16,0" />
                             <CheckBox x:Name="MicrosoftCheckBox" Content="Microsoft" />
                         </StackPanel>
                         <!-- OS / Arch / Type -->
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
-                            <Label Content="Operating System:" Width="110" />
+                            <Label Content="Operating System:" Width="125" />
                             <ComboBox x:Name="OsCombo" Width="190" Margin="0,0,16,0" />
                             <Label Content="Architecture:" />
                             <ComboBox x:Name="ArchCombo" Width="90" Margin="0,0,16,0" SelectedIndex="0">
@@ -221,19 +423,29 @@
                         </StackPanel>
                         <!-- Search / actions -->
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                            <Label Content="Search Models:" Width="110" />
+                            <Label Content="Search Models:" Width="125" />
                             <TextBox x:Name="SearchBox" Width="260" Margin="0,0,12,0" />
-                            <Button x:Name="RefreshButton" Content="Refresh Models" Style="{StaticResource StandardButton}" Width="120" Margin="0,0,8,0" />
-                            <Button x:Name="SelectAllButton" Content="Select All" Style="{StaticResource StandardButton}" Width="80" Margin="0,0,8,0" />
-                            <Button x:Name="SelectNoneButton" Content="Select None" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,12,0" />
+                            <Button x:Name="RefreshButton" Content="Refresh Models" Style="{StaticResource StandardButton}" Width="132" Margin="0,0,8,0" />
+                            <Button x:Name="SelectAllButton" Content="Select All" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,8,0" />
+                            <Button x:Name="SelectNoneButton" Content="Select None" Style="{StaticResource StandardButton}" Width="100" Margin="0,0,12,0" />
                             <CheckBox x:Name="KnownModelsCheckBox" Content="Select Known Models" IsEnabled="False" />
                         </StackPanel>
+                        <!-- Busy indicator for the background model load -->
+                        <ProgressBar x:Name="ModelProgress" Height="4" Margin="0,0,0,8" Minimum="0" Maximum="100"
+                                     IsIndeterminate="False" Visibility="Collapsed"
+                                     Background="Transparent" BorderThickness="0" Foreground="{DynamicResource AccentBg}" />
                     </StackPanel>
 
                     <DataGrid x:Name="ModelGrid">
                         <DataGrid.Columns>
-                            <DataGridCheckBoxColumn Header="" Width="30"
-                                Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" />
+                            <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox Style="{StaticResource GridCheckCell}"
+                                                  IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
                             <DataGridTextColumn Header="Manufacturer" Width="110" IsReadOnly="True" Binding="{Binding Manufacturer}" />
                             <DataGridTextColumn Header="Model" Width="*" IsReadOnly="True" Binding="{Binding Model}" />
                             <DataGridTextColumn Header="System ID / Machine Type" Width="200" IsReadOnly="True" Binding="{Binding SystemID}" />
@@ -243,9 +455,367 @@
                 </DockPanel>
             </TabItem>
 
-            <!-- ============ Tab 2: SCCM Settings ============ -->
+            <!-- ============ Package Management ============ -->
+            <TabItem Header="Package Management">
+                <DockPanel Margin="16" LastChildFill="True">
+                    <StackPanel DockPanel.Dock="Top">
+                        <WrapPanel Margin="0,0,0,6">
+                            <Button x:Name="PkgRefreshButton" Content="Refresh Packages" Style="{StaticResource StandardButton}" Width="148" Margin="0,0,8,0" />
+                            <ComboBox x:Name="PkgFilterCombo" Width="150" Margin="0,0,8,0" SelectedIndex="0">
+                                <sys:String>All Packages</sys:String>
+                                <sys:String>Drivers Only</sys:String>
+                                <sys:String>BIOS Only</sys:String>
+                            </ComboBox>
+                            <Button x:Name="PkgDeleteButton" Content="Remove Selected" Style="{StaticResource StandardButton}" Width="142" Margin="0,0,8,0" Foreground="#FFE74C3C" />
+                            <CheckBox x:Name="PkgIncludeDriverPkgsCheckBox" Content="Include Driver Packages" Margin="0,0,16,0" />
+                            <Button x:Name="PkgCleanupOverlayButton" Content="Cleanup Overlay TS Packages..." Style="{StaticResource StandardButton}" Width="238" Foreground="#FFE74C3C" />
+                        </WrapPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                            <Label Content="Action:" Width="55" />
+                            <ComboBox x:Name="PkgActionCombo" Width="220" Margin="0,0,8,0" SelectedIndex="0">
+                                <sys:String>Patch Driver Package</sys:String>
+                                <sys:String>Move to Production</sys:String>
+                                <sys:String>Move to Pilot</sys:String>
+                                <sys:String>Mark as Retired</sys:String>
+                                <sys:String>Move to Windows 11 24H2</sys:String>
+                                <sys:String>Move to Windows 11 23H2</sys:String>
+                                <sys:String>Move to Windows 11 22H2</sys:String>
+                                <sys:String>Move to Windows 11</sys:String>
+                                <sys:String>Move to Windows 10 22H2</sys:String>
+                                <sys:String>Move to Windows 10 21H2</sys:String>
+                            </ComboBox>
+                            <Button x:Name="PkgApplyButton" Content="Apply Action" Style="{StaticResource StandardButton}" Width="116" Margin="0,0,8,0" />
+                            <Button x:Name="PkgSelectAllButton" Content="Select All" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,8,0" />
+                            <Button x:Name="PkgSelectNoneButton" Content="Select None" Style="{StaticResource StandardButton}" Width="100" />
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                            <Label Content="Search:" Width="55" />
+                            <TextBox x:Name="PkgSearchBox" Width="350" />
+                        </StackPanel>
+                    </StackPanel>
+
+                    <DataGrid x:Name="PkgGrid">
+                        <DataGrid.Columns>
+                            <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox Style="{StaticResource GridCheckCell}"
+                                                  IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                            <DataGridTextColumn Header="PackageID" Width="80" IsReadOnly="True" Binding="{Binding PackageID}" />
+                            <DataGridTextColumn Header="Name" Width="2*" IsReadOnly="True" Binding="{Binding Name}" />
+                            <DataGridTextColumn Header="Version" Width="80" IsReadOnly="True" Binding="{Binding Version}" />
+                            <DataGridTextColumn Header="Manufacturer" Width="110" IsReadOnly="True" Binding="{Binding Manufacturer}" />
+                            <DataGridTextColumn Header="Type" Width="90" IsReadOnly="True" Binding="{Binding PackageType}" />
+                            <DataGridTextColumn Header="SourcePath" Width="*" IsReadOnly="True" Binding="{Binding SourcePath}" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ============ Deploy Applications ============ -->
+            <TabItem Header="Deploy Applications">
+                <DockPanel Margin="16" LastChildFill="True">
+                    <StackPanel DockPanel.Dock="Top">
+                        <!-- Filters + options row -->
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" MinWidth="210" />
+                                <ColumnDefinition Width="Auto" MinWidth="210" />
+                                <ColumnDefinition Width="*" MinWidth="430" />
+                            </Grid.ColumnDefinitions>
+
+                            <GroupBox Grid.Column="0" Header="Application Type" Margin="0,0,10,10">
+                                <StackPanel>
+                                    <CheckBox x:Name="DeployDriverCheckBox" Content="Driver Applications" IsChecked="True" />
+                                    <CheckBox x:Name="DeployDriverUpdatesCheckBox" Content="Driver Update Applications" IsChecked="True" />
+                                    <CheckBox x:Name="DeployBIOSCheckBox" Content="BIOS Applications" />
+                                    <CheckBox x:Name="DeployIncludeTestCheckBox" Content="Include 'Test - ' apps" />
+                                </StackPanel>
+                            </GroupBox>
+
+                            <GroupBox Grid.Column="1" Header="Manufacturer Filter" Margin="0,0,10,10">
+                                <StackPanel>
+                                    <StackPanel Orientation="Horizontal">
+                                        <CheckBox x:Name="DeployDellCheckBox" Content="Dell" IsChecked="True" Margin="0,4,12,4" />
+                                        <CheckBox x:Name="DeployLenovoCheckBox" Content="Lenovo" IsChecked="True" Margin="0,4,12,4" />
+                                        <CheckBox x:Name="DeployMicrosoftCheckBox" Content="Microsoft" IsChecked="True" />
+                                    </StackPanel>
+                                    <Label Content="Model contains:" Margin="0,4,0,0" />
+                                    <TextBox x:Name="DeployModelInput" />
+                                </StackPanel>
+                            </GroupBox>
+
+                            <GroupBox Grid.Column="2" Header="Deployment Options" Margin="0,0,0,10">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <!-- Purpose + Action -->
+                                    <WrapPanel Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal">
+                                        <Label Content="Purpose:" />
+                                        <RadioButton x:Name="DeployPurposeAvailableRadio" GroupName="DeployPurpose" Content="Available" IsChecked="True" />
+                                        <RadioButton x:Name="DeployPurposeRequiredRadio" GroupName="DeployPurpose" Content="Required" />
+                                        <Label Content="Action:" Margin="12,0,0,0" />
+                                        <RadioButton x:Name="DeployActionInstallRadio" GroupName="DeployAction" Content="Install" IsChecked="True" />
+                                        <RadioButton x:Name="DeployActionUninstallRadio" GroupName="DeployAction" Content="Uninstall" />
+                                    </WrapPanel>
+
+                                    <!-- User notification -->
+                                    <StackPanel Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
+                                        <Label Content="User notification:" Width="125" />
+                                        <ComboBox x:Name="DeployUserNotifCombo" Width="220" SelectedIndex="0">
+                                            <sys:String>DisplayAll</sys:String>
+                                            <sys:String>DisplaySoftwareCenterOnly</sys:String>
+                                            <sys:String>HideAll</sys:String>
+                                        </ComboBox>
+                                    </StackPanel>
+
+                                    <!-- Schedule -->
+                                    <WrapPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
+                                        <CheckBox x:Name="DeployScheduleCheck" Content="Schedule" Width="105" />
+                                        <Label Content="Avail:" />
+                                        <DatePicker x:Name="DeployAvailablePicker" Width="120" IsEnabled="False" />
+                                        <TextBox x:Name="DeployAvailableTime" Width="55" Margin="4,0,0,0" Text="00:00" IsEnabled="False" />
+                                        <Label Content="Deadline:" Margin="12,0,0,0" />
+                                        <DatePicker x:Name="DeployDeadlinePicker" Width="120" IsEnabled="False" />
+                                        <TextBox x:Name="DeployDeadlineTime" Width="55" Margin="4,0,0,0" Text="00:00" IsEnabled="False" />
+                                    </WrapPanel>
+
+                                    <!-- MW behavior -->
+                                    <WrapPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
+                                        <CheckBox x:Name="DeployOverrideSWCheck" Content="Install outside maintenance window" Margin="0,4,18,4" />
+                                        <CheckBox x:Name="DeployRebootOutsideSWCheck" Content="Restart outside maintenance window" />
+                                    </WrapPanel>
+
+                                    <!-- Create MW -->
+                                    <CheckBox Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="2" x:Name="DeployCreateMWCheck"
+                                              Content="Create / ensure maintenance window on collection" Margin="0,6,0,0" />
+                                    <WrapPanel Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="18,4,0,0">
+                                        <Label Content="Start:" />
+                                        <DatePicker x:Name="DeployMWStartPicker" Width="120" IsEnabled="False" />
+                                        <TextBox x:Name="DeployMWStartTime" Width="55" Margin="4,0,0,0" Text="22:00" IsEnabled="False" />
+                                        <Label Content="Dur:" Margin="10,0,0,0" />
+                                        <TextBox x:Name="DeployMWHoursNUD" Width="40" Text="4" IsEnabled="False" />
+                                        <Label Content="h" />
+                                        <TextBox x:Name="DeployMWMinutesNUD" Width="40" Text="0" IsEnabled="False" />
+                                        <Label Content="m" />
+                                        <Label Content="Recur:" Margin="10,0,0,0" />
+                                        <ComboBox x:Name="DeployMWRecurCombo" Width="90" IsEnabled="False">
+                                            <sys:String>None</sys:String>
+                                            <sys:String>Daily</sys:String>
+                                            <sys:String>Weekly</sys:String>
+                                        </ComboBox>
+                                        <Label Content="Day:" Margin="10,0,0,0" />
+                                        <ComboBox x:Name="DeployMWDayCombo" Width="100" IsEnabled="False">
+                                            <sys:String>Sunday</sys:String>
+                                            <sys:String>Monday</sys:String>
+                                            <sys:String>Tuesday</sys:String>
+                                            <sys:String>Wednesday</sys:String>
+                                            <sys:String>Thursday</sys:String>
+                                            <sys:String>Friday</sys:String>
+                                            <sys:String>Saturday</sys:String>
+                                        </ComboBox>
+                                    </WrapPanel>
+                                </Grid>
+                            </GroupBox>
+                        </Grid>
+
+                        <!-- Collection picker (stretches with the window) -->
+                        <Grid Margin="0,0,0,6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Label Grid.Column="0" Content="Target Collection:" Width="125" />
+                            <ComboBox x:Name="DeployCollectionCombo" Grid.Column="1" IsEditable="True" Margin="0,0,10,0" />
+                            <Button x:Name="DeployRefreshCollectionsButton" Grid.Column="2" Content="Refresh Collections" Style="{StaticResource StandardButton}" Width="164" />
+                        </Grid>
+
+                        <!-- App action row -->
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                            <Button x:Name="DeployRefreshAppsButton" Content="Refresh Applications" Style="{StaticResource StandardButton}" Width="176" Margin="0,0,8,0" />
+                            <Button x:Name="DeploySelectAllButton" Content="Select All" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,8,0" />
+                            <Button x:Name="DeploySelectNoneButton" Content="Select None" Style="{StaticResource StandardButton}" Width="100" Margin="0,0,12,0" />
+                            <Label Content="Search:" />
+                            <TextBox x:Name="DeployAppsSearchBox" Width="280" />
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                            <Button x:Name="DeployButton" Content="Deploy Selected" Style="{StaticResource AccentButton}" Width="160" Height="32" Margin="0,0,12,0" />
+                            <TextBlock x:Name="DeployStatusLabel" VerticalAlignment="Center" Foreground="{DynamicResource SubtleFg}"
+                                       Text="Connect to ConfigMgr to populate collections, then click Refresh Applications." />
+                        </StackPanel>
+                    </StackPanel>
+
+                    <DataGrid x:Name="DeployAppsGrid">
+                        <DataGrid.Columns>
+                            <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox Style="{StaticResource GridCheckCell}"
+                                                  IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                            <DataGridTextColumn Header="Name" Width="2*" IsReadOnly="True" Binding="{Binding Name}" />
+                            <DataGridTextColumn Header="Version" Width="90" IsReadOnly="True" Binding="{Binding Version}" />
+                            <DataGridTextColumn Header="Manufacturer" Width="110" IsReadOnly="True" Binding="{Binding Manufacturer}" />
+                            <DataGridTextColumn Header="Kind" Width="90" IsReadOnly="True" Binding="{Binding Kind}" />
+                            <DataGridTextColumn Header="LastModified" Width="*" IsReadOnly="True" Binding="{Binding LastModified}" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ============ Intune ============ -->
+            <TabItem Header="Intune">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="16">
+                    <StackPanel>
+                        <GroupBox Header="Microsoft Intune Connection">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="150" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <Label Grid.Row="0" Grid.Column="0" Content="Tenant ID / domain:" />
+                                <TextBox x:Name="IntuneTenantInput" Grid.Row="0" Grid.Column="1" Margin="0,3" />
+                                <Label Grid.Row="1" Grid.Column="0" Content="Authentication:" />
+                                <ComboBox x:Name="IntuneAuthCombo" Grid.Row="1" Grid.Column="1" Margin="0,3" SelectedIndex="0">
+                                    <sys:String>App registration - certificate</sys:String>
+                                    <sys:String>App registration - client secret</sys:String>
+                                </ComboBox>
+                                <Label Grid.Row="2" Grid.Column="0" Content="Client (app) ID:" />
+                                <TextBox x:Name="IntuneClientIdInput" Grid.Row="2" Grid.Column="1" Margin="0,3" />
+                                <Label Grid.Row="3" Grid.Column="0" Content="Certificate thumbprint:" />
+                                <TextBox x:Name="IntuneCertThumbInput" Grid.Row="3" Grid.Column="1" Margin="0,3"
+                                         ToolTip="Thumbprint of a cert (with private key) in CurrentUser\My or LocalMachine\My." />
+                                <Label Grid.Row="4" Grid.Column="0" Content="Client secret:" />
+                                <PasswordBox x:Name="IntuneSecretBox" Grid.Row="4" Grid.Column="1" Margin="0,3" />
+                                <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,8,0,0">
+                                    <Button x:Name="IntuneConnectButton" Content="Connect" Style="{StaticResource StandardButton}" Width="100" Margin="0,0,8,0" />
+                                    <Button x:Name="IntuneTestButton" Content="Test" Style="{StaticResource StandardButton}" Width="80" Margin="0,0,8,0" />
+                                    <Button x:Name="IntuneDisconnectButton" Content="Disconnect" Style="{StaticResource StandardButton}" Width="100" Margin="0,0,8,0" />
+                                    <Button x:Name="IntunePermsButton" Content="Required permissions..." Style="{StaticResource StandardButton}" Width="170" />
+                                </StackPanel>
+                            </Grid>
+                        </GroupBox>
+
+                        <TextBlock x:Name="IntuneConnStatusLabel" Text="Not connected" Foreground="{DynamicResource SubtleFg}" Margin="2,0,0,10" />
+
+                        <GroupBox Header="Target group (shared by publish and profile)">
+                            <StackPanel Orientation="Horizontal">
+                                <Label Content="Find Entra group:" Width="120" />
+                                <TextBox x:Name="IntuneGroupSearchInput" Width="240" Margin="0,0,8,0" />
+                                <Button x:Name="IntuneGroupSearchButton" Content="Search" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,12,0" />
+                                <Label Content="Group:" />
+                                <ComboBox x:Name="IntuneGroupCombo" Width="300" />
+                            </StackPanel>
+                        </GroupBox>
+
+                        <GroupBox Header="Publish Driver Package as a Win32 App">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="150" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <Label Grid.Row="0" Grid.Column="0" Content="Package folder:" />
+                                <TextBox x:Name="IntunePkgFolderInput" Grid.Row="0" Grid.Column="1" Margin="0,3" />
+                                <Button x:Name="IntunePkgBrowseButton" Grid.Row="0" Grid.Column="2" Content="..." Width="36" Margin="6,3,0,3" Style="{StaticResource StandardButton}" />
+                                <Label Grid.Row="1" Grid.Column="0" Content="Display name:" />
+                                <TextBox x:Name="IntunePkgNameInput" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,3" />
+                                <StackPanel Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,3,0,0">
+                                    <Label Content="Version:" />
+                                    <TextBox x:Name="IntunePkgVersionInput" Width="110" Margin="0,0,12,0" />
+                                    <Label Content="Manufacturer:" />
+                                    <ComboBox x:Name="IntunePkgMfrCombo" Width="110" Margin="0,0,12,0" SelectedIndex="0">
+                                        <sys:String>Dell</sys:String>
+                                        <sys:String>Lenovo</sys:String>
+                                        <sys:String>Microsoft</sys:String>
+                                    </ComboBox>
+                                    <Label Content="Mode:" />
+                                    <ComboBox x:Name="IntunePkgModeCombo" Width="130" Margin="0,0,12,0" SelectedIndex="0">
+                                        <sys:String>Driver</sys:String>
+                                        <sys:String>BIOS</sys:String>
+                                        <sys:String>DriverUpdates</sys:String>
+                                    </ComboBox>
+                                    <Label Content="Intent:" />
+                                    <ComboBox x:Name="IntuneIntentCombo" Width="110" SelectedIndex="0">
+                                        <sys:String>Available</sys:String>
+                                        <sys:String>Required</sys:String>
+                                        <sys:String>Uninstall</sys:String>
+                                    </ComboBox>
+                                </StackPanel>
+                            </Grid>
+                        </GroupBox>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                            <Button x:Name="IntunePublishButton" Content="Publish to Intune" Style="{StaticResource AccentButton}" Width="170" Height="32" Margin="0,0,12,0" />
+                            <TextBlock Text="Packages the folder and uploads it as a Win32 app (assigns to the selected group if one is chosen)." VerticalAlignment="Center" Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <GroupBox Header="Windows Driver-Update Profile">
+                            <StackPanel Orientation="Horizontal">
+                                <Label Content="Name:" Width="60" />
+                                <TextBox x:Name="IntuneProfileNameInput" Width="240" Margin="0,0,12,0" />
+                                <Label Content="Approval:" />
+                                <ComboBox x:Name="IntuneProfileApprovalCombo" Width="120" Margin="0,0,12,0" SelectedIndex="0">
+                                    <sys:String>Manual</sys:String>
+                                    <sys:String>Automatic</sys:String>
+                                </ComboBox>
+                                <Label Content="Defer (days):" />
+                                <TextBox x:Name="IntuneProfileDeferralInput" Width="60" Text="0" Margin="0,0,12,0" />
+                                <Button x:Name="IntuneCreateProfileButton" Content="Create Profile" Style="{StaticResource StandardButton}" Width="130" />
+                            </StackPanel>
+                        </GroupBox>
+
+                        <TextBlock x:Name="IntuneStatusLabel" Text="" Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" Margin="2,4,0,0" />
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ============ Progress ============ -->
+            <TabItem x:Name="ProgressTab" Header="Progress">
+                <DockPanel Margin="16" LastChildFill="True">
+                    <StackPanel DockPanel.Dock="Top" Margin="0,0,0,8">
+                        <ProgressBar x:Name="ProgressBar" Height="24" Minimum="0" Maximum="100" />
+                        <TextBlock x:Name="StatusLabel" Text="Ready" FontSize="13" Margin="0,8,0,0" Foreground="{DynamicResource Fg}" />
+                    </StackPanel>
+                    <ListBox x:Name="LogListBox" FontFamily="Consolas" FontSize="12"
+                             Background="#FF1E1E1E" Foreground="#FFC8C8C8" BorderBrush="{DynamicResource BorderClr}"
+                             ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                             ScrollViewer.VerticalScrollBarVisibility="Auto" />
+                </DockPanel>
+            </TabItem>
+
+            <!-- ============ SCCM Settings ============ -->
             <TabItem Header="SCCM Settings">
-                <Grid Margin="10">
+                <Grid Margin="16">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" MinWidth="470" />
                         <ColumnDefinition Width="*" MinWidth="380" />
@@ -311,12 +881,12 @@
                                     <CheckBox x:Name="VerifyHashCheckBox" Content="Verify download hash (Dell)" Width="250" />
                                 </WrapPanel>
                                 <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                                    <Label Content="Driver exclusions:" Width="130" />
+                                    <Label Content="Driver exclusions:" Width="150" />
                                     <TextBox x:Name="ExcludeDriversInput" Width="380"
                                              ToolTip="Semicolon-separated driver name or filename patterns to exclude from every package (Dell). Wildcards supported; plain text matches as a substring. Example: Realtek Card Reader; *Killer*Performance*" />
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                                    <Label Content="Deployment Platform:" Width="130" />
+                                    <Label Content="Deployment Platform:" Width="150" />
                                     <ComboBox x:Name="DeployPlatformCombo" Width="240" SelectedIndex="0">
                                         <sys:String>ConfigMgr - Standard Pkg</sys:String>
                                         <sys:String>ConfigMgr - Driver Pkg</sys:String>
@@ -327,7 +897,7 @@
                                     </ComboBox>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                                    <CheckBox x:Name="CompressPackageCheckBox" Content="Compress Package:" Width="130" />
+                                    <CheckBox x:Name="CompressPackageCheckBox" Content="Compress Package:" Width="150" />
                                     <ComboBox x:Name="CompressionTypeCombo" Width="90" IsEnabled="False" SelectedIndex="0">
                                         <sys:String>ZIP</sys:String>
                                         <sys:String>WIM</sys:String>
@@ -346,8 +916,14 @@
                         <GroupBox Grid.Row="0" Header="Distribution Points">
                             <DataGrid x:Name="DPGrid">
                                 <DataGrid.Columns>
-                                    <DataGridCheckBoxColumn Header="" Width="30"
-                                        Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" />
+                                    <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <CheckBox Style="{StaticResource GridCheckCell}"
+                                                          IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
                                     <DataGridTextColumn Header="Distribution Point" Width="*" IsReadOnly="True" Binding="{Binding Name}" />
                                 </DataGrid.Columns>
                             </DataGrid>
@@ -355,241 +931,20 @@
                         <GroupBox Grid.Row="1" Header="Distribution Point Groups">
                             <DataGrid x:Name="DPGGrid">
                                 <DataGrid.Columns>
-                                    <DataGridCheckBoxColumn Header="" Width="30"
-                                        Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" />
+                                    <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <CheckBox Style="{StaticResource GridCheckCell}"
+                                                          IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
                                     <DataGridTextColumn Header="Distribution Point Group" Width="*" IsReadOnly="True" Binding="{Binding Name}" />
                                 </DataGrid.Columns>
                             </DataGrid>
                         </GroupBox>
                     </Grid>
                 </Grid>
-            </TabItem>
-
-            <!-- ============ Tab 3: Progress ============ -->
-            <TabItem Header="Progress">
-                <DockPanel Margin="10" LastChildFill="True">
-                    <StackPanel DockPanel.Dock="Top" Margin="0,0,0,8">
-                        <ProgressBar x:Name="ProgressBar" Height="24" Minimum="0" Maximum="100" />
-                        <TextBlock x:Name="StatusLabel" Text="Ready" FontSize="13" Margin="0,8,0,0" Foreground="{DynamicResource Fg}" />
-                    </StackPanel>
-                    <ListBox x:Name="LogListBox" FontFamily="Consolas" FontSize="12"
-                             Background="#FF1E1E1E" Foreground="#FFC8C8C8" BorderBrush="{DynamicResource BorderClr}"
-                             ScrollViewer.HorizontalScrollBarVisibility="Auto"
-                             ScrollViewer.VerticalScrollBarVisibility="Auto" />
-                </DockPanel>
-            </TabItem>
-
-            <!-- ============ Tab 4: Package Management ============ -->
-            <TabItem Header="Package Management">
-                <DockPanel Margin="10" LastChildFill="True">
-                    <StackPanel DockPanel.Dock="Top">
-                        <WrapPanel Margin="0,0,0,6">
-                            <Button x:Name="PkgRefreshButton" Content="Refresh Packages" Style="{StaticResource StandardButton}" Width="130" Margin="0,0,8,0" />
-                            <ComboBox x:Name="PkgFilterCombo" Width="150" Margin="0,0,8,0" SelectedIndex="0">
-                                <sys:String>All Packages</sys:String>
-                                <sys:String>Drivers Only</sys:String>
-                                <sys:String>BIOS Only</sys:String>
-                            </ComboBox>
-                            <Button x:Name="PkgDeleteButton" Content="Remove Selected" Style="{StaticResource StandardButton}" Width="130" Margin="0,0,8,0" Foreground="#FFC42B1C" />
-                            <CheckBox x:Name="PkgIncludeDriverPkgsCheckBox" Content="Include Driver Packages" Margin="0,0,16,0" />
-                            <Button x:Name="PkgCleanupOverlayButton" Content="Cleanup Overlay TS Packages..." Style="{StaticResource StandardButton}" Width="210" Foreground="#FFC42B1C" />
-                        </WrapPanel>
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
-                            <Label Content="Action:" Width="55" />
-                            <ComboBox x:Name="PkgActionCombo" Width="220" Margin="0,0,8,0" SelectedIndex="0">
-                                <sys:String>Patch Driver Package</sys:String>
-                                <sys:String>Move to Production</sys:String>
-                                <sys:String>Move to Pilot</sys:String>
-                                <sys:String>Mark as Retired</sys:String>
-                                <sys:String>Move to Windows 11 24H2</sys:String>
-                                <sys:String>Move to Windows 11 23H2</sys:String>
-                                <sys:String>Move to Windows 11 22H2</sys:String>
-                                <sys:String>Move to Windows 11</sys:String>
-                                <sys:String>Move to Windows 10 22H2</sys:String>
-                                <sys:String>Move to Windows 10 21H2</sys:String>
-                            </ComboBox>
-                            <Button x:Name="PkgApplyButton" Content="Apply Action" Style="{StaticResource StandardButton}" Width="110" Margin="0,0,8,0" />
-                            <Button x:Name="PkgSelectAllButton" Content="Select All" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,8,0" />
-                            <Button x:Name="PkgSelectNoneButton" Content="Select None" Style="{StaticResource StandardButton}" Width="90" />
-                        </StackPanel>
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                            <Label Content="Search:" Width="55" />
-                            <TextBox x:Name="PkgSearchBox" Width="350" />
-                        </StackPanel>
-                    </StackPanel>
-
-                    <DataGrid x:Name="PkgGrid">
-                        <DataGrid.Columns>
-                            <DataGridCheckBoxColumn Header="" Width="30"
-                                Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" />
-                            <DataGridTextColumn Header="PackageID" Width="80" IsReadOnly="True" Binding="{Binding PackageID}" />
-                            <DataGridTextColumn Header="Name" Width="2*" IsReadOnly="True" Binding="{Binding Name}" />
-                            <DataGridTextColumn Header="Version" Width="80" IsReadOnly="True" Binding="{Binding Version}" />
-                            <DataGridTextColumn Header="Manufacturer" Width="110" IsReadOnly="True" Binding="{Binding Manufacturer}" />
-                            <DataGridTextColumn Header="Type" Width="90" IsReadOnly="True" Binding="{Binding PackageType}" />
-                            <DataGridTextColumn Header="SourcePath" Width="*" IsReadOnly="True" Binding="{Binding SourcePath}" />
-                        </DataGrid.Columns>
-                    </DataGrid>
-                </DockPanel>
-            </TabItem>
-
-            <!-- ============ Tab 5: Deploy Applications ============ -->
-            <TabItem Header="Deploy Applications">
-                <DockPanel Margin="10" LastChildFill="True">
-                    <StackPanel DockPanel.Dock="Top">
-                        <!-- Filters + options row -->
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" MinWidth="210" />
-                                <ColumnDefinition Width="Auto" MinWidth="210" />
-                                <ColumnDefinition Width="*" MinWidth="430" />
-                            </Grid.ColumnDefinitions>
-
-                            <GroupBox Grid.Column="0" Header="Application Type" Margin="0,0,10,10">
-                                <StackPanel>
-                                    <CheckBox x:Name="DeployDriverCheckBox" Content="Driver Applications" IsChecked="True" />
-                                    <CheckBox x:Name="DeployDriverUpdatesCheckBox" Content="Driver Update Applications" IsChecked="True" />
-                                    <CheckBox x:Name="DeployBIOSCheckBox" Content="BIOS Applications" />
-                                    <CheckBox x:Name="DeployIncludeTestCheckBox" Content="Include 'Test - ' apps" />
-                                </StackPanel>
-                            </GroupBox>
-
-                            <GroupBox Grid.Column="1" Header="Manufacturer Filter" Margin="0,0,10,10">
-                                <StackPanel>
-                                    <StackPanel Orientation="Horizontal">
-                                        <CheckBox x:Name="DeployDellCheckBox" Content="Dell" IsChecked="True" Margin="0,4,12,4" />
-                                        <CheckBox x:Name="DeployLenovoCheckBox" Content="Lenovo" IsChecked="True" Margin="0,4,12,4" />
-                                        <CheckBox x:Name="DeployMicrosoftCheckBox" Content="Microsoft" IsChecked="True" />
-                                    </StackPanel>
-                                    <Label Content="Model contains:" Margin="0,4,0,0" />
-                                    <TextBox x:Name="DeployModelInput" />
-                                </StackPanel>
-                            </GroupBox>
-
-                            <GroupBox Grid.Column="2" Header="Deployment Options" Margin="0,0,0,10">
-                                <Grid>
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
-                                    <Grid.RowDefinitions>
-                                        <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
-                                    </Grid.RowDefinitions>
-
-                                    <!-- Purpose + Action -->
-                                    <WrapPanel Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal">
-                                        <Label Content="Purpose:" />
-                                        <RadioButton x:Name="DeployPurposeAvailableRadio" GroupName="DeployPurpose" Content="Available" IsChecked="True" />
-                                        <RadioButton x:Name="DeployPurposeRequiredRadio" GroupName="DeployPurpose" Content="Required" />
-                                        <Label Content="Action:" Margin="12,0,0,0" />
-                                        <RadioButton x:Name="DeployActionInstallRadio" GroupName="DeployAction" Content="Install" IsChecked="True" />
-                                        <RadioButton x:Name="DeployActionUninstallRadio" GroupName="DeployAction" Content="Uninstall" />
-                                    </WrapPanel>
-
-                                    <!-- User notification -->
-                                    <StackPanel Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
-                                        <Label Content="User notification:" Width="105" />
-                                        <ComboBox x:Name="DeployUserNotifCombo" Width="220" SelectedIndex="0">
-                                            <sys:String>DisplayAll</sys:String>
-                                            <sys:String>DisplaySoftwareCenterOnly</sys:String>
-                                            <sys:String>HideAll</sys:String>
-                                        </ComboBox>
-                                    </StackPanel>
-
-                                    <!-- Schedule -->
-                                    <WrapPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
-                                        <CheckBox x:Name="DeployScheduleCheck" Content="Schedule" Width="105" />
-                                        <Label Content="Avail:" />
-                                        <DatePicker x:Name="DeployAvailablePicker" Width="120" IsEnabled="False" />
-                                        <TextBox x:Name="DeployAvailableTime" Width="55" Margin="4,0,0,0" Text="00:00" IsEnabled="False" />
-                                        <Label Content="Deadline:" Margin="12,0,0,0" />
-                                        <DatePicker x:Name="DeployDeadlinePicker" Width="120" IsEnabled="False" />
-                                        <TextBox x:Name="DeployDeadlineTime" Width="55" Margin="4,0,0,0" Text="00:00" IsEnabled="False" />
-                                    </WrapPanel>
-
-                                    <!-- MW behavior -->
-                                    <WrapPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
-                                        <CheckBox x:Name="DeployOverrideSWCheck" Content="Install outside maintenance window" Margin="0,4,18,4" />
-                                        <CheckBox x:Name="DeployRebootOutsideSWCheck" Content="Restart outside maintenance window" />
-                                    </WrapPanel>
-
-                                    <!-- Create MW -->
-                                    <CheckBox Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="2" x:Name="DeployCreateMWCheck"
-                                              Content="Create / ensure maintenance window on collection" Margin="0,6,0,0" />
-                                    <WrapPanel Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="18,4,0,0">
-                                        <Label Content="Start:" />
-                                        <DatePicker x:Name="DeployMWStartPicker" Width="120" IsEnabled="False" />
-                                        <TextBox x:Name="DeployMWStartTime" Width="55" Margin="4,0,0,0" Text="22:00" IsEnabled="False" />
-                                        <Label Content="Dur:" Margin="10,0,0,0" />
-                                        <TextBox x:Name="DeployMWHoursNUD" Width="40" Text="4" IsEnabled="False" />
-                                        <Label Content="h" />
-                                        <TextBox x:Name="DeployMWMinutesNUD" Width="40" Text="0" IsEnabled="False" />
-                                        <Label Content="m" />
-                                        <Label Content="Recur:" Margin="10,0,0,0" />
-                                        <ComboBox x:Name="DeployMWRecurCombo" Width="90" IsEnabled="False">
-                                            <sys:String>None</sys:String>
-                                            <sys:String>Daily</sys:String>
-                                            <sys:String>Weekly</sys:String>
-                                        </ComboBox>
-                                        <Label Content="Day:" Margin="10,0,0,0" />
-                                        <ComboBox x:Name="DeployMWDayCombo" Width="100" IsEnabled="False">
-                                            <sys:String>Sunday</sys:String>
-                                            <sys:String>Monday</sys:String>
-                                            <sys:String>Tuesday</sys:String>
-                                            <sys:String>Wednesday</sys:String>
-                                            <sys:String>Thursday</sys:String>
-                                            <sys:String>Friday</sys:String>
-                                            <sys:String>Saturday</sys:String>
-                                        </ComboBox>
-                                    </WrapPanel>
-                                </Grid>
-                            </GroupBox>
-                        </Grid>
-
-                        <!-- Collection picker (stretches with the window) -->
-                        <Grid Margin="0,0,0,6">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <Label Grid.Column="0" Content="Target Collection:" Width="115" />
-                            <ComboBox x:Name="DeployCollectionCombo" Grid.Column="1" IsEditable="True" Margin="0,0,10,0" />
-                            <Button x:Name="DeployRefreshCollectionsButton" Grid.Column="2" Content="Refresh Collections" Style="{StaticResource StandardButton}" Width="140" />
-                        </Grid>
-
-                        <!-- App action row -->
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
-                            <Button x:Name="DeployRefreshAppsButton" Content="Refresh Applications" Style="{StaticResource StandardButton}" Width="150" Margin="0,0,8,0" />
-                            <Button x:Name="DeploySelectAllButton" Content="Select All" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,8,0" />
-                            <Button x:Name="DeploySelectNoneButton" Content="Select None" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,12,0" />
-                            <Label Content="Search:" />
-                            <TextBox x:Name="DeployAppsSearchBox" Width="280" />
-                        </StackPanel>
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
-                            <Button x:Name="DeployButton" Content="Deploy Selected" Style="{StaticResource AccentButton}" Width="160" Height="28" Margin="0,0,12,0" />
-                            <TextBlock x:Name="DeployStatusLabel" VerticalAlignment="Center" Foreground="{DynamicResource SubtleFg}"
-                                       Text="Connect to ConfigMgr to populate collections, then click Refresh Applications." />
-                        </StackPanel>
-                    </StackPanel>
-
-                    <DataGrid x:Name="DeployAppsGrid">
-                        <DataGrid.Columns>
-                            <DataGridCheckBoxColumn Header="" Width="30"
-                                Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" />
-                            <DataGridTextColumn Header="Name" Width="2*" IsReadOnly="True" Binding="{Binding Name}" />
-                            <DataGridTextColumn Header="Version" Width="90" IsReadOnly="True" Binding="{Binding Version}" />
-                            <DataGridTextColumn Header="Manufacturer" Width="110" IsReadOnly="True" Binding="{Binding Manufacturer}" />
-                            <DataGridTextColumn Header="Kind" Width="90" IsReadOnly="True" Binding="{Binding Kind}" />
-                            <DataGridTextColumn Header="LastModified" Width="*" IsReadOnly="True" Binding="{Binding LastModified}" />
-                        </DataGrid.Columns>
-                    </DataGrid>
-                </DockPanel>
             </TabItem>
         </TabControl>
     </DockPanel>

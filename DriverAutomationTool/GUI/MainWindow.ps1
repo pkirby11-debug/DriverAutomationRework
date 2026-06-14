@@ -45,7 +45,7 @@ function New-DATMainWindow {
 
     # --- Version labels ---
     $ModVer = (Get-Module DriverAutomationTool).Version
-    if (-not $ModVer) { $ModVer = '2.1.6' }
+    if (-not $ModVer) { $ModVer = '2.11.1' }
     $Window.Title = "Driver Automation Tool v$ModVer"
     $Controls['VersionLabel'].Text = "v$ModVer"
 
@@ -82,8 +82,16 @@ function New-DATMainWindow {
     [void](Set-DATComboText -Combo $Controls['DeployMWRecurCombo'] -Value 'Daily')
     [void](Set-DATComboText -Combo $Controls['DeployMWDayCombo'] -Value 'Sunday')
 
-    # Apply the light/dark palette following the Windows app theme.
-    Set-DATWindowTheme -Window $Window -Mode System
+    # Apply the saved theme preference before the window is shown (avoids a
+    # light->dark flash on launch). Manual Dark/Light toggle, default Dark; a
+    # previously saved 'System' preference (the removed option) falls back to Dark.
+    $ThemeMode = 'Dark'
+    try {
+        $SavedMode = (Get-DATConfig).options.themeMode
+        if ($SavedMode -in @('Light', 'Dark')) { $ThemeMode = $SavedMode }
+    } catch { }
+    [void](Set-DATComboText -Combo $Controls['ThemeCombo'] -Value $ThemeMode)
+    Set-DATWindowTheme -Window $Window -Mode $ThemeMode
 
     return $Controls
 }
@@ -126,6 +134,14 @@ function Initialize-DATMainWindow {
     $G = @{
         Initializing             = $true
         LogQueue                 = $null
+        ModelRunspace            = $null
+        ModelHandle              = $null
+        ModelTimer               = $null
+        ModelManufacturers       = @()
+        IntunePublishRunspace    = $null
+        IntunePublishHandle      = $null
+        IntunePublishTimer       = $null
+        IntuneGroupMap           = @{}
         SyncRunspace             = $null
         SyncHandle               = $null
         SyncTimer                = $null
@@ -234,65 +250,136 @@ function Initialize-DATMainWindow {
         if ($gui) { Add-DATWindowLogEntry -LogListBox $gui.Controls['LogListBox'] -LogEvent $Event }
     }
 
-    # --- Refresh Models Button ---
+    # --- Refresh Models Button (background runspace; keeps the UI responsive) ---
+    # The catalog model lists (Dell/Lenovo/Surface) are the slow part - on a cold
+    # cache they download and parse large catalogs, which used to freeze the window
+    # ("Not Responding"). They now run on a background runspace; the grid is filled
+    # and the optional known-model selection (which needs THIS runspace's live CM
+    # connection) runs back on the UI thread when the worker finishes.
     $Controls['RefreshButton'].Add_Click({
-        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
-        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+        if ($G.ModelHandle) { return }   # a load is already running
 
-        $Data = $Controls['ModelGridData']
-        $Data.Rows.Clear()
+        $Manufacturers = @()
+        if ($Controls['DellCheckBox'].IsChecked)      { $Manufacturers += 'Dell' }
+        if ($Controls['LenovoCheckBox'].IsChecked)    { $Manufacturers += 'Lenovo' }
+        if ($Controls['MicrosoftCheckBox'].IsChecked) { $Manufacturers += 'Microsoft' }
+
+        if ($Manufacturers.Count -eq 0) {
+            Show-DATWindowMessage -Message 'Select at least one manufacturer first.' -Type Warning
+            return
+        }
+
+        $Controls['ModelGridData'].Rows.Clear()
+        $Controls['RefreshButton'].IsEnabled = $false
+        $Controls['ModelProgress'].Visibility = [System.Windows.Visibility]::Visible
+        $Controls['ModelProgress'].IsIndeterminate = $true
         $Controls['StatusStripLabel'].Text = 'Loading models...'
-        $Window.Cursor = $WaitCursor
 
-        try {
-            $Manufacturers = @()
-            if ($Controls['DellCheckBox'].IsChecked)      { $Manufacturers += 'Dell' }
-            if ($Controls['LenovoCheckBox'].IsChecked)    { $Manufacturers += 'Lenovo' }
-            if ($Controls['MicrosoftCheckBox'].IsChecked) { $Manufacturers += 'Microsoft' }
+        $G.ModelManufacturers = $Manufacturers
+        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
 
-            $Data.BeginLoadData()
-            try {
+        $ModelScript = {
+            param($ModulePath, $Manufacturers)
+            $Mod = Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force -PassThru
+            # Get-DellModelList / Get-LenovoModelList / Get-SurfaceModelList are
+            # module-PRIVATE (not exported), so a bare Import-Module does not expose
+            # them to this runspace's session - they only resolve inside the module's
+            # own scope. Run the fetch there with & $Mod { ... }.
+            & $Mod {
+                param($Manufacturers)
                 foreach ($Make in $Manufacturers) {
                     $Models = switch ($Make) {
                         'Dell'      { Get-DellModelList }
                         'Lenovo'    { Get-LenovoModelList }
                         'Microsoft' { Get-SurfaceModelList }
                     }
-
                     foreach ($M in $Models) {
                         $ID = if ($M.SystemID) { $M.SystemID }
                               elseif ($M.MachineType) { $M.MachineType }
                               elseif ($M.DownloadID) { $M.DownloadID }
                               else { '' }
-                        $Plat = if ($M.Platform) { $M.Platform } else { '' }
-                        [void]$Data.Rows.Add($false, $M.Manufacturer, $M.Model, $ID, $Plat)
+                        [PSCustomObject]@{
+                            Manufacturer = $M.Manufacturer
+                            Model        = $M.Model
+                            SystemID     = $ID
+                            Platform     = if ($M.Platform) { $M.Platform } else { '' }
+                        }
                     }
                 }
-            } finally {
-                $Data.EndLoadData()
-            }
-
-            $ModelCount = $Data.Rows.Count
-            $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models"
-
-            # Auto-select known models if checkbox is checked and SCCM is connected
-            if ($Controls['KnownModelsCheckBox'].IsChecked -and (Get-DATCMState).Connected -and $ModelCount -gt 0) {
-                $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - querying SCCM inventory and existing packages..."
-                try {
-                    $KnownModels = Get-DATKnownModels -Manufacturers $Manufacturers
-                    $MatchCount = Select-DATKnownModelsInGrid -Table $Data -KnownModels $KnownModels
-                    $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - $MatchCount known model(s) selected (inventory + packages)"
-                } catch {
-                    Write-DATLog -Message "Known models auto-select failed: $($_.Exception.Message)" -Severity 2
-                    $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models (known models query failed)"
-                }
-            }
-        } catch {
-            Show-DATWindowMessage -Message "Error loading models: $($_.Exception.Message)" -Type Error
-            $Controls['StatusStripLabel'].Text = 'Error loading models'
-        } finally {
-            $Window.Cursor = $DefaultCursor
+            } $Manufacturers
         }
+
+        $G.ModelRunspace = [System.Management.Automation.PowerShell]::Create()
+        $G.ModelRunspace.AddScript($ModelScript).AddArgument($ModulePath).AddArgument($Manufacturers) | Out-Null
+        $G.ModelHandle = $G.ModelRunspace.BeginInvoke()
+
+        if ($G.ModelTimer) { $G.ModelTimer.Stop() }
+        $G.ModelTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $G.ModelTimer.Interval = [timespan]::FromMilliseconds(300)
+
+        $G.ModelTimer.Add_Tick({
+            $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+            if ($null -eq $G.ModelHandle -or -not $G.ModelHandle.IsCompleted) { return }
+            $G.ModelTimer.Stop()
+
+            try {
+                $Models = $G.ModelRunspace.EndInvoke($G.ModelHandle)
+                $RsErrors = @($G.ModelRunspace.Streams.Error)
+
+                $Data = $Controls['ModelGridData']
+                $Data.BeginLoadData()
+                try {
+                    foreach ($M in $Models) {
+                        [void]$Data.Rows.Add($false, $M.Manufacturer, $M.Model, $M.SystemID, $M.Platform)
+                    }
+                } finally {
+                    $Data.EndLoadData()
+                }
+
+                $ModelCount = $Data.Rows.Count
+                if ($ModelCount -eq 0 -and $RsErrors.Count -gt 0) {
+                    # Surface a background failure instead of silently showing 0.
+                    $Controls['StatusStripLabel'].Text = 'Error loading models'
+                    Show-DATWindowMessage -Message "Error loading models: $($RsErrors[0].Exception.Message)" -Type Error
+                } else {
+                    $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models"
+
+                    # Known-model auto-select needs THIS runspace's live CM connection.
+                    if ($Controls['KnownModelsCheckBox'].IsChecked -and (Get-DATCMState).Connected -and $ModelCount -gt 0) {
+                        $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - querying SCCM inventory and existing packages..."
+                        try {
+                            $KnownModels = Get-DATKnownModels -Manufacturers $G.ModelManufacturers
+                            $MatchCount = Select-DATKnownModelsInGrid -Table $Data -KnownModels $KnownModels
+                            $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models - $MatchCount known model(s) selected (inventory + packages)"
+                        } catch {
+                            Write-DATLog -Message "Known models auto-select failed: $($_.Exception.Message)" -Severity 2
+                            $Controls['StatusStripLabel'].Text = "Loaded $ModelCount models (known models query failed)"
+                        }
+                    }
+                }
+            } catch {
+                Show-DATWindowMessage -Message "Error loading models: $($_.Exception.Message)" -Type Error
+                $Controls['StatusStripLabel'].Text = 'Error loading models'
+            } finally {
+                if ($G.ModelRunspace) { $G.ModelRunspace.Dispose(); $G.ModelRunspace = $null }
+                $G.ModelHandle = $null
+                $Controls['ModelProgress'].IsIndeterminate = $false
+                $Controls['ModelProgress'].Visibility = [System.Windows.Visibility]::Collapsed
+                $Controls['RefreshButton'].IsEnabled = $true
+            }
+        })
+
+        $G.ModelTimer.Start()
+    })
+
+    # --- Theme picker (header): System / Dark / Light ---
+    $Controls['ThemeCombo'].Add_SelectionChanged({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window; $G = $gui.G
+        if ($G.Initializing) { return }
+        $Mode = Get-DATComboText $Controls['ThemeCombo']
+        if ($Mode -notin @('Light', 'Dark')) { $Mode = 'Dark' }
+        Set-DATWindowTheme -Window $Window -Mode $Mode
     })
 
     # --- Search Box - filter models ---
@@ -486,7 +573,7 @@ function Initialize-DATMainWindow {
         }
 
         # Switch to progress tab
-        $Controls['TabControl'].SelectedIndex = 2
+        $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
         $Controls['LogListBox'].Items.Clear()
 
         $Controls['StartButton'].IsEnabled = $false
@@ -654,7 +741,7 @@ function Initialize-DATMainWindow {
     $Controls['HealthCheckButton'].Add_Click({
         $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
         $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
-        $Controls['TabControl'].SelectedIndex = 2
+        $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
         $Window.Cursor = $WaitCursor
         try {
             $Results = Test-DATCatalogHealth
@@ -702,6 +789,7 @@ function Initialize-DATMainWindow {
                     deploymentPlatform = (Get-DATComboText $Controls['DeployPlatformCombo'])
                     compressPackage = [bool]$Controls['CompressPackageCheckBox'].IsChecked
                     compressionType = (Get-DATComboText $Controls['CompressionTypeCombo'])
+                    themeMode = (Get-DATComboText $Controls['ThemeCombo'])
                 }
             }
 
@@ -787,7 +875,7 @@ function Initialize-DATMainWindow {
     $Controls['PkgDeleteButton'].Add_Click({
         $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
         Complete-DATGridEdit $Controls['PkgGrid']
-        $SelectedRows = @(Get-DATGridSelectedRows -Table $Controls['PkgGridData'])
+        $SelectedRows = Get-DATGridSelectedRows -Table $Controls['PkgGridData']
         if ($SelectedRows.Count -eq 0) {
             Show-DATWindowMessage -Message 'Select packages to remove.' -Type Warning
             return
@@ -1036,7 +1124,7 @@ function Initialize-DATMainWindow {
         }
 
         Complete-DATGridEdit $Controls['PkgGrid']
-        $SelectedRows = @(Get-DATGridSelectedRows -Table $Controls['PkgGridData'])
+        $SelectedRows = Get-DATGridSelectedRows -Table $Controls['PkgGridData']
         if ($SelectedRows.Count -eq 0) {
             Show-DATWindowMessage -Message 'Select at least one package to apply the action.' -Type Warning
             return
@@ -1255,7 +1343,7 @@ function Initialize-DATMainWindow {
         }
 
         Complete-DATGridEdit $Controls['DeployAppsGrid']
-        $SelectedRows = @(Get-DATGridSelectedRows -Table $Controls['DeployAppsGridData'])
+        $SelectedRows = Get-DATGridSelectedRows -Table $Controls['DeployAppsGridData']
         if ($SelectedRows.Count -eq 0) {
             Show-DATWindowMessage -Message 'Select at least one application to deploy.' -Type Warning
             return
@@ -1335,7 +1423,7 @@ function Initialize-DATMainWindow {
         $Controls['DeployStatusLabel'].Text = "Deploying $($AppNames.Count) application(s)..."
         $Controls['DeployStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Orange
 
-        $Controls['TabControl'].SelectedIndex = 2
+        $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
         $Controls['LogListBox'].Items.Clear()
 
         $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
@@ -1445,12 +1533,263 @@ function Initialize-DATMainWindow {
         $G.DeployTimer.Start()
     })
 
+    # ===================== Intune tab =====================
+
+    # --- Connect (app-only: certificate or client secret) ---
+    $Controls['IntuneConnectButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+
+        $Tenant   = $Controls['IntuneTenantInput'].Text
+        $ClientId = $Controls['IntuneClientIdInput'].Text
+        if ([string]::IsNullOrWhiteSpace($Tenant) -or [string]::IsNullOrWhiteSpace($ClientId)) {
+            Show-DATWindowMessage -Message 'Enter the Tenant ID/domain and the Client (app) ID.' -Type Warning
+            return
+        }
+        $UseCert = (Get-DATComboText $Controls['IntuneAuthCombo']) -like '*certificate*'
+
+        $Controls['IntuneConnStatusLabel'].Text = 'Connecting...'
+        $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Orange
+        $Window.Cursor = $WaitCursor
+        try {
+            $Params = @{ AuthMode = 'ClientCredentials'; TenantId = $Tenant; ClientId = $ClientId }
+            if ($UseCert) {
+                $Thumb = $Controls['IntuneCertThumbInput'].Text
+                if ([string]::IsNullOrWhiteSpace($Thumb)) { throw "Enter the certificate thumbprint (or switch to client secret)." }
+                $Params['CertificateThumbprint'] = $Thumb
+            } else {
+                $Secret = $Controls['IntuneSecretBox'].SecurePassword
+                if (-not $Secret -or $Secret.Length -eq 0) { throw "Enter the client secret (or switch to certificate)." }
+                $Params['ClientSecret'] = $Secret
+            }
+            $Info = Connect-DATIntune @Params
+            $Controls['IntuneConnStatusLabel'].Text = "Connected - tenant $($Info.TenantId), token expires $($Info.ExpiresOn.ToString('HH:mm'))"
+            $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Green
+            $Controls['StatusStripLabel'].Text = 'Connected to Intune'
+        } catch {
+            $Controls['IntuneConnStatusLabel'].Text = 'Connection failed'
+            $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Red
+            Show-DATWindowMessage -Message "Intune connect failed: $($_.Exception.Message)" -Type Error
+        } finally {
+            $Window.Cursor = $DefaultCursor
+        }
+    })
+
+    # --- Test connection ---
+    $Controls['IntuneTestButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+        $Window.Cursor = $WaitCursor
+        try {
+            $R = Test-DATIntuneConnection
+            if ($R.Connected) {
+                $Controls['IntuneConnStatusLabel'].Text = "Connected - tenant $($R.TenantId) ($($R.Message))"
+                $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Green
+            } else {
+                $Controls['IntuneConnStatusLabel'].Text = "Not connected - $($R.Message)"
+                $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Red
+            }
+        } catch {
+            Show-DATWindowMessage -Message "Test failed: $($_.Exception.Message)" -Type Error
+        } finally {
+            $Window.Cursor = $DefaultCursor
+        }
+    })
+
+    # --- Disconnect ---
+    $Controls['IntuneDisconnectButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        Disconnect-DATIntune
+        $Controls['IntuneConnStatusLabel'].Text = 'Not connected'
+        $Controls['IntuneConnStatusLabel'].Foreground = [System.Windows.Media.Brushes]::Gray
+    })
+
+    # --- Required permissions (info) ---
+    $Controls['IntunePermsButton'].Add_Click({
+        $Lines = Get-DATIntuneRequiredPermission | ForEach-Object {
+            "{0}  [{1}]`n    {2}" -f $_.Permission, $(if ($_.Required) { 'required' } else { 'optional' }), $_.Reason
+        }
+        Show-DATWindowMessage -Message ("Grant these Microsoft Graph APPLICATION permissions on the app registration, with admin consent:`n`n" +
+            ($Lines -join "`n`n") + "`n`nFull steps: docs/Intune-Setup.md") -Type Information
+    })
+
+    # --- Package folder browse ---
+    $Controls['IntunePkgBrowseButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        $Path = Show-DATFolderDialog -Description 'Select the staged package folder' -InitialPath $Controls['IntunePkgFolderInput'].Text
+        if ($Path) { $Controls['IntunePkgFolderInput'].Text = $Path }
+    })
+
+    # --- Group search (shared by publish + profile) ---
+    $Controls['IntuneGroupSearchButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+        $Search = $Controls['IntuneGroupSearchInput'].Text
+        if ([string]::IsNullOrWhiteSpace($Search)) {
+            Show-DATWindowMessage -Message 'Enter a group-name prefix to search.' -Type Warning
+            return
+        }
+        $Window.Cursor = $WaitCursor
+        try {
+            $Groups = @(Find-DATIntuneEntraGroup -SearchString $Search -Top 50)
+            $Controls['IntuneGroupCombo'].Items.Clear()
+            $G.IntuneGroupMap = @{}
+            foreach ($Grp in $Groups) {
+                $Disp = [string]$Grp.displayName
+                [void]$Controls['IntuneGroupCombo'].Items.Add($Disp)
+                $G.IntuneGroupMap[$Disp] = [string]$Grp.id
+            }
+            if ($Controls['IntuneGroupCombo'].Items.Count -gt 0) { $Controls['IntuneGroupCombo'].SelectedIndex = 0 }
+            $Controls['IntuneStatusLabel'].Text = "Found $($Groups.Count) group(s)."
+        } catch {
+            Show-DATWindowMessage -Message "Group search failed: $($_.Exception.Message)" -Type Error
+        } finally {
+            $Window.Cursor = $DefaultCursor
+        }
+    })
+
+    # --- Create driver-update profile (synchronous; single Graph call) ---
+    $Controls['IntuneCreateProfileButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+
+        $Name = $Controls['IntuneProfileNameInput'].Text
+        if ([string]::IsNullOrWhiteSpace($Name)) { Show-DATWindowMessage -Message 'Enter a profile name.' -Type Warning; return }
+
+        $Approval = Get-DATComboText $Controls['IntuneProfileApprovalCombo']
+        $Defer = 0; [void][int]::TryParse($Controls['IntuneProfileDeferralInput'].Text, [ref]$Defer)
+
+        $Params = @{ DisplayName = $Name; ApprovalType = $Approval }
+        if ($Approval -eq 'Automatic') { $Params['DeploymentDeferralInDays'] = $Defer }
+
+        $GroupDisplay = Get-DATComboText $Controls['IntuneGroupCombo']
+        if ($GroupDisplay -and $G.IntuneGroupMap.ContainsKey($GroupDisplay)) {
+            $Params['Assignment'] = @{ GroupId = $G.IntuneGroupMap[$GroupDisplay]; Mode = 'include' }
+        }
+
+        $Window.Cursor = $WaitCursor
+        try {
+            $Prof = New-DATIntuneDriverUpdateProfile @Params
+            $Controls['IntuneStatusLabel'].Text = "Created driver-update profile '$Name' (id $($Prof.id))."
+            Show-DATWindowMessage -Message "Driver-update profile '$Name' created$(if ($Params.ContainsKey('Assignment')) { ' and assigned' } else { '' })." -Type Information
+        } catch {
+            Show-DATWindowMessage -Message "Create profile failed: $($_.Exception.Message)" -Type Error
+        } finally {
+            $Window.Cursor = $DefaultCursor
+        }
+    })
+
+    # --- Publish Win32 app (background runspace; the upload can be slow) ---
+    $Controls['IntunePublishButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+        if ($G.IntunePublishHandle) { return }   # already publishing
+
+        $Folder  = $Controls['IntunePkgFolderInput'].Text
+        $Name    = $Controls['IntunePkgNameInput'].Text
+        $Version = $Controls['IntunePkgVersionInput'].Text
+        if ([string]::IsNullOrWhiteSpace($Folder) -or -not (Test-Path -LiteralPath $Folder)) {
+            Show-DATWindowMessage -Message 'Choose a valid staged package folder.' -Type Warning; return
+        }
+        if ([string]::IsNullOrWhiteSpace($Name) -or [string]::IsNullOrWhiteSpace($Version)) {
+            Show-DATWindowMessage -Message 'Enter a display name and a version.' -Type Warning; return
+        }
+
+        # Capture the live token for the worker runspace (fails fast if not connected).
+        try { $Session = Export-DATIntuneSession } catch {
+            Show-DATWindowMessage -Message 'Connect to Intune first.' -Type Warning; return
+        }
+
+        $PublishParams = @{
+            SourceFolder = $Folder
+            DisplayName  = $Name
+            Version      = $Version
+            Manufacturer = (Get-DATComboText $Controls['IntunePkgMfrCombo'])
+            Mode         = (Get-DATComboText $Controls['IntunePkgModeCombo'])
+        }
+        $GroupDisplay = Get-DATComboText $Controls['IntuneGroupCombo']
+        if ($GroupDisplay -and $G.IntuneGroupMap.ContainsKey($GroupDisplay)) {
+            $PublishParams['Assignment'] = @{
+                GroupId = $G.IntuneGroupMap[$GroupDisplay]
+                Intent  = (Get-DATComboText $Controls['IntuneIntentCombo']).ToLowerInvariant()
+                Mode    = 'include'
+            }
+        }
+
+        $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
+        $Controls['LogListBox'].Items.Clear()
+        $Controls['StatusLabel'].Text = "Publishing '$Name' to Intune..."
+        $Controls['ProgressBar'].IsIndeterminate = $true
+        $Controls['IntunePublishButton'].IsEnabled = $false
+        $Controls['StatusStripLabel'].Text = "Publishing '$Name' to Intune..."
+
+        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+        $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+        $PublishScript = {
+            param($ModulePath, $Session, $PublishParams, $LogQueue)
+            $Mod = Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force -PassThru
+            Register-DATQueueLogSubscriber -LogQueue $LogQueue
+            # Adopt the parent's Intune token in this runspace's module scope.
+            & $Mod { param($S) Import-DATIntuneSession -Session $S } $Session
+            return New-DATIntuneWin32App @PublishParams
+        }
+
+        $G.IntunePublishRunspace = [System.Management.Automation.PowerShell]::Create()
+        $G.IntunePublishRunspace.AddScript($PublishScript).
+            AddArgument($ModulePath).AddArgument($Session).AddArgument($PublishParams).AddArgument($G.LogQueue) | Out-Null
+        $G.IntunePublishHandle = $G.IntunePublishRunspace.BeginInvoke()
+
+        if ($G.IntunePublishTimer) { $G.IntunePublishTimer.Stop() }
+        $G.IntunePublishTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $G.IntunePublishTimer.Interval = [timespan]::FromMilliseconds(500)
+        $G.IntunePublishTimer.Add_Tick({
+            $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
+
+            if ($null -eq $G.IntunePublishHandle -or -not $G.IntunePublishHandle.IsCompleted) { return }
+            $G.IntunePublishTimer.Stop()
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
+
+            try {
+                $Result   = $G.IntunePublishRunspace.EndInvoke($G.IntunePublishHandle)
+                $RsErrors = @($G.IntunePublishRunspace.Streams.Error)
+                $App = @($Result)[0]
+                if ($App -and $App.Id) {
+                    $Controls['StatusLabel'].Text = "Published '$($App.DisplayName)' (app id $($App.Id))"
+                    $Controls['StatusStripLabel'].Text = "Intune publish complete - app id $($App.Id)"
+                    Show-DATWindowMessage -Message "Published to Intune.`n`nApp: $($App.DisplayName)`nId: $($App.Id)`nAssigned: $($App.Assigned)" -Type Information
+                } elseif ($RsErrors.Count -gt 0) {
+                    $Controls['StatusLabel'].Text = 'Intune publish failed'
+                    Show-DATWindowMessage -Message "Intune publish failed: $($RsErrors[0].Exception.Message)" -Type Error
+                } else {
+                    $Controls['StatusLabel'].Text = 'Intune publish finished (no app returned)'
+                }
+            } catch {
+                $Controls['StatusLabel'].Text = 'Intune publish failed'
+                Show-DATWindowMessage -Message "Intune publish failed: $($_.Exception.Message)" -Type Error
+            } finally {
+                if ($G.IntunePublishRunspace) { $G.IntunePublishRunspace.Dispose(); $G.IntunePublishRunspace = $null }
+                $G.IntunePublishHandle = $null
+                $G.LogQueue = $null
+                $Controls['ProgressBar'].IsIndeterminate = $false
+                $Controls['IntunePublishButton'].IsEnabled = $true
+            }
+        })
+        $G.IntunePublishTimer.Start()
+    })
+
     # --- Load saved settings on window load ---
     $Window.Add_Loaded({
         $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window; $G = $gui.G
 
         # Re-apply the theme now the window is fully loaded (belt-and-suspenders).
-        try { Set-DATWindowTheme -Window $Window -Mode System } catch { }
+        # The ThemeCombo already reflects the saved preference (set in
+        # New-DATMainWindow); honour whatever it shows.
+        try {
+            $ThemeMode = Get-DATComboText $Controls['ThemeCombo']
+            if ($ThemeMode -notin @('Light', 'Dark')) { $ThemeMode = 'Dark' }
+            Set-DATWindowTheme -Window $Window -Mode $ThemeMode
+        } catch { }
 
         try {
             $Config = Get-DATConfig
