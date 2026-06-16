@@ -55,10 +55,28 @@ if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
     Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
 }
 
-# Publish
-Write-Host "`nPublishing module to PSGallery..." -ForegroundColor Cyan
-if ($PSCmdlet.ShouldProcess($manifest.Name, "Publish to PowerShell Gallery")) {
-    Publish-Module -Path $modulePath -NuGetApiKey $ApiKey -Verbose
-    Write-Host "`nSuccessfully published $($manifest.Name) v$($manifest.Version) to PSGallery!" -ForegroundColor Green
-    Write-Host "View it at: https://www.powershellgallery.com/packages/$($manifest.Name)" -ForegroundColor Cyan
+# Stage a clean copy so the published package excludes tests and OS cruft.
+Write-Host "`nStaging a clean copy for publish..." -ForegroundColor Cyan
+$staging     = Join-Path ([System.IO.Path]::GetTempPath()) ("DATPublish_" + [Guid]::NewGuid().ToString('N'))
+$stageModule = Join-Path $staging 'DriverAutomationTool'
+try {
+    New-Item -ItemType Directory -Path $stageModule -Force | Out-Null
+    Copy-Item -Path (Join-Path $modulePath '*') -Destination $stageModule -Recurse -Force
+    Remove-Item -Path (Join-Path $stageModule 'Tests') -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $stageModule -Recurse -Force -Filter '.DS_Store' | Remove-Item -Force -ErrorAction SilentlyContinue
+    Write-Host "  Staged to $stageModule (tests and .DS_Store removed)." -ForegroundColor Green
+
+    # Re-validate the staged manifest before publishing.
+    [void](Test-ModuleManifest -Path (Join-Path $stageModule 'DriverAutomationTool.psd1'))
+
+    # Publish
+    Write-Host "`nPublishing module to PSGallery..." -ForegroundColor Cyan
+    if ($PSCmdlet.ShouldProcess($manifest.Name, "Publish to PowerShell Gallery")) {
+        Publish-Module -Path $stageModule -NuGetApiKey $ApiKey -Verbose
+        Write-Host "`nSuccessfully published $($manifest.Name) v$($manifest.Version) to PSGallery!" -ForegroundColor Green
+        Write-Host "View it at: https://www.powershellgallery.com/packages/$($manifest.Name)" -ForegroundColor Cyan
+    }
+}
+finally {
+    Remove-Item -Path $staging -Recurse -Force -ErrorAction SilentlyContinue
 }
