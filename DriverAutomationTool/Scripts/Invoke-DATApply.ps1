@@ -1271,6 +1271,21 @@ function Invoke-DCUDriverUpdates {
         }
         if ($ScanCode -eq 500) {
             Write-Log "DCU scan: no applicable updates from the package catalog - everything current"
+            # Signal to BIOSDCU's wrapper (Install-BIOSDCU) that DCU saw the
+            # catalog but concluded nothing applies. For DriverUpdates that's
+            # the expected steady-state. For BIOSDCU the manifest has exactly
+            # one BIOS DUP that sync resolved as newer than the model's
+            # catalog version AND the apply-side pre-flash check just
+            # verified the device is behind, so a "nothing applicable"
+            # verdict is almost certainly DCU's applicability rules
+            # (SystemID match, dellVersion parse, SupportedDevices etc.)
+            # disagreeing with the catalog - in which case BIOSDCU should
+            # NOT exit clean; it should fall back to Flash64W whose DUP
+            # framework re-evaluates against the device directly. Setting
+            # the flag here and leaving the return value at 0 keeps
+            # DriverUpdates' existing semantics intact.
+            $script:DCUNoApplicable = $true
+
             # Diagnostic dump when the verdict is "nothing applicable" but the
             # admin has reason to expect updates (field case: a manifest entry
             # is newer than the installed driver, e.g. UHD Graphics 2140 in
@@ -1554,20 +1569,42 @@ function Install-BIOSDCU {
         BIOS-via-DCU apply path. The package source is a single Dell BIOS DUP
         plus a manifest.json with one entry, the DCU catalog describing it
         (DCUCatalog.xml + invcol embedded), and Flash64W.exe staged alongside
-        as a last-resort fallback.
+        as a guaranteed fallback.
 
         Hand the install to the same DCU engine that DriverUpdates uses
-        (Invoke-DCUDriverUpdates). When the engine returns $null (not Dell /
-        no catalog / dcu-cli not installed / configure or fail-closed gate
-        rejected the run), fall back to Invoke-DellBIOSFlash so a device
-        without DCU still gets its BIOS via the proven Flash64W path.
+        (Invoke-DCUDriverUpdates). Fall back to Invoke-DellBIOSFlash when:
+
+        - The engine returns $null (not Dell / no catalog / dcu-cli not
+          installed / configure or fail-closed gate rejected the run).
+
+        - The engine returns 0 BUT $script:DCUNoApplicable was set
+          (DCU scan returned 500 - "no applicable updates"). For BIOSDCU
+          this is almost always a false negative: the manifest holds
+          exactly one BIOS DUP that the sync resolved as newer than the
+          model's catalog version AND the apply script's pre-flash version
+          check just verified the device is behind. DCU's applicability
+          rules (SystemID match, dellVersion parsing, SupportedDevices,
+          inventory collector verdict) can still disagree and skip it -
+          which is exactly the "showed nothing to do while the BIOS sat
+          at 1.8.1 vs target 1.9.0" failure mode. Flash64W's DUP framework
+          re-evaluates against the live device directly and is the
+          trusted reference path the legacy BIOS deployments have always
+          used.
     #>
     param([Parameter(Mandatory)][string]$Path)
 
+    $script:DCUNoApplicable = $false
     $DcuExit = Invoke-DCUDriverUpdates -Path $Path
-    if ($null -ne $DcuExit) { return $DcuExit }
 
-    Write-Log "DCU engine declined or unavailable - falling back to Flash64W for BIOS"
+    if ($null -ne $DcuExit -and -not $script:DCUNoApplicable) {
+        return $DcuExit
+    }
+
+    if ($script:DCUNoApplicable) {
+        Write-Log "DCU reported NO applicable updates but the BIOSDCU package's manifest entry was resolved newer than the model's catalog version at sync time AND the pre-flash check just confirmed this device is behind - DCU's applicability evaluation rejected the BIOS DUP. Falling back to Flash64W (its DUP framework re-evaluates against the device directly)." -Severity 2
+    } else {
+        Write-Log "DCU engine declined or unavailable - falling back to Flash64W for BIOS"
+    }
     return Invoke-DellBIOSFlash -Path $Path
 }
 
