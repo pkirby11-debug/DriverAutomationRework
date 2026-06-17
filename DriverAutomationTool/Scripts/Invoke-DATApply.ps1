@@ -1409,7 +1409,21 @@ function Invoke-DCUDriverUpdates {
                     $script:RebootRequired = $true
                     $ApplyResult = 0
                 }
-            500 { Write-Log "DCU applyUpdates: no applicable updates (exit 500) - everything current"; $ApplyResult = 0 }
+            500 {
+                    # applyUpdates returned "nothing applicable" AFTER /scan said
+                    # otherwise (the scan gate above only reaches here when scan
+                    # exit was 0 and at least one update matched). DCU re-scans
+                    # internally inside applyUpdates and can decline based on
+                    # runtime conditions the catalog-only scan doesn't evaluate
+                    # (Dell BIOS DUP framework checks for AC power, battery
+                    # level, pending reboot, etc.), so this is the operative
+                    # "DCU disagreed with itself" signal - flag it for the
+                    # BIOSDCU wrapper to fall back to Flash64W, whose DUP
+                    # framework re-evaluates against the device directly.
+                    Write-Log "DCU applyUpdates: no applicable updates (exit 500) - scan had matched one or more updates but applyUpdates' internal re-scan declined them all (typical when the DUP framework's runtime conditions - AC power, battery level, pending reboot, TPM/Secure Boot state - aren't met)" -Severity 2
+                    $script:DCUNoApplicable = $true
+                    $ApplyResult = 0
+                }
             default {
                 Write-Log "DCU applyUpdates FAILED (dcu-cli exit $ApplyCode)" -Severity 3
                 & $TailConsole 'applyUpdates'
@@ -1577,19 +1591,22 @@ function Install-BIOSDCU {
         - The engine returns $null (not Dell / no catalog / dcu-cli not
           installed / configure or fail-closed gate rejected the run).
 
-        - The engine returns 0 BUT $script:DCUNoApplicable was set
-          (DCU scan returned 500 - "no applicable updates"). For BIOSDCU
-          this is almost always a false negative: the manifest holds
-          exactly one BIOS DUP that the sync resolved as newer than the
-          model's catalog version AND the apply script's pre-flash version
-          check just verified the device is behind. DCU's applicability
-          rules (SystemID match, dellVersion parsing, SupportedDevices,
-          inventory collector verdict) can still disagree and skip it -
-          which is exactly the "showed nothing to do while the BIOS sat
-          at 1.8.1 vs target 1.9.0" failure mode. Flash64W's DUP framework
-          re-evaluates against the live device directly and is the
-          trusted reference path the legacy BIOS deployments have always
-          used.
+        - The engine returns 0 BUT $script:DCUNoApplicable was set. This
+          flag fires from EITHER DCU path that ends "nothing applicable":
+              * /scan exit 500 - catalog evaluation found no match.
+              * /applyUpdates exit 500 - scan matched but applyUpdates'
+                internal re-scan declined (a Dell DUP framework runtime
+                check like AC power / battery level / pending reboot /
+                TPM state / Secure Boot state can produce this even
+                after /scan accepted the same DUP).
+          For BIOSDCU this is almost always a false negative: the
+          manifest holds exactly one BIOS DUP that the sync resolved as
+          newer than the model's catalog version AND the apply script's
+          pre-flash version check just verified the device is behind.
+          Flash64W's DUP framework re-evaluates against the live device
+          directly and is the trusted reference path the legacy BIOS
+          deployments have always used; falling back is the right
+          behavior whichever 500 fired.
     #>
     param([Parameter(Mandatory)][string]$Path)
 
