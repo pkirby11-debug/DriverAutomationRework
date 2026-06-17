@@ -521,6 +521,7 @@ function Get-DellBIOSUpdate {
         FileName     = Split-Path $DownloadUrl -Leaf
         HashMD5      = $Latest.hashMD5
         Size         = $Latest.size
+        ComponentXml = $Latest.OuterXml
     }
 
     Write-DATLog -Message "Found Dell BIOS update: v$($Result.Version) ($($Result.ReleaseDate)) for $Model" -Severity 1

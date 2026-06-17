@@ -68,7 +68,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Driver', 'BIOS', 'DriverUpdates')]
+    [ValidateSet('Driver', 'BIOS', 'BIOSDCU', 'DriverUpdates')]
     [string]$Mode,
 
     [Parameter(Mandatory)]
@@ -248,6 +248,7 @@ $MarkerSubKey = switch ($Mode) {
     'Driver'        { 'Drivers' }
     'DriverUpdates' { 'DriverUpdates' }
     'BIOS'          { 'BIOS' }
+    'BIOSDCU'       { 'BIOSDCU' }
     default         { 'Drivers' }
 }
 $MarkerPath = Join-Path $MarkerRoot $MarkerSubKey
@@ -1534,6 +1535,28 @@ function Invoke-DCUDriverUpdates {
     }
 }
 
+function Install-BIOSDCU {
+    <#
+        BIOS-via-DCU apply path. The package source is a single Dell BIOS DUP
+        plus a manifest.json with one entry, the DCU catalog describing it
+        (DCUCatalog.xml + invcol embedded), and Flash64W.exe staged alongside
+        as a last-resort fallback.
+
+        Hand the install to the same DCU engine that DriverUpdates uses
+        (Invoke-DCUDriverUpdates). When the engine returns $null (not Dell /
+        no catalog / dcu-cli not installed / configure or fail-closed gate
+        rejected the run), fall back to Invoke-DellBIOSFlash so a device
+        without DCU still gets its BIOS via the proven Flash64W path.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $DcuExit = Invoke-DCUDriverUpdates -Path $Path
+    if ($null -ne $DcuExit) { return $DcuExit }
+
+    Write-Log "DCU engine declined or unavailable - falling back to Flash64W for BIOS"
+    return Invoke-DellBIOSFlash -Path $Path
+}
+
 function Install-DriverUpdates {
     <#
         Catalog-only Driver Updates apply path. The package source is a flat folder
@@ -2180,8 +2203,11 @@ function Invoke-DellBIOSFlash {
         throw "Flash64W.exe not found in $Path - Dell BIOS package is incomplete."
     }
 
+    # BIOSDCU packages also stage Dell's Inventory Collector (InvColPC_*.exe)
+    # for DCU's offline scan - it's NOT a flashable firmware. Exclude it here so
+    # the Flash64W fallback can't mistake it for the BIOS DUP.
     $BiosExe = Get-ChildItem -Path $Path -Filter '*.exe' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notlike 'Flash64W*' } |
+        Where-Object { $_.Name -notlike 'Flash64W*' -and $_.Name -notlike 'InvColPC*' } |
         Select-Object -First 1
     if (-not $BiosExe) {
         throw "No BIOS firmware .exe found alongside Flash64W.exe in $Path"
@@ -2400,10 +2426,14 @@ try {
         }
 
         Suspend-BitLockerForFlash
-        switch ($DeviceMfr) {
-            'Dell'   { $ExitCode = Invoke-DellBIOSFlash   -Path $ContentPath }
-            'Lenovo' { $ExitCode = Invoke-LenovoBIOSFlash -Path $ContentPath }
-            default  { throw "BIOS flash not implemented for manufacturer '$DeviceMfr'" }
+        if ($Mode -eq 'BIOSDCU') {
+            $ExitCode = Install-BIOSDCU -Path $ContentPath
+        } else {
+            switch ($DeviceMfr) {
+                'Dell'   { $ExitCode = Invoke-DellBIOSFlash   -Path $ContentPath }
+                'Lenovo' { $ExitCode = Invoke-LenovoBIOSFlash -Path $ContentPath }
+                default  { throw "BIOS flash not implemented for manufacturer '$DeviceMfr'" }
+            }
         }
     }
 

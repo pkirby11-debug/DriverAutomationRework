@@ -581,7 +581,7 @@ function Find-DATExistingDriverPackages {
         [string]$Manufacturer,
         [string]$Model,
 
-        [ValidateSet('Drivers', 'BIOS', 'DriverUpdates', 'All')]
+        [ValidateSet('Drivers', 'BIOS', 'BIOSDCU', 'DriverUpdates', 'All')]
         [string]$Type = 'All'
     )
 
@@ -1064,11 +1064,12 @@ function Get-DATKnownModels {
             }
 
             # Regex captures the model name portion of the package name.
-            # Strips optional "Test - " and optional "Drivers - "/"BIOS Update - " prefixes,
-            # then requires the manufacturer, then captures everything up to the first " - "
-            # (or end of string for BIOS packages).
+            # Strips optional "Test - " and optional "Drivers - "/"BIOS Update - "/
+            # "BIOS Update (DCU) - " prefixes, then requires the manufacturer,
+            # then captures everything up to the first " - " (or end of string
+            # for BIOS packages).
             $MfrEscaped = [regex]::Escape($Mfr)
-            $NamePattern = "^(?:Test - )?(?:Drivers - |BIOS Update - )?$MfrEscaped (.+?)(?: - .+)?$"
+            $NamePattern = "^(?:Test - )?(?:Drivers - |BIOS Update \(DCU\) - |BIOS Update - )?$MfrEscaped (.+?)(?: - .+)?$"
 
             $PkgModels = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             $PkgIDs    = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1551,7 +1552,7 @@ function Find-DATExistingPackages {
         [string]$Manufacturer,
         [string]$Model,
 
-        [ValidateSet('Drivers', 'BIOS', 'DriverUpdates', 'All')]
+        [ValidateSet('Drivers', 'BIOS', 'BIOSDCU', 'DriverUpdates', 'All')]
         [string]$Type = 'All',
 
         [switch]$IncludeDriverPackages
@@ -1573,6 +1574,17 @@ function Find-DATExistingPackages {
         if ($Type -eq 'DriverUpdates') {
             $StdPackages = @($StdPackages | Where-Object {
                 $_.Name -like 'Driver Updates - *' -or $_.Name -like 'Test - Driver Updates - *'
+            })
+        } elseif ($Type -eq 'BIOSDCU') {
+            $StdPackages = @($StdPackages | Where-Object {
+                $_.Name -like 'BIOS Update (DCU) - *' -or $_.Name -like 'Test - BIOS Update (DCU) - *'
+            })
+        } elseif ($Type -eq 'BIOS') {
+            # Match "BIOS Update - ..." but NOT "BIOS Update (DCU) - ..." so the
+            # two sync types don't collide on each other's packages.
+            $StdPackages = @($StdPackages | Where-Object {
+                ($_.Name -like 'BIOS Update - *' -or $_.Name -like 'Test - BIOS Update - *') -and
+                $_.Name -notlike '*BIOS Update (DCU)*'
             })
         } elseif ($Type -ne 'All') {
             $StdPackages = @($StdPackages | Where-Object {
@@ -2194,7 +2206,7 @@ function Get-DATDetectionScript {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Driver', 'BIOS', 'DriverUpdates')]
+        [ValidateSet('Driver', 'BIOS', 'BIOSDCU', 'DriverUpdates')]
         [string]$Mode,
 
         [Parameter(Mandatory)]
@@ -2205,6 +2217,7 @@ function Get-DATDetectionScript {
         'Driver'        { 'Drivers' }
         'DriverUpdates' { 'DriverUpdates' }
         'BIOS'          { 'BIOS' }
+        'BIOSDCU'       { 'BIOSDCU' }
         default         { 'Drivers' }
     }
     $EscapedVersion = $ExpectedVersion -replace "'", "''"
@@ -2242,7 +2255,7 @@ function Get-DATInstallCommand {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Driver', 'BIOS', 'DriverUpdates')]
+        [ValidateSet('Driver', 'BIOS', 'BIOSDCU', 'DriverUpdates')]
         [string]$Mode,
 
         [Parameter(Mandatory)]
@@ -2267,7 +2280,7 @@ function Get-DATInstallCommand {
     [void]$InstallArgs.Add("-Version `"$Version`"")
     [void]$InstallArgs.Add("-SafetyManufacturer $SafetyManufacturer")
 
-    if ($Mode -eq 'BIOS' -and $BIOSPassword) {
+    if (($Mode -eq 'BIOS' -or $Mode -eq 'BIOSDCU') -and $BIOSPassword) {
         # Decrypt SecureString to plaintext only here - it is immediately
         # consumed by the install-command string that CM persists.
         $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($BIOSPassword)
@@ -2694,7 +2707,7 @@ function New-DATConfigMgrApplication {
         [string]$SourcePath,
 
         [Parameter(Mandatory)]
-        [ValidateSet('Driver', 'BIOS', 'DriverUpdates')]
+        [ValidateSet('Driver', 'BIOS', 'BIOSDCU', 'DriverUpdates')]
         [string]$Mode,
 
         [Parameter(Mandatory)]
@@ -2728,6 +2741,7 @@ function New-DATConfigMgrApplication {
         # type gets its own prefix.
         $Description = switch ($Mode) {
             'BIOS'          { "BIOS Update - $Manufacturer $Model - Version $Version" }
+            'BIOSDCU'       { "BIOS Update (DCU) - $Manufacturer $Model - Version $Version" }
             'DriverUpdates' { "Driver Updates - $Manufacturer $Model - Version $Version" }
             default         { "Driver Pack - $Manufacturer $Model - Version $Version" }
         }
@@ -2801,11 +2815,13 @@ function New-DATConfigMgrApplication {
         if ($PSCmdlet.ShouldProcess($Name, 'Configure deployment type')) {
             $Timeout   = switch ($Mode) {
                 'BIOS'          { 30 }
+                'BIOSDCU'       { 60 }   # DCU adds scan + configure + restore phases on top of the flash
                 'DriverUpdates' { 90 }   # Each DUP can take 30-180s; 30+ DUPs need headroom
                 default         { 60 }   # 'Driver'
             }
             $Estimated = switch ($Mode) {
                 'BIOS'          { 10 }
+                'BIOSDCU'       { 20 }
                 'DriverUpdates' { 25 }
                 default         { 15 }   # 'Driver'
             }
@@ -2924,11 +2940,12 @@ function New-DATConfigMgrApplication {
 
             # Ensure the DAT-standard custom return codes (Dell DUP / Flash64W /
             # Lenovo SRSETUP) are attached to the DT. Idempotent - safe on both
-            # the create and update branches above. DriverUpdates is exempt:
-            # its apply script normalizes every engine outcome to 0/1/3010
-            # (which SCCM maps natively), so vendor-code mapping is only needed
-            # where raw vendor exit codes can still surface (BIOS flash).
-            if ($Mode -ne 'DriverUpdates') {
+            # the create and update branches above. DriverUpdates and BIOSDCU
+            # are exempt: their apply scripts normalize every engine outcome
+            # to 0/1/3010 (which SCCM maps natively), so vendor-code mapping
+            # is only needed where raw vendor exit codes can still surface
+            # (the legacy BIOS Flash path).
+            if ($Mode -ne 'DriverUpdates' -and $Mode -ne 'BIOSDCU') {
                 Set-DATDeploymentTypeReturnCodes -ApplicationName $Name -DeploymentTypeName $DTName
             }
         }
@@ -3028,7 +3045,7 @@ function Find-DATExistingApplications {
         [string]$Manufacturer,
         [string]$Model,
 
-        [ValidateSet('Drivers', 'BIOS', 'DriverUpdates', 'All')]
+        [ValidateSet('Drivers', 'BIOS', 'BIOSDCU', 'DriverUpdates', 'All')]
         [string]$Type = 'All',
 
         [switch]$IncludeSourcePath
@@ -3061,8 +3078,15 @@ function Find-DATExistingApplications {
                 $_.LocalizedDisplayName -like 'Drivers - *' -or $_.LocalizedDisplayName -like 'Test - Drivers - *'
             }
         } elseif ($Type -eq 'BIOS') {
+            # Match "BIOS Update - ..." but NOT "BIOS Update (DCU) - ..." so the
+            # two sync types don't collide on each other's applications.
             $Apps = $Apps | Where-Object {
-                $_.LocalizedDisplayName -like 'BIOS Update - *' -or $_.LocalizedDisplayName -like 'Test - BIOS Update - *'
+                ($_.LocalizedDisplayName -like 'BIOS Update - *' -or $_.LocalizedDisplayName -like 'Test - BIOS Update - *') -and
+                $_.LocalizedDisplayName -notlike '*BIOS Update (DCU)*'
+            }
+        } elseif ($Type -eq 'BIOSDCU') {
+            $Apps = $Apps | Where-Object {
+                $_.LocalizedDisplayName -like 'BIOS Update (DCU) - *' -or $_.LocalizedDisplayName -like 'Test - BIOS Update (DCU) - *'
             }
         } elseif ($Type -eq 'DriverUpdates') {
             $Apps = $Apps | Where-Object {
