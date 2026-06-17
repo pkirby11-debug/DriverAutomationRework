@@ -263,6 +263,20 @@ function Write-DetectionMarker {
         New-ItemProperty -Path $MarkerPath -Name 'Version'     -Value $Version     -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $MarkerPath -Name 'InstalledOn' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $MarkerPath -Name 'Status'      -Value $Status      -PropertyType String -Force | Out-Null
+
+        # For BIOS modes, record the device's CURRENT SMBIOSBIOSVersion so the
+        # detection script can verify the firmware actually moved. This is what
+        # closes the "marker says Installed forever even though the flash never
+        # really applied" gap (deferred reboot, exit 3/4/5 not-applicable, etc.).
+        # Drivers / DriverUpdates have no single hardware version to record so
+        # they stay marker-only.
+        if ($Mode -eq 'BIOS' -or $Mode -eq 'BIOSDCU') {
+            $LiveBios = $null
+            try { $LiveBios = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SMBIOSBIOSVersion } catch { }
+            if ($LiveBios) {
+                New-ItemProperty -Path $MarkerPath -Name 'BIOSAtMarker' -Value $LiveBios -PropertyType String -Force | Out-Null
+            }
+        }
         Write-Log "Detection marker written to $MarkerPath (Status=$Status)"
     } catch {
         Write-Log "Failed to write detection marker: $($_.Exception.Message)" -Severity 2
@@ -2247,14 +2261,18 @@ function Invoke-DellBIOSFlash {
     # Dell Flash64W / BIOS DUP convention:
     #   0     = success, no reboot
     #   2     = success, reboot required
-    #   3/4/5 = not applicable (dependency / qualification mismatch)
+    #   3/4/5 = not applicable (dependency / qualification mismatch) - the BIOS
+    #           did NOT flash and the firmware version is unchanged. Signalled
+    #           up to the main flow via $script:BIOSNotApplicable so the
+    #           detection marker is written as NotApplicable instead of the
+    #           old "Installed" lie that trapped devices in false-compliant.
     #   6     = rebooting now
     switch ($ExitCode) {
         0 { return 0 }
         2 { $script:RebootRequired = $true; return 0 }
-        3 { Write-Log 'Flash64W returned 3 (dependency soft error / not applicable) - treating as success' -Severity 2; return 0 }
-        4 { Write-Log 'Flash64W returned 4 (dependency hard error / not applicable) - treating as success' -Severity 2; return 0 }
-        5 { Write-Log 'Flash64W returned 5 (qualification mismatch / not applicable) - treating as success' -Severity 2; return 0 }
+        3 { Write-Log 'Flash64W returned 3 (dependency soft error / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
+        4 { Write-Log 'Flash64W returned 4 (dependency hard error / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
+        5 { Write-Log 'Flash64W returned 5 (qualification mismatch / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
         6 { $script:RebootRequired = $true; return 0 }
         default { return $ExitCode }
     }
@@ -2441,6 +2459,19 @@ try {
         Write-Log "Vendor utility returned non-zero exit code: $ExitCode" -Severity 3
         Write-DetectionMarker -Status 'Failed'
         exit $ExitCode
+    }
+
+    # BIOS not-applicable (Flash64W 3/4/5): the firmware did NOT flash. Record
+    # the live BIOS string in the marker (BIOSAtMarker) and use a distinct
+    # NotApplicable status so the version-aware detection script knows to
+    # report compliant against THAT exact firmware level (preventing a
+    # re-run loop on devices where the BIOS DUP genuinely doesn't apply to
+    # this revision) while still re-running if the live BIOS ever changes
+    # to something other than what was recorded.
+    if ($script:BIOSNotApplicable) {
+        Write-DetectionMarker -Status 'NotApplicable'
+        Write-Log 'BIOS DUP reported not-applicable - device firmware unchanged; marker = NotApplicable'
+        exit 0
     }
 
     Write-DetectionMarker -Status 'Installed'

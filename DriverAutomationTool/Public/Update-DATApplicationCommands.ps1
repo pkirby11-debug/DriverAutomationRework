@@ -181,7 +181,7 @@ function Update-DATApplicationCommands {
                 # single-quoted form (which is exactly what we're trying to
                 # repair) and the current double-quoted form.
                 $BIOSPasswordSecure = $null
-                if ($Mode -eq 'BIOS' -and $ExistingCmd) {
+                if (($Mode -eq 'BIOS' -or $Mode -eq 'BIOSDCU') -and $ExistingCmd) {
                     if ($ExistingCmd -match '-BIOSPassword\s+(?:"([^"]*)"|''([^'']*)'')') {
                         $Raw = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
                         if ($Raw) {

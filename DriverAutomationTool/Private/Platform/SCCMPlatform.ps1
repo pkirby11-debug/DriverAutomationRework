@@ -2202,6 +2202,31 @@ function Get-DATDetectionScript {
     <#
     .SYNOPSIS
         Returns the PowerShell detection script text for a DAT-managed Application.
+    .DESCRIPTION
+        Driver / DriverUpdates use a registry-marker detection (no single
+        hardware version exists to verify against).
+
+        BIOS / BIOSDCU use a HARDWARE-AWARE detection that reads the device's
+        live Win32_BIOS.SMBIOSBIOSVersion and reports installed only when the
+        firmware is at or above the target. This closes the trap where a
+        deferred reboot, a vendor "not applicable" exit (3/4/5), or a null
+        exit would leave the marker saying Installed forever even though the
+        firmware never actually moved - which silently held entire fleets at
+        old BIOS levels because SCCM short-circuited on the marker and never
+        ran the apply script again.
+
+        The version comparison mirrors the apply script's Compare-BIOSVersion
+        (exact match, then [System.Version] on the raw string, then the first
+        numeric-dotted substring). When the strings can't be compared
+        numerically the script falls back to the marker - but only when the
+        live BIOS exactly matches what the apply script recorded as
+        BIOSAtMarker at install time, so any post-install firmware change
+        invalidates the fallback and detection becomes hardware-based again.
+
+        NotApplicable status (Flash64W exit 3/4/5: the BIOS DUP doesn't apply
+        to this exact SKU/revision) is honored against the same
+        BIOSAtMarker == live anchor, so the deployment doesn't re-run on
+        every cycle on devices it provably can't update.
     #>
     [CmdletBinding()]
     param(
@@ -2221,6 +2246,76 @@ function Get-DATDetectionScript {
         default         { 'Drivers' }
     }
     $EscapedVersion = $ExpectedVersion -replace "'", "''"
+
+    if ($Mode -eq 'BIOS' -or $Mode -eq 'BIOSDCU') {
+        return @"
+`$Path = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation\$SubKey'
+`$Target = '$EscapedVersion'
+`$Current = `$null
+try { `$Current = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SMBIOSBIOSVersion } catch { }
+if (-not `$Current) { return }
+
+function Compare-DATBIOSVersion {
+    param([string]`$Current, [string]`$Target)
+    if (`$Current -eq `$Target) { return 'equal' }
+    `$cv = `$null; `$tv = `$null
+    if ([System.Version]::TryParse(`$Current, [ref]`$cv) -and [System.Version]::TryParse(`$Target, [ref]`$tv)) {
+        `$cmp = `$cv.CompareTo(`$tv)
+        if (`$cmp -lt 0) { return 'lower' }
+        if (`$cmp -gt 0) { return 'higher' }
+        return 'equal'
+    }
+    `$cn = [regex]::Match(`$Current, '\d+(?:\.\d+)+').Value
+    `$tn = [regex]::Match(`$Target,  '\d+(?:\.\d+)+').Value
+    if (`$cn -and `$tn -and
+        [System.Version]::TryParse(`$cn, [ref]`$cv) -and
+        [System.Version]::TryParse(`$tn, [ref]`$tv)) {
+        `$cmp = `$cv.CompareTo(`$tv)
+        if (`$cmp -lt 0) { return 'lower' }
+        if (`$cmp -gt 0) { return 'higher' }
+        return 'equal'
+    }
+    return 'unknown'
+}
+
+# Primary: device firmware at or above the target = installed
+`$State = Compare-DATBIOSVersion -Current `$Current -Target `$Target
+if (`$State -eq 'equal' -or `$State -eq 'higher') {
+    Write-Output `$Current
+    return
+}
+
+# Fallback paths use the marker - but ONLY when anchored to the live BIOS
+# string the apply script saw at install time. Any divergence between the
+# anchor and the current live BIOS invalidates the fallback and detection
+# remains hardware-based.
+if (Test-Path `$Path) {
+    `$Marker      = Get-ItemProperty -Path `$Path -ErrorAction SilentlyContinue
+    `$MkVersion   = `$Marker.Version
+    `$MkStatus    = `$Marker.Status
+    `$MkBiosAnchor = `$Marker.BIOSAtMarker
+
+    if (`$MkVersion -eq `$Target -and `$MkBiosAnchor -and `$MkBiosAnchor -eq `$Current) {
+        if (`$MkStatus -eq 'NotApplicable') {
+            # BIOS DUP genuinely doesn't apply to this device's SKU/revision -
+            # report installed so we don't re-run forever, but only against
+            # the exact firmware level the apply script recorded.
+            Write-Output `$Current
+            return
+        }
+        if (`$MkStatus -eq 'Installed' -and `$State -eq 'unknown') {
+            # Vendor uses non-numeric version strings (e.g. some Lenovo
+            # firmware tags). Trust the marker only when the live BIOS
+            # exactly matches what we recorded - any change would mean the
+            # firmware moved and re-detection is required.
+            Write-Output `$Current
+            return
+        }
+    }
+}
+# Otherwise: not installed - SCCM will run the install script.
+"@
+    }
 
     return @"
 `$Path = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation\$SubKey'
