@@ -1523,6 +1523,15 @@ function Invoke-DCUDriverUpdates {
                             Write-Log "Persistent catalog set, but disabling dell.com failed (exit $(if ($null -eq $PDef) { 'timeout/launch' } else { $PDef })) - next run retries" -Severity 2
                             & $TailConsole 'persist-nodefaultsrc'
                         }
+                    } elseif ($PCode -eq 5 -and $script:RebootRequired) {
+                        # Expected after a successful BIOS apply / reboot-signalling
+                        # run: dcu-cli refuses ANY follow-on /configure with exit 5
+                        # ("a previous operation requires a system reboot") until
+                        # the device reboots. The persistent CatalogPC.xml is
+                        # already on disk so the next engine run after reboot
+                        # picks it up cleanly. Log at Severity 1 so it doesn't
+                        # read like a settings regression.
+                        Write-Log "Deferred pointing resident DCU at the persistent catalog (dcu-cli exit 5 = pending reboot from this run's successful BIOS apply); the persistent CatalogPC.xml is already staged at $PersistTarget and the next run after reboot completes this step."
                     } else {
                         if ($PCode -eq 5) { $script:RebootRequired = $true }
                         Write-Log "Could not point resident DCU at the persistent catalog (exit $(if ($null -eq $PCode) { 'timeout/launch' } else { $PCode })) - dell.com may remain enabled until the next run" -Severity 2
@@ -1531,7 +1540,18 @@ function Invoke-DCUDriverUpdates {
                 } catch {
                     Write-Log "Persistent DCU end-state failed: $($_.Exception.Message) - next run retries" -Severity 2
                 }
-                & $AssertDcuManaged 'post-run'
+                if ($script:RebootRequired) {
+                    # dcu-cli is now refusing every /configure with exit 5 until
+                    # the device reboots from this run's flash. Re-asserting the
+                    # managed sequence would produce four exit-5 lines reading
+                    # like "not supported", which falsely implies the keys are
+                    # unsupported - they ARE supported and ARE already set from
+                    # the pre-run pass. Skip the re-assertion; the next engine
+                    # run after reboot does it for free.
+                    Write-Log "Skipping post-run DAT-managed mode re-assertion (reboot pending from this run's successful flash; dcu-cli would refuse every /configure with exit 5). The pre-run lockdown is still in effect and the next engine run after reboot re-asserts."
+                } else {
+                    & $AssertDcuManaged 'post-run'
+                }
             } else {
                 # OPTED-OUT devices get the polite behavior: restore whatever
                 # the box had. Source: pristine (true original) when
