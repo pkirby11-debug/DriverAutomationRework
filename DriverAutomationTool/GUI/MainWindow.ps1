@@ -1261,7 +1261,11 @@ function Initialize-DATMainWindow {
             $Types = @()
             if ($Controls['DeployDriverCheckBox'].IsChecked)        { $Types += 'Drivers' }
             if ($Controls['DeployDriverUpdatesCheckBox'].IsChecked) { $Types += 'DriverUpdates' }
-            if ($Controls['DeployBIOSCheckBox'].IsChecked)          { $Types += 'BIOS' }
+            # The BIOS checkbox is treated as the user-facing "BIOS" category and
+            # surfaces BOTH delivery flavors: legacy Flash64W ("BIOS Update - ...")
+            # and DCU ("BIOS Update (DCU) - ..."). The engine choice was made at
+            # sync time; at deploy time the admin thinks of these as one bucket.
+            if ($Controls['DeployBIOSCheckBox'].IsChecked)          { $Types += 'BIOS'; $Types += 'BIOSDCU' }
 
             $Found = @()
             foreach ($T in $Types) {
