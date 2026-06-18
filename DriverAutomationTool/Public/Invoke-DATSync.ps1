@@ -119,6 +119,9 @@ function Invoke-DATSync {
         # Catalog-only "Driver Updates" application: skips the OEM base pack and builds a
         # package containing only Dell catalog DUPs (the same feed DCU consumes). Dell-only.
         [bool]$IncludeDriverUpdates = $false,
+        # BIOS Updates (DCU) application: single-BIOS package per sync, installed by the
+        # same DCU engine as DriverUpdates with a Flash64W fallback. Dell-only.
+        [bool]$IncludeBIOSDCU = $false,
         [switch]$RemoveLegacy,
         [switch]$CleanSource,
         [switch]$EnableBDR,
@@ -224,6 +227,7 @@ function Invoke-DATSync {
         $IncludeDrivers = if ($null -ne $Config.options.includeDrivers) { $Config.options.includeDrivers } else { $true }
         $IncludeBIOS = if ($null -ne $Config.options.includeBIOS) { $Config.options.includeBIOS } else { $false }
         $IncludeDriverUpdates = if ($null -ne $Config.options.includeDriverUpdates) { $Config.options.includeDriverUpdates } else { $false }
+        $IncludeBIOSDCU = if ($null -ne $Config.options.includeBIOSDCU) { $Config.options.includeBIOSDCU } else { $false }
         $RemoveLegacy = [switch]$Config.options.removeLegacy
         $CleanSource = [switch]$Config.options.cleanSource
         $EnableBDR = [switch]$Config.options.enableBDR
@@ -412,6 +416,40 @@ function Invoke-DATSync {
                     Write-DATLog -Message "Error processing BIOS for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
                 }
             }
+
+            # --- BIOS UPDATES (DCU) ---
+            # Single-BIOS package installed via the DCU engine (reuses the DriverUpdates
+            # apply path) with a Flash64W fallback when DCU isn't available. Dell-only.
+            if ($IncludeBIOSDCU) {
+                if ($Make -ne 'Dell') {
+                    Write-DATLog -Message "BIOS Updates (DCU) is currently Dell-only - skipping $Make $ModelName" -Severity 2
+                } else {
+                    try {
+                        $BiosUpdate = Get-DellBIOSUpdate -Model $ModelName -ForceRefresh:$ForceRefresh
+                        if ($BiosUpdate) {
+                            $BiosDcuResult = Invoke-DATSyncSinglePackage -PackageInfo $BiosUpdate `
+                                -Type 'BIOSDCU' -DownloadPath $DownloadPath -PackagePath $PackagePath `
+                                -OperatingSystem $OperatingSystem -Architecture $Architecture `
+                                -EnableBDR:$EnableBDR -RemoveLegacy:$RemoveLegacy -CleanSource:$CleanSource `
+                                -CompressPackage:$CompressPackage -CompressionType $CompressionType `
+                                -WimExcludeFiles $WimExcludeFiles -WimExcludeDirs $WimExcludeDirs -WimOptimizeExport:$WimOptimizeExport `
+                                -DeploymentPlatform $DeploymentPlatform `
+                                -VerifyDownloadHash:$VerifyDownloadHash `
+                                -BIOSPassword $BIOSPassword `
+                                -DistributionPoints $DistributionPoints `
+                                -DistributionPointGroups $DistributionPointGroups `
+                                -ForceRefresh:$ForceRefresh
+
+                            $SyncResults.Add($BiosDcuResult)
+                        } else {
+                            Write-DATLog -Message "No BIOS update found for Dell $ModelName" -Severity 2
+                        }
+                    } catch {
+                        $ErrorCount++
+                        Write-DATLog -Message "Error processing BIOS (DCU) for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
+                    }
+                }
+            }
         }
     }
 
@@ -483,7 +521,7 @@ function Invoke-DATSyncSinglePackage {
         [Parameter(Mandatory)]
         [PSCustomObject]$PackageInfo,
 
-        [ValidateSet('Drivers', 'BIOS', 'DriverUpdates')]
+        [ValidateSet('Drivers', 'BIOS', 'DriverUpdates', 'BIOSDCU')]
         [string]$Type = 'Drivers',
 
         [string]$DownloadPath,
@@ -537,6 +575,8 @@ function Invoke-DATSyncSinglePackage {
     $IsApplication = $DeploymentPlatform -like 'ConfigMgr - Application*'
     if ($Type -eq 'BIOS') {
         $PackageName = "BIOS Update - $Make $DisplayModelName"
+    } elseif ($Type -eq 'BIOSDCU') {
+        $PackageName = "BIOS Update (DCU) - $Make $DisplayModelName"
     } elseif ($Type -eq 'DriverUpdates') {
         $PackageName = "Driver Updates - $Make $DisplayModelName - $OperatingSystem $Architecture"
     } elseif ($DeploymentPlatform -like 'ConfigMgr - Standard Pkg*' -or $IsApplication) {
@@ -589,18 +629,20 @@ function Invoke-DATSyncSinglePackage {
         $AppMachineType = @($AppMachineType | Select-Object -Unique)
 
         $FolderPath = if ($Type -eq 'BIOS') { "Driver Automation\BIOS\$Make" }
+                      elseif ($Type -eq 'BIOSDCU') { "Driver Automation\BIOS (DCU)\$Make" }
                       elseif ($Type -eq 'DriverUpdates') { "Driver Automation\Driver Updates\$Make" }
                       else { "Driver Automation\Drivers\$Make" }
 
-        # Map sync-side $Type (Drivers/BIOS/DriverUpdates) to app-side Mode
-        # (Driver/BIOS/DriverUpdates). The previous mapping collapsed
-        # DriverUpdates into 'Driver', which on the refresh path rebuilt the
-        # deployment type with the wrong install command (-Mode Driver against
-        # a folder of DUPs), wrote the detection marker to the Drivers subkey
-        # instead of DriverUpdates, and used the wrong timeout/runtime budget in
-        # New-DATConfigMgrApplication.
+        # Map sync-side $Type (Drivers/BIOS/BIOSDCU/DriverUpdates) to app-side
+        # Mode (Driver/BIOS/BIOSDCU/DriverUpdates). The previous mapping
+        # collapsed DriverUpdates into 'Driver', which on the refresh path
+        # rebuilt the deployment type with the wrong install command (-Mode
+        # Driver against a folder of DUPs), wrote the detection marker to the
+        # Drivers subkey instead of DriverUpdates, and used the wrong
+        # timeout/runtime budget in New-DATConfigMgrApplication.
         $AppMode = switch ($Type) {
             'BIOS'          { 'BIOS' }
+            'BIOSDCU'       { 'BIOSDCU' }
             'DriverUpdates' { 'DriverUpdates' }
             default         { 'Driver' }   # 'Drivers'
         }
@@ -615,7 +657,7 @@ function Invoke-DATSyncSinglePackage {
         }
         if ($AppSystemSKU.Count -gt 0)   { $AppParams['SystemSKU']   = $AppSystemSKU }
         if ($AppMachineType.Count -gt 0) { $AppParams['MachineType'] = $AppMachineType }
-        if ($Type -eq 'BIOS' -and $BIOSPassword) { $AppParams['BIOSPassword'] = $BIOSPassword }
+        if (($Type -eq 'BIOS' -or $Type -eq 'BIOSDCU') -and $BIOSPassword) { $AppParams['BIOSPassword'] = $BIOSPassword }
 
         try {
             $PkgResult = New-DATConfigMgrApplication @AppParams
@@ -1062,7 +1104,7 @@ function Invoke-DATSyncSinglePackage {
     }
     New-Item -Path $PackageSourceDir -ItemType Directory -Force | Out-Null
 
-    if ($Type -eq 'BIOS') {
+    if ($Type -eq 'BIOS' -or $Type -eq 'BIOSDCU') {
         if ($Make -eq 'Lenovo') {
             # Lenovo BIOS .exe is an InnoSetup self-extracting installer. The TS deploy
             # script expects the extracted firmware payload, not the wrapper. Use the
@@ -1151,6 +1193,60 @@ function Invoke-DATSyncSinglePackage {
 
         $BiosFiles = @(Get-ChildItem $PackageSourceDir -File -ErrorAction SilentlyContinue)
         Write-DATLog -Message "BIOS package source ready: $($BiosFiles.Count) file(s) in $PackageSourceDir" -Severity 1
+
+        # BIOSDCU: add a manifest + DCU repository catalog so the apply script
+        # can hand the install to dcu-cli. Falls back to the staged Flash64W
+        # path when DCU isn't installed or fails to take the catalog.
+        if ($Type -eq 'BIOSDCU' -and $Make -eq 'Dell') {
+            $BiosFileName = $PackageInfo.FileName
+            $StagedBios = Join-Path $PackageSourceDir $BiosFileName
+            $StagedBiosSize = if (Test-Path $StagedBios) { (Get-Item $StagedBios).Length } else { 0 }
+            $ManifestObj = [PSCustomObject]@{
+                schemaVersion = 1
+                manufacturer  = $Make
+                model         = $ModelName
+                operatingSystem = $OperatingSystem
+                architecture  = $Architecture
+                generatedAt   = (Get-Date).ToUniversalTime().ToString('o')
+                drivers       = @(
+                    [PSCustomObject]@{
+                        FileName    = $BiosFileName
+                        Name        = "BIOS Update"
+                        Version     = $PackageInfo.Version
+                        Category    = 'BIOS'
+                        ReleaseDate = $PackageInfo.ReleaseDate
+                        Size        = $StagedBiosSize
+                        HardwareIds = @()
+                    }
+                )
+            }
+            $ManifestPath = Join-Path $PackageSourceDir 'manifest.json'
+            $ManifestObj | ConvertTo-Json -Depth 5 | Set-Content -Path $ManifestPath -Encoding UTF8
+            Write-DATLog -Message "Wrote BIOSDCU manifest: 1 BIOS DUP -> $ManifestPath" -Severity 1
+
+            if (-not $PackageInfo.ComponentXml) {
+                Write-DATLog -Message "BIOS catalog component XML not captured for $ModelName - DCU catalog will be skipped; client will use Flash64W fallback" -Severity 2
+            } else {
+                $BiosForCatalog = @(
+                    [PSCustomObject]@{
+                        FileName     = $BiosFileName
+                        ComponentXml = $PackageInfo.ComponentXml
+                    }
+                )
+                $DcuCatParams = @{ PackageSourceDir = $PackageSourceDir; Drivers = $BiosForCatalog }
+                $InvComp = $null
+                try {
+                    $InvComp = & $AddDellInventoryToPackage $PackageSourceDir $PackageInfo.SystemID
+                } catch {
+                    Write-DATLog -Message "Inventory Collector embed failed: $($_.Exception.Message) - catalog ships without it; client will fall back to Flash64W" -Severity 3
+                }
+                if ($InvComp) {
+                    $DcuCatParams['InventoryComponentXml'] = $InvComp.Xml
+                    $DcuCatParams['InventoryFileName'] = $InvComp.FileName
+                }
+                [void](Write-DATDCUCatalog @DcuCatParams)
+            }
+        }
     } else {
         # Drivers and DriverUpdates: extract archive content (skipped for DriverUpdates -
         # there is no OEM base pack; the catalog overlay block populates the package source).
@@ -1843,10 +1939,10 @@ function Invoke-DATSyncSinglePackage {
         }
 
         # Compress driver package if requested (BIOS packages are never compressed,
-        # and DriverUpdates skips it: DUPs are already vendor-compressed and the
-        # apply script needs them as standalone .exe files, not WIM-mounted).
+        # and DriverUpdates/BIOSDCU skip it: DUPs are already vendor-compressed and
+        # the apply script needs them as standalone .exe files, not WIM-mounted).
         $OrigExtractDir = $null
-        if ($CompressPackage -and $Type -ne 'DriverUpdates') {
+        if ($CompressPackage -and $Type -ne 'DriverUpdates' -and $Type -ne 'BIOSDCU') {
             $OrigExtractDir = $PackageSourceDir
             Write-DATLog -Message "Compressing package as $CompressionType..." -Severity 1
             $OsTag = "$OsShort-$Architecture"
@@ -1909,9 +2005,11 @@ function Invoke-DATSyncSinglePackage {
     # Applications use a dedicated folder hierarchy so they're easy to spot in the console.
     $FolderPath = if ($IsApplication) {
         if ($Type -eq 'BIOS') { "Driver Automation\BIOS\$Make" }
+        elseif ($Type -eq 'BIOSDCU') { "Driver Automation\BIOS (DCU)\$Make" }
         elseif ($Type -eq 'DriverUpdates') { "Driver Automation\Driver Updates\$Make" }
         else { "Driver Automation\Drivers\$Make" }
     } elseif ($Type -eq 'BIOS') { "BIOS Packages\$Make" }
+    elseif ($Type -eq 'BIOSDCU') { "BIOS (DCU) Packages\$Make" }
     elseif ($Type -eq 'DriverUpdates') { "Driver Update Packages\$Make" }
     else { "Driver Packages\$Make" }
 
@@ -1933,6 +2031,7 @@ function Invoke-DATSyncSinglePackage {
                 SourcePath   = $PackageSourceDir
                 Mode         = switch ($Type) {
                                     'BIOS'           { 'BIOS' }
+                                    'BIOSDCU'        { 'BIOSDCU' }
                                     'DriverUpdates'  { 'DriverUpdates' }
                                     default          { 'Driver' }
                                 }
@@ -1943,7 +2042,7 @@ function Invoke-DATSyncSinglePackage {
             }
             if ($AppSystemSKU.Count -gt 0)   { $AppParams['SystemSKU']   = $AppSystemSKU }
             if ($AppMachineType.Count -gt 0) { $AppParams['MachineType'] = $AppMachineType }
-            if ($Type -eq 'BIOS' -and $BIOSPassword) { $AppParams['BIOSPassword'] = $BIOSPassword }
+            if (($Type -eq 'BIOS' -or $Type -eq 'BIOSDCU') -and $BIOSPassword) { $AppParams['BIOSPassword'] = $BIOSPassword }
 
             $PkgResult = New-DATConfigMgrApplication @AppParams
         } elseif ($IsDriverPkg) {

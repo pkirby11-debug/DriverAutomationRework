@@ -590,6 +590,7 @@ function Initialize-DATMainWindow {
         $IncludeDrivers = $TypeSelection -in @('Drivers', 'Drivers + BIOS')
         $IncludeBIOS = $TypeSelection -in @('BIOS Updates', 'Drivers + BIOS')
         $IncludeDriverUpdates = $TypeSelection -eq 'Driver Updates (Catalog Only)'
+        $IncludeBIOSDCU = $TypeSelection -eq 'BIOS Updates (DCU)'
 
         Complete-DATGridEdit $Controls['DPGrid']
         Complete-DATGridEdit $Controls['DPGGrid']
@@ -608,6 +609,7 @@ function Initialize-DATMainWindow {
             IncludeDrivers           = $IncludeDrivers
             IncludeBIOS              = $IncludeBIOS
             IncludeDriverUpdates     = $IncludeDriverUpdates
+            IncludeBIOSDCU           = $IncludeBIOSDCU
             RemoveLegacy             = [bool]$Controls['RemoveLegacyCheckBox'].IsChecked
             CleanSource              = [bool]$Controls['CleanSourceCheckBox'].IsChecked
             EnableBDR                = [bool]$Controls['EnableBDRCheckBox'].IsChecked

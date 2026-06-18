@@ -68,7 +68,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Driver', 'BIOS', 'DriverUpdates')]
+    [ValidateSet('Driver', 'BIOS', 'BIOSDCU', 'DriverUpdates')]
     [string]$Mode,
 
     [Parameter(Mandatory)]
@@ -248,6 +248,7 @@ $MarkerSubKey = switch ($Mode) {
     'Driver'        { 'Drivers' }
     'DriverUpdates' { 'DriverUpdates' }
     'BIOS'          { 'BIOS' }
+    'BIOSDCU'       { 'BIOSDCU' }
     default         { 'Drivers' }
 }
 $MarkerPath = Join-Path $MarkerRoot $MarkerSubKey
@@ -262,6 +263,20 @@ function Write-DetectionMarker {
         New-ItemProperty -Path $MarkerPath -Name 'Version'     -Value $Version     -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $MarkerPath -Name 'InstalledOn' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $MarkerPath -Name 'Status'      -Value $Status      -PropertyType String -Force | Out-Null
+
+        # For BIOS modes, record the device's CURRENT SMBIOSBIOSVersion so the
+        # detection script can verify the firmware actually moved. This is what
+        # closes the "marker says Installed forever even though the flash never
+        # really applied" gap (deferred reboot, exit 3/4/5 not-applicable, etc.).
+        # Drivers / DriverUpdates have no single hardware version to record so
+        # they stay marker-only.
+        if ($Mode -eq 'BIOS' -or $Mode -eq 'BIOSDCU') {
+            $LiveBios = $null
+            try { $LiveBios = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SMBIOSBIOSVersion } catch { }
+            if ($LiveBios) {
+                New-ItemProperty -Path $MarkerPath -Name 'BIOSAtMarker' -Value $LiveBios -PropertyType String -Force | Out-Null
+            }
+        }
         Write-Log "Detection marker written to $MarkerPath (Status=$Status)"
     } catch {
         Write-Log "Failed to write detection marker: $($_.Exception.Message)" -Severity 2
@@ -1256,6 +1271,21 @@ function Invoke-DCUDriverUpdates {
         }
         if ($ScanCode -eq 500) {
             Write-Log "DCU scan: no applicable updates from the package catalog - everything current"
+            # Signal to BIOSDCU's wrapper (Install-BIOSDCU) that DCU saw the
+            # catalog but concluded nothing applies. For DriverUpdates that's
+            # the expected steady-state. For BIOSDCU the manifest has exactly
+            # one BIOS DUP that sync resolved as newer than the model's
+            # catalog version AND the apply-side pre-flash check just
+            # verified the device is behind, so a "nothing applicable"
+            # verdict is almost certainly DCU's applicability rules
+            # (SystemID match, dellVersion parse, SupportedDevices etc.)
+            # disagreeing with the catalog - in which case BIOSDCU should
+            # NOT exit clean; it should fall back to Flash64W whose DUP
+            # framework re-evaluates against the device directly. Setting
+            # the flag here and leaving the return value at 0 keeps
+            # DriverUpdates' existing semantics intact.
+            $script:DCUNoApplicable = $true
+
             # Diagnostic dump when the verdict is "nothing applicable" but the
             # admin has reason to expect updates (field case: a manifest entry
             # is newer than the installed driver, e.g. UHD Graphics 2140 in
@@ -1379,7 +1409,21 @@ function Invoke-DCUDriverUpdates {
                     $script:RebootRequired = $true
                     $ApplyResult = 0
                 }
-            500 { Write-Log "DCU applyUpdates: no applicable updates (exit 500) - everything current"; $ApplyResult = 0 }
+            500 {
+                    # applyUpdates returned "nothing applicable" AFTER /scan said
+                    # otherwise (the scan gate above only reaches here when scan
+                    # exit was 0 and at least one update matched). DCU re-scans
+                    # internally inside applyUpdates and can decline based on
+                    # runtime conditions the catalog-only scan doesn't evaluate
+                    # (Dell BIOS DUP framework checks for AC power, battery
+                    # level, pending reboot, etc.), so this is the operative
+                    # "DCU disagreed with itself" signal - flag it for the
+                    # BIOSDCU wrapper to fall back to Flash64W, whose DUP
+                    # framework re-evaluates against the device directly.
+                    Write-Log "DCU applyUpdates: no applicable updates (exit 500) - scan had matched one or more updates but applyUpdates' internal re-scan declined them all (typical when the DUP framework's runtime conditions - AC power, battery level, pending reboot, TPM/Secure Boot state - aren't met)" -Severity 2
+                    $script:DCUNoApplicable = $true
+                    $ApplyResult = 0
+                }
             default {
                 Write-Log "DCU applyUpdates FAILED (dcu-cli exit $ApplyCode)" -Severity 3
                 & $TailConsole 'applyUpdates'
@@ -1479,6 +1523,15 @@ function Invoke-DCUDriverUpdates {
                             Write-Log "Persistent catalog set, but disabling dell.com failed (exit $(if ($null -eq $PDef) { 'timeout/launch' } else { $PDef })) - next run retries" -Severity 2
                             & $TailConsole 'persist-nodefaultsrc'
                         }
+                    } elseif ($PCode -eq 5 -and $script:RebootRequired) {
+                        # Expected after a successful BIOS apply / reboot-signalling
+                        # run: dcu-cli refuses ANY follow-on /configure with exit 5
+                        # ("a previous operation requires a system reboot") until
+                        # the device reboots. The persistent CatalogPC.xml is
+                        # already on disk so the next engine run after reboot
+                        # picks it up cleanly. Log at Severity 1 so it doesn't
+                        # read like a settings regression.
+                        Write-Log "Deferred pointing resident DCU at the persistent catalog (dcu-cli exit 5 = pending reboot from this run's successful BIOS apply); the persistent CatalogPC.xml is already staged at $PersistTarget and the next run after reboot completes this step."
                     } else {
                         if ($PCode -eq 5) { $script:RebootRequired = $true }
                         Write-Log "Could not point resident DCU at the persistent catalog (exit $(if ($null -eq $PCode) { 'timeout/launch' } else { $PCode })) - dell.com may remain enabled until the next run" -Severity 2
@@ -1487,7 +1540,18 @@ function Invoke-DCUDriverUpdates {
                 } catch {
                     Write-Log "Persistent DCU end-state failed: $($_.Exception.Message) - next run retries" -Severity 2
                 }
-                & $AssertDcuManaged 'post-run'
+                if ($script:RebootRequired) {
+                    # dcu-cli is now refusing every /configure with exit 5 until
+                    # the device reboots from this run's flash. Re-asserting the
+                    # managed sequence would produce four exit-5 lines reading
+                    # like "not supported", which falsely implies the keys are
+                    # unsupported - they ARE supported and ARE already set from
+                    # the pre-run pass. Skip the re-assertion; the next engine
+                    # run after reboot does it for free.
+                    Write-Log "Skipping post-run DAT-managed mode re-assertion (reboot pending from this run's successful flash; dcu-cli would refuse every /configure with exit 5). The pre-run lockdown is still in effect and the next engine run after reboot re-asserts."
+                } else {
+                    & $AssertDcuManaged 'post-run'
+                }
             } else {
                 # OPTED-OUT devices get the polite behavior: restore whatever
                 # the box had. Source: pristine (true original) when
@@ -1532,6 +1596,53 @@ function Invoke-DCUDriverUpdates {
         # untouched either way).
         try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     }
+}
+
+function Install-BIOSDCU {
+    <#
+        BIOS-via-DCU apply path. The package source is a single Dell BIOS DUP
+        plus a manifest.json with one entry, the DCU catalog describing it
+        (DCUCatalog.xml + invcol embedded), and Flash64W.exe staged alongside
+        as a guaranteed fallback.
+
+        Hand the install to the same DCU engine that DriverUpdates uses
+        (Invoke-DCUDriverUpdates). Fall back to Invoke-DellBIOSFlash when:
+
+        - The engine returns $null (not Dell / no catalog / dcu-cli not
+          installed / configure or fail-closed gate rejected the run).
+
+        - The engine returns 0 BUT $script:DCUNoApplicable was set. This
+          flag fires from EITHER DCU path that ends "nothing applicable":
+              * /scan exit 500 - catalog evaluation found no match.
+              * /applyUpdates exit 500 - scan matched but applyUpdates'
+                internal re-scan declined (a Dell DUP framework runtime
+                check like AC power / battery level / pending reboot /
+                TPM state / Secure Boot state can produce this even
+                after /scan accepted the same DUP).
+          For BIOSDCU this is almost always a false negative: the
+          manifest holds exactly one BIOS DUP that the sync resolved as
+          newer than the model's catalog version AND the apply script's
+          pre-flash version check just verified the device is behind.
+          Flash64W's DUP framework re-evaluates against the live device
+          directly and is the trusted reference path the legacy BIOS
+          deployments have always used; falling back is the right
+          behavior whichever 500 fired.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $script:DCUNoApplicable = $false
+    $DcuExit = Invoke-DCUDriverUpdates -Path $Path
+
+    if ($null -ne $DcuExit -and -not $script:DCUNoApplicable) {
+        return $DcuExit
+    }
+
+    if ($script:DCUNoApplicable) {
+        Write-Log "DCU reported NO applicable updates but the BIOSDCU package's manifest entry was resolved newer than the model's catalog version at sync time AND the pre-flash check just confirmed this device is behind - DCU's applicability evaluation rejected the BIOS DUP. Falling back to Flash64W (its DUP framework re-evaluates against the device directly)." -Severity 2
+    } else {
+        Write-Log "DCU engine declined or unavailable - falling back to Flash64W for BIOS"
+    }
+    return Invoke-DellBIOSFlash -Path $Path
 }
 
 function Install-DriverUpdates {
@@ -2180,8 +2291,11 @@ function Invoke-DellBIOSFlash {
         throw "Flash64W.exe not found in $Path - Dell BIOS package is incomplete."
     }
 
+    # BIOSDCU packages also stage Dell's Inventory Collector (InvColPC_*.exe)
+    # for DCU's offline scan - it's NOT a flashable firmware. Exclude it here so
+    # the Flash64W fallback can't mistake it for the BIOS DUP.
     $BiosExe = Get-ChildItem -Path $Path -Filter '*.exe' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notlike 'Flash64W*' } |
+        Where-Object { $_.Name -notlike 'Flash64W*' -and $_.Name -notlike 'InvColPC*' } |
         Select-Object -First 1
     if (-not $BiosExe) {
         throw "No BIOS firmware .exe found alongside Flash64W.exe in $Path"
@@ -2221,14 +2335,18 @@ function Invoke-DellBIOSFlash {
     # Dell Flash64W / BIOS DUP convention:
     #   0     = success, no reboot
     #   2     = success, reboot required
-    #   3/4/5 = not applicable (dependency / qualification mismatch)
+    #   3/4/5 = not applicable (dependency / qualification mismatch) - the BIOS
+    #           did NOT flash and the firmware version is unchanged. Signalled
+    #           up to the main flow via $script:BIOSNotApplicable so the
+    #           detection marker is written as NotApplicable instead of the
+    #           old "Installed" lie that trapped devices in false-compliant.
     #   6     = rebooting now
     switch ($ExitCode) {
         0 { return 0 }
         2 { $script:RebootRequired = $true; return 0 }
-        3 { Write-Log 'Flash64W returned 3 (dependency soft error / not applicable) - treating as success' -Severity 2; return 0 }
-        4 { Write-Log 'Flash64W returned 4 (dependency hard error / not applicable) - treating as success' -Severity 2; return 0 }
-        5 { Write-Log 'Flash64W returned 5 (qualification mismatch / not applicable) - treating as success' -Severity 2; return 0 }
+        3 { Write-Log 'Flash64W returned 3 (dependency soft error / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
+        4 { Write-Log 'Flash64W returned 4 (dependency hard error / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
+        5 { Write-Log 'Flash64W returned 5 (qualification mismatch / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
         6 { $script:RebootRequired = $true; return 0 }
         default { return $ExitCode }
     }
@@ -2400,10 +2518,14 @@ try {
         }
 
         Suspend-BitLockerForFlash
-        switch ($DeviceMfr) {
-            'Dell'   { $ExitCode = Invoke-DellBIOSFlash   -Path $ContentPath }
-            'Lenovo' { $ExitCode = Invoke-LenovoBIOSFlash -Path $ContentPath }
-            default  { throw "BIOS flash not implemented for manufacturer '$DeviceMfr'" }
+        if ($Mode -eq 'BIOSDCU') {
+            $ExitCode = Install-BIOSDCU -Path $ContentPath
+        } else {
+            switch ($DeviceMfr) {
+                'Dell'   { $ExitCode = Invoke-DellBIOSFlash   -Path $ContentPath }
+                'Lenovo' { $ExitCode = Invoke-LenovoBIOSFlash -Path $ContentPath }
+                default  { throw "BIOS flash not implemented for manufacturer '$DeviceMfr'" }
+            }
         }
     }
 
@@ -2411,6 +2533,19 @@ try {
         Write-Log "Vendor utility returned non-zero exit code: $ExitCode" -Severity 3
         Write-DetectionMarker -Status 'Failed'
         exit $ExitCode
+    }
+
+    # BIOS not-applicable (Flash64W 3/4/5): the firmware did NOT flash. Record
+    # the live BIOS string in the marker (BIOSAtMarker) and use a distinct
+    # NotApplicable status so the version-aware detection script knows to
+    # report compliant against THAT exact firmware level (preventing a
+    # re-run loop on devices where the BIOS DUP genuinely doesn't apply to
+    # this revision) while still re-running if the live BIOS ever changes
+    # to something other than what was recorded.
+    if ($script:BIOSNotApplicable) {
+        Write-DetectionMarker -Status 'NotApplicable'
+        Write-Log 'BIOS DUP reported not-applicable - device firmware unchanged; marker = NotApplicable'
+        exit 0
     }
 
     Write-DetectionMarker -Status 'Installed'
