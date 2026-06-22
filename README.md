@@ -184,6 +184,42 @@ restarts when the install script signals `3010`.
 
 ---
 
+<a name="osd"></a>
+## OSD / task-sequence driver injection
+
+`Invoke-DATApply.ps1` is one script for both contexts. In the **full OS** it installs
+drivers with `pnputil` and flashes firmware with the vendor utility (Application /
+Intune / maintenance-window path). In **WinPE during a task sequence** it switches to
+**offline** mode and injects the pack's INFs into the *offline* image with `dism.exe`
+instead.
+
+- **Auto-detected** in WinPE (the `X:` system drive / the `MiniNT` marker key); force it
+  anywhere with `-Offline`.
+- **Target volume** comes from `-TargetPath '<drive>:\'`, else the `OSDTargetSystemDrive`
+  task-sequence variable, else an auto-detected fixed volume that carries `\Windows`.
+- **Firmware is skipped offline.** Firmware-class INFs (`ClassGuid f2e7dd72-…` — Surface
+  UEFI/SAM/ME and any OEM firmware) only install in the full OS, so they're left out of
+  the offline pass; run them as a full-OS step. This is what lets a Surface pack inject
+  in a task sequence at all.
+- **BIOS / BIOSDCU / DriverUpdates** modes are skipped in WinPE (they need the running
+  OS), and no detection marker / `3010` is written offline — the task sequence owns the
+  reboot.
+
+Wire it as a single **Run PowerShell Script** step (full-OS or WinPE) against the staged
+package, e.g.:
+
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-DATApply.ps1 ^
+  -Mode Driver -PackageName "Drivers - Surface Pro 12th Edition Intel - Win11 24H2" -Version "1.0"
+```
+
+This replaces the offline driver-injection role of the legacy
+`Invoke-CMApplyDriverPackage.ps1` for a known package. Dynamic
+device-identity → package matching and download from the ConfigMgr **AdminService**
+(so one step picks the right package per model) lands in a follow-up build.
+
+---
+
 <a name="dcu-engine"></a>
 ## The Driver Updates (DCU) engine
 

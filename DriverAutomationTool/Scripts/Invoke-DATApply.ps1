@@ -52,18 +52,36 @@
 .PARAMETER DebugMode
     Do not actually install drivers / flash BIOS; just log what would happen.
 
+.PARAMETER Offline
+    Inject drivers into an OFFLINE Windows image (OSD / task sequence) with
+    dism.exe instead of pnputil into the running OS. Auto-detected when the
+    script runs in WinPE; this switch forces it.
+
+.PARAMETER TargetPath
+    Offline target Windows volume root (e.g. 'C:\'). Only used in offline mode.
+    Defaults to the OSDTargetSystemDrive task-sequence variable, else an
+    auto-detected fixed volume that carries \Windows.
+
 .EXAMPLE
     PS> .\Invoke-DATApply.ps1 -Mode Driver -PackageName 'Drivers - Dell Latitude 7430 - Win11 24H2' -Version 'A05'
+
+.EXAMPLE
+    PS> .\Invoke-DATApply.ps1 -Mode Driver -PackageName 'Drivers - Surface Pro 12th Edition Intel - Win11 24H2' -Version '1.0' -Offline -TargetPath 'C:\'
 
 .EXAMPLE
     PS> .\Invoke-DATApply.ps1 -Mode BIOS -PackageName 'BIOS Update - Dell Latitude 7430' -Version '1.23.0' -BIOSPassword 'Secret!'
 
 .NOTES
-    Part of the Driver Automation Tool. Replaces the legacy
-    Invoke-CMApplyDriverPackage.ps1 / Invoke-CMApplyBIOSPackage.ps1 pair for
-    maintenance-window deployments via ConfigMgr Applications or Intune Win32 apps.
-    OSD / bare-metal driver injection is still handled by ConfigMgr's Auto Apply
-    Drivers step or the legacy apply scripts in a task sequence.
+    Part of the Driver Automation Tool. One apply script for both contexts:
+      - Full OS (ConfigMgr Application / Intune Win32 app / maintenance window):
+        drivers via pnputil, firmware via the vendor flash utility. Replaces the
+        legacy Invoke-CMApplyBIOSPackage.ps1 / online driver path.
+      - Offline (OSD / task sequence in WinPE): Driver mode injects the pack's
+        INFs into the offline image with dism.exe. This is the basis for
+        retiring the legacy Invoke-CMApplyDriverPackage.ps1; dynamic
+        model->package matching/download from the ConfigMgr AdminService is a
+        follow-up. Firmware / BIOS / Dell DUP/DCU modes are skipped offline (they
+        require the running OS).
 #>
 [CmdletBinding()]
 param(
@@ -99,7 +117,16 @@ param(
     [ValidateRange(1, 1024)]
     [int]$MaxLogSizeMB = 5,
 
-    [switch]$DebugMode
+    [switch]$DebugMode,
+
+    # Inject into an OFFLINE Windows image (OSD / task sequence in WinPE) with
+    # dism.exe instead of installing into the running OS with pnputil. Auto-
+    # detected in WinPE; this switch forces it.
+    [switch]$Offline,
+
+    # Offline target Windows volume root (e.g. 'C:\'). Defaults to the task
+    # sequence's OSDTargetSystemDrive, else an auto-detected volume with \Windows.
+    [string]$TargetPath
 )
 
 # -------------------------------------------------------------------------
@@ -663,6 +690,215 @@ function Install-DriverContentFromWim {
             }
         }
         Remove-Item -Path $MountPoint -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-IsFirmwareInf {
+    <#
+        Returns $true when an INF is a firmware-class package (Class=Firmware /
+        ClassGuid {f2e7dd72-6468-4e36-b6f1-6488f42c1b52}). Such "drivers" are
+        UEFI/EC/SAM/ME firmware updaters that Windows applies from the RUNNING OS
+        via the firmware update platform - they cannot be staged into an OFFLINE
+        image and make dism /Add-Driver error. This is exactly what trips a
+        Surface pack (its MSI bundles UEFI/SAM/ME firmware) during offline
+        injection, but the test is vendor-agnostic and safe for every OEM.
+    #>
+    param([Parameter(Mandatory)][string]$InfPath)
+
+    $Text = $null
+    try {
+        $Text = Get-Content -LiteralPath $InfPath -Raw -ErrorAction Stop
+    } catch {
+        return $false
+    }
+    if ($Text -match '(?im)^\s*Class\s*=\s*Firmware\s*(;.*)?$') { return $true }
+    if ($Text -match '(?i)ClassGuid\s*=\s*\{?\s*f2e7dd72-6468-4e36-b6f1-6488f42c1b52\s*\}?') { return $true }
+    return $false
+}
+
+function Get-DATOfflineContext {
+    <#
+        Decides whether this run should inject drivers into an OFFLINE image
+        (OSD / task sequence in WinPE) instead of the running OS, and resolves
+        the target Windows volume.
+
+        Offline applies when -Offline is passed or when WinPE is detected (the
+        X: system drive / the MiniNT marker key). The target volume comes from
+        -TargetPath, else the task sequence's OSDTargetSystemDrive / OSDisk
+        variable, else an auto-detected fixed volume that carries \Windows.
+    #>
+    param(
+        [string]$TargetPathOverride,
+        [switch]$ForceOffline
+    )
+
+    $InWinPE = ($env:SystemDrive -eq 'X:') -or
+               (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Control\MiniNT' -ErrorAction SilentlyContinue)
+
+    $TSEnv = $null
+    try { $TSEnv = New-Object -ComObject Microsoft.SMS.TSEnvironment -ErrorAction Stop } catch { $TSEnv = $null }
+
+    if (-not ($ForceOffline.IsPresent -or $InWinPE)) {
+        return [pscustomobject]@{ IsOffline = $false; TargetImage = $null; Reason = 'full OS'; TargetSource = $null }
+    }
+
+    $Reason = if ($ForceOffline.IsPresent -and -not $InWinPE) { '-Offline forced' }
+              elseif ($InWinPE -and $TSEnv) { 'WinPE + task sequence' }
+              elseif ($InWinPE) { 'WinPE' }
+              else { 'forced' }
+
+    $Target = $null
+    $Source = $null
+    if ($TargetPathOverride) {
+        $Target = $TargetPathOverride
+        $Source = '-TargetPath'
+    } elseif ($TSEnv) {
+        foreach ($VarName in @('OSDTargetSystemDrive', 'OSDisk')) {
+            $Val = $null
+            try { $Val = $TSEnv.Value($VarName) } catch { $Val = $null }
+            if ($Val) { $Target = $Val; $Source = "TS variable $VarName"; break }
+        }
+    }
+    if (-not $Target) {
+        foreach ($Drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+            if ($Drive.Name.Length -ne 1 -or $Drive.Name -eq 'X') { continue }
+            if (Test-Path ('{0}:\Windows\System32\config\SOFTWARE' -f $Drive.Name)) {
+                $Target = '{0}:' -f $Drive.Name
+                $Source = 'auto-detected offline OS volume'
+                break
+            }
+        }
+    }
+
+    $TargetImage = if ($Target) { ($Target.TrimEnd('\') + '\') } else { $null }
+
+    return [pscustomobject]@{
+        IsOffline    = $true
+        TargetImage  = $TargetImage
+        Reason       = $Reason
+        TargetSource = $Source
+    }
+}
+
+function Install-DriverContentOffline {
+    <#
+        Injects driver INFs into an OFFLINE Windows image with dism.exe - the
+        OSD / task-sequence counterpart to Install-InfTree's online pnputil.
+
+        - Uses dism.exe (always present in WinPE), NOT the DISM PowerShell
+          module (not guaranteed in a boot image).
+        - Firmware-class INFs are skipped (they only install in the full OS);
+          this is what lets a Surface pack inject offline at all.
+        - Fast path: when nothing is filtered, one /Add-Driver /Recurse over the
+          whole tree. Filtered path (e.g. Surface) or a failed bulk pass falls
+          to per-INF with a lenient "some succeeded = success" policy mirroring
+          Install-InfTree.
+        - No reboot is signaled: the target OS is not running.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$TargetImage
+    )
+
+    if (-not (Test-Path (Join-Path $TargetImage 'Windows\System32'))) {
+        throw "Offline target image '$TargetImage' is not a Windows volume (no \Windows\System32). Pass -TargetPath '<drive>:\' or set the OSDTargetSystemDrive task-sequence variable."
+    }
+
+    # Resolve the INF root from the content shape. Loose .inf trees (the shape
+    # DAT builds for Driver/Standard packages) are used directly; a .zip is
+    # expanded first. WIM content is not supported offline here (reading a WIM
+    # needs the DISM PS module / a mount we deliberately avoid in WinPE) - ship
+    # the model as a loose/ZIP pack, or apply it as a full-OS step.
+    $InfRoot = $Path
+    $TempExpand = $null
+    $Wim = Get-ChildItem -Path $Path -Filter '*.wim' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    $Zip = Get-ChildItem -Path $Path -Filter '*.zip' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($Wim) {
+        throw "Offline injection does not support WIM-compressed content ($($Wim.Name)). Build this model as a loose/ZIP driver package, or apply it as a full-OS step."
+    } elseif ($Zip) {
+        $TempExpand = Join-Path $env:TEMP ('DATOffline_{0}' -f $PID)
+        Write-Log "Detected ZIP content: $($Zip.Name) - expanding to $TempExpand"
+        if (Test-Path $TempExpand) { Remove-Item $TempExpand -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -Path $TempExpand -ItemType Directory -Force | Out-Null
+        Expand-Archive -Path $Zip.FullName -DestinationPath $TempExpand -Force
+        $InfRoot = $TempExpand
+    }
+
+    try {
+        $InfFiles = @(Get-ChildItem -Path $InfRoot -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+        if ($InfFiles.Count -eq 0) {
+            throw "No .inf files found under $InfRoot - content is missing or not a driver pack."
+        }
+        Write-Log "Offline injection: $($InfFiles.Count) .inf file(s) under $InfRoot -> image $TargetImage"
+
+        $Firmware = [System.Collections.Generic.List[object]]::new()
+        $Drivers  = [System.Collections.Generic.List[object]]::new()
+        foreach ($Inf in $InfFiles) {
+            if (Test-IsFirmwareInf -InfPath $Inf.FullName) { $Firmware.Add($Inf) } else { $Drivers.Add($Inf) }
+        }
+        if ($Firmware.Count -gt 0) {
+            $FwNames = (($Firmware | Select-Object -First 8 | ForEach-Object { $_.Name }) -join ', ')
+            Write-Log "Skipping $($Firmware.Count) firmware-class INF(s) - firmware installs only in the full OS, never offline: $FwNames$(if ($Firmware.Count -gt 8) { ' ...' })" -Severity 2
+        }
+        if ($Drivers.Count -eq 0) {
+            Write-Log 'Every INF in this pack is firmware-class - nothing to inject offline (Surface firmware must run as a full-OS step).' -Severity 2
+            return 0
+        }
+
+        $Dism = Join-Path $env:SystemRoot 'System32\dism.exe'
+        if (-not (Test-Path $Dism)) { throw "dism.exe not found at $Dism" }
+
+        if ($DebugMode) {
+            Write-Log "DebugMode - would inject $($Drivers.Count) driver INF(s) into $TargetImage via dism /Add-Driver (skipping $($Firmware.Count) firmware INF(s))"
+            return 0
+        }
+
+        $ImageArg = "/Image:$TargetImage"
+
+        # Fast path: nothing filtered -> one recursive add over the whole tree.
+        if ($Firmware.Count -eq 0) {
+            Write-Log "Running: dism.exe $ImageArg /Add-Driver /Driver:$InfRoot /Recurse"
+            $Out = & $Dism $ImageArg '/Add-Driver' "/Driver:$InfRoot" '/Recurse' 2>&1
+            $Code = $LASTEXITCODE
+            foreach ($L in @($Out)) { if ("$L".Trim()) { Write-Log "  $L" } }
+            Write-Log "dism /Add-Driver /Recurse exit code: $Code"
+            if ($Code -eq 0) {
+                Write-Log "Offline injection succeeded ($($Drivers.Count) INF(s) under the tree)"
+                return 0
+            }
+            Write-Log "Bulk offline injection returned $Code - retrying per-INF to salvage installable drivers" -Severity 2
+        }
+
+        # Filtered / salvage path: per-INF so firmware is excluded.
+        $Added = 0
+        $Failed = 0
+        $LastFail = 1
+        foreach ($Inf in $Drivers) {
+            $IOut = & $Dism $ImageArg '/Add-Driver' "/Driver:$($Inf.FullName)" 2>&1
+            $ICode = $LASTEXITCODE
+            if ($ICode -eq 0) {
+                $Added++
+            } else {
+                $Failed++
+                $LastFail = $ICode
+                $Tail = (@($IOut) | Where-Object { "$_".Trim() } | Select-Object -Last 1)
+                Write-Log "  $($Inf.Name): dism exit $ICode - $Tail" -Severity 2
+            }
+        }
+        Write-Log "Offline injection summary: $Added added, $Failed failed (of $($Drivers.Count) driver INF(s); $($Firmware.Count) firmware skipped)"
+
+        if ($Added -gt 0) {
+            if ($Failed -gt 0) {
+                Write-Log "Treating offline injection as success - $Added driver(s) added, $Failed failed (non-fatal)" -Severity 2
+            }
+            return 0
+        }
+        Write-Log "Offline injection added no drivers ($Failed failed)" -Severity 3
+        return $LastFail
+    } finally {
+        if ($TempExpand -and (Test-Path $TempExpand)) {
+            Remove-Item $TempExpand -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -2477,6 +2713,34 @@ try {
 
     if ($SafetyManufacturer -and $DeviceMfr -ne $SafetyManufacturer) {
         throw "Safety check failed: expected manufacturer '$SafetyManufacturer' but device is '$DeviceMfr'. Requirement Rules should have caught this - check your Application configuration."
+    }
+
+    # -------------------------------------------------------------------------
+    # Offline / task-sequence path. In WinPE (or when -Offline is passed) the
+    # target OS is not running, so Driver mode injects INFs into the offline
+    # image with dism.exe instead of pnputil. Firmware, Dell DUP/DCU and BIOS
+    # flashes only work in the full OS and are skipped here with a clear note.
+    # The detection marker and 3010 reboot signal are full-OS concepts and are
+    # not used offline (the TS owns reboots).
+    # -------------------------------------------------------------------------
+    $OfflineCtx = Get-DATOfflineContext -TargetPathOverride $TargetPath -ForceOffline:$Offline
+    if ($OfflineCtx.IsOffline) {
+        Write-Log "OFFLINE mode ($($OfflineCtx.Reason)); target image = $(if ($OfflineCtx.TargetImage) { $OfflineCtx.TargetImage } else { '<unresolved>' }) [$($OfflineCtx.TargetSource)]"
+        if ($Mode -eq 'Driver') {
+            if (-not $OfflineCtx.TargetImage) {
+                throw "Could not resolve the offline target Windows volume. Pass -TargetPath '<drive>:\' or set the OSDTargetSystemDrive task-sequence variable."
+            }
+            $OfflineCode = Install-DriverContentOffline -Path $ContentPath -TargetImage $OfflineCtx.TargetImage
+            if ($OfflineCode -ne 0) {
+                Write-Log "Offline driver injection failed (exit $OfflineCode)" -Severity 3
+                exit $OfflineCode
+            }
+            Write-Log 'Offline driver injection complete (no reboot signaled in WinPE) - exiting 0'
+            exit 0
+        }
+        # Modes that require the running OS.
+        Write-Log "Mode '$Mode' cannot run during offline/WinPE servicing (firmware flashes and Dell DUP/DCU installs need the full OS). Skipping with success - run this as a full-OS step instead." -Severity 2
+        exit 0
     }
 
     $ExitCode = 0
