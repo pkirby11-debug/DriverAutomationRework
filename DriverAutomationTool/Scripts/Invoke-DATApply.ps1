@@ -1166,6 +1166,12 @@ function Resolve-DATDriverPackageViaAdminService {
         local content path (or $null). Server / credentials come from the
         parameters, else the TS variables DATAdminServiceServer / ...User / ...Password.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingUsernameAndPasswordParams', '',
+        Justification='AdminService credentials arrive as plaintext via task-sequence variables / the command line, where a PSCredential cannot be passed; they are converted to a credential immediately and sent over HTTPS.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'Password',
+        Justification='See above - plaintext is unavoidable at the task-sequence variable boundary.')]
     param(
         [string]$Server,
         [string]$User,
