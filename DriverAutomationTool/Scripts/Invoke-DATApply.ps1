@@ -62,11 +62,37 @@
     Defaults to the OSDTargetSystemDrive task-sequence variable, else an
     auto-detected fixed volume that carries \Windows.
 
+.PARAMETER DiscoverFromAdminService
+    Offline/OSD only: identify the device, query the ConfigMgr AdminService for
+    the matching DAT driver package, download it, and inject it - so one TS step
+    services any model with no per-model wiring.
+
+.PARAMETER AdminServiceServer
+    AdminService SMS Provider / site server FQDN. Falls back to the TS variable
+    DATAdminServiceServer.
+
+.PARAMETER AdminServiceUser
+.PARAMETER AdminServicePassword
+    Credentials for the AdminService (a dedicated read-only service account).
+    Fall back to the TS variables DATAdminServiceUser / DATAdminServicePassword.
+
+.PARAMETER TargetOperatingSystem
+.PARAMETER Architecture
+    Used to pick the right package when several match the model (matched against
+    the package name, e.g. 'Windows 11 24H2' / 'x64').
+
+.PARAMETER SkipCertificateCheck
+    Skip TLS validation for the AdminService (self-signed PKI).
+
 .EXAMPLE
     PS> .\Invoke-DATApply.ps1 -Mode Driver -PackageName 'Drivers - Dell Latitude 7430 - Win11 24H2' -Version 'A05'
 
 .EXAMPLE
     PS> .\Invoke-DATApply.ps1 -Mode Driver -PackageName 'Drivers - Surface Pro 12th Edition Intel - Win11 24H2' -Version '1.0' -Offline -TargetPath 'C:\'
+
+.EXAMPLE
+    # One OSD step for any model: discover, download, and inject via AdminService.
+    PS> .\Invoke-DATApply.ps1 -Mode Driver -PackageName 'DAT OSD' -Version '1.0' -DiscoverFromAdminService -AdminServiceServer 'cm.contoso.com' -TargetOperatingSystem 'Windows 11 24H2' -Architecture 'x64'
 
 .EXAMPLE
     PS> .\Invoke-DATApply.ps1 -Mode BIOS -PackageName 'BIOS Update - Dell Latitude 7430' -Version '1.23.0' -BIOSPassword 'Secret!'
@@ -77,11 +103,11 @@
         drivers via pnputil, firmware via the vendor flash utility. Replaces the
         legacy Invoke-CMApplyBIOSPackage.ps1 / online driver path.
       - Offline (OSD / task sequence in WinPE): Driver mode injects the pack's
-        INFs into the offline image with dism.exe. This is the basis for
-        retiring the legacy Invoke-CMApplyDriverPackage.ps1; dynamic
-        model->package matching/download from the ConfigMgr AdminService is a
-        follow-up. Firmware / BIOS / Dell DUP/DCU modes are skipped offline (they
-        require the running OS).
+        INFs into the offline image with dism.exe. With -DiscoverFromAdminService
+        it also identifies the device, finds + downloads the matching driver
+        package from the ConfigMgr AdminService, and injects it - replacing the
+        legacy Invoke-CMApplyDriverPackage.ps1. Firmware / BIOS / Dell DUP/DCU
+        modes are skipped offline (they require the running OS).
 #>
 [CmdletBinding()]
 param(
@@ -126,7 +152,31 @@ param(
 
     # Offline target Windows volume root (e.g. 'C:\'). Defaults to the task
     # sequence's OSDTargetSystemDrive, else an auto-detected volume with \Windows.
-    [string]$TargetPath
+    [string]$TargetPath,
+
+    # PR 2 - dynamic discovery (offline / WinPE). When set, the script identifies
+    # the device, queries the ConfigMgr AdminService for the matching driver
+    # package, downloads it, and injects it - no per-model TS step needed.
+    [switch]$DiscoverFromAdminService,
+
+    # AdminService SMS Provider / site server FQDN. Falls back to the TS variable
+    # DATAdminServiceServer. Credentials fall back to DATAdminServiceUser /
+    # DATAdminServicePassword. Use a dedicated read-only service account.
+    [string]$AdminServiceServer,
+    [string]$AdminServiceUser,
+
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'AdminServicePassword',
+        Justification='TS variables / command line are plaintext at this boundary; sent over HTTPS to the AdminService.')]
+    [string]$AdminServicePassword,
+
+    # Target OS / architecture used to pick the right package when several match
+    # the model (parsed from the package name, e.g. 'Windows 11 24H2' / 'x64').
+    [string]$TargetOperatingSystem,
+    [string]$Architecture,
+
+    # Skip TLS certificate validation for the AdminService (self-signed PKI).
+    [switch]$SkipCertificateCheck
 )
 
 # -------------------------------------------------------------------------
@@ -900,6 +950,262 @@ function Install-DriverContentOffline {
             Remove-Item $TempExpand -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+function Get-DATDeviceIdentity {
+    <#
+        Collects manufacturer / model / SystemSKU / machine type for AdminService
+        matching. CIM works in WinPE when the boot image carries the WMI optional
+        component (standard for ConfigMgr boot media).
+    #>
+    $Cs  = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $Csp = Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction SilentlyContinue
+    $Mfr = Get-DeviceManufacturer
+
+    $Sku = $null
+    try { $Sku = (Get-CimInstance -Namespace 'root\wmi' -ClassName 'MS_SystemInformation' -ErrorAction Stop).SystemSKU } catch { $Sku = $null }
+    if (-not $Sku -and $Cs -and $Cs.PSObject.Properties['SystemSKUNumber']) { $Sku = $Cs.SystemSKUNumber }
+
+    $RawModel    = if ($Cs)  { "$($Cs.Model)".Trim() }   else { '' }
+    $LenovoModel = if ($Csp) { "$($Csp.Version)".Trim() } else { '' }
+
+    $MachineType   = ''
+    $FriendlyModel = $RawModel
+    if ($Mfr -eq 'Lenovo') {
+        # Lenovo: Win32_ComputerSystem.Model is the 4-char machine type prefix;
+        # Win32_ComputerSystemProduct.Version is the friendly model name.
+        if ($RawModel.Length -ge 4) { $MachineType = $RawModel.Substring(0, 4) }
+        if ($LenovoModel) { $FriendlyModel = $LenovoModel }
+    }
+
+    [pscustomobject]@{
+        Manufacturer = $Mfr
+        Model        = $FriendlyModel
+        RawModel     = $RawModel
+        SystemSKU    = if ($Sku) { "$Sku".Trim() } else { '' }
+        MachineType  = $MachineType
+    }
+}
+
+function Find-DATPackageViaAdminService {
+    <#
+        Queries the ConfigMgr AdminService for driver packages (SMS_Package +
+        SMS_DriverPackage) and returns a flat list of {Class, Name, PackageID,
+        Version, Description, Manufacturer}. Auth uses the supplied credential
+        (a dedicated read-only service account) or the default credentials.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Server,
+        [System.Management.Automation.PSCredential]$Credential,
+        [switch]$SkipCertificateCheck
+    )
+
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    $RestoreCertCallback = $false
+    if ($SkipCertificateCheck) {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        $RestoreCertCallback = $true
+    }
+
+    $Base  = "https://$Server/AdminService/wmi"
+    $Found = [System.Collections.Generic.List[object]]::new()
+    try {
+        foreach ($Class in @('SMS_Package', 'SMS_DriverPackage')) {
+            $Params = @{ Uri = "$Base/$Class"; Method = 'Get'; UseBasicParsing = $true; TimeoutSec = 120; ErrorAction = 'Stop' }
+            if ($Credential) { $Params['Credential'] = $Credential } else { $Params['UseDefaultCredentials'] = $true }
+            try {
+                Write-Log "AdminService query: $($Params.Uri)"
+                $Resp  = Invoke-RestMethod @Params
+                $Items = @($Resp.value)
+                Write-Log "  $Class returned $($Items.Count) package(s)"
+                foreach ($P in $Items) {
+                    $Found.Add([pscustomobject]@{
+                        Class        = $Class
+                        Name         = "$($P.Name)"
+                        PackageID    = "$($P.PackageID)"
+                        Version      = "$($P.Version)"
+                        Description  = "$($P.Description)"
+                        Manufacturer = "$($P.Manufacturer)"
+                    })
+                }
+            } catch {
+                Write-Log "  $Class query failed: $($_.Exception.Message)" -Severity 2
+            }
+        }
+    } finally {
+        if ($RestoreCertCallback) { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null }
+    }
+    return $Found
+}
+
+function Select-DATBestPackage {
+    <#
+        Picks the best DAT driver package for the device from AdminService
+        results. Matches the device SystemSKU / MachineType / model against the
+        package's "(Models included:...)" description and DAT name conventions,
+        gated by the target OS / architecture parsed from the package name;
+        newest Version wins. Returns the chosen package object or $null.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Packages,
+        [Parameter(Mandatory)][pscustomobject]$Identity,
+        [string]$TargetOperatingSystem,
+        [string]$Architecture
+    )
+
+    $SkuToken   = "$($Identity.SystemSKU)".Trim()
+    $MtToken    = "$($Identity.MachineType)".Trim()
+    $ModelToken = "$($Identity.Model)".Trim()
+
+    $Candidates = [System.Collections.Generic.List[object]]::new()
+    foreach ($P in $Packages) {
+        $Name = "$($P.Name)"
+        # DAT driver packages only: "Drivers - ..." (Standard/App) or
+        # "<Make> <Model> - <OS> <Arch>" (Driver Pkg). Exclude BIOS / DriverUpdates.
+        if ($Name -match '(?i)^(BIOS Update|Driver Updates )') { continue }
+        if ($Name -notmatch '(?i)(^Drivers - | - Win(dows)? ?\d)') { continue }
+
+        if ($TargetOperatingSystem -and ($Name -notmatch [regex]::Escape($TargetOperatingSystem))) { continue }
+        if ($Architecture -and ($Name -notmatch [regex]::Escape($Architecture))) { continue }
+
+        $Desc   = "$($P.Description)"
+        $Models = ''
+        $Match  = [regex]::Match($Desc, '(?i)\(Models included:(.*?)\)')
+        if ($Match.Success) { $Models = $Match.Groups[1].Value }
+        $ModelList = @($Models -split '[;,]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+        $IsMatch = $false
+        if     ($SkuToken   -and ($ModelList -contains $SkuToken))                                  { $IsMatch = $true }
+        elseif ($SkuToken   -and $Models -and ($Models -match [regex]::Escape($SkuToken)))          { $IsMatch = $true }
+        elseif ($MtToken    -and $Models -and ($Models -match [regex]::Escape($MtToken)))           { $IsMatch = $true }
+        elseif ($ModelToken -and ($Name -match [regex]::Escape($ModelToken) -or $Models -match [regex]::Escape($ModelToken))) { $IsMatch = $true }
+
+        if ($IsMatch) { $Candidates.Add($P) }
+    }
+
+    if ($Candidates.Count -eq 0) { return $null }
+
+    # Newest version wins; [version] when parseable, else string compare.
+    $Best = $Candidates | Sort-Object -Property `
+        @{ Expression = { $v = $null; if ([version]::TryParse((("$($_.Version)") -replace '[^0-9.]', ''), [ref]$v)) { $v } else { [version]'0.0' } } }, `
+        @{ Expression = { "$($_.Version)" } } -Descending | Select-Object -First 1
+    return $Best
+}
+
+function Invoke-DATContentDownload {
+    <#
+        Downloads a matched ConfigMgr package in WinPE using the task sequence's
+        OSDDownloadContent agent (the CM-native content engine). Returns the
+        local content path or $null. The resolved PackageID/Name are also written
+        to TS variables (DATDriverPackageID / DATDriverPackageName) so a companion
+        native "Download Package Content" step can be used instead if preferred.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$PackageID,
+        [string]$PackageName
+    )
+
+    $TSEnv = $null
+    try { $TSEnv = New-Object -ComObject Microsoft.SMS.TSEnvironment -ErrorAction Stop } catch { $TSEnv = $null }
+    if (-not $TSEnv) {
+        Write-Log 'Not running in a task sequence - cannot download package content. Run inside an OSD TS, or pre-stage content and pass -ContentPath.' -Severity 3
+        return $null
+    }
+    try { $TSEnv.Value('DATDriverPackageID')   = $PackageID } catch { }
+    try { $TSEnv.Value('DATDriverPackageName') = "$PackageName" } catch { }
+
+    $Agent = $null
+    foreach ($Root in @($env:_SMSTSMDataPath, "$env:SystemDrive\_SMSTaskSequence", 'X:\sms\bin', "$env:WINDIR\ccm")) {
+        if (-not $Root -or -not (Test-Path $Root)) { continue }
+        $Hit = Get-ChildItem -Path $Root -Filter 'OSDDownloadContent.exe' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($Hit) { $Agent = $Hit.FullName; break }
+    }
+    if (-not $Agent) {
+        Write-Log "OSDDownloadContent.exe not found. The matched PackageID is in TS variable DATDriverPackageID - add a native 'Download Package Content' step bound to that variable, then run this script with -ContentPath <that step's path variable>." -Severity 2
+        return $null
+    }
+    Write-Log "Content agent: $Agent"
+
+    $DestRoot = if ($env:_SMSTSMDataPath) { $env:_SMSTSMDataPath } else { "$env:TEMP" }
+    $Dest = Join-Path $DestRoot ('DATDriverPkg_{0}' -f $PackageID)
+    try {
+        $TSEnv.Value('OSDDownloadDownloadPackages')      = $PackageID
+        $TSEnv.Value('OSDDownloadDestinationLocationType') = 'Custom'
+        $TSEnv.Value('OSDDownloadDestinationPath')        = $Dest
+        $TSEnv.Value('OSDDownloadContentVariable')        = 'DATDownloaded'
+    } catch {
+        Write-Log "Failed to set OSDDownloadContent variables: $($_.Exception.Message)" -Severity 3
+        return $null
+    }
+
+    Write-Log "Downloading package $PackageID via OSDDownloadContent -> $Dest"
+    $Out  = & $Agent 2>&1
+    $Code = $LASTEXITCODE
+    foreach ($L in @($Out)) { if ("$L".Trim()) { Write-Log "  $L" } }
+    Write-Log "OSDDownloadContent exit code: $Code"
+    if ($Code -ne 0) {
+        Write-Log "Content download failed (exit $Code)" -Severity 3
+        return $null
+    }
+
+    $Path = $null
+    try { $Path = $TSEnv.Value('DATDownloaded01') } catch { $Path = $null }
+    if (-not $Path) { $Path = $Dest }
+    if (-not (Test-Path $Path)) {
+        Write-Log "Downloaded content path '$Path' not found after OSDDownloadContent" -Severity 3
+        return $null
+    }
+    Write-Log "Package content downloaded to: $Path"
+    return $Path
+}
+
+function Resolve-DATDriverPackageViaAdminService {
+    <#
+        End-to-end discovery for offline/OSD: identify the device, query the
+        AdminService, select the best driver package, download it, and return the
+        local content path (or $null). Server / credentials come from the
+        parameters, else the TS variables DATAdminServiceServer / ...User / ...Password.
+    #>
+    param(
+        [string]$Server,
+        [string]$User,
+        [string]$Password,
+        [string]$TargetOperatingSystem,
+        [string]$Architecture,
+        [switch]$SkipCertificateCheck
+    )
+
+    $TSEnv = $null
+    try { $TSEnv = New-Object -ComObject Microsoft.SMS.TSEnvironment -ErrorAction Stop } catch { $TSEnv = $null }
+    if (-not $Server   -and $TSEnv) { try { $Server   = $TSEnv.Value('DATAdminServiceServer') }   catch { } }
+    if (-not $User     -and $TSEnv) { try { $User     = $TSEnv.Value('DATAdminServiceUser') }     catch { } }
+    if (-not $Password -and $TSEnv) { try { $Password = $TSEnv.Value('DATAdminServicePassword') } catch { } }
+    if (-not $Server) {
+        Write-Log 'AdminService discovery requested but no server given (-AdminServiceServer or TS variable DATAdminServiceServer).' -Severity 3
+        return $null
+    }
+
+    $Identity = Get-DATDeviceIdentity
+    Write-Log "Device identity: Mfr=$($Identity.Manufacturer), Model='$($Identity.Model)', SystemSKU='$($Identity.SystemSKU)', MachineType='$($Identity.MachineType)'"
+
+    $Cred = $null
+    if ($User) {
+        $Sec = ConvertTo-SecureString $Password -AsPlainText -Force
+        $Cred = New-Object System.Management.Automation.PSCredential($User, $Sec)
+    }
+
+    $Packages = Find-DATPackageViaAdminService -Server $Server -Credential $Cred -SkipCertificateCheck:$SkipCertificateCheck
+    Write-Log "AdminService returned $($Packages.Count) total package(s)"
+    if ($Packages.Count -eq 0) { return $null }
+
+    $Best = Select-DATBestPackage -Packages $Packages -Identity $Identity -TargetOperatingSystem $TargetOperatingSystem -Architecture $Architecture
+    if (-not $Best) {
+        Write-Log 'No driver package in the AdminService results matched this device (SystemSKU / MachineType / model + OS/arch).' -Severity 3
+        return $null
+    }
+    Write-Log "Matched package: '$($Best.Name)' (PackageID $($Best.PackageID), Version $($Best.Version), $($Best.Class))"
+
+    return (Invoke-DATContentDownload -PackageID $Best.PackageID -PackageName $Best.Name)
 }
 
 function Invoke-DCUDriverUpdates {
@@ -2730,7 +3036,24 @@ try {
             if (-not $OfflineCtx.TargetImage) {
                 throw "Could not resolve the offline target Windows volume. Pass -TargetPath '<drive>:\' or set the OSDTargetSystemDrive task-sequence variable."
             }
-            $OfflineCode = Install-DriverContentOffline -Path $ContentPath -TargetImage $OfflineCtx.TargetImage
+
+            # Dynamic discovery: identify the device, find + download the matching
+            # driver package from the AdminService, then inject it. Otherwise use
+            # the content the step was pointed at (-ContentPath / co-located).
+            $InjectPath = $ContentPath
+            if ($DiscoverFromAdminService) {
+                Write-Log 'AdminService discovery enabled - resolving the driver package for this device'
+                $InjectPath = Resolve-DATDriverPackageViaAdminService `
+                    -Server $AdminServiceServer -User $AdminServiceUser -Password $AdminServicePassword `
+                    -TargetOperatingSystem $TargetOperatingSystem -Architecture $Architecture `
+                    -SkipCertificateCheck:$SkipCertificateCheck
+                if (-not $InjectPath) {
+                    Write-Log 'AdminService discovery did not yield a usable driver package for this device' -Severity 3
+                    exit 1
+                }
+            }
+
+            $OfflineCode = Install-DriverContentOffline -Path $InjectPath -TargetImage $OfflineCtx.TargetImage
             if ($OfflineCode -ne 0) {
                 Write-Log "Offline driver injection failed (exit $OfflineCode)" -Severity 3
                 exit $OfflineCode

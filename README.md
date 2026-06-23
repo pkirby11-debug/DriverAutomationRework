@@ -205,18 +205,45 @@ instead.
   OS), and no detection marker / `3010` is written offline — the task sequence owns the
   reboot.
 
-Wire it as a single **Run PowerShell Script** step (full-OS or WinPE) against the staged
-package, e.g.:
+For a **known** package, wire a single **Run PowerShell Script** step against the staged
+content:
 
 ```
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-DATApply.ps1 ^
   -Mode Driver -PackageName "Drivers - Surface Pro 12th Edition Intel - Win11 24H2" -Version "1.0"
 ```
 
-This replaces the offline driver-injection role of the legacy
-`Invoke-CMApplyDriverPackage.ps1` for a known package. Dynamic
-device-identity → package matching and download from the ConfigMgr **AdminService**
-(so one step picks the right package per model) lands in a follow-up build.
+### Dynamic matching via the AdminService
+
+`-DiscoverFromAdminService` makes one step service **every** model — the full replacement
+for the legacy `Invoke-CMApplyDriverPackage.ps1`. In WinPE the script:
+
+1. **Identifies the device** — manufacturer, model, `SystemSKU` (from `root\wmi`
+   `MS_SystemInformation`), and the Lenovo 4-char machine type.
+2. **Queries the ConfigMgr AdminService** (`SMS_Package` + `SMS_DriverPackage` over HTTPS),
+   authenticating with a dedicated read-only service account (or default credentials).
+3. **Selects the best package** — matches the device SystemSKU / machine type / model
+   against each package's existing `(Models included:…)` description and DAT name
+   conventions, gated by target OS / architecture, newest version wins. (No package
+   rebuild needed — it reuses metadata the sync already writes.)
+4. **Downloads** the match with the task sequence's `OSDDownloadContent` agent and
+   **injects** it via the offline path above.
+
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-DATApply.ps1 ^
+  -Mode Driver -PackageName "DAT OSD" -Version "1.0" ^
+  -DiscoverFromAdminService -AdminServiceServer "cm.contoso.com" ^
+  -TargetOperatingSystem "Windows 11 24H2" -Architecture "x64"
+```
+
+Server / credentials may instead come from the TS variables `DATAdminServiceServer` /
+`DATAdminServiceUser` / `DATAdminServicePassword`. The resolved PackageID is also written
+to `DATDriverPackageID`, so a native **Download Package Content** step can be used in
+place of the built-in download if you prefer. Stage the script itself in a small package
+referenced by the step (`-File .\Invoke-DATApply.ps1`).
+
+> The AdminService matching and content download run only in WinPE and **can't be
+> exercised in CI** — validate them in a real OSD task sequence before relying on them.
 
 ---
 
