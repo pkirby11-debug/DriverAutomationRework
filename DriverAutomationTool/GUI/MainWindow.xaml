@@ -417,6 +417,7 @@
                             <ComboBox x:Name="TypeCombo" Width="220" SelectedIndex="0">
                                 <sys:String>Drivers</sys:String>
                                 <sys:String>BIOS Updates</sys:String>
+                                <sys:String>BIOS Updates (DCU)</sys:String>
                                 <sys:String>Drivers + BIOS</sys:String>
                                 <sys:String>Driver Updates (Catalog Only)</sys:String>
                             </ComboBox>

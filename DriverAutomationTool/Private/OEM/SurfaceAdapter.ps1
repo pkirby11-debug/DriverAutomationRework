@@ -116,6 +116,23 @@ function Get-SurfaceDriverPack {
 
     $DownloadID = if ($ModelInfo -is [hashtable] -or $ModelInfo -is [PSCustomObject]) { $ModelInfo.id } else { $ModelInfo }
 
+    # SystemSKU(s) for OSD / task-sequence matching. Surface has no machine-readable
+    # catalog, so the SystemSKU string(s) a device reports in
+    # (Get-CimInstance -Namespace root\wmi MS_SystemInformation).SystemSKU are
+    # maintained by hand in OEMSources.json as 'sku' (a string, or an array when a
+    # model has consumer/commercial/region variants). They become the package's
+    # "(Models included:...)" description, which the apply script matches against the
+    # device. Without them the description falls back to the MODEL NAME, which never
+    # matches a real device's SystemSKU - so warn loudly.
+    $SystemSKU = $null
+    if ($ModelInfo -is [hashtable] -or $ModelInfo -is [PSCustomObject]) {
+        $RawSku = $ModelInfo.sku
+        if ($RawSku) { $SystemSKU = (@($RawSku) | Where-Object { $_ }) -join ';' }
+    }
+    if (-not $SystemSKU) {
+        Write-DATLog -Message "Surface model '$Model' has no 'sku' in OEMSources.json - its package '(Models included:...)' will fall back to the model name and will NOT match a device's SystemSKU during OSD/task-sequence deployment. Add the SystemSKU (from MS_SystemInformation.SystemSKU, or Microsoft's Surface System SKU reference) as 'sku' for this model." -Severity 2
+    }
+
     # Resolve target Windows build number from OS name
     $TargetBuild = $null
     if ($Sources.windowsBuilds) {
@@ -278,6 +295,7 @@ function Get-SurfaceDriverPack {
         FileName     = $BestFileName
         DownloadID   = $DownloadID
         BuildNumber  = $BestBuild
+        SystemID     = $SystemSKU
     }
 
     Write-DATLog -Message "Selected Surface driver pack: $BestFileName (v$BestVersion, build $BestBuild) for $Model" -Severity 1

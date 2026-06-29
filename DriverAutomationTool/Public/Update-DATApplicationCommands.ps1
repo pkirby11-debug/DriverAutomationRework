@@ -73,7 +73,7 @@ function Update-DATApplicationCommands {
 
         [string]$Model,
 
-        [ValidateSet('Drivers', 'BIOS', 'DriverUpdates', 'All')]
+        [ValidateSet('Drivers', 'BIOS', 'BIOSDCU', 'DriverUpdates', 'All')]
         [string]$Type = 'All',
 
         [string[]]$ApplicationName,
@@ -130,7 +130,8 @@ function Update-DATApplicationCommands {
                 # Mode is implied by the naming convention enforced in
                 # New-DATConfigMgrApplication. Tolerate the optional "Test - "
                 # prefix used during validation runs.
-                $Mode = if ($AppName -match '^(?:Test - )?Driver Updates - ') { 'DriverUpdates' }
+                $Mode = if ($AppName -match '^(?:Test - )?Driver Updates - ')  { 'DriverUpdates' }
+                        elseif ($AppName -match '^(?:Test - )?BIOS Update \(DCU\) - ') { 'BIOSDCU' }
                         elseif ($AppName -match '^(?:Test - )?BIOS Update - ')  { 'BIOS' }
                         elseif ($AppName -match '^(?:Test - )?Drivers - ')      { 'Driver' }
                         else { throw "Cannot infer Mode from name '$AppName' - not a DAT-managed app?" }
@@ -180,7 +181,7 @@ function Update-DATApplicationCommands {
                 # single-quoted form (which is exactly what we're trying to
                 # repair) and the current double-quoted form.
                 $BIOSPasswordSecure = $null
-                if ($Mode -eq 'BIOS' -and $ExistingCmd) {
+                if (($Mode -eq 'BIOS' -or $Mode -eq 'BIOSDCU') -and $ExistingCmd) {
                     if ($ExistingCmd -match '-BIOSPassword\s+(?:"([^"]*)"|''([^'']*)'')') {
                         $Raw = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
                         if ($Raw) {

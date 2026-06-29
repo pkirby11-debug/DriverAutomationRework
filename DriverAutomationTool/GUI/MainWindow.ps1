@@ -590,6 +590,7 @@ function Initialize-DATMainWindow {
         $IncludeDrivers = $TypeSelection -in @('Drivers', 'Drivers + BIOS')
         $IncludeBIOS = $TypeSelection -in @('BIOS Updates', 'Drivers + BIOS')
         $IncludeDriverUpdates = $TypeSelection -eq 'Driver Updates (Catalog Only)'
+        $IncludeBIOSDCU = $TypeSelection -eq 'BIOS Updates (DCU)'
 
         Complete-DATGridEdit $Controls['DPGrid']
         Complete-DATGridEdit $Controls['DPGGrid']
@@ -608,6 +609,7 @@ function Initialize-DATMainWindow {
             IncludeDrivers           = $IncludeDrivers
             IncludeBIOS              = $IncludeBIOS
             IncludeDriverUpdates     = $IncludeDriverUpdates
+            IncludeBIOSDCU           = $IncludeBIOSDCU
             RemoveLegacy             = [bool]$Controls['RemoveLegacyCheckBox'].IsChecked
             CleanSource              = [bool]$Controls['CleanSourceCheckBox'].IsChecked
             EnableBDR                = [bool]$Controls['EnableBDRCheckBox'].IsChecked
@@ -1259,7 +1261,11 @@ function Initialize-DATMainWindow {
             $Types = @()
             if ($Controls['DeployDriverCheckBox'].IsChecked)        { $Types += 'Drivers' }
             if ($Controls['DeployDriverUpdatesCheckBox'].IsChecked) { $Types += 'DriverUpdates' }
-            if ($Controls['DeployBIOSCheckBox'].IsChecked)          { $Types += 'BIOS' }
+            # The BIOS checkbox is treated as the user-facing "BIOS" category and
+            # surfaces BOTH delivery flavors: legacy Flash64W ("BIOS Update - ...")
+            # and DCU ("BIOS Update (DCU) - ..."). The engine choice was made at
+            # sync time; at deploy time the admin thinks of these as one bucket.
+            if ($Controls['DeployBIOSCheckBox'].IsChecked)          { $Types += 'BIOS'; $Types += 'BIOSDCU' }
 
             $Found = @()
             foreach ($T in $Types) {
