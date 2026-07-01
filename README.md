@@ -184,6 +184,69 @@ restarts when the install script signals `3010`.
 
 ---
 
+<a name="osd"></a>
+## OSD / task-sequence driver injection
+
+`Invoke-DATApply.ps1` is one script for both contexts. In the **full OS** it installs
+drivers with `pnputil` and flashes firmware with the vendor utility (Application /
+Intune / maintenance-window path). In **WinPE during a task sequence** it switches to
+**offline** mode and injects the pack's INFs into the *offline* image with `dism.exe`
+instead.
+
+- **Auto-detected** in WinPE (the `X:` system drive / the `MiniNT` marker key); force it
+  anywhere with `-Offline`.
+- **Target volume** comes from `-TargetPath '<drive>:\'`, else the `OSDTargetSystemDrive`
+  task-sequence variable, else an auto-detected fixed volume that carries `\Windows`.
+- **Firmware is skipped offline.** Firmware-class INFs (`ClassGuid f2e7dd72-…` — Surface
+  UEFI/SAM/ME and any OEM firmware) only install in the full OS, so they're left out of
+  the offline pass; run them as a full-OS step. This is what lets a Surface pack inject
+  in a task sequence at all.
+- **BIOS / BIOSDCU / DriverUpdates** modes are skipped in WinPE (they need the running
+  OS), and no detection marker / `3010` is written offline — the task sequence owns the
+  reboot.
+
+For a **known** package, wire a single **Run PowerShell Script** step against the staged
+content:
+
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-DATApply.ps1 ^
+  -Mode Driver -PackageName "Drivers - Surface Pro 12th Edition Intel - Win11 24H2" -Version "1.0"
+```
+
+### Dynamic matching via the AdminService
+
+`-DiscoverFromAdminService` makes one step service **every** model — the full replacement
+for the legacy `Invoke-CMApplyDriverPackage.ps1`. In WinPE the script:
+
+1. **Identifies the device** — manufacturer, model, `SystemSKU` (from `root\wmi`
+   `MS_SystemInformation`), and the Lenovo 4-char machine type.
+2. **Queries the ConfigMgr AdminService** (`SMS_Package` + `SMS_DriverPackage` over HTTPS),
+   authenticating with a dedicated read-only service account (or default credentials).
+3. **Selects the best package** — matches the device SystemSKU / machine type / model
+   against each package's existing `(Models included:…)` description and DAT name
+   conventions, gated by target OS / architecture, newest version wins. (No package
+   rebuild needed — it reuses metadata the sync already writes.)
+4. **Downloads** the match with the task sequence's `OSDDownloadContent` agent and
+   **injects** it via the offline path above.
+
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-DATApply.ps1 ^
+  -Mode Driver -PackageName "DAT OSD" -Version "1.0" ^
+  -DiscoverFromAdminService -AdminServiceServer "cm.contoso.com" ^
+  -TargetOperatingSystem "Windows 11 24H2" -Architecture "x64"
+```
+
+Server / credentials may instead come from the TS variables `DATAdminServiceServer` /
+`DATAdminServiceUser` / `DATAdminServicePassword`. The resolved PackageID is also written
+to `DATDriverPackageID`, so a native **Download Package Content** step can be used in
+place of the built-in download if you prefer. Stage the script itself in a small package
+referenced by the step (`-File .\Invoke-DATApply.ps1`).
+
+> The AdminService matching and content download run only in WinPE and **can't be
+> exercised in CI** — validate them in a real OSD task sequence before relying on them.
+
+---
+
 <a name="dcu-engine"></a>
 ## The Driver Updates (DCU) engine
 

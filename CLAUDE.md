@@ -29,14 +29,25 @@ Source of truth: Microsoft's official driver/firmware table at
 https://learn.microsoft.com/en-us/surface/manage-surface-driver-and-firmware-updates
 
 To add a model, add one line mapping the model name to its Microsoft
-Download Center ID:
+Download Center ID, plus the SystemSKU(s) the device reports:
 
 ```json
-"Surface Pro 12th Edition Intel": { "id": "108671" }
+"Surface Pro 12th Edition Intel": { "id": "108671", "sku": ["Surface_Pro_for_Business_13in_12th_Ed_Intel_2103", "Surface_Pro_for_Business_13in_12th_Ed_Intel_2134"] }
 ```
 
 The `id` is the `details.aspx?id=<NNNNNN>` number from that model's Download
 Center page.
+
+The `sku` is the device's System SKU - what
+`(Get-CimInstance -Namespace root\wmi -ClassName MS_SystemInformation).SystemSKU`
+returns on the hardware. It is written into the package's
+`(Models included:...)` description, which the OSD/task-sequence apply path
+matches against the device. **Without a `sku`, the description falls back to
+the model name, which never matches a real device** - `Get-SurfaceDriverPack`
+logs a Severity-2 warning when it's missing. Use a string for one value or an
+array when a model has consumer/commercial/region variants (Microsoft lists
+them all in the
+[Surface System SKU reference](https://learn.microsoft.com/en-us/surface/surface-system-sku-reference)).
 
 Watch for these gotchas:
 - **Per-chipset SKUs.** Microsoft now splits most models into separate Intel
