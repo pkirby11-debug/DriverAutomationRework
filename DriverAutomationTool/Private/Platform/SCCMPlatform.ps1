@@ -3124,6 +3124,58 @@ function Set-DATApplicationFolder {
     }
 }
 
+function Test-DATManagedApplicationName {
+    <#
+    .SYNOPSIS
+        Returns $true when an Application name matches the DAT naming convention
+        for the given sync type(s).
+    .DESCRIPTION
+        Central name gate for bulk operations that enumerate site-wide (e.g.
+        Invoke-DATRemoveDeployments). Matches the same per-type prefixes
+        Find-DATExistingApplications filters on, including the optional
+        "Test - " prefix:
+
+          Drivers        "Drivers - ..."
+          BIOS           "BIOS Update - ..."        (excluding the DCU flavor)
+          BIOSDCU        "BIOS Update (DCU) - ..."
+          DriverUpdates  "Driver Updates - ..."
+
+        Unlike Find-DATExistingApplications - where Type='All' performs no name
+        filtering at all - 'All' here means "any of the four DAT prefixes".
+        Bulk destructive callers must never touch applications this module
+        didn't create, so an unrecognized name always returns $false.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Name,
+
+        [ValidateSet('Drivers', 'BIOS', 'BIOSDCU', 'DriverUpdates', 'All')]
+        [string[]]$Type = @('All')
+    )
+
+    # Strip the optional "Test - " prefix once so each pattern below only needs
+    # its canonical form.
+    $Effective = $Name -replace '^Test - ', ''
+
+    if ($Type -contains 'All') {
+        $Type = @('Drivers', 'BIOS', 'BIOSDCU', 'DriverUpdates')
+    }
+
+    foreach ($T in $Type) {
+        $IsMatch = switch ($T) {
+            'Drivers'       { $Effective -like 'Drivers - *' }
+            'BIOS'          { $Effective -like 'BIOS Update - *' -and $Effective -notlike 'BIOS Update (DCU)*' }
+            'BIOSDCU'       { $Effective -like 'BIOS Update (DCU) - *' }
+            'DriverUpdates' { $Effective -like 'Driver Updates - *' }
+        }
+        if ($IsMatch) { return $true }
+    }
+    return $false
+}
+
 function Find-DATExistingApplications {
     <#
     .SYNOPSIS
