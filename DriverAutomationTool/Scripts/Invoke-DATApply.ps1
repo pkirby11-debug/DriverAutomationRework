@@ -1586,10 +1586,20 @@ function Invoke-DCUDriverUpdates {
     # locked even when an old pre-managed pristine was the restore source -
     # the field case where the restore re-enabled dell.com).
     #
-    # Opt-out: Set-DATDellCommandUpdateMode -Mode Default writes
-    # HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode = 'Default',
-    # which skips both assertions (per-run scan purity via
-    # -defaultSourceLocation=disable still applies).
+    # Opt-outs (both markers written by Set-DATDellCommandUpdateMode / the
+    # standalone Set-DATDcuManaged.ps1 to
+    # HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode):
+    #   'Default'     - skips both assertions entirely; the end state restores
+    #                   whatever the box originally had.
+    #   'ManualCloud' - tech-interactive: the run still clamps DCU exactly
+    #                   like a managed device (the engine needs sole control
+    #                   while it works), but the end state re-enables dell.com
+    #                   and BitLocker auto-suspend instead of pinning the
+    #                   persistent curated catalog, so techs can CHECK against
+    #                   Dell's cloud between deployments while autonomy stays
+    #                   off. The marker is never rewritten to DATManaged.
+    # Per-run scan purity via -defaultSourceLocation=disable applies to all
+    # modes.
     $DcuManagedMode = $null
     try { $DcuManagedMode = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation' -Name 'DcuManagedMode' -ErrorAction Stop).DcuManagedMode } catch { }
     # Sequence trimmed to what 5.6.0.17's named-key results proved viable:
@@ -1610,22 +1620,40 @@ function Invoke-DCUDriverUpdates {
         'updatesNotification'   = 'disable'
         'autoSuspendBitLocker'  = 'disable'
     }
-    $AssertDcuManaged = {
-        param([string]$Phase)
+    # ManualCloud end state: dell.com back on as the interactive source,
+    # autonomy still fully clamped, BitLocker auto-suspend re-enabled so a
+    # tech-driven BIOS install through the DCU GUI behaves like stock DCU
+    # (during engine runs Suspend-BitLockerForFlash owns BitLocker instead).
+    # Applied post-run only - see the end-state block in the finally.
+    $DcuManualCloudSequence = [ordered]@{
+        'defaultSourceLocation' = 'enable'
+        'scheduleManual'        = ''
+        'scheduleAction'        = 'NotifyAvailableUpdates'
+        'updatesNotification'   = 'disable'
+        'autoSuspendBitLocker'  = 'enable'
+    }
+    $AssertDcuSequence = {
+        param([string]$Phase, [System.Collections.IDictionary]$Sequence, [string]$Label)
         $OkKeys = @()
         $BadKeys = @()
-        foreach ($K in $DcuManagedSequence.Keys) {
-            $V = $DcuManagedSequence[$K]
+        foreach ($K in $Sequence.Keys) {
+            $V = $Sequence[$K]
             $OptArg = if ($V) { "-$K=$V" } else { "-$K" }
-            $RC = & $RunDcu @('/configure', $OptArg, "-outputLog=$SessionDir\dcu-managed-$Phase-$K.log") 120000 "managed-$Phase-$K"
+            $RC = & $RunDcu @('/configure', $OptArg, "-outputLog=$SessionDir\dcu-$Label-$Phase-$K.log") 120000 "$Label-$Phase-$K"
             if ($RC -eq 0) { $OkKeys += $K } else { $BadKeys += ("{0}(exit {1})" -f $K, $(if ($null -eq $RC) { 'timeout' } else { $RC })) }
         }
-        Write-Log "DCU locked to DAT-managed mode [$Phase]: applied $($OkKeys -join ', '); not supported: $(if ($BadKeys.Count -gt 0) { $BadKeys -join ', ' } else { 'none' })"
+        Write-Log "DCU locked to $Label mode [$Phase]: applied $($OkKeys -join ', '); not supported: $(if ($BadKeys.Count -gt 0) { $BadKeys -join ', ' } else { 'none' })"
     }
     if ($DcuManagedMode -eq 'Default') {
         Write-Log "DCU managed mode: device is explicitly opted out (DcuManagedMode=Default) - leaving DCU autonomy settings as-is" -Severity 2
+    } elseif ($DcuManagedMode -eq 'ManualCloud') {
+        # Same run clamps as a managed device so the engine keeps sole control
+        # of DCU while it works; the ManualCloud end state comes back in the
+        # end-state block. Marker deliberately NOT rewritten.
+        Write-Log "DCU managed mode: device is opted into ManualCloud (tech-interactive) - clamping DCU for this run only; dell.com and BitLocker auto-suspend are restored in the end state"
+        & $AssertDcuSequence 'pre-run' $DcuManagedSequence 'run-clamp'
     } else {
-        & $AssertDcuManaged 'pre-run'
+        & $AssertDcuSequence 'pre-run' $DcuManagedSequence 'DAT-managed'
         # Marker for inventory/visibility and so the cmdlet/standalone script
         # see a consistent state. Idempotent.
         try {
@@ -1994,7 +2022,7 @@ function Invoke-DCUDriverUpdates {
         # this run's backup unless it was already hijacked by a failed prior
         # restore.
         if ($CatalogConfigured) {
-            if ($DcuManagedMode -ne 'Default') {
+            if ($DcuManagedMode -ne 'Default' -and $DcuManagedMode -ne 'ManualCloud') {
                 # MANAGED END STATE (sole-update-source design). The pristine
                 # restore is deliberately NOT performed here - importing
                 # pre-managed settings is exactly what kept re-enabling
@@ -2098,12 +2126,14 @@ function Invoke-DCUDriverUpdates {
                     # run after reboot does it for free.
                     Write-Log "Skipping post-run DAT-managed mode re-assertion (reboot pending from this run's successful flash; dcu-cli would refuse every /configure with exit 5). The pre-run lockdown is still in effect and the next engine run after reboot re-asserts."
                 } else {
-                    & $AssertDcuManaged 'post-run'
+                    & $AssertDcuSequence 'post-run' $DcuManagedSequence 'DAT-managed'
                 }
             } else {
-                # OPTED-OUT devices get the polite behavior: restore whatever
-                # the box had. Source: pristine (true original) when
-                # available, else this run's backup unless hijacked.
+                # OPTED-OUT devices (Default and ManualCloud) get the polite
+                # behavior: restore whatever the box had. Source: pristine
+                # (true original) when available, else this run's backup
+                # unless hijacked. ManualCloud devices additionally get their
+                # end-state sequence asserted after the restore, below.
                 $RestoreSource = $null
                 if (Test-Path $PristineSettings) { $RestoreSource = $PristineSettings }
                 elseif ($SettingsBackupFile -and -not $BackupHijacked) { $RestoreSource = $SettingsBackupFile }
@@ -2136,6 +2166,21 @@ function Invoke-DCUDriverUpdates {
                     }
                 } else {
                     Write-Log "No trustworthy DCU settings source to restore (no pristine copy, and the current settings already pointed at a session catalog) - reconfigure the catalog in the DCU GUI or import an older settings-backup from $WorkRoot\DCU\<session>\settings-backup manually" -Severity 2
+                }
+
+                if ($DcuManagedMode -eq 'ManualCloud') {
+                    # The restored settings are whatever the box originally had
+                    # (a long-managed device's pristine may even carry Dell
+                    # factory autonomy or a pinned catalog). Re-assert the
+                    # ManualCloud end state on top: dell.com on for interactive
+                    # scans, autonomy off, BitLocker auto-suspend on. Runs even
+                    # when no restore source existed - the sequence is
+                    # self-contained.
+                    if ($script:RebootRequired) {
+                        Write-Log "Deferred re-asserting the ManualCloud end state (dcu-cli refuses /configure with exit 5 until the pending reboot clears); the next engine run after reboot re-asserts."
+                    } else {
+                        & $AssertDcuSequence 'post-run' $DcuManualCloudSequence 'ManualCloud'
+                    }
                 }
             }
         }

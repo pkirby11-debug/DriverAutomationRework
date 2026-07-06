@@ -13,24 +13,37 @@
     auto-suspend - DCU acts only when the apply-side DCU engine explicitly
     drives it.
 
+    ManualCloud mode is the tech-interactive middle ground: dell.com comes
+    back as a valid source so a technician can open DCU and CHECK/install
+    updates on demand, but every autonomous behavior stays off (no scheduled
+    scans, notify-only if a schedule ever fires, no toasts) and BitLocker
+    auto-suspend is re-enabled so tech-driven BIOS installs behave like stock
+    DCU. The apply engine respects the marker: deployments still clamp DCU for
+    the duration of the run, then restore the ManualCloud end state instead of
+    pinning the curated catalog - the mode survives every deployment.
+
     NOTE: as of 2.6.0 the DriverUpdates application applies DAT-managed mode
     automatically on every Dell device it runs on - deploying this script is
     only needed to pre-stage devices BEFORE their first deployment, or to opt
-    a device OUT (-Mode Default writes the marker value 'Default', which the
-    apply engine respects and skips the lockdown on that device).
+    a device out of the lockdown (-Mode ManualCloud for interactive-scan
+    devices, or -Mode Default for full Dell out-of-box behavior; both marker
+    values are respected by the apply engine).
 
     Logs to:  C:\Temp\DriverAutomationTool\DCU-modecfg\<timestamp>\
     Marker:   HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode
 .PARAMETER Mode
-    DATManaged (default), or Default to revert to Dell out-of-box behavior.
+    DATManaged (default), ManualCloud (manual dell.com scans, no autonomy),
+    or Default to revert to Dell out-of-box behavior.
 .EXAMPLE
     powershell.exe -ExecutionPolicy Bypass -File .\Set-DATDcuManaged.ps1
+.EXAMPLE
+    powershell.exe -ExecutionPolicy Bypass -File .\Set-DATDcuManaged.ps1 -Mode ManualCloud
 .EXAMPLE
     powershell.exe -ExecutionPolicy Bypass -File .\Set-DATDcuManaged.ps1 -Mode Default
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('DATManaged', 'Default')]
+    [ValidateSet('DATManaged', 'ManualCloud', 'Default')]
     [string]$Mode = 'DATManaged',
 
     [int]$PerCommandTimeoutSec = 120
@@ -69,23 +82,40 @@ Write-Out "Configuring Dell Command Update -> '$Mode' mode on $env:COMPUTERNAME 
 
 # Settings sequence mirrors Set-DATDellCommandUpdateMode exactly so the two
 # entry points stay equivalent.
-$Settings = if ($Mode -eq 'DATManaged') {
-    [ordered]@{
-        'scheduleManual'        = ''
-        'scheduleAction'        = 'NotifyAvailableUpdates'
-        'updatesNotification'   = 'disable'
-        'autoSuspendBitLocker'  = 'disable'
+$Settings = switch ($Mode) {
+    'DATManaged' {
+        [ordered]@{
+            'scheduleManual'        = ''
+            'scheduleAction'        = 'NotifyAvailableUpdates'
+            'updatesNotification'   = 'disable'
+            'autoSuspendBitLocker'  = 'disable'
+        }
     }
-} else {
-    [ordered]@{
-        'defaultSourceLocation' = 'enable'
-        'scheduleAuto'          = 'enable'
-        'scheduleAction'        = 'DownloadInstallAndNotify'
-        'updatesNotification'   = 'enable'
-        'userConsent'           = 'enable'
-        'systemRestartDeferral' = 'disable'
-        'installationDeferral'  = 'disable'
-        'autoSuspendBitLocker'  = 'enable'
+    'ManualCloud' {
+        # restoreDefaults FIRST: clears a pinned custom catalog and re-enables
+        # dell.com in one sanctioned call (builds without it log-and-skip;
+        # defaultSourceLocation=enable covers them). Autonomy clamps follow so
+        # the factory schedule it restores is disarmed in the same pass.
+        [ordered]@{
+            'restoreDefaults'       = ''
+            'defaultSourceLocation' = 'enable'
+            'scheduleManual'        = ''
+            'scheduleAction'        = 'NotifyAvailableUpdates'
+            'updatesNotification'   = 'disable'
+            'autoSuspendBitLocker'  = 'enable'
+        }
+    }
+    default {
+        [ordered]@{
+            'defaultSourceLocation' = 'enable'
+            'scheduleAuto'          = 'enable'
+            'scheduleAction'        = 'DownloadInstallAndNotify'
+            'updatesNotification'   = 'enable'
+            'userConsent'           = 'enable'
+            'systemRestartDeferral' = 'disable'
+            'installationDeferral'  = 'disable'
+            'autoSuspendBitLocker'  = 'enable'
+        }
     }
 }
 
