@@ -1846,21 +1846,19 @@ function Invoke-DCUDriverUpdates {
             return $null
         }
         if ($ScanCode -eq 500) {
-            Write-Log "DCU scan: no applicable updates from the package catalog - everything current"
             # Signal to BIOSDCU's wrapper (Install-BIOSDCU) that DCU saw the
-            # catalog but concluded nothing applies. For DriverUpdates that's
-            # the expected steady-state. For BIOSDCU the manifest has exactly
-            # one BIOS DUP that sync resolved as newer than the model's
-            # catalog version AND the apply-side pre-flash check just
+            # catalog but concluded nothing applies. For BIOSDCU the manifest
+            # has exactly one BIOS DUP that sync resolved as newer than the
+            # model's catalog version AND the apply-side pre-flash check just
             # verified the device is behind, so a "nothing applicable"
             # verdict is almost certainly DCU's applicability rules
             # (SystemID match, dellVersion parse, SupportedDevices etc.)
             # disagreeing with the catalog - in which case BIOSDCU should
             # NOT exit clean; it should fall back to Flash64W whose DUP
-            # framework re-evaluates against the device directly. Setting
-            # the flag here and leaving the return value at 0 keeps
-            # DriverUpdates' existing semantics intact.
+            # framework re-evaluates against the device directly.
             $script:DCUNoApplicable = $true
+
+            Write-Log "DCU scan exit 500 ('no updates available') - verifying the verdict against DCU's own scan report before trusting it"
 
             # Diagnostic dump when the verdict is "nothing applicable" but the
             # admin has reason to expect updates (field case: a manifest entry
@@ -1875,6 +1873,33 @@ function Invoke-DCUDriverUpdates {
             Write-Log "  Diagnostic: manifest contains $($Drivers.Count) driver(s); first 5: $ManifestSample" -Severity 2
             $ScanReportItems = @(& $ParseScanReport $ReportDir)
             Write-Log "  Diagnostic: scan report contains $($ScanReportItems.Count) <Update> node(s) (0 confirms DCU's verdict was 'nothing applicable')" -Severity 2
+
+            # Distrust guard, DriverUpdates counterpart of the BIOSDCU
+            # Flash64W fallback. Field-confirmed on an OptiPlex 7020 Tower:
+            # dcu-cli exited 500 ("No updates available") while its own
+            # -report XML listed the package's Intel PCIe Ethernet Controller
+            # DUP (20.0.3.28) - the device was genuinely behind, and a manual
+            # DCU scan installed that exact DUP the same morning. When the
+            # verdict contradicts the report on one of OUR staged DUPs, hand
+            # the run to the built-in DUP engine: each DUP's own framework
+            # re-evaluates applicability against the device directly,
+            # not-applicable DUPs self-skip with exit 3/4/5, and the
+            # per-component version markers keep repeat cycles cheap.
+            # Foreign-only report nodes (DCU's system-update channel riding
+            # along) don't trigger the fallback - with none of ours listed,
+            # "nothing applicable" is the true steady-state verdict.
+            $OursInReport = @($ScanReportItems | Where-Object { $_.IsOurs })
+            if ($OursInReport.Count -gt 0) {
+                $OursDesc = @($OursInReport | Select-Object -First 5 | ForEach-Object {
+                    if ($_.Name) { $_.Name } elseif ($_.File) { $_.File } else { '(unnamed)' }
+                }) -join '; '
+                Write-Log "DCU's verdict contradicts its own scan report: exit 500 ('no applicable updates') but the report lists $($OursInReport.Count) update(s) from THIS package: $OursDesc. Distrusting the verdict - falling back to the built-in DUP engine." -Severity 2
+                & $TailConsole 'scan'
+                & $TailLog $ScanLog
+                return $null
+            }
+
+            Write-Log "DCU scan: no applicable updates from the package catalog (scan report lists none of this package's DUPs, so the verdict is corroborated) - everything current"
             & $TailConsole 'scan'
             & $TailLog $ScanLog
             Write-Log "  If a manifest driver IS newer than what is installed and you expected DCU to apply it, paste a sample SoftwareComponent from $LocalCatalogXml back - applicability evaluation depends on <SupportedDevices> PCI VEN/DEV matching the device, and catalog metadata can target a specific hardware config within a model line." -Severity 2
@@ -1993,12 +2018,15 @@ function Invoke-DCUDriverUpdates {
                     # runtime conditions the catalog-only scan doesn't evaluate
                     # (Dell BIOS DUP framework checks for AC power, battery
                     # level, pending reboot, etc.), so this is the operative
-                    # "DCU disagreed with itself" signal - flag it for the
-                    # BIOSDCU wrapper to fall back to Flash64W, whose DUP
-                    # framework re-evaluates against the device directly.
-                    Write-Log "DCU applyUpdates: no applicable updates (exit 500) - scan had matched one or more updates but applyUpdates' internal re-scan declined them all (typical when the DUP framework's runtime conditions - AC power, battery level, pending reboot, TPM/Secure Boot state - aren't met)" -Severity 2
+                    # "DCU disagreed with itself" signal. The flag sends the
+                    # BIOSDCU wrapper to Flash64W; returning $null sends
+                    # DriverUpdates to the built-in DUP engine - in both cases
+                    # each DUP's own framework re-evaluates against the device
+                    # directly and self-skips (exit 3/4/5) when a runtime
+                    # condition genuinely blocks it.
+                    Write-Log "DCU applyUpdates: no applicable updates (exit 500) - scan had matched one or more updates but applyUpdates' internal re-scan declined them all (typical when the DUP framework's runtime conditions - AC power, battery level, pending reboot, TPM/Secure Boot state - aren't met). Distrusting the verdict - falling back to the built-in DUP engine." -Severity 2
                     $script:DCUNoApplicable = $true
-                    $ApplyResult = 0
+                    $ApplyResult = $null
                 }
             default {
                 Write-Log "DCU applyUpdates FAILED (dcu-cli exit $ApplyCode)" -Severity 3
