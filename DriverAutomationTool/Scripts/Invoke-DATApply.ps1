@@ -1365,6 +1365,14 @@ function Invoke-DCUDriverUpdates {
     # $null on launch failure/timeout. dcu-cli is a CONSOLE app (unlike DUPs) -
     # its input-validation errors are printed to stdout/stderr in plain text,
     # so both streams are captured per-call for failure diagnostics.
+    # dcu-cli exit 2 = "An unexpected fatal error occurred" - not a per-command
+    # grammar rejection but DCU itself failing. One or two can be transient;
+    # EVERY call exiting 2 (field case: DCU 5.7.0.97, all of run-clamp +
+    # settings-export + catalogLocation returned 2) means the DCU installation
+    # or its 'Dell Client Management Service' is broken on the device. Counted
+    # here so the built-in-engine fallback can say so instead of leaving a trail
+    # of per-command warnings that read like tool bugs.
+    $script:DcuFatalErrorCount = 0
     $RunDcu = {
         param([string[]]$DcuArgs, [int]$TimeoutMs, [string]$Label)
         $OutFile = Join-Path $SessionDir ($Label + '.out.log')
@@ -1378,6 +1386,7 @@ function Invoke-DCUDriverUpdates {
                 try { $P.Kill() } catch { }
                 return $null
             }
+            if ($P.ExitCode -eq 2) { $script:DcuFatalErrorCount++ }
             return $P.ExitCode
         } catch {
             Write-Log "dcu-cli $Label failed to launch: $($_.Exception.Message)" -Severity 2
@@ -1642,7 +1651,7 @@ function Invoke-DCUDriverUpdates {
             $RC = & $RunDcu @('/configure', $OptArg, "-outputLog=$SessionDir\dcu-$Label-$Phase-$K.log") 120000 "$Label-$Phase-$K"
             if ($RC -eq 0) { $OkKeys += $K } else { $BadKeys += ("{0}(exit {1})" -f $K, $(if ($null -eq $RC) { 'timeout' } else { $RC })) }
         }
-        Write-Log "DCU locked to $Label mode [$Phase]: applied $($OkKeys -join ', '); not supported: $(if ($BadKeys.Count -gt 0) { $BadKeys -join ', ' } else { 'none' })"
+        Write-Log "DCU locked to $Label mode [$Phase]: applied $(if ($OkKeys.Count -gt 0) { $OkKeys -join ', ' } else { 'none' }); not supported: $(if ($BadKeys.Count -gt 0) { $BadKeys -join ', ' } else { 'none' })"
     }
     if ($DcuManagedMode -eq 'Default') {
         Write-Log "DCU managed mode: device is explicitly opted out (DcuManagedMode=Default) - leaving DCU autonomy settings as-is" -Severity 2
@@ -1724,6 +1733,14 @@ function Invoke-DCUDriverUpdates {
                 Write-Log "dcu-cli /configure -catalogLocation failed (exit $(if ($null -eq $CfgCode) { 'timeout/launch' } else { $CfgCode })) - falling back to built-in DUP engine" -Severity 2
                 & $TailConsole 'configure'
                 & $TailLog "$SessionDir\dcu-configure.log"
+                if ($CfgCode -eq 2 -and $script:DcuFatalErrorCount -ge 3) {
+                    # Not a grammar/settings issue: every dcu-cli invocation this
+                    # run has died with the same generic fatal error, before any
+                    # catalog work happened. The DCU installation itself is the
+                    # problem - name it so the trail of exit-2 warnings above
+                    # doesn't read as a tool bug.
+                    Write-Log "DCU HEALTH: $script:DcuFatalErrorCount dcu-cli call(s) this run all exited 2 ('An unexpected fatal error occurred') - the Dell Command Update installation on this device (version $(if ($DcuVersion) { $DcuVersion } else { 'unknown' })) appears broken, not any specific setting. Check that the 'Dell Client Management Service' is running, or repair/reinstall DCU. Driver installs are unaffected this run (built-in DUP engine covers them)." -Severity 3
+                }
                 return $null
             }
             $CatalogInUse = $LocalCatalog
@@ -2328,10 +2345,22 @@ function Install-DriverUpdates {
     $RebootCodes     = @(2, 6)
     $PerDupTimeoutMs = 900000  # 15 minutes per DUP
 
+    # Persistent-failure quarantine: after this many CONSECUTIVE vendor-exit
+    # failures of the SAME manifest version on this device, the DUP is skipped
+    # (with an advisory) instead of failing the whole application forever.
+    # Field driver: Intel Dynamic Tuning vA07 dying in 2.6s with "Installer
+    # execution Error: -1" on a Dell Pro Micro - a deterministic vendor
+    # installer bug on that hardware that re-failed every cycle and kept a
+    # 25-DUP app permanently red over one DUP. Two strikes so a transient
+    # failure (locked files, pending reboot) still gets one clean retry. A new
+    # version in the manifest, or one success, resets the ledger.
+    $QuarantineThreshold = 2
+
     $Successful   = 0
     $NotApply     = 0
     $Failed       = 0
     $AlreadyInst  = 0
+    $Quarantined  = 0
     $Rebooted     = $false
     $FailureLines = [System.Collections.Generic.List[string]]::new()
 
@@ -2565,6 +2594,24 @@ function Install-DriverUpdates {
             } catch { }
         }
 
+        # Persistent-failure quarantine (see $QuarantineThreshold above): this
+        # exact version has repeatedly failed on this device - skip it so one
+        # broken vendor installer doesn't keep the whole application red. Only
+        # vendor-exit failures build the ledger; a missing/quarantined-by-AV
+        # file stays a hard failure because its fix is an admin action.
+        if (Test-Path $CompKeyPath) {
+            try {
+                $CProps = Get-ItemProperty -Path $CompKeyPath -ErrorAction Stop
+                if ($CProps.PSObject.Properties['FailedVersion'] -and
+                    $CProps.FailedVersion -eq $Drv.Version -and
+                    [int]$CProps.FailCount -ge $QuarantineThreshold) {
+                    Write-Log "$DriverLabel - QUARANTINED: v$($Drv.Version) failed $($CProps.FailCount) consecutive time(s) on this device (last exit $($CProps.LastFailExit) at $($CProps.LastFailAt)) - the vendor installer is deterministically broken here. Skipping; a newer version in the manifest re-arms it automatically. To force a retry now, delete HKLM:\...\DriverUpdates\Components\$CompKey." -Severity 2
+                    $Quarantined++
+                    continue
+                }
+            } catch { }
+        }
+
         if (-not (Test-Path $DriverExe)) {
             # A missing DUP .EXE is most often AV/Defender quarantining it in the
             # CM cache. Surface it loudly and recommend the exclusion. (Hardware
@@ -2734,6 +2781,10 @@ function Install-DriverUpdates {
                 New-ItemProperty -Path $CompKeyPath -Name 'Name'       -Value $Drv.Name    -PropertyType String -Force | Out-Null
                 New-ItemProperty -Path $CompKeyPath -Name 'InstalledOn' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
                 New-ItemProperty -Path $CompKeyPath -Name 'ExitCode'   -Value $DupCode     -PropertyType DWord -Force | Out-Null
+                # Success resets the persistent-failure ledger.
+                foreach ($FProp in 'FailedVersion', 'FailCount', 'LastFailExit', 'LastFailAt') {
+                    Remove-ItemProperty -Path $CompKeyPath -Name $FProp -ErrorAction SilentlyContinue
+                }
             } catch {
                 Write-Log "  Failed to write component marker for $($Drv.FileName): $($_.Exception.Message)" -Severity 2
             }
@@ -2760,6 +2811,32 @@ function Install-DriverUpdates {
                 $Failed++
                 $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
                 if ($Elapsed -lt 2) { $InstantFailed++ }
+
+                # Persistent-failure ledger (consumed by the quarantine
+                # pre-check above). Same version failing again increments the
+                # count; a different version starts a fresh ledger.
+                try {
+                    if (-not (Test-Path $CompKeyPath)) {
+                        New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null
+                    }
+                    $PrevFailVer = $null
+                    $PrevCount = 0
+                    try {
+                        $Prev = Get-ItemProperty -Path $CompKeyPath -ErrorAction Stop
+                        if ($Prev.PSObject.Properties['FailedVersion']) {
+                            $PrevFailVer = $Prev.FailedVersion
+                            $PrevCount = [int]$Prev.FailCount
+                        }
+                    } catch { }
+                    $NewCount = if ($PrevFailVer -eq $Drv.Version) { $PrevCount + 1 } else { 1 }
+                    New-ItemProperty -Path $CompKeyPath -Name 'FailedVersion' -Value $Drv.Version -PropertyType String -Force | Out-Null
+                    New-ItemProperty -Path $CompKeyPath -Name 'FailCount'     -Value $NewCount     -PropertyType DWord  -Force | Out-Null
+                    New-ItemProperty -Path $CompKeyPath -Name 'LastFailExit'  -Value $DupCode      -PropertyType DWord  -Force | Out-Null
+                    New-ItemProperty -Path $CompKeyPath -Name 'LastFailAt'    -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
+                    if ($NewCount -ge $QuarantineThreshold) {
+                        Write-Log "$DriverLabel - v$($Drv.Version) has now failed $NewCount consecutive time(s) on this device; future runs will QUARANTINE (skip) it until a newer version ships, so this one DUP stops failing the application" -Severity 2
+                    }
+                } catch { }
                 # Pull the verdict out of Dell's framework log so the apply log
                 # itself says why. No framework log after a failure = the process
                 # was killed before Dell's framework initialized (AV/EDR pattern).
@@ -2840,7 +2917,7 @@ function Install-DriverUpdates {
                 "Manual differential (elevated cmd): run any failed DUP as '<name>.EXE /s /l=C:\Windows\Temp\duptest.log' - if it installs by hand, the block is specific to the CCMExec-spawned context.") -Severity 3
         }
     }
-    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Failed failed$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
+    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Quarantined quarantined (persistent vendor failures, skipped), $Failed failed$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
     }
