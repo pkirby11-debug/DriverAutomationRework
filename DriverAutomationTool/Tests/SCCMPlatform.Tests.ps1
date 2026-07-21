@@ -155,3 +155,177 @@ Describe 'ConfigManager' {
         }
     }
 }
+
+Describe 'Get-DATLenovoMachineTypeScript' {
+    # The Global Condition script runs on clients and must report the same
+    # machine-type derivation Get-DATDeviceIdentity uses at apply time:
+    # uppercased first 4 chars of Win32_ComputerSystem.Model.
+    It 'Derives the machine type from the MTM string' {
+        function Get-CimInstance { param($ClassName, $ErrorAction) [PSCustomObject]@{ Model = ' 20x3S02D00 ' } }
+        $Output = & ([scriptblock]::Create((Get-DATLenovoMachineTypeScript)))
+        $Output | Should -Be '20X3'
+    }
+
+    It 'Returns a short model uppercased and untruncated' {
+        function Get-CimInstance { param($ClassName, $ErrorAction) [PSCustomObject]@{ Model = 'x1' } }
+        $Output = & ([scriptblock]::Create((Get-DATLenovoMachineTypeScript)))
+        $Output | Should -Be 'X1'
+    }
+
+    It 'Returns an empty string when the WMI query fails' {
+        function Get-CimInstance { param($ClassName, $ErrorAction) throw 'no WMI here' }
+        $Output = & ([scriptblock]::Create((Get-DATLenovoMachineTypeScript)))
+        $Output | Should -Be ''
+    }
+}
+
+Describe 'New-DATApplicationRequirementRules' {
+    BeforeAll {
+        # The ConfigMgr console module is absent on CI runners, so define a
+        # recording stub for the rule-builder cmdlet the code pipes into. It
+        # mimics the cmdlet's generated display name ("<GC name> <operator>
+        # {values}"), which the Lenovo repair matcher parses.
+        function script:New-CMRequirementRuleCommonValue {
+            [CmdletBinding()]
+            param(
+                [Parameter(ValueFromPipeline)] $InputObject,
+                $RuleOperator,
+                $Value1,
+                $Value2
+            )
+            process {
+                $script:RuleCalls.Add([PSCustomObject]@{
+                    Condition = $InputObject
+                    Operator  = $RuleOperator
+                    Value1    = @($Value1)
+                })
+                [PSCustomObject]@{ Name = "$($InputObject.Name) $RuleOperator {$(@($Value1) -join ', ')}" }
+            }
+        }
+
+        $script:FakeConditions = @{
+            SystemSKU           = [PSCustomObject]@{ Name = 'DAT - Computer SystemSKU' }
+            Manufacturer        = [PSCustomObject]@{ Name = 'DAT - Computer Manufacturer' }
+            ComputerModel       = [PSCustomObject]@{ Name = 'DAT - Computer Model' }
+            ComputerSystemModel = [PSCustomObject]@{ Name = 'DAT - Computer Model (System)' }
+            LenovoMachineType   = [PSCustomObject]@{ Name = 'DAT - Lenovo Machine Type' }
+        }
+    }
+
+    BeforeEach {
+        $script:RuleCalls = [System.Collections.Generic.List[object]]::new()
+        Mock Initialize-DATGlobalConditions { $script:FakeConditions }
+        # Write-DATLog touches WindowsPrincipal, which throws on non-Windows
+        # dev boxes; logging isn't under test here.
+        Mock Write-DATLog {}
+    }
+
+    It 'Binds the Lenovo machine-type rule to the script condition, never the friendly-name model condition' {
+        $Rules = New-DATApplicationRequirementRules -Manufacturer Lenovo -MachineType @(' 20x3 ', '20X4', '20X3')
+
+        # Manufacturer + VM exclusion + machine type
+        @($Rules).Count | Should -Be 3
+
+        $TypeCalls = @($script:RuleCalls | Where-Object { $_.Condition.Name -eq 'DAT - Lenovo Machine Type' })
+        $TypeCalls.Count | Should -Be 1
+        $TypeCalls[0].Operator | Should -Be 'OneOf'
+        # Trimmed, uppercased, de-duplicated to match the uppercased value the
+        # script Global Condition reports.
+        $TypeCalls[0].Value1 | Should -Be @('20X3', '20X4')
+
+        # The pre-2.16.1 bug: machine types matched against
+        # Win32_ComputerSystemProduct.Version (the friendly model name), which
+        # no real Lenovo device can satisfy - the app never surfaced in
+        # Software Center.
+        @($script:RuleCalls | Where-Object { $_.Condition.Name -eq 'DAT - Computer Model' }).Count | Should -Be 0
+
+        $MfrCalls = @($script:RuleCalls | Where-Object { $_.Condition.Name -eq 'DAT - Computer Manufacturer' })
+        $MfrCalls[0].Value1 | Should -Be @('LENOVO')
+    }
+
+    It 'Ignores SystemSKU for Lenovo (device SystemSKU embeds the type in a longer string; exact match is never true)' {
+        New-DATApplicationRequirementRules -Manufacturer Lenovo -MachineType @('21HD') -SystemSKU @('21HD') | Out-Null
+        @($script:RuleCalls | Where-Object { $_.Condition.Name -eq 'DAT - Computer SystemSKU' }).Count | Should -Be 0
+    }
+
+    It 'Keeps the Dell SystemSKU rule' {
+        New-DATApplicationRequirementRules -Manufacturer Dell -SystemSKU @('0D03', '0D04') | Out-Null
+        $SkuCalls = @($script:RuleCalls | Where-Object { $_.Condition.Name -eq 'DAT - Computer SystemSKU' })
+        $SkuCalls.Count | Should -Be 1
+        $SkuCalls[0].Operator | Should -Be 'OneOf'
+        $SkuCalls[0].Value1 | Should -Be @('0D03', '0D04')
+    }
+
+    It 'Still emits manufacturer and VM rules when the Lenovo machine-type condition is unavailable' {
+        Mock Initialize-DATGlobalConditions {
+            $Degraded = $script:FakeConditions.Clone()
+            $Degraded['LenovoMachineType'] = $null
+            $Degraded
+        }
+        $Rules = New-DATApplicationRequirementRules -Manufacturer Lenovo -MachineType @('20X3')
+        @($Rules).Count | Should -Be 2
+    }
+}
+
+Describe 'New-DATLenovoMachineTypeRequirementRule' {
+    It 'Returns $null for an empty or whitespace machine-type list without touching the site' {
+        # Reaching Initialize-DATGlobalConditions would throw 'Not connected'
+        # here, so a $null return also proves the early exit.
+        $script:CMConnected = $false
+        New-DATLenovoMachineTypeRequirementRule -MachineType @('', '   ') | Should -BeNullOrEmpty
+    }
+
+    It 'Throws when the machine-type Global Condition is unavailable' {
+        { New-DATLenovoMachineTypeRequirementRule -MachineType @('20X3') -Conditions @{ LenovoMachineType = $null } } |
+            Should -Throw '*not available*'
+    }
+}
+
+Describe 'Get-DATLenovoRequirementRepair' {
+    It 'Flags the unsatisfiable friendly-name model rule and requests the machine-type rule' {
+        $Reqs = @(
+            [PSCustomObject]@{ Name = 'DAT - Computer Manufacturer OneOf {LENOVO}' }
+            [PSCustomObject]@{ Name = 'DAT - Computer Model (System) NotContains {Virtual}' }
+            [PSCustomObject]@{ Name = 'DAT - Computer Model OneOf {20X3, 20X4}' }
+        )
+        $Repair = Get-DATLenovoRequirementRepair -Requirements $Reqs -MachineType @('20X3', '20X4')
+
+        @($Repair.RemoveRules).Count | Should -Be 1
+        $Repair.RemoveRules[0].Name | Should -Be 'DAT - Computer Model OneOf {20X3, 20X4}'
+        $Repair.AddNeeded | Should -BeTrue
+    }
+
+    It 'Leaves an already-repaired deployment type alone' {
+        $Reqs = @(
+            [PSCustomObject]@{ Name = 'DAT - Computer Manufacturer OneOf {LENOVO}' }
+            [PSCustomObject]@{ Name = 'DAT - Computer Model (System) NotContains {Virtual}' }
+            [PSCustomObject]@{ Name = 'DAT - Lenovo Machine Type OneOf {20X3, 20X4}' }
+        )
+        $Repair = Get-DATLenovoRequirementRepair -Requirements $Reqs -MachineType @('20X3', '20X4')
+
+        @($Repair.RemoveRules).Count | Should -Be 0
+        $Repair.AddNeeded | Should -BeFalse
+    }
+
+    It 'Adds the machine-type rule to a deployment type that has no hardware gate at all' {
+        $Reqs = @(
+            [PSCustomObject]@{ Name = 'DAT - Computer Manufacturer OneOf {LENOVO}' }
+        )
+        $Repair = Get-DATLenovoRequirementRepair -Requirements $Reqs -MachineType @('21HD')
+
+        @($Repair.RemoveRules).Count | Should -Be 0
+        $Repair.AddNeeded | Should -BeTrue
+    }
+
+    It 'Does not request a machine-type rule when no machine types are known' {
+        $Reqs = @(
+            [PSCustomObject]@{ Name = 'DAT - Computer Model OneOf {20X3}' }
+        )
+        $Repair = Get-DATLenovoRequirementRepair -Requirements $Reqs -MachineType @()
+
+        # The unsatisfiable rule is still removed - manufacturer/VM gating
+        # remains - but nothing is added without types to add.
+        @($Repair.RemoveRules).Count | Should -Be 1
+        $Repair.AddNeeded | Should -BeFalse
+    }
+}

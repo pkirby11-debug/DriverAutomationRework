@@ -2039,6 +2039,14 @@ function Invoke-DATPatchPackage {
 # window driver/BIOS updates. (v1.7.0 - 2026-04-22)
 # =============================================================================
 
+# Global Condition display names, shared by condition creation, requirement
+# rule building, and the Lenovo targeting repair in New-DATConfigMgrApplication.
+$script:DATGCNameSystemSKU           = 'DAT - Computer SystemSKU'
+$script:DATGCNameManufacturer        = 'DAT - Computer Manufacturer'
+$script:DATGCNameComputerModel       = 'DAT - Computer Model'
+$script:DATGCNameComputerModelSystem = 'DAT - Computer Model (System)'
+$script:DATGCNameLenovoMachineType   = 'DAT - Lenovo Machine Type'
+
 function Get-DATGlobalCondition {
     <#
     .SYNOPSIS
@@ -2087,18 +2095,88 @@ function Get-DATGlobalCondition {
     }
 }
 
+function Get-DATLenovoMachineTypeScript {
+    <#
+    .SYNOPSIS
+        Returns the client-side script text for the Lenovo machine-type Global Condition.
+    .DESCRIPTION
+        Emits the uppercased first 4 characters of Win32_ComputerSystem.Model.
+        On Lenovo commercial hardware Model is the full MTM (e.g. "20X3S02D00")
+        and its first 4 characters are the machine type ("20X3") - the same
+        derivation Get-DATDeviceIdentity uses in Invoke-DATApply.ps1, so the
+        requirement gate and the apply-time matcher agree on device identity.
+        Runs on clients under the CM agent; kept Windows PowerShell 5.1
+        compatible like the other client-side scripts.
+    #>
+    [CmdletBinding()]
+    param()
+
+    return @'
+$Model = ''
+try { $Model = "$((Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Model)".Trim() } catch { $Model = '' }
+if ($Model.Length -ge 4) { $Model = $Model.Substring(0, 4) }
+Write-Output $Model.ToUpper()
+'@
+}
+
+function Get-DATLenovoMachineTypeCondition {
+    <#
+    .SYNOPSIS
+        Gets the script-based Global Condition reporting the Lenovo machine type, creating it if missing.
+    .DESCRIPTION
+        Lenovo hardware identity for driver/BIOS targeting is the 4-character
+        machine type, but no WMI property EQUALS it on a device:
+        Win32_ComputerSystem.Model is the full MTM ("20X3S02D00"),
+        Win32_ComputerSystemProduct.Version is the friendly name ("ThinkPad
+        L15 Gen 2"), and MS_SystemInformation.SystemSKU embeds the type in a
+        longer string ("LENOVO_MT_20X3_BU_Think_FM_..."). A plain WQL Global
+        Condition therefore cannot power a OneOf machine-type rule; this
+        script condition computes the comparable value instead.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Assert-DATConfigMgrConnected
+
+    $OriginalLocation = Get-Location
+    try {
+        Set-Location -Path "$($script:CMSiteCode):" -ErrorAction Stop
+
+        $Existing = Get-CMGlobalCondition -Name $script:DATGCNameLenovoMachineType -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($Existing) {
+            return $Existing
+        }
+
+        Write-DATLog -Message "Creating Global Condition '$($script:DATGCNameLenovoMachineType)' (PowerShell script: first 4 chars of Win32_ComputerSystem.Model)" -Severity 1
+        $GC = New-CMGlobalConditionScript -Name $script:DATGCNameLenovoMachineType `
+            -DataType String `
+            -ScriptLanguage PowerShell `
+            -ScriptText (Get-DATLenovoMachineTypeScript) `
+            -Description 'Created by DriverAutomationTool. Reports the uppercased first 4 characters of Win32_ComputerSystem.Model (the Lenovo machine type) for Application requirement rules.'
+        return $GC
+    } catch {
+        Write-DATLog -Message "Failed to get/create Global Condition '$($script:DATGCNameLenovoMachineType)': $($_.Exception.Message)" -Severity 3
+        throw
+    } finally {
+        Set-Location -Path $OriginalLocation
+    }
+}
+
 function Initialize-DATGlobalConditions {
     <#
     .SYNOPSIS
         Ensures the DAT Global Conditions used by Application requirement rules exist.
     .DESCRIPTION
         Idempotent - safe to call on every sync. Returns a hashtable mapping
-        condition key (SystemSKU, Manufacturer, ComputerModel) to the GC object.
+        condition key (SystemSKU, Manufacturer, ComputerModel,
+        ComputerSystemModel, LenovoMachineType) to the GC object.
 
-        SystemSKU uses root\wmi\MS_SystemInformation which exposes the SKU for
-        both Dell (matches Dell SystemID from the catalog) and newer Lenovo
-        models. Lenovo machine types historically live in
-        Win32_ComputerSystemProduct.Version, so ComputerModel is queried there.
+        SystemSKU uses root\wmi\MS_SystemInformation, which exposes the SKU
+        Dell devices report (matches Dell SystemID from the catalog) and the
+        Surface SystemSKU. ComputerModel queries
+        Win32_ComputerSystemProduct.Version - on Lenovo that is the FRIENDLY
+        model name ("ThinkPad L15 Gen 2"), NOT the machine type, so Lenovo
+        machine-type gating uses the LenovoMachineType script condition.
     #>
     [CmdletBinding()]
     param()
@@ -2106,14 +2184,25 @@ function Initialize-DATGlobalConditions {
     Assert-DATConfigMgrConnected
 
     $Conditions = @{}
-    $Conditions['SystemSKU']    = Get-DATGlobalCondition -Name 'DAT - Computer SystemSKU'    -Namespace 'root\wmi'   -Class 'MS_SystemInformation'        -Property 'SystemSKU'    -DataType String
-    $Conditions['Manufacturer'] = Get-DATGlobalCondition -Name 'DAT - Computer Manufacturer' -Namespace 'root\cimv2' -Class 'Win32_ComputerSystem'        -Property 'Manufacturer' -DataType String
-    $Conditions['ComputerModel']= Get-DATGlobalCondition -Name 'DAT - Computer Model'        -Namespace 'root\cimv2' -Class 'Win32_ComputerSystemProduct' -Property 'Version'      -DataType String
+    $Conditions['SystemSKU']    = Get-DATGlobalCondition -Name $script:DATGCNameSystemSKU    -Namespace 'root\wmi'   -Class 'MS_SystemInformation'        -Property 'SystemSKU'    -DataType String
+    $Conditions['Manufacturer'] = Get-DATGlobalCondition -Name $script:DATGCNameManufacturer -Namespace 'root\cimv2' -Class 'Win32_ComputerSystem'        -Property 'Manufacturer' -DataType String
+    $Conditions['ComputerModel']= Get-DATGlobalCondition -Name $script:DATGCNameComputerModel -Namespace 'root\cimv2' -Class 'Win32_ComputerSystemProduct' -Property 'Version'     -DataType String
     # Win32_ComputerSystem.Model reports "Virtual Machine" on Hyper-V/AVD,
     # "VMware Virtual Platform" on VMware, etc. Used to exclude VMs from
     # driver/BIOS deployments (the ComputerModel condition above queries the
     # product Version instead, which doesn't carry the virtual marker).
-    $Conditions['ComputerSystemModel'] = Get-DATGlobalCondition -Name 'DAT - Computer Model (System)' -Namespace 'root\cimv2' -Class 'Win32_ComputerSystem' -Property 'Model' -DataType String
+    $Conditions['ComputerSystemModel'] = Get-DATGlobalCondition -Name $script:DATGCNameComputerModelSystem -Namespace 'root\cimv2' -Class 'Win32_ComputerSystem' -Property 'Model' -DataType String
+    # The Lenovo machine type is a SCRIPT condition (no WMI property equals
+    # the 4-char type - see Get-DATLenovoMachineTypeCondition). Non-fatal on
+    # failure so Dell/Surface rule building still works on a console build
+    # that rejects script conditions; the Lenovo rule builder surfaces the
+    # missing entry itself.
+    try {
+        $Conditions['LenovoMachineType'] = Get-DATLenovoMachineTypeCondition
+    } catch {
+        $Conditions['LenovoMachineType'] = $null
+        Write-DATLog -Message "Lenovo machine-type Global Condition unavailable - Lenovo Applications cannot be hardware-gated until this is resolved: $($_.Exception.Message)" -Severity 2
+    }
     return $Conditions
 }
 
@@ -2123,9 +2212,10 @@ function New-DATApplicationRequirementRules {
         Builds a collection of requirement rules from manufacturer and system identifier.
     .DESCRIPTION
         Always includes a Manufacturer rule. For Dell, adds a SystemSKU rule with
-        one-or-more SKU values (Dell SystemID). For Lenovo, adds a ComputerModel
-        rule matching the machine type(s). CCMExec enforces the intersection,
-        so the Application never runs on a device that doesn't match.
+        one-or-more SKU values (Dell SystemID). For Lenovo, adds a machine-type
+        rule bound to the script-based machine-type condition. CCMExec enforces
+        the intersection, so the Application never runs on a device that
+        doesn't match.
     #>
     [CmdletBinding()]
     param(
@@ -2175,27 +2265,99 @@ function New-DATApplicationRequirementRules {
         }
     }
 
-    # Lenovo: Win32_ComputerSystemProduct.Version reports the friendly model name.
-    # Machine types (e.g. "21HD") sometimes appear in SystemSKU on modern
-    # firmware, sometimes not - include both rules when available.
-    if ($Manufacturer -eq 'Lenovo') {
-        if ($SystemSKU) {
-            $SKUList = @($SystemSKU | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            if ($SKUList.Count -gt 0) {
-                $SKURule = $Conditions['SystemSKU'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value1 $SKUList
-                $Rules.Add($SKURule)
-            }
-        }
-        if ($MachineType) {
-            $TypeList = @($MachineType | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            if ($TypeList.Count -gt 0) {
-                $TypeRule = $Conditions['ComputerModel'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value1 $TypeList
-                $Rules.Add($TypeRule)
-            }
+    # Lenovo: gate on the MACHINE TYPE via the dedicated script condition.
+    # The type is the first 4 characters of Win32_ComputerSystem.Model - no
+    # WMI property equals it directly. Pre-2.16.1 builds matched the type
+    # list against 'DAT - Computer Model' (Win32_ComputerSystemProduct
+    # .Version = the FRIENDLY name, "ThinkPad L15 Gen 2"), a rule no real
+    # device can satisfy; because requirement rules AND together, every
+    # Lenovo Application evaluated not-applicable and never appeared in
+    # Software Center. SystemSKU input is deliberately ignored for Lenovo:
+    # the device value is "LENOVO_MT_20X3_BU_Think_FM_..." (type embedded,
+    # never equal), so an exact-match rule built from machine types would
+    # recreate the same never-true gate.
+    if ($Manufacturer -eq 'Lenovo' -and $MachineType) {
+        try {
+            $TypeRule = New-DATLenovoMachineTypeRequirementRule -MachineType $MachineType -Conditions $Conditions
+            if ($TypeRule) { $Rules.Add($TypeRule) }
+        } catch {
+            Write-DATLog -Message "Could not build the Lenovo machine-type requirement rule (continuing with manufacturer/VM rules only - the app will surface on ALL physical Lenovo devices in the collection): $($_.Exception.Message)" -Severity 2
         }
     }
 
     return $Rules
+}
+
+function New-DATLenovoMachineTypeRequirementRule {
+    <#
+    .SYNOPSIS
+        Builds the OneOf machine-type requirement rule for a Lenovo Application.
+    .DESCRIPTION
+        Shared by New-DATApplicationRequirementRules (app creation) and the
+        Lenovo targeting repair in New-DATConfigMgrApplication (app update).
+        Values are trimmed, uppercased, and de-duplicated to match the
+        uppercased 4-char value the script Global Condition reports.
+        Returns $null when no usable machine types are supplied.
+    #>
+    [CmdletBinding()]
+    param(
+        [string[]]$MachineType,
+
+        # Pass the Initialize-DATGlobalConditions result when already in hand
+        # to avoid re-querying the site.
+        [hashtable]$Conditions
+    )
+
+    $TypeList = @($MachineType | Where-Object { $_ } | ForEach-Object { "$_".Trim().ToUpper() } | Where-Object { $_ } | Select-Object -Unique)
+    if ($TypeList.Count -eq 0) { return $null }
+
+    if (-not $Conditions) { $Conditions = Initialize-DATGlobalConditions }
+    if (-not $Conditions['LenovoMachineType']) {
+        throw "Global Condition '$($script:DATGCNameLenovoMachineType)' is not available."
+    }
+    return $Conditions['LenovoMachineType'] | New-CMRequirementRuleCommonValue -RuleOperator OneOf -Value1 $TypeList
+}
+
+function Get-DATLenovoRequirementRepair {
+    <#
+    .SYNOPSIS
+        Decides how to repair a Lenovo deployment type's requirement rules in place.
+    .DESCRIPTION
+        Pre-2.16.1 Lenovo Applications carry a requirement rule that matched
+        the machine-type list against 'DAT - Computer Model'
+        (Win32_ComputerSystemProduct.Version = the friendly model name) -
+        unsatisfiable on real hardware, which kept the app out of Software
+        Center on every device. Requirement rules are only attached at app
+        creation, so existing apps need an in-place repair on update.
+
+        Pure decision logic (no site calls) so it is unit-testable:
+        - RemoveRules: the unsatisfiable 'DAT - Computer Model' rules. The
+          VM-exclusion rule on 'DAT - Computer Model (System)' is a distinct
+          condition and is never matched.
+        - AddNeeded: true when no 'DAT - Lenovo Machine Type' rule exists yet
+          and machine types are available to build one.
+    #>
+    [CmdletBinding()]
+    param(
+        # Deserialized deployment-type Requirements collection (items expose .Name).
+        $Requirements,
+
+        [string[]]$MachineType
+    )
+
+    $Reqs = @($Requirements | Where-Object { $_ })
+    $RemoveRules = @($Reqs | Where-Object {
+        $RuleName = "$($_.Name)"
+        $RuleName -like "*$($script:DATGCNameComputerModel)*" -and
+            $RuleName -notlike "*$($script:DATGCNameComputerModelSystem)*"
+    })
+    $HasTypeRule = [bool]($Reqs | Where-Object { "$($_.Name)" -like "*$($script:DATGCNameLenovoMachineType)*" })
+    $HasTypes = @($MachineType | Where-Object { $_ -and "$_".Trim() }).Count -gt 0
+
+    return [PSCustomObject]@{
+        RemoveRules = $RemoveRules
+        AddNeeded   = ((-not $HasTypeRule) -and $HasTypes)
+    }
 }
 
 function Get-DATDetectionScript {
@@ -2979,6 +3141,7 @@ function New-DATConfigMgrApplication {
                 # content hash changed and we DO need the DT update so the DP
                 # picks up the new script).
                 $DTDiffs = @()
+                $EDT = $null
                 if ($ScriptChanged) { $DTDiffs += 'StagedScript' }
                 try {
                     $FullApp = Get-CMApplication -Name $Name -ErrorAction Stop | Select-Object -First 1
@@ -3004,12 +3167,43 @@ function New-DATConfigMgrApplication {
                     $DTDiffs += 'PreCheckException'
                 }
 
+                # Lenovo targeting repair (2.16.1): pre-fix Lenovo apps carry
+                # an unsatisfiable machine-type rule bound to 'DAT - Computer
+                # Model' (the friendly-name WMI property), which kept them out
+                # of Software Center on every device. Requirement rules are
+                # otherwise only attached at creation, so swap them here in
+                # place. The Remove/Add ride the same
+                # Set-CMScriptDeploymentType call as any pending DT update
+                # (one CI revision bump), and once the machine-type rule is
+                # present this detects nothing, so the no-op skip below keeps
+                # applying on later syncs.
+                if ($Manufacturer -eq 'Lenovo' -and $EDT) {
+                    try {
+                        $Repair = Get-DATLenovoRequirementRepair -Requirements $EDT.Requirements -MachineType $MachineType
+                        if (@($Repair.RemoveRules).Count -gt 0) {
+                            $DTParams['RemoveRequirement'] = @($Repair.RemoveRules)
+                        }
+                        if ($Repair.AddNeeded) {
+                            $NewTypeRule = New-DATLenovoMachineTypeRequirementRule -MachineType $MachineType
+                            if ($NewTypeRule) { $DTParams['AddRequirement'] = @($NewTypeRule) }
+                        }
+                        if ($DTParams.ContainsKey('RemoveRequirement') -or $DTParams.ContainsKey('AddRequirement')) {
+                            $DTDiffs += 'LenovoTargetingRules'
+                            $AddedText = if ($DTParams.ContainsKey('AddRequirement')) { $MachineType -join ', ' } else { 'none (already present)' }
+                            Write-DATLog -Message "Lenovo targeting repair for '$Name': removing $(@($Repair.RemoveRules).Count) unsatisfiable model rule(s), adding machine-type rule for: $AddedText" -Severity 1
+                        }
+                    } catch {
+                        Write-DATLog -Message "Lenovo targeting repair skipped for '$Name' (app may remain hidden in Software Center until repaired): $($_.Exception.Message)" -Severity 2
+                    }
+                }
+
                 if ($DTDiffs.Count -eq 0) {
                     Write-DATLog -Message "Deployment type '$DTName' params and content unchanged - skipping update to avoid CI revision bump" -Severity 1
                 } else {
                     Write-DATLog -Message "Updating deployment type '$DTName' for $Name in place (RebootBehavior=$RebootBehavior; changed: $($DTDiffs -join ', '))" -Severity 1
                     Set-CMScriptDeploymentType @DTParams | Out-Null
-                    Write-DATLog -Message "Deployment type '$DTName' updated (install command, content, detection script refreshed; existing requirement rules preserved)" -Severity 1
+                    $RulesNote = if ($DTDiffs -contains 'LenovoTargetingRules') { 'Lenovo targeting rules repaired, other rules preserved' } else { 'existing requirement rules preserved' }
+                    Write-DATLog -Message "Deployment type '$DTName' updated (install command, content, detection script refreshed; $RulesNote)" -Severity 1
                 }
             } else {
                 Write-DATLog -Message "Creating new deployment type '$DTName' for $Name (RebootBehavior=$RebootBehavior)" -Severity 1
