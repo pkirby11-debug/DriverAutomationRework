@@ -3053,28 +3053,110 @@ function Invoke-DellBIOSFlash {
 # -------------------------------------------------------------------------
 # BIOS flash - Lenovo
 # -------------------------------------------------------------------------
+function Find-LenovoFlashUtility {
+    param([string]$Root)
+
+    # Which utility ships depends on the product line: ThinkPad payloads carry
+    # WINUPTP(64).EXE, modern ThinkCentre/ThinkStation payloads SRSETUP64.exe,
+    # legacy desktops wFlashGUIX64.exe. Search recursively - the sync extracts
+    # the vendor package into the content root, but some packages nest their
+    # payload in a subfolder (and the client-side extraction fallback below
+    # lands in its own directory).
+    foreach ($Spec in @(
+        @{ Filter = 'WINUPTP64.EXE';    Type = 'WINUPTP' },
+        @{ Filter = 'WINUPTP.EXE';      Type = 'WINUPTP' },
+        @{ Filter = 'SRSETUP64.exe';    Type = 'SRSETUP' },
+        @{ Filter = 'SRSETUP*.exe';     Type = 'SRSETUP' },
+        @{ Filter = 'wFlashGUIX64.exe'; Type = 'wFlashGUI' }
+    )) {
+        $Hit = Get-ChildItem -Path $Root -Filter $Spec.Filter -File -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($Hit) {
+            return [PSCustomObject]@{ Utility = $Hit; Type = $Spec.Type }
+        }
+    }
+    return $null
+}
+
+function Expand-LenovoBIOSInstaller {
+    param([string]$Root)
+
+    # The sync normally extracts the vendor installer server-side, but when
+    # that extraction produces no files it ships the RAW self-extracting
+    # installer and defers extraction to this script. Run the InnoSetup
+    # extraction Lenovo documents for its BIOS packages against every
+    # content-root exe that isn't itself a flash utility, and search each
+    # payload for one.
+    $Candidates = @(Get-ChildItem -Path $Root -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch '^(WINUPTP|SRSETUP|wFlash|Flash64W)' })
+    if ($Candidates.Count -eq 0) { return $null }
+
+    # Same self-pruning session-directory family the DUP extract root uses.
+    # The payload (and winuptp.log for ThinkPads) stays behind for diagnostics.
+    $ExtractParent = Join-Path $env:SystemDrive 'Temp\DriverAutomationTool\LenovoBIOSExtract'
+    $ExtractRoot = Join-Path $ExtractParent (Get-Date -Format 'yyyyMMdd-HHmmss')
+    try {
+        New-Item -Path $ExtractRoot -ItemType Directory -Force | Out-Null
+        Get-ChildItem -Path $ExtractParent -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $ExtractRoot -and $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Log "Could not create Lenovo BIOS extract directory '$ExtractRoot': $($_.Exception.Message)" -Severity 2
+        return $null
+    }
+
+    foreach ($Installer in $Candidates) {
+        $Dest = Join-Path $ExtractRoot $Installer.BaseName
+        New-Item -Path $Dest -ItemType Directory -Force | Out-Null
+        Write-Log "No pre-extracted flash utility in content - extracting vendor installer $($Installer.Name) to $Dest"
+        $ExtractArgs = "/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$Dest`""
+        try {
+            $Proc = Start-Process -FilePath $Installer.FullName -ArgumentList $ExtractArgs `
+                -PassThru -NoNewWindow -ErrorAction Stop
+            $null = $Proc.Handle
+            if (-not $Proc.WaitForExit(600000)) {
+                Write-Log "Extraction of $($Installer.Name) timed out after 10 minutes - killing" -Severity 2
+                try { $Proc.Kill() } catch { $null = $_ }
+                continue
+            }
+            Write-Log "$($Installer.Name) extraction exit code: $($Proc.ExitCode)"
+        } catch {
+            Write-Log "Could not run $($Installer.Name) for extraction: $($_.Exception.Message)" -Severity 2
+            continue
+        }
+
+        $Found = Find-LenovoFlashUtility -Root $Dest
+        if ($Found) { return $Found }
+        Write-Log "No flash utility in the extracted payload of $($Installer.Name)" -Severity 2
+    }
+    return $null
+}
+
 function Invoke-LenovoBIOSFlash {
     param([string]$Path)
 
-    # Prefer SRSETUP (modern Lenovo firmware package format) over wFlashGUI (legacy).
-    $Utility = Get-ChildItem -Path $Path -Filter 'SRSETUP64.exe' -File -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $Utility) {
-        $Utility = Get-ChildItem -Path $Path -Filter 'SRSETUP*.exe' -File -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+    $Found = Find-LenovoFlashUtility -Root $Path
+    if (-not $Found) {
+        $Found = Expand-LenovoBIOSInstaller -Root $Path
     }
-    $UtilityType = 'SRSETUP'
-    if (-not $Utility) {
-        $Utility = Get-ChildItem -Path $Path -Filter 'wFlashGUIX64.exe' -File -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        $UtilityType = 'wFlashGUI'
+    if (-not $Found) {
+        $RootFiles = (@(Get-ChildItem -Path $Path -File -ErrorAction SilentlyContinue |
+            Select-Object -First 20 -ExpandProperty Name) -join ', ')
+        throw "No Lenovo flash utility (WINUPTP/SRSETUP64/wFlashGUIX64) found in $Path - searched recursively and attempted vendor-installer extraction. Content root files: $RootFiles"
     }
-    if (-not $Utility) {
-        throw "No Lenovo flash utility (SRSETUP64.exe or wFlashGUIX64.exe) found in $Path"
-    }
+
+    $Utility = $Found.Utility
+    $UtilityType = $Found.Type
     Write-Log "Lenovo flash utility: $($Utility.FullName) ($UtilityType)"
 
-    if ($UtilityType -eq 'SRSETUP') {
+    if ($UtilityType -eq 'WINUPTP') {
+        # ThinkPad BIOS update utility. -s = silent; the flash itself is
+        # prestaged and applied across the following reboot(s).
+        $FlashArgs = @('-s')
+        if ($BIOSPassword) {
+            Write-Log 'WINUPTP has no password argument - a ThinkPad with a supervisor password set may not flash silently' -Severity 2
+        }
+    } elseif ($UtilityType -eq 'SRSETUP') {
         $FlashArgs = @('/S')
         if ($BIOSPassword) {
             $FlashArgs += "/pass:`"$BIOSPassword`""
@@ -3092,8 +3174,11 @@ function Invoke-LenovoBIOSFlash {
     }
 
     Write-Log "Running: $($Utility.Name) $($FlashArgs -replace '/pass:".+"', '/pass:"***"' -join ' ')"
+    # Working directory is the utility's own folder (not the content root) so
+    # it finds its payload when it lives in a subfolder or an extracted dir,
+    # and so winuptp.log lands somewhere predictable.
     $Proc = Start-Process -FilePath $Utility.FullName -ArgumentList $FlashArgs `
-        -PassThru -NoNewWindow -WorkingDirectory $Path
+        -PassThru -NoNewWindow -WorkingDirectory $Utility.DirectoryName
     # See Invoke-DellBIOSFlash for the .Handle rationale - same PS 5.1 / CCMExec
     # ExitCode-is-null issue applies to the Lenovo utilities.
     $null = $Proc.Handle
@@ -3105,6 +3190,25 @@ function Invoke-LenovoBIOSFlash {
         Write-Log "$($Utility.Name) ExitCode came back null - treating as soft-reboot success (flash most likely completed; let SCCM reboot and re-detect)." -Severity 2
         $script:RebootRequired = $true
         return 0
+    }
+
+    if ($UtilityType -eq 'WINUPTP') {
+        # winuptp -s: 0 and 1 both mean the update was accepted (1 = reboot
+        # required to complete; the ROM flash happens during the reboots).
+        if ($ExitCode -eq 0 -or $ExitCode -eq 1) {
+            # Lenovo guidance: winuptp can still be prestaging briefly after
+            # it returns - give it a settle window before SCCM may reboot.
+            Start-Sleep -Seconds 30
+            $script:RebootRequired = $true
+            return 0
+        }
+        $UptpLog = Get-ChildItem -Path $Utility.DirectoryName -Filter 'winuptp.log' -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($UptpLog) {
+            $Tail = (@(Get-Content -Path $UptpLog.FullName -ErrorAction SilentlyContinue | Select-Object -Last 10) -join ' | ')
+            Write-Log "winuptp.log tail: $Tail" -Severity 2
+        }
+        return $ExitCode
     }
 
     if ($UtilityType -eq 'SRSETUP') {
