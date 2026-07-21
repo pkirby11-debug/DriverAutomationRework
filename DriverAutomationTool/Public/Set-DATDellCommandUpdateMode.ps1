@@ -39,19 +39,32 @@ function Set-DATDellCommandUpdateMode {
         deployment of this cmdlet is required. It remains useful for:
           - pre-staging devices before their first deployment,
           - re-asserting outside a deployment window,
-          - OPTING A DEVICE OUT: -Mode Default writes the marker value
-            'Default', which the apply engine respects (it then leaves DCU's
-            autonomy settings alone on that device).
+          - OPTING A DEVICE OUT of the lockdown: -Mode ManualCloud keeps
+            autonomy off but restores dell.com for tech-driven interactive
+            scans; -Mode Default reverts fully to Dell out-of-box behavior.
+            Both write their marker value, which the apply engine respects
+            across subsequent deployment runs.
         Marker: HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode
 
         The standalone, module-free equivalent is
         Scripts\Set-DATDcuManaged.ps1.
     .PARAMETER Mode
         DATManaged (default): passive mode, DCU acts only when driven.
+        ManualCloud: tech-interactive mode. dell.com is restored as a valid
+        source so a technician can open DCU and CHECK/install updates on
+        demand, but every autonomous behavior stays off (no scheduled scans,
+        notify-only if a schedule ever fires, no toasts) and BitLocker
+        auto-suspend is re-enabled so tech-driven BIOS installs behave like
+        stock DCU. The apply engine respects the marker: during a deployment
+        run it clamps DCU exactly like a managed device, then restores the
+        ManualCloud end state afterward instead of pinning the curated
+        catalog - so the mode survives every nightly deployment.
         Default: revert to Dell out-of-box behavior AND opt the device out of
         the apply engine's automatic lockdown.
     .EXAMPLE
         Set-DATDellCommandUpdateMode
+    .EXAMPLE
+        Set-DATDellCommandUpdateMode -Mode ManualCloud
     .EXAMPLE
         Set-DATDellCommandUpdateMode -Mode Default
     .OUTPUTS
@@ -60,7 +73,7 @@ function Set-DATDellCommandUpdateMode {
     #>
     [CmdletBinding()]
     param(
-        [ValidateSet('DATManaged', 'Default')]
+        [ValidateSet('DATManaged', 'ManualCloud', 'Default')]
         [string]$Mode = 'DATManaged',
 
         [int]$PerCommandTimeoutSec = 120
@@ -90,25 +103,45 @@ function Set-DATDellCommandUpdateMode {
     # Each setting is one /configure call (a single bulk call with multiple
     # options exists on some builds but per-key gives per-key fallback if a
     # build doesn't know an option - same graceful pattern as -allowXML).
-    $Settings = if ($Mode -eq 'DATManaged') {
-        [ordered]@{
-            'scheduleManual'        = ''
-            'scheduleAction'        = 'NotifyAvailableUpdates'
-            'updatesNotification'   = 'disable'
-            'autoSuspendBitLocker'  = 'disable'
+    $Settings = switch ($Mode) {
+        'DATManaged' {
+            [ordered]@{
+                'scheduleManual'        = ''
+                'scheduleAction'        = 'NotifyAvailableUpdates'
+                'updatesNotification'   = 'disable'
+                'autoSuspendBitLocker'  = 'disable'
+            }
         }
-    } else {
-        # Dell out-of-box behavior. scheduleAction value picks
-        # DownloadInstallAndNotify - the most common Dell-default fleet behavior.
-        [ordered]@{
-            'defaultSourceLocation' = 'enable'
-            'scheduleAuto'          = 'enable'
-            'scheduleAction'        = 'DownloadInstallAndNotify'
-            'updatesNotification'   = 'enable'
-            'userConsent'           = 'enable'
-            'systemRestartDeferral' = 'disable'
-            'installationDeferral'  = 'disable'
-            'autoSuspendBitLocker'  = 'enable'
+        'ManualCloud' {
+            # Tech-interactive. restoreDefaults goes FIRST: one sanctioned call
+            # that clears a pinned custom catalog (the persistent package
+            # catalog a managed device carries) and re-enables dell.com; builds
+            # without the option log-and-skip, and defaultSourceLocation=enable
+            # below covers them. The autonomy clamps follow immediately so the
+            # factory schedule restoreDefaults brings back is disarmed in the
+            # same pass.
+            [ordered]@{
+                'restoreDefaults'       = ''
+                'defaultSourceLocation' = 'enable'
+                'scheduleManual'        = ''
+                'scheduleAction'        = 'NotifyAvailableUpdates'
+                'updatesNotification'   = 'disable'
+                'autoSuspendBitLocker'  = 'enable'
+            }
+        }
+        default {
+            # Dell out-of-box behavior. scheduleAction value picks
+            # DownloadInstallAndNotify - the most common Dell-default fleet behavior.
+            [ordered]@{
+                'defaultSourceLocation' = 'enable'
+                'scheduleAuto'          = 'enable'
+                'scheduleAction'        = 'DownloadInstallAndNotify'
+                'updatesNotification'   = 'enable'
+                'userConsent'           = 'enable'
+                'systemRestartDeferral' = 'disable'
+                'installationDeferral'  = 'disable'
+                'autoSuspendBitLocker'  = 'enable'
+            }
         }
     }
 

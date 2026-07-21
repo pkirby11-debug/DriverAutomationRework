@@ -2267,7 +2267,7 @@ function New-DATApplicationRequirementRules {
 
     # Lenovo: gate on the MACHINE TYPE via the dedicated script condition.
     # The type is the first 4 characters of Win32_ComputerSystem.Model - no
-    # WMI property equals it directly. Pre-2.16.1 builds matched the type
+    # WMI property equals it directly. Pre-2.20.1 builds matched the type
     # list against 'DAT - Computer Model' (Win32_ComputerSystemProduct
     # .Version = the FRIENDLY name, "ThinkPad L15 Gen 2"), a rule no real
     # device can satisfy; because requirement rules AND together, every
@@ -2323,7 +2323,7 @@ function Get-DATLenovoRequirementRepair {
     .SYNOPSIS
         Decides how to repair a Lenovo deployment type's requirement rules in place.
     .DESCRIPTION
-        Pre-2.16.1 Lenovo Applications carry a requirement rule that matched
+        Pre-2.20.1 Lenovo Applications carry a requirement rule that matched
         the machine-type list against 'DAT - Computer Model'
         (Win32_ComputerSystemProduct.Version = the friendly model name) -
         unsatisfiable on real hardware, which kept the app out of Software
@@ -3167,7 +3167,7 @@ function New-DATConfigMgrApplication {
                     $DTDiffs += 'PreCheckException'
                 }
 
-                # Lenovo targeting repair (2.16.1): pre-fix Lenovo apps carry
+                # Lenovo targeting repair (2.20.1): pre-fix Lenovo apps carry
                 # an unsatisfiable machine-type rule bound to 'DAT - Computer
                 # Model' (the friendly-name WMI property), which kept them out
                 # of Software Center on every device. Requirement rules are
@@ -3316,6 +3316,58 @@ function Set-DATApplicationFolder {
     } finally {
         Set-Location -Path $OriginalLocation
     }
+}
+
+function Test-DATManagedApplicationName {
+    <#
+    .SYNOPSIS
+        Returns $true when an Application name matches the DAT naming convention
+        for the given sync type(s).
+    .DESCRIPTION
+        Central name gate for bulk operations that enumerate site-wide (e.g.
+        Invoke-DATRemoveDeployments). Matches the same per-type prefixes
+        Find-DATExistingApplications filters on, including the optional
+        "Test - " prefix:
+
+          Drivers        "Drivers - ..."
+          BIOS           "BIOS Update - ..."        (excluding the DCU flavor)
+          BIOSDCU        "BIOS Update (DCU) - ..."
+          DriverUpdates  "Driver Updates - ..."
+
+        Unlike Find-DATExistingApplications - where Type='All' performs no name
+        filtering at all - 'All' here means "any of the four DAT prefixes".
+        Bulk destructive callers must never touch applications this module
+        didn't create, so an unrecognized name always returns $false.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Name,
+
+        [ValidateSet('Drivers', 'BIOS', 'BIOSDCU', 'DriverUpdates', 'All')]
+        [string[]]$Type = @('All')
+    )
+
+    # Strip the optional "Test - " prefix once so each pattern below only needs
+    # its canonical form.
+    $Effective = $Name -replace '^Test - ', ''
+
+    if ($Type -contains 'All') {
+        $Type = @('Drivers', 'BIOS', 'BIOSDCU', 'DriverUpdates')
+    }
+
+    foreach ($T in $Type) {
+        $IsMatch = switch ($T) {
+            'Drivers'       { $Effective -like 'Drivers - *' }
+            'BIOS'          { $Effective -like 'BIOS Update - *' -and $Effective -notlike 'BIOS Update (DCU)*' }
+            'BIOSDCU'       { $Effective -like 'BIOS Update (DCU) - *' }
+            'DriverUpdates' { $Effective -like 'Driver Updates - *' }
+        }
+        if ($IsMatch) { return $true }
+    }
+    return $false
 }
 
 function Find-DATExistingApplications {

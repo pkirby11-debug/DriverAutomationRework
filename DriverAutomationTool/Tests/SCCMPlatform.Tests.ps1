@@ -31,6 +31,49 @@ Describe 'Assert-DATConfigMgrConnected' {
     }
 }
 
+Describe 'Test-DATManagedApplicationName' {
+    It 'Matches each DAT prefix under its own type' {
+        Test-DATManagedApplicationName -Name 'Drivers - Dell Latitude 7430 - Windows 11 x64' -Type Drivers | Should -BeTrue
+        Test-DATManagedApplicationName -Name 'BIOS Update - Dell Latitude 7430 - Version 1.2.3' -Type BIOS | Should -BeTrue
+        Test-DATManagedApplicationName -Name 'BIOS Update (DCU) - Dell Latitude 7430 - Version 1.2.3' -Type BIOSDCU | Should -BeTrue
+        Test-DATManagedApplicationName -Name 'Driver Updates - Dell Latitude 7430 - Windows 11 x64' -Type DriverUpdates | Should -BeTrue
+    }
+
+    It 'Matches the optional "Test - " prefix' {
+        Test-DATManagedApplicationName -Name 'Test - Driver Updates - Dell Latitude 7430' -Type DriverUpdates | Should -BeTrue
+        Test-DATManagedApplicationName -Name 'Test - BIOS Update - Dell Latitude 7430' -Type BIOS | Should -BeTrue
+    }
+
+    It 'Keeps BIOS and BIOSDCU flavors separate' {
+        Test-DATManagedApplicationName -Name 'BIOS Update (DCU) - Dell Latitude 7430' -Type BIOS | Should -BeFalse
+        Test-DATManagedApplicationName -Name 'BIOS Update - Dell Latitude 7430' -Type BIOSDCU | Should -BeFalse
+    }
+
+    It 'Treats All as the union of the four DAT prefixes, not a wildcard' {
+        foreach ($Name in @(
+            'Drivers - Dell Latitude 7430'
+            'BIOS Update - Dell Latitude 7430'
+            'BIOS Update (DCU) - Dell Latitude 7430'
+            'Driver Updates - Dell Latitude 7430'
+        )) {
+            Test-DATManagedApplicationName -Name $Name | Should -BeTrue
+        }
+        Test-DATManagedApplicationName -Name '7-Zip 23.01 (x64)' | Should -BeFalse
+        Test-DATManagedApplicationName -Name 'Microsoft 365 Apps' | Should -BeFalse
+        Test-DATManagedApplicationName -Name '' | Should -BeFalse
+    }
+
+    It 'Accepts multiple types' {
+        Test-DATManagedApplicationName -Name 'BIOS Update - Dell Latitude 7430' -Type BIOS, BIOSDCU | Should -BeTrue
+        Test-DATManagedApplicationName -Name 'Driver Updates - Dell Latitude 7430' -Type BIOS, BIOSDCU | Should -BeFalse
+    }
+
+    It 'Rejects names that merely contain a DAT prefix mid-string' {
+        Test-DATManagedApplicationName -Name 'Contoso Drivers - Dell Latitude 7430' | Should -BeFalse
+        Test-DATManagedApplicationName -Name 'Old BIOS Update - Dell' | Should -BeFalse
+    }
+}
+
 Describe 'ConfigManager' {
     Describe 'Merge-DATHashtable' {
         It 'Should merge flat hashtables' {
@@ -233,7 +276,7 @@ Describe 'New-DATApplicationRequirementRules' {
         # script Global Condition reports.
         $TypeCalls[0].Value1 | Should -Be @('20X3', '20X4')
 
-        # The pre-2.16.1 bug: machine types matched against
+        # The pre-2.20.1 bug: machine types matched against
         # Win32_ComputerSystemProduct.Version (the friendly model name), which
         # no real Lenovo device can satisfy - the app never surfaced in
         # Software Center.

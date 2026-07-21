@@ -81,3 +81,70 @@ Describe 'Get-DellModelList' {
         $Models[0].Model | Should -Not -BeNullOrEmpty
     }
 }
+
+Describe 'Get-DellDriverPack Windows 10 fallback' {
+    BeforeAll {
+        # Fixture DriverPackCatalog: one legacy model with only a Win10 pack
+        # (the XPS 13 9370 case), one current model with distinct Win10/Win11
+        # packs, and one Win11-only model to prove the fallback never runs in
+        # reverse.
+        $FixturePath = Join-Path $TestDrive 'FixtureDriverPackCatalog.xml'
+        @'
+<?xml version="1.0" encoding="utf-8"?>
+<DriverPackManifest version="1.0" baseLocation="downloads.dell.com">
+  <DriverPackage path="FOLDER1/XPS-13-9370-Win10-A23.CAB" dellVersion="A23" dateTime="2022-05-01T00:00:00" hashMD5="aaa" size="100">
+    <SupportedSystems><Brand><Model Name="XPS 13 9370" SystemID="07E6" /></Brand></SupportedSystems>
+    <SupportedOperatingSystems><OperatingSystem osCode="Windows10" osArch="x64" /></SupportedOperatingSystems>
+  </DriverPackage>
+  <DriverPackage path="FOLDER2/Latitude-5430-Win11-A15.CAB" dellVersion="A15" dateTime="2024-06-01T00:00:00" hashMD5="bbb" size="100">
+    <SupportedSystems><Brand><Model Name="Latitude 5430" SystemID="0B04" /></Brand></SupportedSystems>
+    <SupportedOperatingSystems><OperatingSystem osCode="Windows11" osArch="x64" /></SupportedOperatingSystems>
+  </DriverPackage>
+  <DriverPackage path="FOLDER3/Latitude-5430-Win10-A12.CAB" dellVersion="A12" dateTime="2023-06-01T00:00:00" hashMD5="ccc" size="100">
+    <SupportedSystems><Brand><Model Name="Latitude 5430" SystemID="0B04" /></Brand></SupportedSystems>
+    <SupportedOperatingSystems><OperatingSystem osCode="Windows10" osArch="x64" /></SupportedOperatingSystems>
+  </DriverPackage>
+  <DriverPackage path="FOLDER4/FutureBook-Win11-A01.CAB" dellVersion="A01" dateTime="2026-01-01T00:00:00" hashMD5="ddd" size="100">
+    <SupportedSystems><Brand><Model Name="FutureBook 9999" SystemID="0F99" /></Brand></SupportedSystems>
+    <SupportedOperatingSystems><OperatingSystem osCode="Windows11" osArch="x64" /></SupportedOperatingSystems>
+  </DriverPackage>
+</DriverPackManifest>
+'@ | Set-Content -Path $FixturePath -Encoding UTF8
+
+        Mock Get-DATCachedItem { $FixturePath } -ParameterFilter { $Key -eq 'Dell_DriverPackCatalog.xml' }
+    }
+
+    It 'Falls back to the Windows 10 pack when Dell ships no Windows 11 pack' {
+        $Result = Get-DellDriverPack -Model 'XPS 13 9370' -OperatingSystem 'Windows 11 24H2'
+        $Result | Should -Not -BeNullOrEmpty
+        $Result.FileName | Should -Be 'XPS-13-9370-Win10-A23.CAB'
+        $Result.SystemID | Should -Be '07E6'
+        $Result.OSFallback | Should -Be 'Windows 10'
+        # Requested OS is preserved for package naming
+        $Result.OS | Should -Be 'Windows 11 24H2'
+    }
+
+    It 'Prefers the native Windows 11 pack when one exists' {
+        $Result = Get-DellDriverPack -Model 'Latitude 5430' -OperatingSystem 'Windows 11 24H2'
+        $Result | Should -Not -BeNullOrEmpty
+        $Result.FileName | Should -Be 'Latitude-5430-Win11-A15.CAB'
+        $Result.OSFallback | Should -BeNullOrEmpty
+    }
+
+    It 'Still resolves a native Windows 10 request without fallback markers' {
+        $Result = Get-DellDriverPack -Model 'Latitude 5430' -OperatingSystem 'Windows 10 22H2'
+        $Result | Should -Not -BeNullOrEmpty
+        $Result.FileName | Should -Be 'Latitude-5430-Win10-A12.CAB'
+        $Result.OSFallback | Should -BeNullOrEmpty
+    }
+
+    It 'Never falls back in reverse (Windows 10 request, Win11-only model)' {
+        $Result = Get-DellDriverPack -Model 'FutureBook 9999' -OperatingSystem 'Windows 10 22H2'
+        $Result | Should -BeNullOrEmpty
+    }
+
+    It 'Returns null when the model has no pack for any OS' {
+        $Result = Get-DellDriverPack -Model 'Nonexistent 1234' -OperatingSystem 'Windows 11 24H2'
+        $Result | Should -BeNullOrEmpty
+    }
+}

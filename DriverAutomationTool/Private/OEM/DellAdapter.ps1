@@ -361,32 +361,56 @@ function Get-DellDriverPack {
     # Map OS name to Dell's OS code format
     $OsCode = ConvertTo-DellOSCode -OperatingSystem $OperatingSystem
 
-    # Find matching driver packages
-    $Matches = foreach ($DriverPack in $Xml.DriverPackManifest.DriverPackage) {
-        $PackageModels = @($DriverPack.SupportedSystems.Brand.Model.Name)
-        $PackageOS = $DriverPack.SupportedOperatingSystems.OperatingSystem
+    # Find matching driver packages for a given OS code. ($Matched, not
+    # $Matches - that name is PowerShell's automatic regex variable.)
+    $FindMatches = {
+        param([string]$Code)
+        foreach ($DriverPack in $Xml.DriverPackManifest.DriverPackage) {
+            $PackageModels = @($DriverPack.SupportedSystems.Brand.Model.Name)
+            $PackageOS = $DriverPack.SupportedOperatingSystems.OperatingSystem
 
-        $ModelMatch = $PackageModels | Where-Object { $_ -eq $Model }
+            $ModelMatch = $PackageModels | Where-Object { $_ -eq $Model }
 
-        if ($ModelMatch) {
-            # Check OS match
-            $OsMatch = $PackageOS | Where-Object {
-                $OsCode -and $_.osCode -and $_.osCode -like "*$OsCode*"
-            }
+            if ($ModelMatch) {
+                # Check OS match
+                $OsMatch = $PackageOS | Where-Object {
+                    $Code -and $_.osCode -and $_.osCode -like "*$Code*"
+                }
 
-            if ($OsMatch) {
-                $DriverPack
+                if ($OsMatch) {
+                    $DriverPack
+                }
             }
         }
     }
 
-    if (-not $Matches) {
+    $Matched = @(& $FindMatches $OsCode)
+
+    # Windows 10 fallback for Windows 11 targets. Dell stopped cutting Win11
+    # enterprise CABs for models that were already end-of-sale at Win11 GA
+    # (field case: XPS 13 9370 - Win11-capable, per-model DUP catalog still
+    # maintained, but DriverPackCatalog only carries its Windows10 pack).
+    # Win10/Win11 share the same driver model and using the Win10 CAB is
+    # Dell's own supported practice for Win11 imaging on those models, so
+    # offer the Win10 pack rather than nothing. Loudly logged, surfaced on
+    # the result as OSFallback, and visible in the pack's Win10 filename.
+    # One-directional: a Windows 10 request never picks up a Win11 pack.
+    $OSFallbackUsed = $null
+    if ($Matched.Count -eq 0 -and $OsCode -eq 'Windows11') {
+        $Matched = @(& $FindMatches 'Windows10')
+        if ($Matched.Count -gt 0) {
+            $OSFallbackUsed = 'Windows 10'
+            Write-DATLog -Message "Dell publishes no Windows 11 driver pack for $Model - using its Windows 10 pack instead (Dell's supported practice for Win11 imaging on models without Win11 CABs; Win10/Win11 share the same driver model). The per-driver overlay and catalog-only Driver Updates still resolve current Win11-applicable DUPs on top." -Severity 2
+        }
+    }
+
+    if ($Matched.Count -eq 0) {
         Write-DATLog -Message "No Dell driver pack found for $Model / $OperatingSystem" -Severity 2
         return $null
     }
 
     # Take the most recent match (by dateTime attribute if available, or version)
-    $Best = $Matches | Sort-Object { $_.dateTime } -Descending | Select-Object -First 1
+    $Best = $Matched | Sort-Object { $_.dateTime } -Descending | Select-Object -First 1
 
     $DownloadPath = $Best.path -replace '^/', ''
     $DownloadUrl = '{0}/{1}' -f $Sources.dell.baseUrl.TrimEnd('/'), $DownloadPath
@@ -406,9 +430,13 @@ function Get-DellDriverPack {
         FileName     = Split-Path $DownloadUrl -Leaf
         HashMD5      = $Best.hashMD5
         Size         = $Best.size
+        # Non-null when the pack was resolved via the Windows 10 fallback
+        # (Dell ships no pack for the requested OS). The requested OS is kept
+        # in .OS so package naming reflects the deployment target.
+        OSFallback   = $OSFallbackUsed
     }
 
-    Write-DATLog -Message "Found Dell driver pack: $($Result.FileName) v$($Result.Version) for $Model" -Severity 1
+    Write-DATLog -Message "Found Dell driver pack: $($Result.FileName) v$($Result.Version) for $Model$(if ($OSFallbackUsed) { " (via $OSFallbackUsed fallback)" })" -Severity 1
     return $Result
 }
 
