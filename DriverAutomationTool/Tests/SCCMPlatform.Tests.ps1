@@ -372,3 +372,32 @@ Describe 'Get-DATLenovoRequirementRepair' {
         $Repair.AddNeeded | Should -BeFalse
     }
 }
+
+Describe 'Set-DATResultObjectProperty' {
+    # The indexer-StringValue mechanism needs a real AdminUI SDK object and is
+    # exercised only on a live console; these cover the method-present path,
+    # the fallback chain landing on plain assignment, and the all-fail error.
+    It 'Uses SetPropertyValue when the object exposes it' {
+        $Obj = [PSCustomObject]@{ SDMPackageXML = 'old' }
+        $Obj | Add-Member -MemberType ScriptMethod -Name SetPropertyValue -Value {
+            param($Name, $NewValue)
+            $this.$Name = "via-method:$NewValue"
+        }
+
+        Set-DATResultObjectProperty -ResultObject $Obj -PropertyName 'SDMPackageXML' -Value 'new-xml'
+        $Obj.SDMPackageXML | Should -Be 'via-method:new-xml'
+    }
+
+    It 'Falls back to property assignment when SetPropertyValue does not exist' {
+        $Obj = [PSCustomObject]@{ SDMPackageXML = 'old' }
+
+        Set-DATResultObjectProperty -ResultObject $Obj -PropertyName 'SDMPackageXML' -Value 'new-xml'
+        $Obj.SDMPackageXML | Should -Be 'new-xml'
+    }
+
+    It 'Throws with every attempted mechanism when nothing can set the property' {
+        $Obj = [PSCustomObject]@{}
+        { Set-DATResultObjectProperty -ResultObject $Obj -PropertyName 'SDMPackageXML' -Value 'x' } |
+            Should -Throw "*Could not set 'SDMPackageXML'*"
+    }
+}

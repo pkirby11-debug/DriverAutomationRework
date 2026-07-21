@@ -2871,6 +2871,70 @@ function Set-DATInstallerReturnCodes {
     return @{ Added = $Added; Updated = $Updated }
 }
 
+function Set-DATResultObjectProperty {
+    <#
+    .SYNOPSIS
+        Sets a property on a ConfigMgr IResultObject across console builds.
+    .DESCRIPTION
+        Get-CMApplication returns the AdminUI SDK's WqlResultObject. Writing a
+        property back (e.g. SDMPackageXML before Put()) has no single API that
+        exists on every console build: some builds expose
+        SetPropertyValue(name, value), others do not have that method at all
+        (field-reported by the first 2.20.1 sync: "does not contain a method
+        named 'SetPropertyValue'", which made the return-code attach fail).
+        Mechanisms are tried in order:
+          1. SetPropertyValue - first, so builds where it works keep the exact
+             behavior that has been shipping.
+          2. The AdminUI SDK indexer property wrapper
+             ($obj['Prop'].StringValue = ...), the documented SDK write path.
+          3. Adapted-property assignment ($obj.Prop = ...), the common
+             community pattern for SDMPackageXML edits.
+        Throws with every attempted mechanism's error when none works, so the
+        caller's warning names the real reason.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $ResultObject,
+
+        [Parameter(Mandatory)]
+        [string]$PropertyName,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    $Attempts = [System.Collections.Generic.List[string]]::new()
+
+    if ($ResultObject.PSObject.Methods['SetPropertyValue']) {
+        try {
+            $ResultObject.SetPropertyValue($PropertyName, $Value)
+            return
+        } catch {
+            $Attempts.Add("SetPropertyValue: $($_.Exception.Message)")
+        }
+    } else {
+        $Attempts.Add('SetPropertyValue: method not present on this console build')
+    }
+
+    try {
+        $ResultObject[$PropertyName].StringValue = $Value
+        return
+    } catch {
+        $Attempts.Add("indexer StringValue: $($_.Exception.Message)")
+    }
+
+    try {
+        $ResultObject.$PropertyName = $Value
+        return
+    } catch {
+        $Attempts.Add("property assignment: $($_.Exception.Message)")
+    }
+
+    throw "Could not set '$PropertyName' on [$($ResultObject.GetType().FullName)]: $($Attempts -join ' | ')"
+}
+
 function Set-DATDeploymentTypeReturnCodes {
     <#
     .SYNOPSIS
@@ -2926,7 +2990,7 @@ function Set-DATDeploymentTypeReturnCodes {
         }
 
         $NewXml = ConvertTo-DATSdkApplicationXml -AppDef $AppDef
-        $App.SetPropertyValue('SDMPackageXML', $NewXml)
+        Set-DATResultObjectProperty -ResultObject $App -PropertyName 'SDMPackageXML' -Value $NewXml
         $App.Put() | Out-Null
         Write-DATLog -Message "Updated return codes on $ApplicationName\$DeploymentTypeName (added=$($Rc.Added), updated=$($Rc.Updated))" -Severity 1
     } catch {

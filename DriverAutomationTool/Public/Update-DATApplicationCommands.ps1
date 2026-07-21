@@ -244,7 +244,7 @@ function Update-DATApplicationCommands {
                 }
 
                 $NewXml = ConvertTo-DATSdkApplicationXml -AppDef $AppDef
-                $CmApp.SetPropertyValue('SDMPackageXML', $NewXml)
+                Set-DATResultObjectProperty -ResultObject $CmApp -PropertyName 'SDMPackageXML' -Value $NewXml
                 $CmApp.Put() | Out-Null
                 Write-DATLog -Message "[$AppName] DT rebuilt in one revision (Mode=$Mode, install-cmd=$InstallCmdNeedsUpdate, return-codes added=$RcAdded updated=$RcUpdated)" -Severity 1
 
