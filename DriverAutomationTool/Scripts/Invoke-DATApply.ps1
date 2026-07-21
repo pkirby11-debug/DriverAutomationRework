@@ -1365,6 +1365,14 @@ function Invoke-DCUDriverUpdates {
     # $null on launch failure/timeout. dcu-cli is a CONSOLE app (unlike DUPs) -
     # its input-validation errors are printed to stdout/stderr in plain text,
     # so both streams are captured per-call for failure diagnostics.
+    # dcu-cli exit 2 = "An unexpected fatal error occurred" - not a per-command
+    # grammar rejection but DCU itself failing. One or two can be transient;
+    # EVERY call exiting 2 (field case: DCU 5.7.0.97, all of run-clamp +
+    # settings-export + catalogLocation returned 2) means the DCU installation
+    # or its 'Dell Client Management Service' is broken on the device. Counted
+    # here so the built-in-engine fallback can say so instead of leaving a trail
+    # of per-command warnings that read like tool bugs.
+    $script:DcuFatalErrorCount = 0
     $RunDcu = {
         param([string[]]$DcuArgs, [int]$TimeoutMs, [string]$Label)
         $OutFile = Join-Path $SessionDir ($Label + '.out.log')
@@ -1378,6 +1386,7 @@ function Invoke-DCUDriverUpdates {
                 try { $P.Kill() } catch { }
                 return $null
             }
+            if ($P.ExitCode -eq 2) { $script:DcuFatalErrorCount++ }
             return $P.ExitCode
         } catch {
             Write-Log "dcu-cli $Label failed to launch: $($_.Exception.Message)" -Severity 2
@@ -1586,10 +1595,20 @@ function Invoke-DCUDriverUpdates {
     # locked even when an old pre-managed pristine was the restore source -
     # the field case where the restore re-enabled dell.com).
     #
-    # Opt-out: Set-DATDellCommandUpdateMode -Mode Default writes
-    # HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode = 'Default',
-    # which skips both assertions (per-run scan purity via
-    # -defaultSourceLocation=disable still applies).
+    # Opt-outs (both markers written by Set-DATDellCommandUpdateMode / the
+    # standalone Set-DATDcuManaged.ps1 to
+    # HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation\DcuManagedMode):
+    #   'Default'     - skips both assertions entirely; the end state restores
+    #                   whatever the box originally had.
+    #   'ManualCloud' - tech-interactive: the run still clamps DCU exactly
+    #                   like a managed device (the engine needs sole control
+    #                   while it works), but the end state re-enables dell.com
+    #                   and BitLocker auto-suspend instead of pinning the
+    #                   persistent curated catalog, so techs can CHECK against
+    #                   Dell's cloud between deployments while autonomy stays
+    #                   off. The marker is never rewritten to DATManaged.
+    # Per-run scan purity via -defaultSourceLocation=disable applies to all
+    # modes.
     $DcuManagedMode = $null
     try { $DcuManagedMode = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation' -Name 'DcuManagedMode' -ErrorAction Stop).DcuManagedMode } catch { }
     # Sequence trimmed to what 5.6.0.17's named-key results proved viable:
@@ -1610,22 +1629,40 @@ function Invoke-DCUDriverUpdates {
         'updatesNotification'   = 'disable'
         'autoSuspendBitLocker'  = 'disable'
     }
-    $AssertDcuManaged = {
-        param([string]$Phase)
+    # ManualCloud end state: dell.com back on as the interactive source,
+    # autonomy still fully clamped, BitLocker auto-suspend re-enabled so a
+    # tech-driven BIOS install through the DCU GUI behaves like stock DCU
+    # (during engine runs Suspend-BitLockerForFlash owns BitLocker instead).
+    # Applied post-run only - see the end-state block in the finally.
+    $DcuManualCloudSequence = [ordered]@{
+        'defaultSourceLocation' = 'enable'
+        'scheduleManual'        = ''
+        'scheduleAction'        = 'NotifyAvailableUpdates'
+        'updatesNotification'   = 'disable'
+        'autoSuspendBitLocker'  = 'enable'
+    }
+    $AssertDcuSequence = {
+        param([string]$Phase, [System.Collections.IDictionary]$Sequence, [string]$Label)
         $OkKeys = @()
         $BadKeys = @()
-        foreach ($K in $DcuManagedSequence.Keys) {
-            $V = $DcuManagedSequence[$K]
+        foreach ($K in $Sequence.Keys) {
+            $V = $Sequence[$K]
             $OptArg = if ($V) { "-$K=$V" } else { "-$K" }
-            $RC = & $RunDcu @('/configure', $OptArg, "-outputLog=$SessionDir\dcu-managed-$Phase-$K.log") 120000 "managed-$Phase-$K"
+            $RC = & $RunDcu @('/configure', $OptArg, "-outputLog=$SessionDir\dcu-$Label-$Phase-$K.log") 120000 "$Label-$Phase-$K"
             if ($RC -eq 0) { $OkKeys += $K } else { $BadKeys += ("{0}(exit {1})" -f $K, $(if ($null -eq $RC) { 'timeout' } else { $RC })) }
         }
-        Write-Log "DCU locked to DAT-managed mode [$Phase]: applied $($OkKeys -join ', '); not supported: $(if ($BadKeys.Count -gt 0) { $BadKeys -join ', ' } else { 'none' })"
+        Write-Log "DCU locked to $Label mode [$Phase]: applied $(if ($OkKeys.Count -gt 0) { $OkKeys -join ', ' } else { 'none' }); not supported: $(if ($BadKeys.Count -gt 0) { $BadKeys -join ', ' } else { 'none' })"
     }
     if ($DcuManagedMode -eq 'Default') {
         Write-Log "DCU managed mode: device is explicitly opted out (DcuManagedMode=Default) - leaving DCU autonomy settings as-is" -Severity 2
+    } elseif ($DcuManagedMode -eq 'ManualCloud') {
+        # Same run clamps as a managed device so the engine keeps sole control
+        # of DCU while it works; the ManualCloud end state comes back in the
+        # end-state block. Marker deliberately NOT rewritten.
+        Write-Log "DCU managed mode: device is opted into ManualCloud (tech-interactive) - clamping DCU for this run only; dell.com and BitLocker auto-suspend are restored in the end state"
+        & $AssertDcuSequence 'pre-run' $DcuManagedSequence 'run-clamp'
     } else {
-        & $AssertDcuManaged 'pre-run'
+        & $AssertDcuSequence 'pre-run' $DcuManagedSequence 'DAT-managed'
         # Marker for inventory/visibility and so the cmdlet/standalone script
         # see a consistent state. Idempotent.
         try {
@@ -1696,6 +1733,14 @@ function Invoke-DCUDriverUpdates {
                 Write-Log "dcu-cli /configure -catalogLocation failed (exit $(if ($null -eq $CfgCode) { 'timeout/launch' } else { $CfgCode })) - falling back to built-in DUP engine" -Severity 2
                 & $TailConsole 'configure'
                 & $TailLog "$SessionDir\dcu-configure.log"
+                if ($CfgCode -eq 2 -and $script:DcuFatalErrorCount -ge 3) {
+                    # Not a grammar/settings issue: every dcu-cli invocation this
+                    # run has died with the same generic fatal error, before any
+                    # catalog work happened. The DCU installation itself is the
+                    # problem - name it so the trail of exit-2 warnings above
+                    # doesn't read as a tool bug.
+                    Write-Log "DCU HEALTH: $script:DcuFatalErrorCount dcu-cli call(s) this run all exited 2 ('An unexpected fatal error occurred') - the Dell Command Update installation on this device (version $(if ($DcuVersion) { $DcuVersion } else { 'unknown' })) appears broken, not any specific setting. Check that the 'Dell Client Management Service' is running, or repair/reinstall DCU. Driver installs are unaffected this run (built-in DUP engine covers them)." -Severity 3
+                }
                 return $null
             }
             $CatalogInUse = $LocalCatalog
@@ -1818,21 +1863,19 @@ function Invoke-DCUDriverUpdates {
             return $null
         }
         if ($ScanCode -eq 500) {
-            Write-Log "DCU scan: no applicable updates from the package catalog - everything current"
             # Signal to BIOSDCU's wrapper (Install-BIOSDCU) that DCU saw the
-            # catalog but concluded nothing applies. For DriverUpdates that's
-            # the expected steady-state. For BIOSDCU the manifest has exactly
-            # one BIOS DUP that sync resolved as newer than the model's
-            # catalog version AND the apply-side pre-flash check just
+            # catalog but concluded nothing applies. For BIOSDCU the manifest
+            # has exactly one BIOS DUP that sync resolved as newer than the
+            # model's catalog version AND the apply-side pre-flash check just
             # verified the device is behind, so a "nothing applicable"
             # verdict is almost certainly DCU's applicability rules
             # (SystemID match, dellVersion parse, SupportedDevices etc.)
             # disagreeing with the catalog - in which case BIOSDCU should
             # NOT exit clean; it should fall back to Flash64W whose DUP
-            # framework re-evaluates against the device directly. Setting
-            # the flag here and leaving the return value at 0 keeps
-            # DriverUpdates' existing semantics intact.
+            # framework re-evaluates against the device directly.
             $script:DCUNoApplicable = $true
+
+            Write-Log "DCU scan exit 500 ('no updates available') - verifying the verdict against DCU's own scan report before trusting it"
 
             # Diagnostic dump when the verdict is "nothing applicable" but the
             # admin has reason to expect updates (field case: a manifest entry
@@ -1847,6 +1890,33 @@ function Invoke-DCUDriverUpdates {
             Write-Log "  Diagnostic: manifest contains $($Drivers.Count) driver(s); first 5: $ManifestSample" -Severity 2
             $ScanReportItems = @(& $ParseScanReport $ReportDir)
             Write-Log "  Diagnostic: scan report contains $($ScanReportItems.Count) <Update> node(s) (0 confirms DCU's verdict was 'nothing applicable')" -Severity 2
+
+            # Distrust guard, DriverUpdates counterpart of the BIOSDCU
+            # Flash64W fallback. Field-confirmed on an OptiPlex 7020 Tower:
+            # dcu-cli exited 500 ("No updates available") while its own
+            # -report XML listed the package's Intel PCIe Ethernet Controller
+            # DUP (20.0.3.28) - the device was genuinely behind, and a manual
+            # DCU scan installed that exact DUP the same morning. When the
+            # verdict contradicts the report on one of OUR staged DUPs, hand
+            # the run to the built-in DUP engine: each DUP's own framework
+            # re-evaluates applicability against the device directly,
+            # not-applicable DUPs self-skip with exit 3/4/5, and the
+            # per-component version markers keep repeat cycles cheap.
+            # Foreign-only report nodes (DCU's system-update channel riding
+            # along) don't trigger the fallback - with none of ours listed,
+            # "nothing applicable" is the true steady-state verdict.
+            $OursInReport = @($ScanReportItems | Where-Object { $_.IsOurs })
+            if ($OursInReport.Count -gt 0) {
+                $OursDesc = @($OursInReport | Select-Object -First 5 | ForEach-Object {
+                    if ($_.Name) { $_.Name } elseif ($_.File) { $_.File } else { '(unnamed)' }
+                }) -join '; '
+                Write-Log "DCU's verdict contradicts its own scan report: exit 500 ('no applicable updates') but the report lists $($OursInReport.Count) update(s) from THIS package: $OursDesc. Distrusting the verdict - falling back to the built-in DUP engine." -Severity 2
+                & $TailConsole 'scan'
+                & $TailLog $ScanLog
+                return $null
+            }
+
+            Write-Log "DCU scan: no applicable updates from the package catalog (scan report lists none of this package's DUPs, so the verdict is corroborated) - everything current"
             & $TailConsole 'scan'
             & $TailLog $ScanLog
             Write-Log "  If a manifest driver IS newer than what is installed and you expected DCU to apply it, paste a sample SoftwareComponent from $LocalCatalogXml back - applicability evaluation depends on <SupportedDevices> PCI VEN/DEV matching the device, and catalog metadata can target a specific hardware config within a model line." -Severity 2
@@ -1965,12 +2035,15 @@ function Invoke-DCUDriverUpdates {
                     # runtime conditions the catalog-only scan doesn't evaluate
                     # (Dell BIOS DUP framework checks for AC power, battery
                     # level, pending reboot, etc.), so this is the operative
-                    # "DCU disagreed with itself" signal - flag it for the
-                    # BIOSDCU wrapper to fall back to Flash64W, whose DUP
-                    # framework re-evaluates against the device directly.
-                    Write-Log "DCU applyUpdates: no applicable updates (exit 500) - scan had matched one or more updates but applyUpdates' internal re-scan declined them all (typical when the DUP framework's runtime conditions - AC power, battery level, pending reboot, TPM/Secure Boot state - aren't met)" -Severity 2
+                    # "DCU disagreed with itself" signal. The flag sends the
+                    # BIOSDCU wrapper to Flash64W; returning $null sends
+                    # DriverUpdates to the built-in DUP engine - in both cases
+                    # each DUP's own framework re-evaluates against the device
+                    # directly and self-skips (exit 3/4/5) when a runtime
+                    # condition genuinely blocks it.
+                    Write-Log "DCU applyUpdates: no applicable updates (exit 500) - scan had matched one or more updates but applyUpdates' internal re-scan declined them all (typical when the DUP framework's runtime conditions - AC power, battery level, pending reboot, TPM/Secure Boot state - aren't met). Distrusting the verdict - falling back to the built-in DUP engine." -Severity 2
                     $script:DCUNoApplicable = $true
-                    $ApplyResult = 0
+                    $ApplyResult = $null
                 }
             default {
                 Write-Log "DCU applyUpdates FAILED (dcu-cli exit $ApplyCode)" -Severity 3
@@ -1994,7 +2067,7 @@ function Invoke-DCUDriverUpdates {
         # this run's backup unless it was already hijacked by a failed prior
         # restore.
         if ($CatalogConfigured) {
-            if ($DcuManagedMode -ne 'Default') {
+            if ($DcuManagedMode -ne 'Default' -and $DcuManagedMode -ne 'ManualCloud') {
                 # MANAGED END STATE (sole-update-source design). The pristine
                 # restore is deliberately NOT performed here - importing
                 # pre-managed settings is exactly what kept re-enabling
@@ -2098,12 +2171,14 @@ function Invoke-DCUDriverUpdates {
                     # run after reboot does it for free.
                     Write-Log "Skipping post-run DAT-managed mode re-assertion (reboot pending from this run's successful flash; dcu-cli would refuse every /configure with exit 5). The pre-run lockdown is still in effect and the next engine run after reboot re-asserts."
                 } else {
-                    & $AssertDcuManaged 'post-run'
+                    & $AssertDcuSequence 'post-run' $DcuManagedSequence 'DAT-managed'
                 }
             } else {
-                # OPTED-OUT devices get the polite behavior: restore whatever
-                # the box had. Source: pristine (true original) when
-                # available, else this run's backup unless hijacked.
+                # OPTED-OUT devices (Default and ManualCloud) get the polite
+                # behavior: restore whatever the box had. Source: pristine
+                # (true original) when available, else this run's backup
+                # unless hijacked. ManualCloud devices additionally get their
+                # end-state sequence asserted after the restore, below.
                 $RestoreSource = $null
                 if (Test-Path $PristineSettings) { $RestoreSource = $PristineSettings }
                 elseif ($SettingsBackupFile -and -not $BackupHijacked) { $RestoreSource = $SettingsBackupFile }
@@ -2136,6 +2211,21 @@ function Invoke-DCUDriverUpdates {
                     }
                 } else {
                     Write-Log "No trustworthy DCU settings source to restore (no pristine copy, and the current settings already pointed at a session catalog) - reconfigure the catalog in the DCU GUI or import an older settings-backup from $WorkRoot\DCU\<session>\settings-backup manually" -Severity 2
+                }
+
+                if ($DcuManagedMode -eq 'ManualCloud') {
+                    # The restored settings are whatever the box originally had
+                    # (a long-managed device's pristine may even carry Dell
+                    # factory autonomy or a pinned catalog). Re-assert the
+                    # ManualCloud end state on top: dell.com on for interactive
+                    # scans, autonomy off, BitLocker auto-suspend on. Runs even
+                    # when no restore source existed - the sequence is
+                    # self-contained.
+                    if ($script:RebootRequired) {
+                        Write-Log "Deferred re-asserting the ManualCloud end state (dcu-cli refuses /configure with exit 5 until the pending reboot clears); the next engine run after reboot re-asserts."
+                    } else {
+                        & $AssertDcuSequence 'post-run' $DcuManualCloudSequence 'ManualCloud'
+                    }
                 }
             }
         }
@@ -2255,10 +2345,22 @@ function Install-DriverUpdates {
     $RebootCodes     = @(2, 6)
     $PerDupTimeoutMs = 900000  # 15 minutes per DUP
 
+    # Persistent-failure quarantine: after this many CONSECUTIVE vendor-exit
+    # failures of the SAME manifest version on this device, the DUP is skipped
+    # (with an advisory) instead of failing the whole application forever.
+    # Field driver: Intel Dynamic Tuning vA07 dying in 2.6s with "Installer
+    # execution Error: -1" on a Dell Pro Micro - a deterministic vendor
+    # installer bug on that hardware that re-failed every cycle and kept a
+    # 25-DUP app permanently red over one DUP. Two strikes so a transient
+    # failure (locked files, pending reboot) still gets one clean retry. A new
+    # version in the manifest, or one success, resets the ledger.
+    $QuarantineThreshold = 2
+
     $Successful   = 0
     $NotApply     = 0
     $Failed       = 0
     $AlreadyInst  = 0
+    $Quarantined  = 0
     $Rebooted     = $false
     $FailureLines = [System.Collections.Generic.List[string]]::new()
 
@@ -2492,6 +2594,24 @@ function Install-DriverUpdates {
             } catch { }
         }
 
+        # Persistent-failure quarantine (see $QuarantineThreshold above): this
+        # exact version has repeatedly failed on this device - skip it so one
+        # broken vendor installer doesn't keep the whole application red. Only
+        # vendor-exit failures build the ledger; a missing/quarantined-by-AV
+        # file stays a hard failure because its fix is an admin action.
+        if (Test-Path $CompKeyPath) {
+            try {
+                $CProps = Get-ItemProperty -Path $CompKeyPath -ErrorAction Stop
+                if ($CProps.PSObject.Properties['FailedVersion'] -and
+                    $CProps.FailedVersion -eq $Drv.Version -and
+                    [int]$CProps.FailCount -ge $QuarantineThreshold) {
+                    Write-Log "$DriverLabel - QUARANTINED: v$($Drv.Version) failed $($CProps.FailCount) consecutive time(s) on this device (last exit $($CProps.LastFailExit) at $($CProps.LastFailAt)) - the vendor installer is deterministically broken here. Skipping; a newer version in the manifest re-arms it automatically. To force a retry now, delete HKLM:\...\DriverUpdates\Components\$CompKey." -Severity 2
+                    $Quarantined++
+                    continue
+                }
+            } catch { }
+        }
+
         if (-not (Test-Path $DriverExe)) {
             # A missing DUP .EXE is most often AV/Defender quarantining it in the
             # CM cache. Surface it loudly and recommend the exclusion. (Hardware
@@ -2661,6 +2781,10 @@ function Install-DriverUpdates {
                 New-ItemProperty -Path $CompKeyPath -Name 'Name'       -Value $Drv.Name    -PropertyType String -Force | Out-Null
                 New-ItemProperty -Path $CompKeyPath -Name 'InstalledOn' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
                 New-ItemProperty -Path $CompKeyPath -Name 'ExitCode'   -Value $DupCode     -PropertyType DWord -Force | Out-Null
+                # Success resets the persistent-failure ledger.
+                foreach ($FProp in 'FailedVersion', 'FailCount', 'LastFailExit', 'LastFailAt') {
+                    Remove-ItemProperty -Path $CompKeyPath -Name $FProp -ErrorAction SilentlyContinue
+                }
             } catch {
                 Write-Log "  Failed to write component marker for $($Drv.FileName): $($_.Exception.Message)" -Severity 2
             }
@@ -2687,6 +2811,32 @@ function Install-DriverUpdates {
                 $Failed++
                 $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
                 if ($Elapsed -lt 2) { $InstantFailed++ }
+
+                # Persistent-failure ledger (consumed by the quarantine
+                # pre-check above). Same version failing again increments the
+                # count; a different version starts a fresh ledger.
+                try {
+                    if (-not (Test-Path $CompKeyPath)) {
+                        New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null
+                    }
+                    $PrevFailVer = $null
+                    $PrevCount = 0
+                    try {
+                        $Prev = Get-ItemProperty -Path $CompKeyPath -ErrorAction Stop
+                        if ($Prev.PSObject.Properties['FailedVersion']) {
+                            $PrevFailVer = $Prev.FailedVersion
+                            $PrevCount = [int]$Prev.FailCount
+                        }
+                    } catch { }
+                    $NewCount = if ($PrevFailVer -eq $Drv.Version) { $PrevCount + 1 } else { 1 }
+                    New-ItemProperty -Path $CompKeyPath -Name 'FailedVersion' -Value $Drv.Version -PropertyType String -Force | Out-Null
+                    New-ItemProperty -Path $CompKeyPath -Name 'FailCount'     -Value $NewCount     -PropertyType DWord  -Force | Out-Null
+                    New-ItemProperty -Path $CompKeyPath -Name 'LastFailExit'  -Value $DupCode      -PropertyType DWord  -Force | Out-Null
+                    New-ItemProperty -Path $CompKeyPath -Name 'LastFailAt'    -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
+                    if ($NewCount -ge $QuarantineThreshold) {
+                        Write-Log "$DriverLabel - v$($Drv.Version) has now failed $NewCount consecutive time(s) on this device; future runs will QUARANTINE (skip) it until a newer version ships, so this one DUP stops failing the application" -Severity 2
+                    }
+                } catch { }
                 # Pull the verdict out of Dell's framework log so the apply log
                 # itself says why. No framework log after a failure = the process
                 # was killed before Dell's framework initialized (AV/EDR pattern).
@@ -2767,7 +2917,7 @@ function Install-DriverUpdates {
                 "Manual differential (elevated cmd): run any failed DUP as '<name>.EXE /s /l=C:\Windows\Temp\duptest.log' - if it installs by hand, the block is specific to the CCMExec-spawned context.") -Severity 3
         }
     }
-    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Failed failed$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
+    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Quarantined quarantined (persistent vendor failures, skipped), $Failed failed$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
     }
