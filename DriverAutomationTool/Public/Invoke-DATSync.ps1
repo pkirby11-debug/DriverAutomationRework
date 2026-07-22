@@ -117,7 +117,9 @@ function Invoke-DATSync {
         [bool]$IncludeDrivers = $true,
         [bool]$IncludeBIOS = $false,
         # Catalog-only "Driver Updates" application: skips the OEM base pack and builds a
-        # package containing only Dell catalog DUPs (the same feed DCU consumes). Dell-only.
+        # package containing only per-model catalog updates. Dell: catalog DUPs (the same
+        # feed DCU consumes). Lenovo: per-machine-type update packages (the same feed
+        # Lenovo System Update / Thin Installer consume). Other makes are skipped.
         [bool]$IncludeDriverUpdates = $false,
         # BIOS Updates (DCU) application: single-BIOS package per sync, installed by the
         # same DCU engine as DriverUpdates with a Flash64W fallback. Dell-only.
@@ -149,14 +151,24 @@ function Invoke-DATSync {
         # driver never reaches a client by any engine.
         [string[]]$ExcludeDrivers = @(),
 
-        # Screen each DriverUpdates DUP against the Microsoft Vulnerable
-        # Driver Blocklist before staging (the list the Defender ASR rule
-        # "Block abuse of in-the-wild exploited vulnerable signed drivers"
-        # enforces). Advisory: matches are logged loudly with the exact
-        # exclusion to add, but the DUP still ships until the admin excludes
-        # it. Verdicts are cached per DUP, so only new/changed DUPs and
-        # blocklist updates cost extraction time.
+        # Screen driver content against the Microsoft Vulnerable Driver
+        # Blocklist (the list the Defender ASR rule "Block abuse of
+        # in-the-wild exploited vulnerable signed drivers" enforces):
+        # DriverUpdates payloads (Dell DUPs and Lenovo catalog packages)
+        # before staging, and the extracted base Drivers packs of every make
+        # (Dell CAB / Lenovo pack / Surface MSI) before packaging. Update
+        # verdicts are cached per payload, so only new/changed payloads and
+        # blocklist updates cost extraction time; base-pack scans read the
+        # already-extracted tree.
         [bool]$ScreenVulnerableDrivers = $true,
+
+        # What a screening HIT does. $true (default): the driver is added to
+        # the persistent exclusion ledger (see Add-DATDriverExclusion) and
+        # skipped - it never ships, on this sync or any future one, without
+        # the admin touching the exclusion list. $false: legacy advisory
+        # behavior - the hit is logged loudly with the exact exclusion to add,
+        # but the payload still ships until excluded by hand.
+        [bool]$AutoExcludeVulnerableDrivers = $true,
 
         [switch]$VerifyDownloadHash,
 
@@ -175,11 +187,13 @@ function Invoke-DATSync {
     $ErrorCount = 0
 
     # Vulnerable-driver screening state. The blocklist loads lazily on the
-    # first DriverUpdates DUP so non-DriverUpdates syncs never pay for it;
-    # vulnerable findings accumulate here for the end-of-sync summary.
+    # first DriverUpdates payload so non-DriverUpdates syncs never pay for it;
+    # findings accumulate here for the end-of-sync summaries. Both lists are
+    # mutated (.Add) from Invoke-DATSyncSinglePackage via parent-scope reads.
     $VulnBlocklist = $null
     $VulnBlocklistLoaded = $false
     $VulnerableFound = [System.Collections.Generic.List[string]]::new()
+    $AutoExcludedDrivers = [System.Collections.Generic.List[string]]::new()
 
     # Stages Dell's Inventory Collector (invcol) into a DriverUpdates package
     # and returns the catalog reference for Write-DATDCUCatalog. DCU downloads
@@ -239,6 +253,7 @@ function Invoke-DATSync {
         if ($null -ne $Config.options.wimExcludeDirs)  { $WimExcludeDirs  = @($Config.options.wimExcludeDirs) }
         if ($null -ne $Config.options.excludeDrivers)  { $ExcludeDrivers  = @($Config.options.excludeDrivers) }
         if ($null -ne $Config.options.screenVulnerableDrivers) { $ScreenVulnerableDrivers = [bool]$Config.options.screenVulnerableDrivers }
+        if ($null -ne $Config.options.autoExcludeVulnerableDrivers) { $AutoExcludeVulnerableDrivers = [bool]$Config.options.autoExcludeVulnerableDrivers }
         $WimOptimizeExport = [switch]$Config.options.wimOptimizeExport
         $WebhookUrl = $Config.logging.webhookUrl
 
@@ -250,6 +265,16 @@ function Invoke-DATSync {
     Write-DATLog -Message "Manufacturers: $($Manufacturer -join ', ')" -Severity 1
     Write-DATLog -Message "OS: $OperatingSystem ($Architecture)" -Severity 1
     Write-DATLog -Message "Models: $(if ($Models) { $Models -join ', ' } else { 'All available' })" -Severity 1
+    # Merge the persistent exclusion ledger (auto-added by vulnerable-driver
+    # screening + Add-DATDriverExclusion) into the admin-typed patterns.
+    # Everything downstream - Dell and Lenovo resolvers, smart-check
+    # fingerprints and staging - reads $ExcludeDrivers, so this single merge
+    # point keeps every pass consistent.
+    $LedgerPatterns = @(Get-DATDriverExclusion | ForEach-Object { $_.Pattern } | Where-Object { $_ })
+    if ($LedgerPatterns.Count -gt 0) {
+        Write-DATLog -Message "Driver exclusion ledger active: $($LedgerPatterns.Count) pattern(s) ($($LedgerPatterns -join '; ')) - see Get-DATDriverExclusion" -Severity 1
+        $ExcludeDrivers = @(@($ExcludeDrivers) + $LedgerPatterns | Where-Object { $_ } | Select-Object -Unique)
+    }
     if ($ExcludeDrivers.Count -gt 0) {
         Write-DATLog -Message "Driver exclusions active: $($ExcludeDrivers -join '; ')" -Severity 1
     }
@@ -329,14 +354,60 @@ function Invoke-DATSync {
                 }
             }
 
-            # --- DRIVER UPDATES (catalog-only, Dell only) ---
-            # Builds a package from the Dell per-model catalog DUPs without touching
-            # the OEM base driver pack. Used when the base pack's complex DCH driver
-            # INFs (Intel iigd_dch, NVIDIA nvdd, Storage VMD, etc.) fail to import via
-            # pnputil but the standalone catalog DUPs install cleanly.
+            # --- DRIVER UPDATES (catalog-only, Dell + Lenovo) ---
+            # Builds a package from the OEM's per-model update catalog without touching
+            # the OEM base driver pack. Dell: per-model catalog DUPs (used when the base
+            # pack's complex DCH driver INFs - Intel iigd_dch, NVIDIA nvdd, Storage VMD,
+            # etc. - fail to import via pnputil but the standalone catalog DUPs install
+            # cleanly). Lenovo: per-machine-type update packages from the same feed
+            # Lenovo System Update / Thin Installer consume, each carrying its own
+            # silent install command.
             if ($IncludeDriverUpdates) {
-                if ($Make -ne 'Dell') {
-                    Write-DATLog -Message "Driver Updates (catalog-only) is currently Dell-only - skipping $Make $ModelName" -Severity 2
+                if ($Make -eq 'Lenovo') {
+                    try {
+                        # The Lenovo catalog lookup needs only the machine type(s) -
+                        # there is no base pack involved and nothing is downloaded yet.
+                        $MTypes = @(Find-LenovoMachineType -Model $ModelName)
+                        if (-not $MTypes -or $MTypes.Count -eq 0) {
+                            Write-DATLog -Message "Cannot resolve machine types for Lenovo $ModelName - skipping catalog-only Driver Updates" -Severity 2
+                        } else {
+                            $UpdatesInfo = [PSCustomObject]@{
+                                Manufacturer    = 'Lenovo'
+                                Model           = $ModelName
+                                # Placeholder; gets replaced with "Cat.<fingerprint>" after catalog scan.
+                                Version         = 'Catalog'
+                                ReleaseDate     = '1970-01-01T00:00:00'
+                                SystemID        = $null
+                                MachineType     = $MTypes[0]
+                                AllMachineTypes = ($MTypes -join ';')
+                                OS              = $OperatingSystem
+                                Url             = $null
+                                FileName        = $null
+                                Size            = 0
+                                HashMD5         = $null
+                            }
+
+                            $UpdResult = Invoke-DATSyncSinglePackage -PackageInfo $UpdatesInfo `
+                                -Type 'DriverUpdates' -DownloadPath $DownloadPath -PackagePath $PackagePath `
+                                -OperatingSystem $OperatingSystem -Architecture $Architecture `
+                                -EnableBDR:$EnableBDR -RemoveLegacy:$RemoveLegacy -CleanSource:$CleanSource `
+                                -CompressPackage:$CompressPackage -CompressionType $CompressionType `
+                                -WimExcludeFiles $WimExcludeFiles -WimExcludeDirs $WimExcludeDirs -WimOptimizeExport:$WimOptimizeExport `
+                                -DeploymentPlatform $DeploymentPlatform `
+                                -UpdateIndividualDrivers `
+                                -VerifyDownloadHash:$VerifyDownloadHash `
+                                -DistributionPoints $DistributionPoints `
+                                -DistributionPointGroups $DistributionPointGroups `
+                                -ForceRefresh:$ForceRefresh
+
+                            $SyncResults.Add($UpdResult)
+                        }
+                    } catch {
+                        $ErrorCount++
+                        Write-DATLog -Message "Error processing driver updates for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
+                    }
+                } elseif ($Make -ne 'Dell') {
+                    Write-DATLog -Message "Driver Updates (catalog-only) supports Dell and Lenovo - skipping $Make $ModelName" -Severity 2
                 } else {
                     try {
                         # Reuse Get-DellDriverPack purely to derive SystemID/MachineType for
@@ -493,8 +564,12 @@ function Invoke-DATSync {
     $SkipCount = ($SyncResults | Where-Object { $_.Status -eq 'Skipped' }).Count
 
     if ($VulnerableFound.Count -gt 0) {
-        Write-DATLog -Message ("VULNERABLE-DRIVER SUMMARY: $($VulnerableFound.Count) packaged DUP(s) match Microsoft's vulnerable-driver blocklist and will trip Defender ASR fleet-wide: " +
+        Write-DATLog -Message ("VULNERABLE-DRIVER SUMMARY: $($VulnerableFound.Count) packaged payload(s) match Microsoft's vulnerable-driver blocklist and will trip Defender ASR fleet-wide: " +
             ($VulnerableFound -join '; ') + ". Add these to Driver exclusions and re-sync to stop the alerts at the source.") -Severity 3
+    }
+    if ($AutoExcludedDrivers.Count -gt 0) {
+        Write-DATLog -Message ("AUTO-EXCLUDED VULNERABLE DRIVERS: $($AutoExcludedDrivers.Count) payload(s) matched Microsoft's vulnerable-driver blocklist, were added to the exclusion ledger, and were left out of today's package(s): " +
+            ($AutoExcludedDrivers -join '; ') + ". They stay excluded on every future sync (review with Get-DATDriverExclusion; undo with Remove-DATDriverExclusion). Package versions settle on the next sync.") -Severity 3
     }
     Write-DATLog -Message "======== Sync Complete ========" -Severity 1
     Write-DATLog -Message "Duration: $([math]::Round($Duration.TotalMinutes, 1)) minutes" -Severity 1
@@ -710,7 +785,8 @@ function Invoke-DATSyncSinglePackage {
     # below; both must agree on which packages are eligible.
     $OverlayApplies = (
         ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers' -and $IsApplication) -or
-        ($Make -eq 'Dell' -and $Type -eq 'DriverUpdates')
+        ($Make -eq 'Dell' -and $Type -eq 'DriverUpdates') -or
+        ($Make -eq 'Lenovo' -and $Type -eq 'DriverUpdates')
     )
 
     # base version (e.g. "A01.OVL.abc123" starts with "A01") - these are previous overlay runs
@@ -721,7 +797,7 @@ function Invoke-DATSyncSinglePackage {
     # DriverUpdates packages versioned as "Cat.<fingerprint>" (no base pack involved).
     # The previous deployment's version IS the overlay fingerprint, so we treat any
     # existing DriverUpdates package as the candidate to fingerprint-compare against.
-    if ($Make -eq 'Dell' -and $Type -eq 'DriverUpdates' -and -not $Existing) {
+    if ($Type -eq 'DriverUpdates' -and -not $Existing) {
         $OverlayExisting = $AllExisting | Where-Object { $_.Version -like 'Cat.*' }
     }
 
@@ -744,7 +820,7 @@ function Invoke-DATSyncSinglePackage {
     $SmartCheckEnabled = ($OverlayApplies -and ($Existing -or $OverlayExisting))
     if ($SmartCheckEnabled) {
         try {
-            Write-DATLog -Message "Checking if individual Dell drivers have changed for $ModelName..." -Severity 1
+            Write-DATLog -Message "Checking if individual $Make catalog drivers have changed for $ModelName..." -Severity 1
 
             # Scan the existing package source to detect missing categories for a more accurate smart check.
             $SmartCheckMissing = @()
@@ -755,7 +831,12 @@ function Invoke-DATSyncSinglePackage {
                 if ($Existing -is [array]) { $Existing[0] } else { $Existing }
             } else { $null }
 
-            if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
+            if ($Make -eq 'Lenovo') {
+                # Lenovo: no base pack and no INF categories to scan - the
+                # resolved catalog list below is authoritative on its own, so
+                # the no-change skip is safe without a source scan.
+                $SourceScanComplete = $true
+            } elseif ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
                 Write-DATLog -Message "Smart check: scanning package source: $($ExPkg.SourcePath)" -Severity 1
                 $InfScanResult = Get-DATBasePackCategories -Path $ExPkg.SourcePath
                 $PresentCats = $InfScanResult.Categories
@@ -848,7 +929,17 @@ function Invoke-DATSyncSinglePackage {
             if ($ForceRefresh) {
                 $GetDriverParams['ForceRefresh'] = $true
             }
-            $CachedIndividualDrivers = Get-DellIndividualDrivers @GetDriverParams
+            $CachedIndividualDrivers = if ($Make -eq 'Lenovo') {
+                # Lenovo resolver takes the machine types straight from the
+                # package info; the Dell-shaped $GetDriverParams don't apply.
+                # The result is reused by the staging block below, so the
+                # Lenovo catalog XMLs are fetched once per model per sync.
+                Get-LenovoIndividualUpdates -Model $ModelName `
+                    -MachineTypes @(($PackageInfo.AllMachineTypes -split ';') | Where-Object { $_ }) `
+                    -OperatingSystem $PackageInfo.OS -ExcludeDrivers $ExcludeDrivers
+            } else {
+                Get-DellIndividualDrivers @GetDriverParams
+            }
 
             if ($CachedIndividualDrivers -and $CachedIndividualDrivers.Count -gt 0) {
                 # Build fingerprint: sorted "Name=Version" strings hashed together
@@ -878,8 +969,9 @@ function Invoke-DATSyncSinglePackage {
                     # writes it never runs). Only DUPs actually present in the
                     # existing source go in. The refresh below distributes the
                     # updated content; if the catalog was already current this is
-                    # a no-op and the content hash doesn't churn.
-                    if ($Type -eq 'DriverUpdates' -and $ExistingToCheck.SourcePath -and (Test-Path $ExistingToCheck.SourcePath)) {
+                    # a no-op and the content hash doesn't churn. Dell-only: the
+                    # Lenovo engine has no DCU-equivalent repository catalog.
+                    if ($Make -eq 'Dell' -and $Type -eq 'DriverUpdates' -and $ExistingToCheck.SourcePath -and (Test-Path $ExistingToCheck.SourcePath)) {
                         $OnDisk = @($CachedIndividualDrivers | Where-Object {
                             $_.FileName -and (Test-Path (Join-Path $ExistingToCheck.SourcePath $_.FileName))
                         })
@@ -1347,6 +1439,194 @@ function Invoke-DATSyncSinglePackage {
         Write-DATLog -Message "Extraction complete: $($ExtractedFiles.Count) files in $PackageSourceDir" -Severity 1
         }  # end "if ($Type -ne 'DriverUpdates')"
 
+        # --- Lenovo catalog-only Driver Updates staging ---
+        # The package is built ENTIRELY from Lenovo's per-machine-type update
+        # catalog (the feed Lenovo System Update / Thin Installer consume) -
+        # there is no base pack. Each eligible package lands in its own
+        # subfolder named by package id (multi-file packages and duplicate
+        # payload filenames across packages stay isolated) next to its
+        # descriptor XML, and manifest.json tells the apply script how to run
+        # each one silently. Failures here are fatal for the package (the
+        # catalog scan IS the content), matching the Dell DriverUpdates
+        # contract: the exception propagates so the caller logs an error and
+        # skips distribution.
+        if ($OverlayApplies -and $Make -eq 'Lenovo') {
+            Write-DATLog -Message "Resolving Lenovo catalog updates for $ModelName (catalog-only Driver Updates)..." -Severity 1
+
+            # Reuse the smart check's resolve when it ran; otherwise this is a
+            # fresh package and we resolve now. Where-Object strips the $null
+            # that $CachedIndividualDrivers holds when no smart check ran
+            # (@($null).Count is 1, which would skip the resolve).
+            $LenovoUpdates = @($CachedIndividualDrivers | Where-Object { $_ })
+            if ($LenovoUpdates.Count -eq 0) {
+                # Where-Object also strips the $null the resolver returns when
+                # it cannot resolve machine types (@($null).Count would be 1).
+                $LenovoUpdates = @(Get-LenovoIndividualUpdates -Model $ModelName `
+                    -MachineTypes @(($PackageInfo.AllMachineTypes -split ';') | Where-Object { $_ }) `
+                    -OperatingSystem $PackageInfo.OS -ExcludeDrivers $ExcludeDrivers | Where-Object { $_ })
+            }
+            if ($LenovoUpdates.Count -eq 0) {
+                throw "No eligible Lenovo catalog updates resolved for $ModelName - cannot build catalog-only Driver Updates package"
+            }
+
+            $ManifestEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+            foreach ($Upd in $LenovoUpdates) {
+                Write-DATLog -Message "  [UPDATE] Staging: $($Upd.Category) - $($Upd.Name) v$($Upd.Version) ($($Upd.ReleaseDate))" -Severity 1
+                $PkgDir = Join-Path $PackageSourceDir $Upd.Id
+                New-Item -Path $PkgDir -ItemType Directory -Force | Out-Null
+
+                # Serial downloads through Invoke-DATDownload keep its
+                # exponential-backoff retry behavior; Lenovo payloads are
+                # smaller than Dell DUP sets so the parallel machinery the
+                # Dell branch grew isn't needed here yet.
+                $AllFilesOk = $true
+                foreach ($UpdFile in $Upd.Files) {
+                    try {
+                        Write-DATLog -Message "    Downloading: $($UpdFile.Name)" -Severity 1
+                        $FileDest = Join-Path $PkgDir $UpdFile.Name
+                        $DlParams = @{
+                            Url             = $UpdFile.Url
+                            DestinationPath = $FileDest
+                            MaxRetries      = 2
+                            TimeoutSeconds  = 600
+                        }
+                        if ($UpdFile.Size) { $DlParams['ExpectedSize'] = [long]$UpdFile.Size }
+                        # Lenovo's CRC field is a SHA-256 of the payload.
+                        if ($VerifyDownloadHash -and $UpdFile.CRC) {
+                            $DlParams['ExpectedHash']  = $UpdFile.CRC
+                            $DlParams['HashAlgorithm'] = 'SHA256'
+                        }
+                        $DlPath = Invoke-DATDownload @DlParams
+                        if (-not $DlPath) { throw 'download timed out' }
+                        Unblock-File -Path $FileDest -ErrorAction SilentlyContinue
+                    } catch {
+                        Write-DATLog -Message "    WARNING: Download failed for $($UpdFile.Name): $($_.Exception.Message) - skipping package '$($Upd.Name)'" -Severity 2
+                        $AllFilesOk = $false
+                        break
+                    }
+                }
+                if (-not $AllFilesOk) {
+                    # A partial package must not ship - its install command would
+                    # fail on the missing file. Drop the folder; the update stays
+                    # in the fingerprint so the next sync retries the download.
+                    Remove-Item -Path $PkgDir -Recurse -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+
+                # Stage the descriptor beside the payload: it documents the
+                # install/applicability rules for field diagnostics and keeps
+                # the folder consumable by Lenovo tooling later.
+                try {
+                    Set-Content -Path (Join-Path $PkgDir "$($Upd.Id).xml") -Value $Upd.DescriptorXml -Encoding UTF8
+                } catch {
+                    Write-DATLog -Message "    Could not stage descriptor XML for $($Upd.Id): $($_.Exception.Message)" -Severity 2
+                }
+
+                # Vulnerable-driver screening - same blocklist and policy as
+                # the Dell branch, against the Lenovo payload's extracted
+                # driver binaries. With AutoExcludeVulnerableDrivers (default)
+                # a hit lands in the exclusion ledger and the package is
+                # dropped before it can enter the manifest; otherwise the
+                # legacy advisory applies.
+                if ($ScreenVulnerableDrivers) {
+                    if (-not $VulnBlocklistLoaded) {
+                        $VulnBlocklistLoaded = $true
+                        $VulnBlocklist = Update-DATVulnerableDriverBlocklist
+                        if (-not $VulnBlocklist) {
+                            Write-DATLog -Message "Vulnerable-driver screening unavailable this run (no blocklist) - Lenovo packages stage unscreened" -Severity 2
+                        }
+                    }
+                    if ($VulnBlocklist) {
+                        $Verdict = Get-DATLenovoScreenVerdict -PackageDir $PkgDir -FileName $Upd.FileName -HashSHA256 $Upd.HashSHA256 -ExtractCommand $Upd.ExtractCommand -Blocklist $VulnBlocklist
+                        if ($Verdict.Status -eq 'Vulnerable') {
+                            $Entry = "$($Upd.Name) [$ModelName]"
+                            if ($AutoExcludeVulnerableDrivers) {
+                                Write-DATLog -Message ("VULNERABLE DRIVER AUTO-EXCLUDED: '$($Upd.Name)' ($($Upd.FileName)) - $(@($Verdict.Matches) -join '; '). " +
+                                    "Added to the exclusion ledger and NOT packaged; it stays out of every future sync (Remove-DATDriverExclusion to undo). " +
+                                    "The package version settles on the next sync.") -Severity 3
+                                Add-DATDriverExclusion -Pattern $Upd.Name -Source 'sync-screen' -Manufacturer $Make -Model $ModelName `
+                                    -Reason ("Microsoft vulnerable-driver blocklist: " + (@($Verdict.Matches) -join '; '))
+                                if (-not $AutoExcludedDrivers.Contains($Entry)) { $AutoExcludedDrivers.Add($Entry) }
+                                Remove-Item -Path $PkgDir -Recurse -Force -ErrorAction SilentlyContinue
+                                continue
+                            }
+                            Write-DATLog -Message ("VULNERABLE DRIVER: '$($Upd.Name)' ($($Upd.FileName)) - $(@($Verdict.Matches) -join '; '). " +
+                                "Defender's ASR vulnerable-driver rule will block this on every enforcing device. The package is still being staged - " +
+                                "add '$($Upd.Name)' to Driver exclusions (Models tab > Options, or -ExcludeDrivers) and re-sync to stop deploying it.") -Severity 3
+                            if (-not $VulnerableFound.Contains($Entry)) { $VulnerableFound.Add($Entry) }
+                        } elseif ($Verdict.Status -eq 'Unscreenable') {
+                            Write-DATLog -Message "  Could not screen $($Upd.FileName) for vulnerable drivers: $($Verdict.Detail)" -Severity 2
+                        }
+                    }
+                }
+
+                $StagedSize = (Get-ChildItem -Path $PkgDir -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+                $ManifestEntries.Add([PSCustomObject]@{
+                    Id             = $Upd.Id
+                    # Subfolder (relative to the package root) holding this
+                    # package's payload - the apply script resolves FileName
+                    # against it.
+                    Folder         = $Upd.Id
+                    FileName       = $Upd.FileName
+                    Name           = $Upd.Name
+                    Version        = $Upd.Version
+                    Category       = $Upd.Category
+                    LenovoCategory = $Upd.LenovoCategory
+                    Severity       = $Upd.Severity
+                    RebootType     = $Upd.RebootType
+                    ReleaseDate    = $Upd.ReleaseDate
+                    Size           = $StagedSize
+                    ExtractCommand = $Upd.ExtractCommand
+                    InstallCommand = $Upd.InstallCommand
+                    InstallType    = $Upd.InstallType
+                    SuccessCodes   = @($Upd.SuccessCodes)
+                    # Positive-context PnPID dependencies from the package
+                    # descriptor. Non-empty -> the apply script only runs the
+                    # package when matching hardware is present (this is
+                    # Lenovo's own applicability contract, unlike Dell's
+                    # advisory PCIInfo). Empty -> always runs.
+                    HardwareIds    = @($Upd.HardwareIds)
+                })
+                Write-DATLog -Message "  Staged package: $($Upd.Id) ($([math]::Round($StagedSize / 1MB, 2)) MB)" -Severity 1
+            }
+
+            if ($ManifestEntries.Count -eq 0) {
+                throw "No Lenovo packages were successfully staged for $ModelName - cannot build catalog-only Driver Updates package"
+            }
+
+            $TotalFiles = @(Get-ChildItem $PackageSourceDir -Recurse -File -ErrorAction SilentlyContinue)
+            Write-DATLog -Message "Lenovo catalog staging complete. Total files in package: $($TotalFiles.Count)" -Severity 1
+
+            $ManifestPath = Join-Path $PackageSourceDir 'manifest.json'
+            $ManifestObj = [PSCustomObject]@{
+                schemaVersion   = 1
+                manufacturer    = $Make
+                model           = $ModelName
+                operatingSystem = $OperatingSystem
+                architecture    = $Architecture
+                generatedAt     = (Get-Date).ToUniversalTime().ToString('o')
+                drivers         = @($ManifestEntries)
+            }
+            # Depth 5: manifest -> drivers[] -> driver -> SuccessCodes/HardwareIds[] -> values
+            $ManifestObj | ConvertTo-Json -Depth 5 | Set-Content -Path $ManifestPath -Encoding UTF8
+            Write-DATLog -Message "Wrote DriverUpdates manifest: $($ManifestEntries.Count) Lenovo package(s) -> $ManifestPath" -Severity 1
+
+            # Same versioning scheme as the Dell branch: the package version IS
+            # the catalog fingerprint, computed over the FULL resolved list
+            # (staged or not) so it always matches what the smart check
+            # computes - a failed download this run doesn't fake a new version.
+            if (-not $OverlayFingerprint) {
+                $FpString = ($LenovoUpdates |
+                    Sort-Object Name |
+                    ForEach-Object { "$($_.Name)=$($_.Version)" }) -join '|'
+                $Md5 = [System.Security.Cryptography.MD5]::Create()
+                $FpBytes = $Md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($FpString))
+                $OverlayFingerprint = (($FpBytes | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
+            }
+            $Version = 'Cat.{0}' -f $OverlayFingerprint
+            Write-DATLog -Message "Driver Updates package version: $Version" -Severity 1
+        }
+
         # --- Individual driver overlay (Dell only) ---
         # After extracting the base driver pack, check Dell's component catalog
         # for newer individual drivers and overlay them into the package source.
@@ -1355,7 +1635,7 @@ function Invoke-DATSyncSinglePackage {
         # Reuse $CachedIndividualDrivers if the smart check already queried them.
         # $OverlayApplies is the single gate (computed near the top of this function)
         # that excludes TS-targeted Standard/Driver Packages so they ship base-pack-only.
-        if ($OverlayApplies) {
+        if ($OverlayApplies -and $Make -eq 'Dell') {
             if ($Type -eq 'DriverUpdates') {
                 Write-DATLog -Message "Resolving Dell catalog drivers for $ModelName (catalog-only Driver Updates)..." -Severity 1
             } else {
@@ -1676,11 +1956,14 @@ function Invoke-DATSyncSinglePackage {
                                 # vendor-tested install path that DCU uses) instead of trying to
                                 # feed extracted INFs through pnputil.
                                 if ($Type -eq 'DriverUpdates') {
-                                    # Vulnerable-driver screening: warn BEFORE the DUP ships if its
-                                    # payload matches the Microsoft blocklist that Defender's ASR
-                                    # vulnerable-driver rule enforces - those installs get blocked
-                                    # on every device and page the security team. Advisory only:
-                                    # the DUP still stages; the admin decides via Driver exclusions.
+                                    # Vulnerable-driver screening: catch a payload that matches the
+                                    # Microsoft blocklist BEFORE it ships - those installs get
+                                    # blocked by Defender's ASR vulnerable-driver rule on every
+                                    # enforcing device and page the security team. With
+                                    # AutoExcludeVulnerableDrivers (default) a hit is added to the
+                                    # persistent exclusion ledger and the DUP is skipped here and
+                                    # on every future sync; otherwise the legacy advisory applies
+                                    # (log loudly, stage anyway, admin excludes by hand).
                                     if ($ScreenVulnerableDrivers) {
                                         if (-not $VulnBlocklistLoaded) {
                                             $VulnBlocklistLoaded = $true
@@ -1692,10 +1975,19 @@ function Invoke-DATSyncSinglePackage {
                                         if ($VulnBlocklist) {
                                             $Verdict = Get-DATDupScreenVerdict -DupPath $DriverExePath -FileName $IndvDriver.FileName -HashMD5 $IndvDriver.HashMD5 -Blocklist $VulnBlocklist
                                             if ($Verdict.Status -eq 'Vulnerable') {
+                                                $Entry = "$($IndvDriver.Name) [$ModelName]"
+                                                if ($AutoExcludeVulnerableDrivers) {
+                                                    Write-DATLog -Message ("VULNERABLE DRIVER AUTO-EXCLUDED: '$($IndvDriver.Name)' ($($IndvDriver.FileName)) - $(@($Verdict.Matches) -join '; '). " +
+                                                        "Added to the exclusion ledger and NOT packaged; it stays out of every future sync (Remove-DATDriverExclusion to undo). " +
+                                                        "The package version settles on the next sync.") -Severity 3
+                                                    Add-DATDriverExclusion -Pattern $IndvDriver.Name -Source 'sync-screen' -Manufacturer $Make -Model $ModelName `
+                                                        -Reason ("Microsoft vulnerable-driver blocklist: " + (@($Verdict.Matches) -join '; '))
+                                                    if (-not $AutoExcludedDrivers.Contains($Entry)) { $AutoExcludedDrivers.Add($Entry) }
+                                                    continue
+                                                }
                                                 Write-DATLog -Message ("VULNERABLE DRIVER: '$($IndvDriver.Name)' ($($IndvDriver.FileName)) - $(@($Verdict.Matches) -join '; '). " +
                                                     "Defender's ASR vulnerable-driver rule will block this on every enforcing device. The DUP is still being packaged - " +
                                                     "add '$($IndvDriver.Name)' to Driver exclusions (Models tab > Options, or -ExcludeDrivers) and re-sync to stop deploying it.") -Severity 3
-                                                $Entry = "$($IndvDriver.Name) [$ModelName]"
                                                 if (-not $VulnerableFound.Contains($Entry)) { $VulnerableFound.Add($Entry) }
                                             } elseif ($Verdict.Status -eq 'Unscreenable') {
                                                 Write-DATLog -Message "  Could not screen $($IndvDriver.FileName) for vulnerable drivers: $($Verdict.Detail)" -Severity 2
@@ -1935,6 +2227,55 @@ function Invoke-DATSyncSinglePackage {
                     throw
                 }
                 Write-DATLog -Message "Individual driver overlay failed: $($_.Exception.Message) - continuing with base driver pack" -Severity 2
+            }
+        }
+
+        # --- Base-pack vulnerable-driver screening (all makes) ---
+        # DriverUpdates payloads are screened at staging; the monolithic
+        # Drivers packs (Dell CAB / Lenovo pack / Surface MSI - the only shape
+        # Surface ships in) were the remaining unscreened path. The full
+        # extracted tree exists exactly here (base pack plus any Dell overlay,
+        # before optional compression and INF-cache trimming), so scan every
+        # .sys against the same Microsoft blocklist and prune each match's
+        # driver folder so neither pnputil online nor dism offline can install
+        # it. Enforcement is the per-sync scan itself - packs re-extract from
+        # vendor content and re-prune deterministically - so no ledger entry
+        # is written (a raw .sys-name pattern could cross-match unrelated
+        # update packages).
+        if ($Type -eq 'Drivers' -and $ScreenVulnerableDrivers) {
+            if (-not $VulnBlocklistLoaded) {
+                $VulnBlocklistLoaded = $true
+                $VulnBlocklist = Update-DATVulnerableDriverBlocklist
+                if (-not $VulnBlocklist) {
+                    Write-DATLog -Message "Vulnerable-driver screening unavailable this run (no blocklist) - base pack ships unscreened" -Severity 2
+                }
+            }
+            if ($VulnBlocklist) {
+                $PruneResults = @(Invoke-DATDriverPackVulnerabilityPrune -PackageSourceDir $PackageSourceDir `
+                    -Blocklist $VulnBlocklist -AutoPrune $AutoExcludeVulnerableDrivers)
+                foreach ($Prune in $PruneResults) {
+                    $Entry = "$($Prune.Name) [base pack, $ModelName]"
+                    switch ($Prune.Action) {
+                        'Pruned' {
+                            Write-DATLog -Message ("VULNERABLE DRIVER PRUNED from base pack: '$($Prune.Removed)' - $(@($Prune.Matches) -join '; '). " +
+                                "Removed before packaging; every future rebuild re-applies this automatically.") -Severity 3
+                            if (-not $AutoExcludedDrivers.Contains($Entry)) { $AutoExcludedDrivers.Add($Entry) }
+                        }
+                        'Flagged' {
+                            Write-DATLog -Message ("VULNERABLE DRIVER in base pack: $($Prune.SysFile) - $(@($Prune.Matches) -join '; '). " +
+                                "Still packaged (AutoExcludeVulnerableDrivers is off) - Defender's ASR vulnerable-driver rule will block it on every enforcing device.") -Severity 3
+                            if (-not $VulnerableFound.Contains($Entry)) { $VulnerableFound.Add($Entry) }
+                        }
+                        'PruneFailed' {
+                            Write-DATLog -Message ("VULNERABLE DRIVER in base pack could NOT be pruned: $($Prune.SysFile) ($($Prune.Detail)) - still packaged; " +
+                                "Defender's ASR rule will block it on enforcing devices.") -Severity 3
+                            if (-not $VulnerableFound.Contains($Entry)) { $VulnerableFound.Add($Entry) }
+                        }
+                    }
+                }
+                if ($PruneResults.Count -eq 0) {
+                    Write-DATLog -Message "Base-pack vulnerable-driver scan: clean" -Severity 1
+                }
             }
         }
 

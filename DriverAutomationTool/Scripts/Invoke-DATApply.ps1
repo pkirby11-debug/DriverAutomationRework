@@ -20,7 +20,10 @@
       other - Failure (non-zero from the vendor utility or an unhandled error)
 
 .PARAMETER Mode
-    'Driver' to install driver INF files, 'BIOS' to flash firmware.
+    'Driver' to install driver INF files, 'BIOS' to flash firmware,
+    'BIOSDCU' to flash via Dell Command Update, 'DriverUpdates' for
+    catalog-only update packages (Dell DUPs via DCU or the built-in DUP
+    loop; Lenovo catalog packages via the built-in Lenovo engine).
 
 .PARAMETER PackageName
     Display name written to the detection marker and log.
@@ -2285,12 +2288,16 @@ function Install-BIOSDCU {
 
 function Install-DriverUpdates {
     <#
-        Catalog-only Driver Updates apply path. The package source is a flat folder
-        of Dell DUP .exe files plus a manifest.json describing each one. We run each
-        DUP's silent installer (the vendor-tested install path that DCU uses) and
-        aggregate exit codes per Dell's published convention. This bypasses pnputil
-        entirely - the failures we saw with WIM-mounted INF imports of complex DCH
-        drivers (Intel iigd_dch, NVIDIA nvdd, Storage VMD, etc.) don't apply here
+        Catalog-only Driver Updates apply path. Dispatches on the manifest's
+        manufacturer: Lenovo packages (per-package subfolders with catalog
+        install commands) go to Install-LenovoDriverUpdates; everything below
+        this function's dispatch is the original Dell contract - the package
+        source is a flat folder of Dell DUP .exe files plus a manifest.json
+        describing each one. We run each DUP's silent installer (the
+        vendor-tested install path that DCU uses) and aggregate exit codes per
+        Dell's published convention. This bypasses pnputil entirely - the
+        failures we saw with WIM-mounted INF imports of complex DCH drivers
+        (Intel iigd_dch, NVIDIA nvdd, Storage VMD, etc.) don't apply here
         because we're delegating to each DUP's own installer.
 
         Dell DUP exit codes (per Dell DUP Reference Guide):
@@ -2326,6 +2333,14 @@ function Install-DriverUpdates {
     $Drivers = @($Manifest.drivers)
     if ($Drivers.Count -eq 0) {
         throw "manifest.json contains no drivers - nothing to install"
+    }
+
+    # Manufacturer dispatch. Lenovo manifests carry each package's own install
+    # contract from Lenovo's catalog (extract command, install command line,
+    # rc success codes) and use the dedicated engine; the Dell DUP path below
+    # is unchanged.
+    if ("$($Manifest.manufacturer)" -eq 'Lenovo') {
+        return Install-LenovoDriverUpdates -Path $Path -Manifest $Manifest
     }
 
     Write-Log "DriverUpdates manifest: $($Drivers.Count) DUP(s) for $($Manifest.manufacturer) $($Manifest.model) ($($Manifest.operatingSystem))"
@@ -2936,6 +2951,527 @@ function Install-DriverUpdates {
     return 0
 }
 
+function Install-LenovoDriverUpdates {
+    <#
+        Lenovo engine for catalog-only Driver Updates packages. The package
+        source is one subfolder per Lenovo update package (payload + descriptor
+        XML) plus a manifest.json whose entries carry each package's own
+        silent-install contract straight from Lenovo's per-machine-type
+        catalog: ExtractCommand, Install command line, rc success codes,
+        install type (cmd vs inf), reboot type, and positive-context PnPID
+        dependencies. There is no separate preferred engine like DCU here -
+        Thin Installer is not factory-present on Lenovo fleets the way DCU is
+        on Dell, so this loop (driving the exact commands Lenovo's own tools
+        would run) IS the engine.
+
+        Flow per package:
+          1. Hardware gate: when the manifest lists PnPIDs and none matches a
+             present PnP hardware ID, the package is skipped as not
+             applicable. Unlike Dell's PCIInfo (advisory-only here after field
+             false-skips), Lenovo's Dependencies PnPIDs are the applicability
+             contract Lenovo System Update itself enforces, and PCI/USB
+             hardware IDs enumerate independent of driver state - absence is
+             positive evidence. If hardware enumeration failed, the gate is
+             disabled and every package runs (fail-open).
+          2. Stage + extract: copy the package's payload into a per-package
+             writable work dir under C:\Temp and run the ExtractCommand with
+             %PACKAGEPATH% pointed THERE - one directory holding the payload
+             AND the extraction output, which is Lenovo's actual
+             %PACKAGEPATH% contract (many Install commands re-invoke the
+             payload exe itself and write to %PACKAGEPATH%\TMP, so the CM
+             cache can't be the package dir). The root is space-free BY
+             CONSTRUCTION - Lenovo commands embed %PACKAGEPATH% both quoted
+             and unquoted, so the substituted path must not need quoting.
+             Extraction is best-effort; only a timed-out extractor fails the
+             package.
+          3. Install: substitute %PACKAGEPATH% into the Install command line
+             and run it from the work dir - directly for "<exe> <args>"
+             forms, via cmd.exe for .cmd/.bat forms, with an explicit error
+             when the command's file target doesn't exist. InstallType 'inf'
+             delegates to the module's pnputil machinery (Install-InfTree),
+             which does its own logging and reboot signaling.
+          4. Exit codes: the descriptor's rc list (plus 0) counts as success;
+             3010/3011/1641 count as success-with-reboot regardless of the rc
+             list (Windows convention). RebootType 3 ("requires reboot") also
+             raises the reboot signal on success - the ROM/driver takes effect
+             after the restart ConfigMgr schedules from our 3010. Sync-side
+             staging already excluded RebootType 1/4/5 (installer-forced
+             reboot/shutdown), so nothing here restarts the machine itself.
+
+        Idempotency and quarantine reuse the same Components registry ledger
+        as the Dell loop (HKLM:\...\DriverAutomation\DriverUpdates\Components,
+        keyed by Lenovo package id): a successful install records the version
+        and is skipped while current; two consecutive vendor-exit failures of
+        one version quarantine that package until a newer version ships.
+        Aggregate behavior also matches the Dell loop: every package is
+        attempted, reboot is signaled via $script:RebootRequired, and any
+        real failure returns 1 so SCCM doesn't claim Installed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object]$Manifest
+    )
+
+    $Drivers = @($Manifest.drivers)
+    Write-Log "DriverUpdates manifest: $($Drivers.Count) Lenovo package(s) for $($Manifest.manufacturer) $($Manifest.model) ($($Manifest.operatingSystem))"
+    if ($Manifest.generatedAt) { Write-Log "  Manifest generated: $($Manifest.generatedAt)" }
+
+    $PerPkgTimeoutMs     = 900000   # 15 minutes for the extract and install phases each
+    $QuarantineThreshold = 2        # consecutive same-version vendor failures before skip
+    $RebootExitCodes     = @(3010, 3011, 1641)
+
+    $Successful    = 0
+    $NotApply      = 0
+    $Failed        = 0
+    $AlreadyInst   = 0
+    $Quarantined   = 0
+    $InstantFailed = 0
+    $Rebooted      = $false
+    $FailureLines  = [System.Collections.Generic.List[string]]::new()
+
+    $ComponentsRoot = Join-Path $MarkerPath 'Components'
+    if (-not (Test-Path $ComponentsRoot)) {
+        try { New-Item -Path $ComponentsRoot -ItemType Directory -Force | Out-Null } catch {
+            Write-Log "Could not create components marker root: $($_.Exception.Message)" -Severity 2
+        }
+    }
+    $SanitizeKey = {
+        param([string]$KeyName)
+        ($KeyName -replace '[^A-Za-z0-9._\-]', '_')
+    }
+    $CompareVersion = {
+        param([string]$Installed, [string]$Target)
+        if ([string]::IsNullOrWhiteSpace($Installed) -or [string]::IsNullOrWhiteSpace($Target)) { return $null }
+        # [version] covers typical Lenovo forms like "23.60.5.6" / "10.1.18.3".
+        try {
+            $vi = [version]$Installed
+            $vt = [version]$Target
+            return $vi.CompareTo($vt)  # -1 / 0 / +1
+        } catch { }
+        # Tagged forms ("2.3.94.0 (Build)") - normalize and compare as
+        # equality only; unknown ordering means "needs install".
+        $ni = ($Installed -replace '[^A-Za-z0-9.]', '').ToUpperInvariant()
+        $nt = ($Target    -replace '[^A-Za-z0-9.]', '').ToUpperInvariant()
+        if ($ni -eq $nt) { return 0 }
+        return $null
+    }
+
+    # Full present PnP hardware IDs - not just PCI VEN/DEV tokens: Lenovo
+    # dependencies also name USB\VID_..., ACPI\... and HID\... devices. The
+    # manifest tokens are matched by substring against these.
+    $PresentIds = New-Object 'System.Collections.Generic.List[string]'
+    try {
+        foreach ($Dev in (Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop)) {
+            foreach ($HwId in @($Dev.HardwareID)) {
+                if ($HwId) { $PresentIds.Add(([string]$HwId).ToUpperInvariant()) }
+            }
+        }
+    } catch {
+        Write-Log "Could not enumerate present hardware ($($_.Exception.Message)) - Lenovo PnPID applicability gate disabled for this run (every package will run)" -Severity 2
+    }
+    Write-Log "Enumerated $($PresentIds.Count) present PnP hardware ID(s) for applicability"
+
+    # Defender correlation (same probe as the Dell loop): packages run
+    # serially, so any Defender ASR/quarantine event between a package's start
+    # and its exit belongs to that package's window. The vulnerable-driver ASR
+    # rule is named because its verdict is deterministic on every enforcing
+    # device and the fix is a one-line sync exclusion.
+    $AsrVulnDriverGuid = '56a863a9-875e-4185-98a7-b882c64b5ce5'
+    $GetDefenderFlags = {
+        param([datetime]$Since)
+        $Flags = @()
+        try {
+            $Events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = @(1121, 1117); StartTime = $Since } -ErrorAction Stop)
+            foreach ($Ev in $Events) {
+                $X = ''
+                try { $X = $Ev.ToXml() } catch { }
+                $EvPath = if ($X -match "Name='Path'>([^<]+)") { $Matches[1] } else { '' }
+                $Flags += [PSCustomObject]@{
+                    Id                   = $Ev.Id
+                    Path                 = $EvPath
+                    VulnerableDriverRule = [bool]($X -match $AsrVulnDriverGuid)
+                }
+            }
+        } catch { }
+        return ,$Flags
+    }
+    $DefenderFlagged = 0
+    $VulnExclusionAdvice = [System.Collections.Generic.List[string]]::new()
+
+    # Per-run work root. C:\Temp deliberately (not %TEMP% / ProgramData /
+    # C:\Windows\Temp): space-free so unquoted %PACKAGEPATH% substitutions
+    # can't split an argument, and outside the trees vendor installers have
+    # field-rejected as "reserved". No automatic OS cleanup there, so prune
+    # runs older than 7 days ourselves.
+    $WorkParent = Join-Path $env:SystemDrive 'Temp\DriverAutomationTool\LenovoPkg'
+    $WorkRoot = Join-Path $WorkParent (Get-Date -Format 'yyyyMMdd-HHmmss')
+    try {
+        New-Item -Path $WorkRoot -ItemType Directory -Force | Out-Null
+        Get-ChildItem -Path $WorkParent -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $WorkRoot -and $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "Per-package work root: $WorkRoot (extracted payloads land here; pruned after 7 days)"
+    } catch {
+        Write-Log "Could not create work root '$WorkRoot' ($($_.Exception.Message)) - cannot extract Lenovo packages" -Severity 3
+        return 1
+    }
+
+    $Index = 0
+    foreach ($Drv in $Drivers) {
+        $Index++
+        $PkgFolder = if ($Drv.Folder) { Join-Path $Path $Drv.Folder } else { $Path }
+        $DriverLabel = "[$Index/$($Drivers.Count)] $($Drv.Category) - $($Drv.Name) v$($Drv.Version)"
+        $CompId = if ($Drv.Id) { [string]$Drv.Id } else { [string]$Drv.FileName }
+        $CompKey = & $SanitizeKey $CompId
+        $CompKeyPath = Join-Path $ComponentsRoot $CompKey
+
+        # Per-package version skip: already installed at >= the manifest
+        # version on a previous cycle - don't re-run the vendor installer.
+        if (Test-Path $CompKeyPath) {
+            try {
+                $ExistingVer = (Get-ItemProperty -Path $CompKeyPath -Name 'Version' -ErrorAction Stop).Version
+                $Cmp = & $CompareVersion $ExistingVer $Drv.Version
+                if ($null -ne $Cmp -and $Cmp -ge 0) {
+                    Write-Log "$DriverLabel - already installed (marker v$ExistingVer) - skipping"
+                    $AlreadyInst++
+                    continue
+                }
+            } catch { }
+        }
+
+        # Persistent-failure quarantine: this exact version has repeatedly
+        # failed here - skip it so one broken vendor installer doesn't keep
+        # the whole application red. A newer version re-arms automatically.
+        if (Test-Path $CompKeyPath) {
+            try {
+                $CProps = Get-ItemProperty -Path $CompKeyPath -ErrorAction Stop
+                if ($CProps.PSObject.Properties['FailedVersion'] -and
+                    $CProps.FailedVersion -eq $Drv.Version -and
+                    [int]$CProps.FailCount -ge $QuarantineThreshold) {
+                    Write-Log "$DriverLabel - QUARANTINED: v$($Drv.Version) failed $($CProps.FailCount) consecutive time(s) on this device (last exit $($CProps.LastFailExit) at $($CProps.LastFailAt)) - the vendor installer is deterministically broken here. Skipping; a newer version in the manifest re-arms it automatically. To force a retry now, delete HKLM:\...\DriverUpdates\Components\$CompKey." -Severity 2
+                    $Quarantined++
+                    continue
+                }
+            } catch { }
+        }
+
+        # Lenovo applicability gate (see function doc). Only positive
+        # evidence skips: no declared IDs, or no enumeration, means run.
+        $PkgHwIds = @($Drv.HardwareIds | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace($_) })
+        if ($PkgHwIds.Count -gt 0 -and $PresentIds.Count -gt 0) {
+            $HwMatched = $false
+            foreach ($Token in $PkgHwIds) {
+                $T = ([string]$Token).TrimEnd('*').ToUpperInvariant()
+                if (-not $T) { continue }
+                foreach ($P in $PresentIds) {
+                    if ($P.IndexOf($T, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $HwMatched = $true; break }
+                }
+                if ($HwMatched) { break }
+            }
+            if (-not $HwMatched) {
+                $IdPreview = @($PkgHwIds | Select-Object -First 4) -join ', '
+                Write-Log "$DriverLabel - target hardware not present (catalog PnPIDs: $IdPreview$(if ($PkgHwIds.Count -gt 4) { ', ...' })) - not applicable, skipping"
+                $NotApply++
+                continue
+            }
+        }
+
+        $PrimaryExe = Join-Path $PkgFolder $Drv.FileName
+        if (-not (Test-Path $PrimaryExe)) {
+            Write-Log "$DriverLabel - payload not found at $PrimaryExe. Most likely AV/Defender quarantined it - exclude the CCM cache (e.g. %WINDIR%\ccmcache) from real-time scanning." -Severity 2
+            $Failed++
+            $FailureLines.Add(("{0} (missing file - possible AV quarantine)" -f $Drv.FileName))
+            continue
+        }
+
+        Write-Log "$DriverLabel - processing $($Drv.FileName)"
+        $PkgStart = Get-Date
+
+        # Lenovo's %PACKAGEPATH% contract (what System Update / Thin
+        # Installer implement) is ONE writable package directory that holds
+        # the downloaded payload, receives the ExtractCommand output, and is
+        # the directory the Install command runs from. Many descriptors'
+        # Install command re-invokes the payload exe itself (e.g.
+        # "%PACKAGEPATH%\n34cm27w.exe /verysilent /DIR=%PACKAGEPATH%\TMP"),
+        # so the payload MUST be in that directory - and it must be writable,
+        # which the CM cache is not (and writing into ccmcache would corrupt
+        # content-hash validation). So: copy the package's staged files into
+        # the per-package work dir and run everything from there. The first
+        # build used a split model (payload left in the CM cache,
+        # %PACKAGEPATH% pointing at a separate extract dir), which broke
+        # every self-referencing Install command - field log on a ThinkPad
+        # showed each of them exit 1 in under a second while
+        # extraction-produced "setup.exe /s" commands succeeded.
+        $PkgWorkDir = Join-Path $WorkRoot ('pkg-{0}' -f $Index)
+        try {
+            New-Item -Path $PkgWorkDir -ItemType Directory -Force | Out-Null
+            Get-ChildItem -Path $PkgFolder -File -ErrorAction Stop |
+                Copy-Item -Destination $PkgWorkDir -Force -ErrorAction Stop
+        } catch {
+            Write-Log "$DriverLabel - could not stage package into work dir '$PkgWorkDir': $($_.Exception.Message)" -Severity 2
+            $Failed++
+            $FailureLines.Add(("{0} (work-dir staging failed)" -f $Drv.FileName))
+            continue
+        }
+        $PackagePathDir = $PkgWorkDir
+        $WorkExe = Join-Path $PkgWorkDir $Drv.FileName
+
+        # Extract phase - BEST-EFFORT. Extraction failing or yielding nothing
+        # is not fatal: self-referencing Install commands run the payload exe
+        # directly and don't need the extraction at all (field case: Lenovo
+        # Universal Device Client's extractor exits 0 with no files, but its
+        # install command runs the payload exe). Only a TIMED-OUT extractor
+        # fails the package - a binary that hangs 15 minutes extracting would
+        # hang the install re-run too.
+        if ("$($Drv.ExtractCommand)".Trim()) {
+            $ExtractTimedOut = $false
+            try {
+                $PreFileCount = @(Get-ChildItem -Path $PkgWorkDir -Recurse -File -ErrorAction SilentlyContinue).Count
+                # First token of ExtractCommand is the payload exe (just
+                # copied to the work dir); the remainder are its arguments.
+                $ExtractParts = "$($Drv.ExtractCommand)".Trim() -split '\s+', 2
+                $ExtractArgs = if ($ExtractParts.Count -gt 1) { $ExtractParts[1] } else { '' }
+                $ExtractArgs = $ExtractArgs -replace '%PACKAGEPATH%', $PackagePathDir
+                Write-Log "  Extracting: $($Drv.FileName) $ExtractArgs"
+                $EspParams = @{
+                    FilePath         = $WorkExe
+                    WorkingDirectory = $PkgWorkDir
+                    NoNewWindow      = $true
+                    PassThru         = $true
+                    ErrorAction      = 'Stop'
+                }
+                if ($ExtractArgs) { $EspParams['ArgumentList'] = $ExtractArgs }
+                $ExtractProc = Start-Process @EspParams
+                # .Handle keeps PS 5.1's ExitCode readable after WaitForExit.
+                $null = $ExtractProc.Handle
+                if (-not $ExtractProc.WaitForExit($PerPkgTimeoutMs)) {
+                    try { $ExtractProc.Kill() } catch { }
+                    $ExtractTimedOut = $true
+                    throw 'extraction timed out after 15 minutes'
+                }
+                $NewFileCount = @(Get-ChildItem -Path $PkgWorkDir -Recurse -File -ErrorAction SilentlyContinue).Count - $PreFileCount
+                if ($NewFileCount -le 0) {
+                    Write-Log "  Extraction produced no new files (exit $($ExtractProc.ExitCode)) - continuing; the Install command may run the payload exe directly" -Severity 2
+                } elseif ($ExtractProc.ExitCode -ne 0) {
+                    Write-Log "  Extraction exit $($ExtractProc.ExitCode) but produced $NewFileCount file(s) - continuing" -Severity 2
+                }
+            } catch {
+                if ($ExtractTimedOut) {
+                    # Timeouts don't build the quarantine ledger (that is for
+                    # vendor INSTALL exit codes) - a transient hang gets a
+                    # clean retry next cycle.
+                    Write-Log "$DriverLabel - extract failed: $($_.Exception.Message)" -Severity 2
+                    $Failed++
+                    $FailureLines.Add(("{0} (extract timeout)" -f $Drv.FileName))
+                    continue
+                }
+                Write-Log "  Extraction failed ($($_.Exception.Message)) - continuing; the Install command may run the payload exe directly" -Severity 2
+            }
+        }
+
+        $InstallCmd = "$($Drv.InstallCommand)" -replace '%PACKAGEPATH%', $PackagePathDir
+        $PkgCode = $null
+        if ("$($Drv.InstallType)" -eq 'inf') {
+            # Vendor-declared INF install: there is no installer exe to run -
+            # hand the extracted tree to the module's pnputil machinery, which
+            # logs per-driver outcomes and signals reboot via
+            # $script:RebootRequired itself.
+            Write-Log "  INF-type install - running pnputil over: $PackagePathDir"
+            try {
+                $PkgCode = Install-InfTree -Path $PackagePathDir
+            } catch {
+                Write-Log "$DriverLabel - INF install failed: $($_.Exception.Message)" -Severity 2
+                $PkgCode = 1
+            }
+        } else {
+            Write-Log "  Installing: $InstallCmd"
+            try {
+                # Direct launch for plain "<exe> <args>" forms (no cmd.exe
+                # quoting layer to mangle arguments); cmd.exe for .cmd/.bat
+                # scripts and anything we can't resolve to a file.
+                $CmdParts = $InstallCmd -split '\s+', 2
+                $CmdExe  = $CmdParts[0].Trim('"')
+                $CmdArgs = if ($CmdParts.Count -gt 1) { $CmdParts[1] } else { '' }
+                # Resolve a relative first token against the package dir (the
+                # command's working directory) so the existence check below
+                # doesn't consult PowerShell's unrelated current directory.
+                if (-not [System.IO.Path]::IsPathRooted($CmdExe)) {
+                    $CmdExe = Join-Path $PkgWorkDir $CmdExe
+                }
+                # A file target that doesn't exist could only produce an
+                # opaque cmd.exe exit 1 - name the real problem instead so
+                # the log says WHY (payload copy or extraction incomplete).
+                if ([System.IO.Path]::HasExtension($CmdExe) -and -not (Test-Path $CmdExe)) {
+                    throw "install command target not found: $CmdExe (extraction incomplete or payload missing)"
+                }
+                $SpParams = @{
+                    WorkingDirectory = $PkgWorkDir
+                    NoNewWindow      = $true
+                    PassThru         = $true
+                    ErrorAction      = 'Stop'
+                }
+                if ($CmdExe -like '*.exe') {
+                    $SpParams['FilePath'] = $CmdExe
+                    if ($CmdArgs) { $SpParams['ArgumentList'] = $CmdArgs }
+                } else {
+                    $SpParams['FilePath'] = Join-Path $env:SystemRoot 'System32\cmd.exe'
+                    $SpParams['ArgumentList'] = ('/d /c "{0}"' -f $InstallCmd)
+                }
+                $Proc = Start-Process @SpParams
+                $null = $Proc.Handle
+                if (-not $Proc.WaitForExit($PerPkgTimeoutMs)) {
+                    Write-Log "$DriverLabel - timed out after 15 minutes - killing" -Severity 2
+                    try { $Proc.Kill() } catch { }
+                    $Failed++
+                    $FailureLines.Add(("{0} (timeout)" -f $Drv.FileName))
+                    continue
+                }
+                $PkgCode = $Proc.ExitCode
+            } catch {
+                Write-Log "$DriverLabel - launch failed: $($_.Exception.Message)" -Severity 2
+                $Failed++
+                $FailureLines.Add(("{0} (launch error: {1})" -f $Drv.FileName, $_.Exception.Message))
+                continue
+            }
+        }
+
+        $Elapsed = [math]::Round(((Get-Date) - $PkgStart).TotalSeconds, 1)
+
+        # Checked on success AND failure: an installer can exit 0 while
+        # Defender silently blocked its driver write - that silent partial
+        # install is exactly what must surface.
+        $PkgFlags = & $GetDefenderFlags $PkgStart
+        if ($PkgFlags.Count -gt 0) {
+            $DefenderFlagged++
+            foreach ($Flag in $PkgFlags) {
+                if ($Flag.VulnerableDriverRule) {
+                    Write-Log "$DriverLabel - Defender's ASR vulnerable-driver rule fired during this package's run window (event $($Flag.Id), blocked path: $($Flag.Path)). This driver is on Microsoft's vulnerable-driver blocklist and will be blocked on every enforcing device - add '$($Drv.Name)' to the sync's Driver exclusions to stop deploying it." -Severity 3
+                    if (-not $VulnExclusionAdvice.Contains([string]$Drv.Name)) { $VulnExclusionAdvice.Add([string]$Drv.Name) }
+                } else {
+                    Write-Log "$DriverLabel - Defender event $($Flag.Id) during this package's run window (path: $($Flag.Path)) - possible AV interference with this install" -Severity 2
+                }
+            }
+        }
+
+        # Success = the descriptor's own rc list (plus 0), or a standard
+        # Windows reboot-required code regardless of the rc list.
+        $SuccessCodes = @(0)
+        if ($Drv.SuccessCodes) {
+            $SuccessCodes += @($Drv.SuccessCodes | ForEach-Object { [int]$_ })
+        }
+        $SuccessCodes = @($SuccessCodes | Select-Object -Unique)
+        $IsRebootCode = ($PkgCode -in $RebootExitCodes)
+
+        if (($PkgCode -in $SuccessCodes) -or $IsRebootCode) {
+            $Successful++
+            $NeedsReboot = $IsRebootCode -or ([int]"$(if ($Drv.RebootType) { $Drv.RebootType } else { 0 })" -eq 3)
+            if ($NeedsReboot) { $Rebooted = $true }
+            $RebootTag = if ($NeedsReboot) { ' (reboot required)' } else { '' }
+            Write-Log "$DriverLabel - exit $PkgCode (success$RebootTag) in ${Elapsed}s"
+
+            # Record the version so subsequent cycles skip this package until
+            # a newer version ships. Success also resets the failure ledger.
+            try {
+                if (-not (Test-Path $CompKeyPath)) {
+                    New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null
+                }
+                New-ItemProperty -Path $CompKeyPath -Name 'Version'     -Value $Drv.Version  -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'Category'    -Value $Drv.Category -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'Name'        -Value $Drv.Name     -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'InstalledOn' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'ExitCode'    -Value ([int]$PkgCode) -PropertyType DWord -Force | Out-Null
+                foreach ($FProp in 'FailedVersion', 'FailCount', 'LastFailExit', 'LastFailAt') {
+                    Remove-ItemProperty -Path $CompKeyPath -Name $FProp -ErrorAction SilentlyContinue
+                }
+            } catch {
+                Write-Log "  Failed to write component marker for $CompId`: $($_.Exception.Message)" -Severity 2
+            }
+        } else {
+            $Failed++
+            $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $PkgCode))
+            if ($Elapsed -lt 2) { $InstantFailed++ }
+
+            # Persistent-failure ledger (consumed by the quarantine pre-check
+            # above). Same version failing again increments the count; a
+            # different version starts a fresh ledger.
+            try {
+                if (-not (Test-Path $CompKeyPath)) {
+                    New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null
+                }
+                $PrevFailVer = $null
+                $PrevCount = 0
+                try {
+                    $Prev = Get-ItemProperty -Path $CompKeyPath -ErrorAction Stop
+                    if ($Prev.PSObject.Properties['FailedVersion']) {
+                        $PrevFailVer = $Prev.FailedVersion
+                        $PrevCount = [int]$Prev.FailCount
+                    }
+                } catch { }
+                $NewCount = if ($PrevFailVer -eq $Drv.Version) { $PrevCount + 1 } else { 1 }
+                New-ItemProperty -Path $CompKeyPath -Name 'FailedVersion' -Value $Drv.Version   -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'FailCount'     -Value $NewCount       -PropertyType DWord  -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'LastFailExit'  -Value ([int]$PkgCode) -PropertyType DWord  -Force | Out-Null
+                New-ItemProperty -Path $CompKeyPath -Name 'LastFailAt'    -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
+                if ($NewCount -ge $QuarantineThreshold) {
+                    Write-Log "$DriverLabel - v$($Drv.Version) has now failed $NewCount consecutive time(s) on this device; future runs will QUARANTINE (skip) it until a newer version ships, so this one package stops failing the application" -Severity 2
+                }
+            } catch { }
+            Write-Log "$DriverLabel - exit $PkgCode (FAILED) in ${Elapsed}s (success codes for this package: $($SuccessCodes -join ','))" -Severity 2
+        }
+    }
+
+    # Marker GC: Lenovo package ids change when a driver version ships under a
+    # new package (new id = new descriptor), leaving orphan keys under
+    # Components\ that no longer match the manifest. Sweep them each run.
+    try {
+        $ExpectedKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($Drv in $Drivers) {
+            $GcId = if ($Drv.Id) { [string]$Drv.Id } else { [string]$Drv.FileName }
+            [void]$ExpectedKeys.Add((& $SanitizeKey $GcId))
+        }
+        $Removed = 0
+        if (Test-Path $ComponentsRoot) {
+            Get-ChildItem -Path $ComponentsRoot -ErrorAction SilentlyContinue |
+                Where-Object { -not $ExpectedKeys.Contains($_.PSChildName) } |
+                ForEach-Object {
+                    try {
+                        Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction Stop
+                        Write-Log "  GC: removed stale component marker '$($_.PSChildName)' (no longer in manifest)" -Severity 1
+                        $Removed++
+                    } catch {
+                        Write-Log "  GC: could not remove '$($_.PSChildName)': $($_.Exception.Message)" -Severity 2
+                    }
+                }
+        }
+        if ($Removed -gt 0) { Write-Log "Component marker GC: $Removed stale entries removed" }
+    } catch {
+        Write-Log "Component marker GC failed: $($_.Exception.Message)" -Severity 2
+    }
+
+    if ($Failed -gt 0 -and $InstantFailed -eq $Failed) {
+        Write-Log ("All $Failed failed package(s) exited within ~2s of launch - on a managed endpoint this almost always means an AV/EDR product terminating installers spawned from the CM cache. " +
+            "Check the AV/EDR console for block/terminate events on '$Path' at this timestamp and consider a publisher-based allow rule for Lenovo-signed installers or an exclusion for the CCM cache. " +
+            "Manual differential (elevated cmd): re-run one package's install command by hand from its work dir under $WorkRoot - if it installs by hand, the block is specific to the CCMExec-spawned context.") -Severity 3
+    }
+    Write-Log "DriverUpdates summary (Lenovo engine): $Successful succeeded, $AlreadyInst already-installed, $NotApply not-applicable (target hardware absent), $Quarantined quarantined (persistent vendor failures, skipped), $Failed failed$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
+    if ($Failed -gt 0) {
+        Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
+    }
+    if ($VulnExclusionAdvice.Count -gt 0) {
+        Write-Log ("VULNERABLE-DRIVER ADVICE: Defender's vulnerable-driver rule fired for: " + ($VulnExclusionAdvice -join '; ') +
+            ". Add these names to the sync's Driver exclusions (Models tab > Options, or -ExcludeDrivers) and re-sync - the package rebuilds without them and the alerts stop fleet-wide.") -Severity 3
+    }
+
+    if ($Rebooted) {
+        $script:RebootRequired = $true
+    }
+
+    # Any real failure -> non-zero return so the SCCM "Installed" state isn't
+    # claimed when packages actually didn't install.
+    if ($Failed -gt 0) { return 1 }
+    return 0
+}
+
 function Install-DriverContentFromZip {
     <#
         Extracts a ZIP-compressed driver pack to a ProgramData temp dir and
@@ -3322,7 +3858,7 @@ try {
             exit 0
         }
         # Modes that require the running OS.
-        Write-Log "Mode '$Mode' cannot run during offline/WinPE servicing (firmware flashes and Dell DUP/DCU installs need the full OS). Skipping with success - run this as a full-OS step instead." -Severity 2
+        Write-Log "Mode '$Mode' cannot run during offline/WinPE servicing (firmware flashes and vendor driver-update installs need the full OS). Skipping with success - run this as a full-OS step instead." -Severity 2
         exit 0
     }
 
