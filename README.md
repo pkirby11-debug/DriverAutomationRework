@@ -48,12 +48,15 @@ how you want ConfigMgr to deliver it:
 | --- | --- | --- | --- |
 | **Drivers** | A driver pack (INF tree / WIM) for a model | Dell, Lenovo | `pnputil` against the INF tree |
 | **BIOS Updates** | The vendor BIOS flash utility + payload | Dell, Lenovo | Dell Flash64W / Lenovo SRSETUP |
-| **Driver Updates** | A flat set of individual Dell **DUP** `.exe`s + a `manifest.json` + a DCU repository catalog | **Dell only** | DCU engine, or the built-in DUP loop as fallback |
+| **Driver Updates** | Dell: a flat set of individual **DUP** `.exe`s + a `manifest.json` + a DCU repository catalog. Lenovo: one subfolder per catalog package (payload + descriptor XML) + a `manifest.json` | Dell, Lenovo | Dell: DCU engine, or the built-in DUP loop as fallback. Lenovo: built-in engine driving each package's own catalog install command |
 
 "Driver Updates" is the newest and most capable shape: instead of one monolithic driver
-pack, it tracks Dell's per-model catalog and packages each individual driver update (a
-"DUP" — Dell Update Package) so devices receive exactly the drivers that have changed,
-installed by Dell's own tooling.
+pack, it tracks the vendor's per-model update catalog and packages each individual driver
+update so devices receive exactly the drivers that have changed, installed the way the
+vendor's own tooling would. For Dell that's the per-model catalog of DUPs (Dell Update
+Packages) that Dell Command Update consumes; for Lenovo it's the per-machine-type
+catalog that Lenovo System Update / Thin Installer consume, with each package's silent
+extract/install command and PnPID applicability rules carried into the manifest.
 
 ---
 
@@ -96,7 +99,7 @@ Pick what to sync and kick off the run.
 - **Manufacturer** — Dell / Lenovo / Microsoft (enabled per the selected OS).
 - **OS / Architecture** — target operating system and arch the content is built for.
 - **Type** — the sync shape: `Drivers`, `BIOS Updates`, `Drivers + BIOS`, or
-  `Driver Updates (Catalog Only)` (Dell-only).
+  `Driver Updates (Catalog Only)` (Dell and Lenovo).
 - **Model grid** — searchable list of catalog models; multi-select. "Known models only"
   filters to models DAT recognizes.
 - **Options** (shared with the run):
@@ -293,6 +296,24 @@ script runs each DUP's own silent installer directly, with hardening learned in 
 - Vendor exit-code mapping (0/2/6 success, 3/4/5 not-applicable, etc.), per-DUP version-skip
   markers, a hardware/GPU applicability advisory, and a Defender correlator (see below).
 
+**The Lenovo engine.** For **Lenovo** "Driver Updates" packages there is no DCU-style
+resident engine to delegate to (Thin Installer isn't factory-present the way DCU is on
+Dell), so the built-in Lenovo engine drives each package exactly the way Lenovo's own
+tooling would, using the install contract the sync captured from Lenovo's per-machine-type
+catalog (the same feed Lenovo System Update / Thin Installer consume):
+
+- Per-package **PnPID applicability gate** from the catalog's `Dependencies` rules —
+  a package whose declared hardware isn't present is skipped as not-applicable
+  (fail-open when hardware enumeration fails). BIOS, applications, component firmware
+  (opt-in), and forced-reboot packages are already excluded at sync time.
+- Runs the package's own `ExtractCommand` and silent `Install` command line
+  (`%PACKAGEPATH%` substitution, per-package work dirs under `C:\Temp`), honoring the
+  descriptor's `rc` success codes; INF-type installs go through the same `pnputil`
+  machinery as driver packs.
+- Reboot-required (`3010`/reboot-type 3) is signaled to ConfigMgr, never forced.
+- The same per-package version-skip markers, two-strike failure quarantine, marker GC,
+  and Defender correlator as the Dell loop.
+
 ---
 
 <a name="security"></a>
@@ -405,12 +426,14 @@ blind.
 <a name="lenovo"></a>
 ## Lenovo & Microsoft support
 
-- **Lenovo** devices are fully supported for **Drivers** and **BIOS Updates**. The DCU
-  engine, vulnerable-driver screening, exclusions, and DCU lockdown are **Dell-only** by
-  design — the apply script's manufacturer gate sends Lenovo (and any non-Dell) devices to
-  the classic driver-pack / BIOS-flash paths untouched. Universal improvements (CMTrace
-  timestamps, VM guard, revision-churn fixes, rev stamping, log rotation) apply to all
-  manufacturers.
+- **Lenovo** devices are fully supported for **Drivers**, **BIOS Updates**, and
+  **Driver Updates (Catalog Only)** — the latter built from Lenovo's per-machine-type
+  update catalog and installed by the built-in Lenovo engine (see
+  [The Driver Updates (DCU) engine](#dcu-engine)). The DCU engine itself,
+  vulnerable-driver **screening at sync time**, and DCU lockdown remain **Dell-only** by
+  design (the apply-side Defender correlator and driver exclusions cover Lenovo too).
+  Universal improvements (CMTrace timestamps, VM guard, revision-churn fixes, rev
+  stamping, log rotation) apply to all manufacturers.
 - **Microsoft (Surface)** is selectable for driver content; Surface hardware is explicitly
   protected from the VM guard's Microsoft-manufacturer heuristic.
 

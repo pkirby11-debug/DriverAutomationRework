@@ -117,7 +117,9 @@ function Invoke-DATSync {
         [bool]$IncludeDrivers = $true,
         [bool]$IncludeBIOS = $false,
         # Catalog-only "Driver Updates" application: skips the OEM base pack and builds a
-        # package containing only Dell catalog DUPs (the same feed DCU consumes). Dell-only.
+        # package containing only per-model catalog updates. Dell: catalog DUPs (the same
+        # feed DCU consumes). Lenovo: per-machine-type update packages (the same feed
+        # Lenovo System Update / Thin Installer consume). Other makes are skipped.
         [bool]$IncludeDriverUpdates = $false,
         # BIOS Updates (DCU) application: single-BIOS package per sync, installed by the
         # same DCU engine as DriverUpdates with a Flash64W fallback. Dell-only.
@@ -329,14 +331,60 @@ function Invoke-DATSync {
                 }
             }
 
-            # --- DRIVER UPDATES (catalog-only, Dell only) ---
-            # Builds a package from the Dell per-model catalog DUPs without touching
-            # the OEM base driver pack. Used when the base pack's complex DCH driver
-            # INFs (Intel iigd_dch, NVIDIA nvdd, Storage VMD, etc.) fail to import via
-            # pnputil but the standalone catalog DUPs install cleanly.
+            # --- DRIVER UPDATES (catalog-only, Dell + Lenovo) ---
+            # Builds a package from the OEM's per-model update catalog without touching
+            # the OEM base driver pack. Dell: per-model catalog DUPs (used when the base
+            # pack's complex DCH driver INFs - Intel iigd_dch, NVIDIA nvdd, Storage VMD,
+            # etc. - fail to import via pnputil but the standalone catalog DUPs install
+            # cleanly). Lenovo: per-machine-type update packages from the same feed
+            # Lenovo System Update / Thin Installer consume, each carrying its own
+            # silent install command.
             if ($IncludeDriverUpdates) {
-                if ($Make -ne 'Dell') {
-                    Write-DATLog -Message "Driver Updates (catalog-only) is currently Dell-only - skipping $Make $ModelName" -Severity 2
+                if ($Make -eq 'Lenovo') {
+                    try {
+                        # The Lenovo catalog lookup needs only the machine type(s) -
+                        # there is no base pack involved and nothing is downloaded yet.
+                        $MTypes = @(Find-LenovoMachineType -Model $ModelName)
+                        if (-not $MTypes -or $MTypes.Count -eq 0) {
+                            Write-DATLog -Message "Cannot resolve machine types for Lenovo $ModelName - skipping catalog-only Driver Updates" -Severity 2
+                        } else {
+                            $UpdatesInfo = [PSCustomObject]@{
+                                Manufacturer    = 'Lenovo'
+                                Model           = $ModelName
+                                # Placeholder; gets replaced with "Cat.<fingerprint>" after catalog scan.
+                                Version         = 'Catalog'
+                                ReleaseDate     = '1970-01-01T00:00:00'
+                                SystemID        = $null
+                                MachineType     = $MTypes[0]
+                                AllMachineTypes = ($MTypes -join ';')
+                                OS              = $OperatingSystem
+                                Url             = $null
+                                FileName        = $null
+                                Size            = 0
+                                HashMD5         = $null
+                            }
+
+                            $UpdResult = Invoke-DATSyncSinglePackage -PackageInfo $UpdatesInfo `
+                                -Type 'DriverUpdates' -DownloadPath $DownloadPath -PackagePath $PackagePath `
+                                -OperatingSystem $OperatingSystem -Architecture $Architecture `
+                                -EnableBDR:$EnableBDR -RemoveLegacy:$RemoveLegacy -CleanSource:$CleanSource `
+                                -CompressPackage:$CompressPackage -CompressionType $CompressionType `
+                                -WimExcludeFiles $WimExcludeFiles -WimExcludeDirs $WimExcludeDirs -WimOptimizeExport:$WimOptimizeExport `
+                                -DeploymentPlatform $DeploymentPlatform `
+                                -UpdateIndividualDrivers `
+                                -VerifyDownloadHash:$VerifyDownloadHash `
+                                -DistributionPoints $DistributionPoints `
+                                -DistributionPointGroups $DistributionPointGroups `
+                                -ForceRefresh:$ForceRefresh
+
+                            $SyncResults.Add($UpdResult)
+                        }
+                    } catch {
+                        $ErrorCount++
+                        Write-DATLog -Message "Error processing driver updates for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
+                    }
+                } elseif ($Make -ne 'Dell') {
+                    Write-DATLog -Message "Driver Updates (catalog-only) supports Dell and Lenovo - skipping $Make $ModelName" -Severity 2
                 } else {
                     try {
                         # Reuse Get-DellDriverPack purely to derive SystemID/MachineType for
@@ -710,7 +758,8 @@ function Invoke-DATSyncSinglePackage {
     # below; both must agree on which packages are eligible.
     $OverlayApplies = (
         ($UpdateIndividualDrivers -and $Make -eq 'Dell' -and $Type -eq 'Drivers' -and $IsApplication) -or
-        ($Make -eq 'Dell' -and $Type -eq 'DriverUpdates')
+        ($Make -eq 'Dell' -and $Type -eq 'DriverUpdates') -or
+        ($Make -eq 'Lenovo' -and $Type -eq 'DriverUpdates')
     )
 
     # base version (e.g. "A01.OVL.abc123" starts with "A01") - these are previous overlay runs
@@ -721,7 +770,7 @@ function Invoke-DATSyncSinglePackage {
     # DriverUpdates packages versioned as "Cat.<fingerprint>" (no base pack involved).
     # The previous deployment's version IS the overlay fingerprint, so we treat any
     # existing DriverUpdates package as the candidate to fingerprint-compare against.
-    if ($Make -eq 'Dell' -and $Type -eq 'DriverUpdates' -and -not $Existing) {
+    if ($Type -eq 'DriverUpdates' -and -not $Existing) {
         $OverlayExisting = $AllExisting | Where-Object { $_.Version -like 'Cat.*' }
     }
 
@@ -744,7 +793,7 @@ function Invoke-DATSyncSinglePackage {
     $SmartCheckEnabled = ($OverlayApplies -and ($Existing -or $OverlayExisting))
     if ($SmartCheckEnabled) {
         try {
-            Write-DATLog -Message "Checking if individual Dell drivers have changed for $ModelName..." -Severity 1
+            Write-DATLog -Message "Checking if individual $Make catalog drivers have changed for $ModelName..." -Severity 1
 
             # Scan the existing package source to detect missing categories for a more accurate smart check.
             $SmartCheckMissing = @()
@@ -755,7 +804,12 @@ function Invoke-DATSyncSinglePackage {
                 if ($Existing -is [array]) { $Existing[0] } else { $Existing }
             } else { $null }
 
-            if ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
+            if ($Make -eq 'Lenovo') {
+                # Lenovo: no base pack and no INF categories to scan - the
+                # resolved catalog list below is authoritative on its own, so
+                # the no-change skip is safe without a source scan.
+                $SourceScanComplete = $true
+            } elseif ($ExPkg -and $ExPkg.SourcePath -and (Test-Path $ExPkg.SourcePath)) {
                 Write-DATLog -Message "Smart check: scanning package source: $($ExPkg.SourcePath)" -Severity 1
                 $InfScanResult = Get-DATBasePackCategories -Path $ExPkg.SourcePath
                 $PresentCats = $InfScanResult.Categories
@@ -848,7 +902,17 @@ function Invoke-DATSyncSinglePackage {
             if ($ForceRefresh) {
                 $GetDriverParams['ForceRefresh'] = $true
             }
-            $CachedIndividualDrivers = Get-DellIndividualDrivers @GetDriverParams
+            $CachedIndividualDrivers = if ($Make -eq 'Lenovo') {
+                # Lenovo resolver takes the machine types straight from the
+                # package info; the Dell-shaped $GetDriverParams don't apply.
+                # The result is reused by the staging block below, so the
+                # Lenovo catalog XMLs are fetched once per model per sync.
+                Get-LenovoIndividualUpdates -Model $ModelName `
+                    -MachineTypes @(($PackageInfo.AllMachineTypes -split ';') | Where-Object { $_ }) `
+                    -OperatingSystem $PackageInfo.OS -ExcludeDrivers $ExcludeDrivers
+            } else {
+                Get-DellIndividualDrivers @GetDriverParams
+            }
 
             if ($CachedIndividualDrivers -and $CachedIndividualDrivers.Count -gt 0) {
                 # Build fingerprint: sorted "Name=Version" strings hashed together
@@ -878,8 +942,9 @@ function Invoke-DATSyncSinglePackage {
                     # writes it never runs). Only DUPs actually present in the
                     # existing source go in. The refresh below distributes the
                     # updated content; if the catalog was already current this is
-                    # a no-op and the content hash doesn't churn.
-                    if ($Type -eq 'DriverUpdates' -and $ExistingToCheck.SourcePath -and (Test-Path $ExistingToCheck.SourcePath)) {
+                    # a no-op and the content hash doesn't churn. Dell-only: the
+                    # Lenovo engine has no DCU-equivalent repository catalog.
+                    if ($Make -eq 'Dell' -and $Type -eq 'DriverUpdates' -and $ExistingToCheck.SourcePath -and (Test-Path $ExistingToCheck.SourcePath)) {
                         $OnDisk = @($CachedIndividualDrivers | Where-Object {
                             $_.FileName -and (Test-Path (Join-Path $ExistingToCheck.SourcePath $_.FileName))
                         })
@@ -1347,6 +1412,158 @@ function Invoke-DATSyncSinglePackage {
         Write-DATLog -Message "Extraction complete: $($ExtractedFiles.Count) files in $PackageSourceDir" -Severity 1
         }  # end "if ($Type -ne 'DriverUpdates')"
 
+        # --- Lenovo catalog-only Driver Updates staging ---
+        # The package is built ENTIRELY from Lenovo's per-machine-type update
+        # catalog (the feed Lenovo System Update / Thin Installer consume) -
+        # there is no base pack. Each eligible package lands in its own
+        # subfolder named by package id (multi-file packages and duplicate
+        # payload filenames across packages stay isolated) next to its
+        # descriptor XML, and manifest.json tells the apply script how to run
+        # each one silently. Failures here are fatal for the package (the
+        # catalog scan IS the content), matching the Dell DriverUpdates
+        # contract: the exception propagates so the caller logs an error and
+        # skips distribution.
+        if ($OverlayApplies -and $Make -eq 'Lenovo') {
+            Write-DATLog -Message "Resolving Lenovo catalog updates for $ModelName (catalog-only Driver Updates)..." -Severity 1
+
+            # Reuse the smart check's resolve when it ran; otherwise this is a
+            # fresh package and we resolve now. Where-Object strips the $null
+            # that $CachedIndividualDrivers holds when no smart check ran
+            # (@($null).Count is 1, which would skip the resolve).
+            $LenovoUpdates = @($CachedIndividualDrivers | Where-Object { $_ })
+            if ($LenovoUpdates.Count -eq 0) {
+                $LenovoUpdates = @(Get-LenovoIndividualUpdates -Model $ModelName `
+                    -MachineTypes @(($PackageInfo.AllMachineTypes -split ';') | Where-Object { $_ }) `
+                    -OperatingSystem $PackageInfo.OS -ExcludeDrivers $ExcludeDrivers)
+            }
+            if ($LenovoUpdates.Count -eq 0) {
+                throw "No eligible Lenovo catalog updates resolved for $ModelName - cannot build catalog-only Driver Updates package"
+            }
+
+            if ($ScreenVulnerableDrivers) {
+                Write-DATLog -Message "Vulnerable-driver screening currently supports Dell DUP payloads only - Lenovo packages stage unscreened" -Severity 2
+            }
+
+            $ManifestEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+            foreach ($Upd in $LenovoUpdates) {
+                Write-DATLog -Message "  [UPDATE] Staging: $($Upd.Category) - $($Upd.Name) v$($Upd.Version) ($($Upd.ReleaseDate))" -Severity 1
+                $PkgDir = Join-Path $PackageSourceDir $Upd.Id
+                New-Item -Path $PkgDir -ItemType Directory -Force | Out-Null
+
+                # Serial downloads through Invoke-DATDownload keep its
+                # exponential-backoff retry behavior; Lenovo payloads are
+                # smaller than Dell DUP sets so the parallel machinery the
+                # Dell branch grew isn't needed here yet.
+                $AllFilesOk = $true
+                foreach ($UpdFile in $Upd.Files) {
+                    try {
+                        Write-DATLog -Message "    Downloading: $($UpdFile.Name)" -Severity 1
+                        $FileDest = Join-Path $PkgDir $UpdFile.Name
+                        $DlParams = @{
+                            Url             = $UpdFile.Url
+                            DestinationPath = $FileDest
+                            MaxRetries      = 2
+                            TimeoutSeconds  = 600
+                        }
+                        if ($UpdFile.Size) { $DlParams['ExpectedSize'] = [long]$UpdFile.Size }
+                        # Lenovo's CRC field is a SHA-256 of the payload.
+                        if ($VerifyDownloadHash -and $UpdFile.CRC) {
+                            $DlParams['ExpectedHash']  = $UpdFile.CRC
+                            $DlParams['HashAlgorithm'] = 'SHA256'
+                        }
+                        $DlPath = Invoke-DATDownload @DlParams
+                        if (-not $DlPath) { throw 'download timed out' }
+                        Unblock-File -Path $FileDest -ErrorAction SilentlyContinue
+                    } catch {
+                        Write-DATLog -Message "    WARNING: Download failed for $($UpdFile.Name): $($_.Exception.Message) - skipping package '$($Upd.Name)'" -Severity 2
+                        $AllFilesOk = $false
+                        break
+                    }
+                }
+                if (-not $AllFilesOk) {
+                    # A partial package must not ship - its install command would
+                    # fail on the missing file. Drop the folder; the update stays
+                    # in the fingerprint so the next sync retries the download.
+                    Remove-Item -Path $PkgDir -Recurse -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+
+                # Stage the descriptor beside the payload: it documents the
+                # install/applicability rules for field diagnostics and keeps
+                # the folder consumable by Lenovo tooling later.
+                try {
+                    Set-Content -Path (Join-Path $PkgDir "$($Upd.Id).xml") -Value $Upd.DescriptorXml -Encoding UTF8
+                } catch {
+                    Write-DATLog -Message "    Could not stage descriptor XML for $($Upd.Id): $($_.Exception.Message)" -Severity 2
+                }
+
+                $StagedSize = (Get-ChildItem -Path $PkgDir -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+                $ManifestEntries.Add([PSCustomObject]@{
+                    Id             = $Upd.Id
+                    # Subfolder (relative to the package root) holding this
+                    # package's payload - the apply script resolves FileName
+                    # against it.
+                    Folder         = $Upd.Id
+                    FileName       = $Upd.FileName
+                    Name           = $Upd.Name
+                    Version        = $Upd.Version
+                    Category       = $Upd.Category
+                    LenovoCategory = $Upd.LenovoCategory
+                    Severity       = $Upd.Severity
+                    RebootType     = $Upd.RebootType
+                    ReleaseDate    = $Upd.ReleaseDate
+                    Size           = $StagedSize
+                    ExtractCommand = $Upd.ExtractCommand
+                    InstallCommand = $Upd.InstallCommand
+                    InstallType    = $Upd.InstallType
+                    SuccessCodes   = @($Upd.SuccessCodes)
+                    # Positive-context PnPID dependencies from the package
+                    # descriptor. Non-empty -> the apply script only runs the
+                    # package when matching hardware is present (this is
+                    # Lenovo's own applicability contract, unlike Dell's
+                    # advisory PCIInfo). Empty -> always runs.
+                    HardwareIds    = @($Upd.HardwareIds)
+                })
+                Write-DATLog -Message "  Staged package: $($Upd.Id) ($([math]::Round($StagedSize / 1MB, 2)) MB)" -Severity 1
+            }
+
+            if ($ManifestEntries.Count -eq 0) {
+                throw "No Lenovo packages were successfully staged for $ModelName - cannot build catalog-only Driver Updates package"
+            }
+
+            $TotalFiles = @(Get-ChildItem $PackageSourceDir -Recurse -File -ErrorAction SilentlyContinue)
+            Write-DATLog -Message "Lenovo catalog staging complete. Total files in package: $($TotalFiles.Count)" -Severity 1
+
+            $ManifestPath = Join-Path $PackageSourceDir 'manifest.json'
+            $ManifestObj = [PSCustomObject]@{
+                schemaVersion   = 1
+                manufacturer    = $Make
+                model           = $ModelName
+                operatingSystem = $OperatingSystem
+                architecture    = $Architecture
+                generatedAt     = (Get-Date).ToUniversalTime().ToString('o')
+                drivers         = @($ManifestEntries)
+            }
+            # Depth 5: manifest -> drivers[] -> driver -> SuccessCodes/HardwareIds[] -> values
+            $ManifestObj | ConvertTo-Json -Depth 5 | Set-Content -Path $ManifestPath -Encoding UTF8
+            Write-DATLog -Message "Wrote DriverUpdates manifest: $($ManifestEntries.Count) Lenovo package(s) -> $ManifestPath" -Severity 1
+
+            # Same versioning scheme as the Dell branch: the package version IS
+            # the catalog fingerprint, computed over the FULL resolved list
+            # (staged or not) so it always matches what the smart check
+            # computes - a failed download this run doesn't fake a new version.
+            if (-not $OverlayFingerprint) {
+                $FpString = ($LenovoUpdates |
+                    Sort-Object Name |
+                    ForEach-Object { "$($_.Name)=$($_.Version)" }) -join '|'
+                $Md5 = [System.Security.Cryptography.MD5]::Create()
+                $FpBytes = $Md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($FpString))
+                $OverlayFingerprint = (($FpBytes | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
+            }
+            $Version = 'Cat.{0}' -f $OverlayFingerprint
+            Write-DATLog -Message "Driver Updates package version: $Version" -Severity 1
+        }
+
         # --- Individual driver overlay (Dell only) ---
         # After extracting the base driver pack, check Dell's component catalog
         # for newer individual drivers and overlay them into the package source.
@@ -1355,7 +1572,7 @@ function Invoke-DATSyncSinglePackage {
         # Reuse $CachedIndividualDrivers if the smart check already queried them.
         # $OverlayApplies is the single gate (computed near the top of this function)
         # that excludes TS-targeted Standard/Driver Packages so they ship base-pack-only.
-        if ($OverlayApplies) {
+        if ($OverlayApplies -and $Make -eq 'Dell') {
             if ($Type -eq 'DriverUpdates') {
                 Write-DATLog -Message "Resolving Dell catalog drivers for $ModelName (catalog-only Driver Updates)..." -Severity 1
             } else {

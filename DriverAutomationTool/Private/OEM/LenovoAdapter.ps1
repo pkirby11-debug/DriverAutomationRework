@@ -461,6 +461,471 @@ function Get-LenovoBIOSUpdate {
     }
 }
 
+function ConvertTo-DATLenovoUpdateCategory {
+    <#
+    .SYNOPSIS
+        Maps a Lenovo catalog category display name to the module's compact
+        category set (Video/Network/Audio/Chipset/Storage/Input/Other).
+    .DESCRIPTION
+        Cosmetic only: the mapped category drives log labels and summary
+        grouping so Lenovo Driver Updates read like the Dell ones. It is NOT
+        used for applicability decisions - those come from the per-package
+        Dependencies PnPIDs and the installer's own exit code. The raw Lenovo
+        category string is preserved on the update object as LenovoCategory.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$LenovoCategory
+    )
+
+    switch -Regex ($LenovoCategory) {
+        'Display|Video|Graphics'                             { return 'Video' }
+        'Network|Ethernet|Wireless|WLAN|WWAN|Bluetooth|Modem' { return 'Network' }
+        'Audio|Sound'                                        { return 'Audio' }
+        'Chipset|Motherboard|Power|Management'               { return 'Chipset' }
+        'Storage|RAID|Disk|SSD'                              { return 'Storage' }
+        'Mouse|Keyboard|Input|Pen|Touch|Camera|Card Reader|Fingerprint' { return 'Input' }
+        default                                              { return 'Other' }
+    }
+}
+
+function Get-DATLenovoPackagePnPIDs {
+    <#
+    .SYNOPSIS
+        Extracts the positive-context _PnPID hardware tokens from a Lenovo
+        package descriptor XML.
+    .DESCRIPTION
+        Lenovo per-package descriptors carry a <Dependencies> rule tree (the
+        same one Lenovo System Update / Thin Installer evaluate) whose _PnPID
+        leaves name the hardware a package applies to. We collect only the
+        _PnPID nodes that are NOT under a _Not subtree - a _Not-scoped ID
+        means "applicable when this hardware is ABSENT", and treating it as a
+        required-hardware token would invert Lenovo's rule. IDs from
+        <DetectInstall> are deliberately ignored: that block describes the
+        installed-state check, not applicability.
+
+        Element-name comparison is done case-insensitively in PowerShell
+        (XPath is case-sensitive and Lenovo's exact casing is not contractual)
+        by walking every element and its ancestors.
+    .OUTPUTS
+        Array of hardware ID strings (e.g. 'PCI\VEN_8086&DEV_51F1',
+        'USB\VID_8087&PID_0033'), upper-cased, trailing wildcards stripped.
+        Empty array when the package declares no positive PnPID dependency
+        (callers must then treat it as applicable everywhere).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [xml]$PackageXml
+    )
+
+    $Ids = [System.Collections.Generic.List[string]]::new()
+    foreach ($Node in @($PackageXml.SelectNodes('//*'))) {
+        if ($Node.LocalName -ne '_PnPID') { continue }
+
+        $UnderDependencies = $false
+        $UnderNot = $false
+        $Ancestor = $Node.ParentNode
+        while ($Ancestor -and $Ancestor.NodeType -eq [System.Xml.XmlNodeType]::Element) {
+            if ($Ancestor.LocalName -eq '_Not')         { $UnderNot = $true }
+            if ($Ancestor.LocalName -eq 'Dependencies') { $UnderDependencies = $true }
+            $Ancestor = $Ancestor.ParentNode
+        }
+        if (-not $UnderDependencies -or $UnderNot) { continue }
+
+        $Value = $Node.InnerText.Trim()
+        if (-not $Value) { continue }
+        # Lenovo tokens sometimes end in '*' (prefix match semantics). The
+        # apply script matches by substring/prefix anyway, so store the bare
+        # token.
+        $Value = $Value.TrimEnd('*').ToUpperInvariant()
+        if ($Value -and -not $Ids.Contains($Value)) { $Ids.Add($Value) }
+    }
+
+    return ,@($Ids)
+}
+
+function ConvertFrom-DATLenovoUpdateDescriptor {
+    <#
+    .SYNOPSIS
+        Converts one Lenovo per-package descriptor XML into a Driver Updates
+        candidate object.
+    .DESCRIPTION
+        The descriptor is the per-package XML the <MT>_Win<10|11>.xml catalog
+        points at via <location> - the same document Get-LenovoBIOSUpdate
+        already consumes for BIOS. For Driver Updates we additionally read:
+          - PackageType (type attr): 1=Application, 2=Driver, 3=BIOS, 4=Firmware
+          - Reboot (type attr):      0=none, 1=forces reboot, 3=requires reboot,
+                                     4=forces shutdown, 5=delayed forced reboot
+          - Severity (type attr):    1=Critical, 2=Recommended, 3=Optional
+          - Files/Installer/File:    payload name(s), SHA-256 CRC, size
+          - ExtractCommand:          self-extract command (%PACKAGEPATH% token)
+          - Install:                 silent install command line + rc success
+                                     codes + install type (cmd/inf)
+        No filtering happens here - the caller decides what package types /
+        reboot behaviors are eligible. Returns $null only when the descriptor
+        is missing the pieces needed to install at all (no installer file or
+        no install command), logging why.
+    .PARAMETER PackageXml
+        Parsed descriptor XML document.
+    .PARAMETER DescriptorUrl
+        URL the descriptor was fetched from. Installer file URLs are built
+        against its parent directory, exactly like the BIOS path does.
+    .PARAMETER LenovoCategory
+        The <category> display name from the per-MTM catalog entry.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [xml]$PackageXml,
+
+        [Parameter(Mandatory)]
+        [string]$DescriptorUrl,
+
+        [string]$LenovoCategory = ''
+    )
+
+    $Pkg = $PackageXml.DocumentElement
+    if (-not $Pkg) { return $null }
+
+    $Id = [string]$Pkg.GetAttribute('id')
+    if (-not $Id) { $Id = [string]$Pkg.GetAttribute('name') }
+    if (-not $Id) { $Id = ([System.IO.Path]::GetFileNameWithoutExtension($DescriptorUrl)) }
+
+    # Display name: Title/Desc (prefer the EN entry). PowerShell's dot access
+    # returns a plain string for <Title>text</Title> and node(s) for
+    # <Title><Desc id="EN">text</Desc></Title> - handle both.
+    $Name = $null
+    $TitleNode = $Pkg.Title
+    if ($TitleNode -is [string]) {
+        $Name = $TitleNode
+    } elseif ($TitleNode) {
+        $DescNodes = @($TitleNode.Desc)
+        $EnDesc = $DescNodes | Where-Object { $_.id -eq 'EN' } | Select-Object -First 1
+        if (-not $EnDesc) { $EnDesc = $DescNodes | Select-Object -First 1 }
+        if ($EnDesc -is [string]) { $Name = $EnDesc }
+        elseif ($EnDesc) { $Name = $EnDesc.InnerText }
+    }
+    if (-not $Name) { $Name = [string]$Pkg.GetAttribute('name') }
+    if (-not $Name) { $Name = $Id }
+    $Name = "$Name".Trim()
+
+    $Version = [string]$Pkg.GetAttribute('version')
+    if (-not $Version) { $Version = [string]$Pkg.version }
+
+    # Attribute-typed metadata. Missing values default conservatively:
+    # unknown package type -1 (caller filters it out), reboot 0 (no reboot),
+    # severity 0 (unspecified).
+    $ParseTypeAttr = {
+        param($Node, [int]$Default)
+        if ($null -eq $Node) { return $Default }
+        $Raw = if ($Node -is [string]) { $Node } else { [string]$Node.type }
+        $Parsed = 0
+        if ([int]::TryParse($Raw, [ref]$Parsed)) { return $Parsed }
+        return $Default
+    }
+    $PackageType = & $ParseTypeAttr $Pkg.PackageType -1
+    $RebootType  = & $ParseTypeAttr $Pkg.Reboot 0
+    $Severity    = & $ParseTypeAttr $Pkg.Severity 0
+
+    $ReleaseDate = [string]$Pkg.ReleaseDate
+
+    # Installer payload files. CRC is SHA-256 in current Lenovo descriptors.
+    $UrlParent = $DescriptorUrl -replace '/[^/]+$', ''
+    $Files = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $FilesNode = $Pkg.Files
+    if ($FilesNode) {
+        foreach ($InstallerNode in @($FilesNode.Installer)) {
+            if (-not $InstallerNode) { continue }
+            foreach ($FileNode in @($InstallerNode.File)) {
+                if (-not $FileNode) { continue }
+                $FName = "$($FileNode.Name)".Trim()
+                if (-not $FName) { continue }
+                $FSize = 0L
+                [void][long]::TryParse("$($FileNode.Size)", [ref]$FSize)
+                $Files.Add([PSCustomObject]@{
+                    Name = $FName
+                    Url  = ('{0}/{1}' -f $UrlParent, $FName) -replace '\\', '/'
+                    Size = $FSize
+                    CRC  = "$($FileNode.CRC)".Trim()
+                })
+            }
+        }
+    }
+    if ($Files.Count -eq 0) {
+        Write-DATLog -Message "Lenovo package '$Name' ($Id) lists no installer files - skipping" -Severity 2
+        return $null
+    }
+
+    $ExtractCommand = [string]$Pkg.ExtractCommand
+
+    # Install command. Some descriptors carry several Install-ish nodes
+    # (e.g. ManualInstall); dot access on the exact name returns only
+    # <Install> elements. rc is a comma list of success exit codes.
+    $InstallNode = @($Pkg.Install) | Select-Object -First 1
+    $InstallCommand = $null
+    $InstallType = 'cmd'
+    $SuccessCodes = @(0)
+    if ($InstallNode) {
+        if ($InstallNode -is [string]) {
+            $InstallCommand = $InstallNode
+        } else {
+            $InstallType = if ($InstallNode.type) { [string]$InstallNode.type } else { 'cmd' }
+            $Cmdline = $InstallNode.Cmdline
+            if (-not $Cmdline) { $Cmdline = $InstallNode.INFCmdline }
+            if ($Cmdline -is [string]) { $InstallCommand = $Cmdline }
+            elseif ($Cmdline) { $InstallCommand = $Cmdline.InnerText }
+            $RcRaw = [string]$InstallNode.rc
+            if ($RcRaw) {
+                $Parsed = foreach ($Tok in ($RcRaw -split ',')) {
+                    $Val = 0
+                    if ([int]::TryParse($Tok.Trim(), [ref]$Val)) { $Val }
+                }
+                if (@($Parsed).Count -gt 0) { $SuccessCodes = @($Parsed) }
+            }
+        }
+    }
+    $InstallCommand = "$InstallCommand".Trim()
+    if (-not $InstallCommand) {
+        Write-DATLog -Message "Lenovo package '$Name' ($Id) has no silent Install command - skipping (manual-install-only package)" -Severity 2
+        return $null
+    }
+
+    # Primary payload = the file the ExtractCommand invokes when we can match
+    # it, else the first .exe, else the first file. Used for the flat
+    # FileName/Url fields shared with the Dell object shape.
+    $Primary = $null
+    if ($ExtractCommand) {
+        $FirstToken = ($ExtractCommand -split '\s+')[0]
+        $Primary = $Files | Where-Object { $_.Name -eq $FirstToken } | Select-Object -First 1
+    }
+    if (-not $Primary) { $Primary = $Files | Where-Object { $_.Name -like '*.exe' } | Select-Object -First 1 }
+    if (-not $Primary) { $Primary = $Files[0] }
+
+    $TotalSize = 0L
+    foreach ($F in $Files) { $TotalSize += [long]$F.Size }
+
+    return [PSCustomObject]@{
+        Manufacturer   = 'Lenovo'
+        Id             = $Id
+        Name           = $Name
+        Version        = $Version
+        Category       = ConvertTo-DATLenovoUpdateCategory -LenovoCategory $LenovoCategory
+        LenovoCategory = $LenovoCategory
+        PackageType    = $PackageType
+        RebootType     = $RebootType
+        Severity       = $Severity
+        ReleaseDate    = $ReleaseDate
+        Url            = $Primary.Url
+        FileName       = $Primary.Name
+        HashSHA256     = $Primary.CRC
+        Size           = $TotalSize
+        Files          = @($Files)
+        ExtractCommand = $ExtractCommand
+        InstallCommand = $InstallCommand
+        InstallType    = $InstallType
+        SuccessCodes   = @($SuccessCodes)
+        HardwareIds    = @(Get-DATLenovoPackagePnPIDs -PackageXml $PackageXml)
+        DescriptorUrl  = $DescriptorUrl
+        DescriptorXml  = $PackageXml.OuterXml
+        # Parity with the Dell individual-driver object shape so shared
+        # logging/fingerprint code treats both alike.
+        IsMissing      = $false
+    }
+}
+
+function Get-LenovoIndividualUpdates {
+    <#
+    .SYNOPSIS
+        Resolves the individual driver update packages Lenovo publishes for a
+        model - the Lenovo counterpart of Get-DellIndividualDrivers for the
+        catalog-only Driver Updates application.
+    .DESCRIPTION
+        Lenovo has no DCU-style separate updates catalog: the per-machine-type
+        XML at <biosBase><MT>_Win<10|11>.xml (the feed Lenovo System Update /
+        Thin Installer consume, already used by Get-LenovoBIOSUpdate) lists
+        EVERY update package for the machine type with a <category> and a
+        <location> pointing at a per-package descriptor XML. This function
+        walks that feed for all of a model's machine types, fetches each
+        descriptor, and returns installable driver updates.
+
+        Filtering:
+          - Category 'BIOS' entries are skipped before the descriptor fetch
+            (the BIOS/BIOSDCU application types own firmware flashing).
+          - PackageType: 2 (Driver) is included; 4 (Firmware) only with
+            -IncludeFirmware; 1 (Application) and 3 (BIOS) are never included.
+          - RebootType 1/4/5 (forces reboot / forces shutdown / delayed forced
+            reboot) are excluded: those installers reboot outside ConfigMgr's
+            control, which breaks the Application reboot contract (exit 3010
+            deferred to the maintenance window). RebootType 0/3 are kept.
+          - -ExcludeDrivers patterns (wildcard, or substring when the pattern
+            has no wildcard) match against package Name and FileName - same
+            semantics as the Dell resolver, so the GUI's one exclusion box
+            serves both makes.
+        Packages are deduplicated by package id across sibling machine types
+        (sibling MTMs list the same package URLs).
+    .PARAMETER Model
+        Lenovo model name, used to resolve machine types when -MachineTypes is
+        not supplied.
+    .PARAMETER MachineTypes
+        Machine type codes (e.g. '21HM','21HN'). Resolved via
+        Find-LenovoMachineType when omitted.
+    .PARAMETER OperatingSystem
+        Target OS ('Windows 11 24H2' etc.) - selects the _Win10/_Win11 catalog.
+    .PARAMETER ExcludeDrivers
+        Admin exclusion patterns (see Description).
+    .PARAMETER IncludeFirmware
+        Also include PackageType 4 (component firmware, e.g. fingerprint
+        reader). Off by default: firmware updates are higher-risk and often
+        pair with forced-reboot behavior.
+    .OUTPUTS
+        Array of update objects (see ConvertFrom-DATLenovoUpdateDescriptor).
+        $null when the model's machine types can't be resolved; empty array
+        when the catalogs are reachable but no eligible package exists.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Model,
+
+        [string[]]$MachineTypes,
+
+        [Parameter(Mandatory)]
+        [string]$OperatingSystem,
+
+        [string[]]$ExcludeDrivers = @(),
+
+        [switch]$IncludeFirmware
+    )
+
+    $Sources = Get-DATOEMSources
+    $WinVersion = if ($OperatingSystem -match 'Windows 10') { '10' } else { '11' }
+
+    if (-not $MachineTypes -or $MachineTypes.Count -eq 0) {
+        $MachineTypes = Find-LenovoMachineType -Model $Model
+        if (-not $MachineTypes) {
+            Write-DATLog -Message "Cannot resolve Lenovo updates: machine type unknown for $Model" -Severity 2
+            return $null
+        }
+    }
+
+    # Compile exclusion matcher once. A pattern without wildcards is a
+    # substring match - identical to Get-DellIndividualDrivers so one
+    # exclusion list drives both makes.
+    $TestExcluded = {
+        param([string]$DisplayName, [string]$File)
+        foreach ($Pattern in $ExcludeDrivers) {
+            if ([string]::IsNullOrWhiteSpace($Pattern)) { continue }
+            $Effective = if ($Pattern -match '[\*\?]') { $Pattern } else { "*$Pattern*" }
+            if ($DisplayName -like $Effective -or $File -like $Effective) { return $true }
+        }
+        return $false
+    }
+
+    $Updates = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $SeenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $SkippedType = 0
+    $SkippedReboot = 0
+    $SkippedExcluded = 0
+
+    $TempDir = Get-DATTempPath -Prefix 'LenovoUpdates'
+    try {
+        foreach ($MType in $MachineTypes) {
+            $CatalogUrl = '{0}{1}_Win{2}.xml' -f $Sources.lenovo.biosBase, $MType, $WinVersion
+            Write-DATLog -Message "Scanning Lenovo update catalog: $CatalogUrl" -Severity 1
+
+            $CatalogPath = Join-Path $TempDir "$MType.xml"
+            try {
+                $null = Invoke-DATDownload -Url $CatalogUrl -DestinationPath $CatalogPath -MaxRetries 2
+            } catch {
+                Write-DATLog -Message "Lenovo update catalog not available for machine type $MType`: $($_.Exception.Message)" -Severity 2
+                continue
+            }
+            if (-not (Test-Path $CatalogPath) -or (Get-Item $CatalogPath).Length -eq 0) {
+                Write-DATLog -Message "Lenovo update catalog empty for machine type $MType - trying next type" -Severity 2
+                continue
+            }
+
+            try {
+                $CatalogXml = Read-DATXml -Path $CatalogPath
+            } catch {
+                Write-DATLog -Message "Unparseable Lenovo update catalog for machine type $MType - trying next type" -Severity 2
+                continue
+            }
+
+            # Same navigation as Get-LenovoBIOSUpdate: lowercase
+            # <packages>/<package>/<category>/<location>, read via the
+            # case-insensitive dot accessor (XPath would be case-sensitive).
+            $PackagesRoot = $CatalogXml.packages
+            if (-not $PackagesRoot) { $PackagesRoot = $CatalogXml.DocumentElement }
+            $AllPackages = @($PackagesRoot.package) | Where-Object { $_ }
+
+            foreach ($Entry in $AllPackages) {
+                $Category = "$($Entry.category)".Trim()
+                $Location = "$($Entry.location)".Trim()
+                if (-not $Location) { continue }
+
+                # BIOS belongs to the BIOS application types, never here.
+                if ($Category -match 'BIOS') { continue }
+
+                # Package id from the descriptor filename (e.g. .../n40uj03w_2_.xml
+                # -> n40uj03w). Good enough for cross-MTM dedup; the authoritative
+                # id attribute is re-read from the descriptor below.
+                $LeafId = ([System.IO.Path]::GetFileNameWithoutExtension($Location)) -replace '_\d+_$', ''
+                if ($SeenIds.Contains($LeafId)) { continue }
+
+                $DescriptorName = Split-Path $Location -Leaf
+                $DescriptorPath = Join-Path $TempDir $DescriptorName
+                try {
+                    if (-not (Test-Path $DescriptorPath)) {
+                        $null = Invoke-DATDownload -Url $Location -DestinationPath $DescriptorPath -MaxRetries 2
+                    }
+                    $PackageXml = Read-DATXml -Path $DescriptorPath
+                } catch {
+                    Write-DATLog -Message "Failed to fetch/parse Lenovo package descriptor ($Location): $($_.Exception.Message) - skipping this package" -Severity 2
+                    continue
+                }
+
+                $Update = ConvertFrom-DATLenovoUpdateDescriptor -PackageXml $PackageXml `
+                    -DescriptorUrl $Location -LenovoCategory $Category
+                if (-not $Update) { continue }
+
+                # Mark seen by BOTH the leaf-derived id and the descriptor's own
+                # id so sibling MTMs can't re-add the package under either name.
+                [void]$SeenIds.Add($LeafId)
+                [void]$SeenIds.Add($Update.Id)
+
+                $EligibleTypes = if ($IncludeFirmware) { @(2, 4) } else { @(2) }
+                if ($Update.PackageType -notin $EligibleTypes) {
+                    $SkippedType++
+                    continue
+                }
+
+                if ($Update.RebootType -in @(1, 4, 5)) {
+                    Write-DATLog -Message "Excluding Lenovo package '$($Update.Name)' v$($Update.Version): reboot type $($Update.RebootType) (forces reboot/shutdown outside ConfigMgr control)" -Severity 2
+                    $SkippedReboot++
+                    continue
+                }
+
+                if (& $TestExcluded $Update.Name $Update.FileName) {
+                    Write-DATLog -Message "Excluding Lenovo package '$($Update.Name)' (matches Driver exclusions)" -Severity 1
+                    $SkippedExcluded++
+                    continue
+                }
+
+                $Updates.Add($Update)
+            }
+        }
+    } finally {
+        Remove-DATTempPath -Path $TempDir
+    }
+
+    Write-DATLog -Message ("Lenovo updates resolved for {0}: {1} eligible driver package(s) ({2} non-driver, {3} forced-reboot, {4} excluded by pattern)" -f `
+        $Model, $Updates.Count, $SkippedType, $SkippedReboot, $SkippedExcluded) -Severity 1
+
+    return ,@($Updates | Sort-Object Category, Name)
+}
+
 function ConvertTo-LenovoOSPattern {
     <#
     .SYNOPSIS
