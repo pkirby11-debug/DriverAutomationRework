@@ -643,9 +643,13 @@ function ConvertFrom-DATLenovoUpdateDescriptor {
                 if (-not $FName) { continue }
                 $FSize = 0L
                 [void][long]::TryParse("$($FileNode.Size)", [ref]$FSize)
+                # Built outside the hashtable: the comma in the -replace RHS
+                # is read as an argument separator when the hashtable sits
+                # inside the .Add() call, which is a parse error.
+                $FUrl = ('{0}/{1}' -f $UrlParent, $FName) -replace '\\', '/'
                 $Files.Add([PSCustomObject]@{
                     Name = $FName
-                    Url  = ('{0}/{1}' -f $UrlParent, $FName) -replace '\\', '/'
+                    Url  = $FUrl
                     Size = $FSize
                     CRC  = "$($FileNode.CRC)".Trim()
                 })
