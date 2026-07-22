@@ -401,3 +401,64 @@ Describe 'Set-DATResultObjectProperty' {
             Should -Throw "*Could not set 'SDMPackageXML'*"
     }
 }
+
+Describe 'Get-DATDetectionScript - BIOS reboot-pending grace' {
+    BeforeAll {
+        $script:BiosDetectSb = [scriptblock]::Create((Get-DATDetectionScript -Mode BIOS -ExpectedVersion '1.74'))
+
+        # Runs the generated client-side detection with the live BIOS and marker
+        # values stubbed. The overrides live inside this helper's scope (visible
+        # to the invoked scriptblock, invisible to the It's assertions). Returns
+        # the detection output string, or $null when the app is not detected.
+        function Invoke-DATBiosDetect {
+            param($LiveBios, $MarkerVersion, $MarkerStatus, $MarkerAnchor, $InstalledOn)
+            function Get-CimInstance { param($ClassName, $ErrorAction) [PSCustomObject]@{ SMBIOSBIOSVersion = $LiveBios } }
+            function Test-Path { param($Path, $ErrorAction) $true }
+            function Get-ItemProperty { param($Path, $Name, $ErrorAction) [PSCustomObject]@{ Version = $MarkerVersion; Status = $MarkerStatus; BIOSAtMarker = $MarkerAnchor; InstalledOn = $InstalledOn } }
+            & $script:BiosDetectSb
+        }
+
+        function Get-DATTestStamp { param([double]$HoursAgo) (Get-Date).AddHours(-$HoursAgo).ToString('yyyy-MM-dd HH:mm:ss') }
+    }
+
+    It 'Reports installed once the firmware actually reaches target (post-reboot)' {
+        Invoke-DATBiosDetect -LiveBios 'R1JET74W (1.74 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET74W (1.74 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'Reports installed during the reboot-pending window (staged flash, live BIOS still old)' {
+        # The core fix: WINUPTP exit 1 / Flash64W exit 2 staged the flash and
+        # exited 3010; ConfigMgr runs detection before the ROM-applying reboot,
+        # so live BIOS is still below target. Must NOT read as Failed.
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'Stops trusting the marker once the grace window elapses (re-flash a stuck device)' {
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 100) |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Ignores the grace when the live BIOS diverged from the recorded anchor' {
+        # Firmware changed to something other than what we staged - detection
+        # must be hardware-based again, not grace-covered.
+        Invoke-DATBiosDetect -LiveBios 'R1JET70W (1.70 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Does not grace a device that was never flashed toward this target' {
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.60' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET60W (1.60 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Still honors NotApplicable against the exact anchor' {
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.74' -MarkerStatus 'NotApplicable' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -Not -BeNullOrEmpty
+    }
+}

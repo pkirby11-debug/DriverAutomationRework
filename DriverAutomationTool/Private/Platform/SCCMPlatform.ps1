@@ -2409,6 +2409,13 @@ function Get-DATDetectionScript {
     }
     $EscapedVersion = $ExpectedVersion -replace "'", "''"
 
+    # Hours a staged-but-not-yet-rebooted BIOS flash is reported as installed
+    # (the reboot-pending grace below). Baked into the generated detection
+    # script as a literal. Long enough to outlast a deferred maintenance-window
+    # reboot; short enough that a flash whose firmware never actually moves is
+    # re-attempted rather than hidden indefinitely.
+    $BIOSRebootGraceHours = 72
+
     if ($Mode -eq 'BIOS' -or $Mode -eq 'BIOSDCU') {
         return @"
 `$Path = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation\$SubKey'
@@ -2472,6 +2479,32 @@ if (Test-Path `$Path) {
             # firmware moved and re-detection is required.
             Write-Output `$Current
             return
+        }
+        if (`$MkStatus -eq 'Installed' -and `$State -eq 'lower') {
+            # Staged-flash reboot-pending window. Lenovo WINUPTP (exit 1) and
+            # Dell Flash64W (exit 2) PRESTAGE the firmware and only write the
+            # ROM during the reboot(s) that follow - so between a successful
+            # install (which exits 3010) and that reboot, the live BIOS still
+            # reads the OLD version, i.e. lower than target. ConfigMgr runs
+            # detection immediately after the install returns, so without this
+            # branch every successful BIOS flash reports "not detected after
+            # installation" = Failed until the device reboots.
+            #
+            # The anchor already proves the firmware has not moved since we
+            # staged (BIOSAtMarker -eq live). Report installed while the reboot
+            # is pending, but only for a bounded window: past it, fall through
+            # to hardware detection so a flash that never actually moves the
+            # firmware is re-attempted (the install script re-stages harmlessly -
+            # its first act is this same version check). A device legitimately
+            # waiting on a maintenance-window reboot longer than the window just
+            # re-stages at that window.
+            `$FlashedAt = [datetime]::MinValue
+            if ([datetime]::TryParseExact("`$(`$Marker.InstalledOn)", 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]`$FlashedAt)) {
+                if (((Get-Date) - `$FlashedAt).TotalHours -lt $BIOSRebootGraceHours) {
+                    Write-Output `$Current
+                    return
+                }
+            }
         }
     }
 }
