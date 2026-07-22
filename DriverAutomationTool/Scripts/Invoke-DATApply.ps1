@@ -2973,17 +2973,23 @@ function Install-LenovoDriverUpdates {
              hardware IDs enumerate independent of driver state - absence is
              positive evidence. If hardware enumeration failed, the gate is
              disabled and every package runs (fail-open).
-          2. Extract: run the payload's ExtractCommand with %PACKAGEPATH%
-             pointed at a per-package work dir under C:\Temp. That root is
-             space-free BY CONSTRUCTION - Lenovo commands embed %PACKAGEPATH%
-             both quoted and unquoted, so the substituted path must not need
-             quoting. Packages without an ExtractCommand install straight from
-             the content subfolder.
+          2. Stage + extract: copy the package's payload into a per-package
+             writable work dir under C:\Temp and run the ExtractCommand with
+             %PACKAGEPATH% pointed THERE - one directory holding the payload
+             AND the extraction output, which is Lenovo's actual
+             %PACKAGEPATH% contract (many Install commands re-invoke the
+             payload exe itself and write to %PACKAGEPATH%\TMP, so the CM
+             cache can't be the package dir). The root is space-free BY
+             CONSTRUCTION - Lenovo commands embed %PACKAGEPATH% both quoted
+             and unquoted, so the substituted path must not need quoting.
+             Extraction is best-effort; only a timed-out extractor fails the
+             package.
           3. Install: substitute %PACKAGEPATH% into the Install command line
-             and run it - directly for "<exe> <args>" forms, via cmd.exe for
-             .cmd/.bat forms. InstallType 'inf' delegates to the module's
-             pnputil machinery (Install-InfTree), which does its own logging
-             and reboot signaling.
+             and run it from the work dir - directly for "<exe> <args>"
+             forms, via cmd.exe for .cmd/.bat forms, with an explicit error
+             when the command's file target doesn't exist. InstallType 'inf'
+             delegates to the module's pnputil machinery (Install-InfTree),
+             which does its own logging and reboot signaling.
           4. Exit codes: the descriptor's rc list (plus 0) counts as success;
              3010/3011/1641 count as success-with-reboot regardless of the rc
              list (Windows convention). RebootType 3 ("requires reboot") also
@@ -3180,26 +3186,56 @@ function Install-LenovoDriverUpdates {
 
         Write-Log "$DriverLabel - processing $($Drv.FileName)"
         $PkgStart = Get-Date
-        $PkgWorkDir = Join-Path $WorkRoot ('pkg-{0}' -f $Index)
 
-        # %PACKAGEPATH% target: the extract dir once extraction ran, else the
-        # content subfolder itself (packages without an ExtractCommand run
-        # their install command against the downloaded payload directly).
-        $PackagePathDir = $PkgFolder
-        $ExtractFailedMsg = $null
+        # Lenovo's %PACKAGEPATH% contract (what System Update / Thin
+        # Installer implement) is ONE writable package directory that holds
+        # the downloaded payload, receives the ExtractCommand output, and is
+        # the directory the Install command runs from. Many descriptors'
+        # Install command re-invokes the payload exe itself (e.g.
+        # "%PACKAGEPATH%\n34cm27w.exe /verysilent /DIR=%PACKAGEPATH%\TMP"),
+        # so the payload MUST be in that directory - and it must be writable,
+        # which the CM cache is not (and writing into ccmcache would corrupt
+        # content-hash validation). So: copy the package's staged files into
+        # the per-package work dir and run everything from there. The first
+        # build used a split model (payload left in the CM cache,
+        # %PACKAGEPATH% pointing at a separate extract dir), which broke
+        # every self-referencing Install command - field log on a ThinkPad
+        # showed each of them exit 1 in under a second while
+        # extraction-produced "setup.exe /s" commands succeeded.
+        $PkgWorkDir = Join-Path $WorkRoot ('pkg-{0}' -f $Index)
+        try {
+            New-Item -Path $PkgWorkDir -ItemType Directory -Force | Out-Null
+            Get-ChildItem -Path $PkgFolder -File -ErrorAction Stop |
+                Copy-Item -Destination $PkgWorkDir -Force -ErrorAction Stop
+        } catch {
+            Write-Log "$DriverLabel - could not stage package into work dir '$PkgWorkDir': $($_.Exception.Message)" -Severity 2
+            $Failed++
+            $FailureLines.Add(("{0} (work-dir staging failed)" -f $Drv.FileName))
+            continue
+        }
+        $PackagePathDir = $PkgWorkDir
+        $WorkExe = Join-Path $PkgWorkDir $Drv.FileName
+
+        # Extract phase - BEST-EFFORT. Extraction failing or yielding nothing
+        # is not fatal: self-referencing Install commands run the payload exe
+        # directly and don't need the extraction at all (field case: Lenovo
+        # Universal Device Client's extractor exits 0 with no files, but its
+        # install command runs the payload exe). Only a TIMED-OUT extractor
+        # fails the package - a binary that hangs 15 minutes extracting would
+        # hang the install re-run too.
         if ("$($Drv.ExtractCommand)".Trim()) {
-            $ExtractDir = Join-Path $PkgWorkDir 'extract'
+            $ExtractTimedOut = $false
             try {
-                New-Item -Path $ExtractDir -ItemType Directory -Force | Out-Null
-                # First token of ExtractCommand is the payload exe (already
-                # staged as $PrimaryExe); the remainder are its arguments.
+                $PreFileCount = @(Get-ChildItem -Path $PkgWorkDir -Recurse -File -ErrorAction SilentlyContinue).Count
+                # First token of ExtractCommand is the payload exe (just
+                # copied to the work dir); the remainder are its arguments.
                 $ExtractParts = "$($Drv.ExtractCommand)".Trim() -split '\s+', 2
                 $ExtractArgs = if ($ExtractParts.Count -gt 1) { $ExtractParts[1] } else { '' }
-                $ExtractArgs = $ExtractArgs -replace '%PACKAGEPATH%', $ExtractDir
+                $ExtractArgs = $ExtractArgs -replace '%PACKAGEPATH%', $PackagePathDir
                 Write-Log "  Extracting: $($Drv.FileName) $ExtractArgs"
                 $EspParams = @{
-                    FilePath         = $PrimaryExe
-                    WorkingDirectory = $PkgFolder
+                    FilePath         = $WorkExe
+                    WorkingDirectory = $PkgWorkDir
                     NoNewWindow      = $true
                     PassThru         = $true
                     ErrorAction      = 'Stop'
@@ -3210,28 +3246,27 @@ function Install-LenovoDriverUpdates {
                 $null = $ExtractProc.Handle
                 if (-not $ExtractProc.WaitForExit($PerPkgTimeoutMs)) {
                     try { $ExtractProc.Kill() } catch { }
+                    $ExtractTimedOut = $true
                     throw 'extraction timed out after 15 minutes'
                 }
-                $ExtractedCount = @(Get-ChildItem -Path $ExtractDir -Recurse -File -ErrorAction SilentlyContinue).Count
-                if ($ExtractedCount -eq 0) {
-                    throw "extraction produced no files (exit $($ExtractProc.ExitCode))"
+                $NewFileCount = @(Get-ChildItem -Path $PkgWorkDir -Recurse -File -ErrorAction SilentlyContinue).Count - $PreFileCount
+                if ($NewFileCount -le 0) {
+                    Write-Log "  Extraction produced no new files (exit $($ExtractProc.ExitCode)) - continuing; the Install command may run the payload exe directly" -Severity 2
+                } elseif ($ExtractProc.ExitCode -ne 0) {
+                    Write-Log "  Extraction exit $($ExtractProc.ExitCode) but produced $NewFileCount file(s) - continuing" -Severity 2
                 }
-                if ($ExtractProc.ExitCode -ne 0) {
-                    Write-Log "  Extraction exit $($ExtractProc.ExitCode) but produced $ExtractedCount file(s) - continuing" -Severity 2
-                }
-                $PackagePathDir = $ExtractDir
             } catch {
-                $ExtractFailedMsg = $_.Exception.Message
+                if ($ExtractTimedOut) {
+                    # Timeouts don't build the quarantine ledger (that is for
+                    # vendor INSTALL exit codes) - a transient hang gets a
+                    # clean retry next cycle.
+                    Write-Log "$DriverLabel - extract failed: $($_.Exception.Message)" -Severity 2
+                    $Failed++
+                    $FailureLines.Add(("{0} (extract timeout)" -f $Drv.FileName))
+                    continue
+                }
+                Write-Log "  Extraction failed ($($_.Exception.Message)) - continuing; the Install command may run the payload exe directly" -Severity 2
             }
-        }
-        if ($ExtractFailedMsg) {
-            # Extract failures don't build the quarantine ledger (that is for
-            # vendor INSTALL exit codes); a transient AV/disk hiccup gets a
-            # clean retry next cycle.
-            Write-Log "$DriverLabel - extract failed: $ExtractFailedMsg" -Severity 2
-            $Failed++
-            $FailureLines.Add(("{0} (extract failed: {1})" -f $Drv.FileName, $ExtractFailedMsg))
-            continue
         }
 
         $InstallCmd = "$($Drv.InstallCommand)" -replace '%PACKAGEPATH%', $PackagePathDir
@@ -3257,13 +3292,25 @@ function Install-LenovoDriverUpdates {
                 $CmdParts = $InstallCmd -split '\s+', 2
                 $CmdExe  = $CmdParts[0].Trim('"')
                 $CmdArgs = if ($CmdParts.Count -gt 1) { $CmdParts[1] } else { '' }
+                # Resolve a relative first token against the package dir (the
+                # command's working directory) so the existence check below
+                # doesn't consult PowerShell's unrelated current directory.
+                if (-not [System.IO.Path]::IsPathRooted($CmdExe)) {
+                    $CmdExe = Join-Path $PkgWorkDir $CmdExe
+                }
+                # A file target that doesn't exist could only produce an
+                # opaque cmd.exe exit 1 - name the real problem instead so
+                # the log says WHY (payload copy or extraction incomplete).
+                if ([System.IO.Path]::HasExtension($CmdExe) -and -not (Test-Path $CmdExe)) {
+                    throw "install command target not found: $CmdExe (extraction incomplete or payload missing)"
+                }
                 $SpParams = @{
-                    WorkingDirectory = $PackagePathDir
+                    WorkingDirectory = $PkgWorkDir
                     NoNewWindow      = $true
                     PassThru         = $true
                     ErrorAction      = 'Stop'
                 }
-                if ($CmdExe -like '*.exe' -and (Test-Path $CmdExe)) {
+                if ($CmdExe -like '*.exe') {
                     $SpParams['FilePath'] = $CmdExe
                     if ($CmdArgs) { $SpParams['ArgumentList'] = $CmdArgs }
                 } else {
@@ -3404,7 +3451,7 @@ function Install-LenovoDriverUpdates {
     if ($Failed -gt 0 -and $InstantFailed -eq $Failed) {
         Write-Log ("All $Failed failed package(s) exited within ~2s of launch - on a managed endpoint this almost always means an AV/EDR product terminating installers spawned from the CM cache. " +
             "Check the AV/EDR console for block/terminate events on '$Path' at this timestamp and consider a publisher-based allow rule for Lenovo-signed installers or an exclusion for the CCM cache. " +
-            "Manual differential (elevated cmd): re-run one package's install command by hand from its extract dir under $WorkRoot - if it installs by hand, the block is specific to the CCMExec-spawned context.") -Severity 3
+            "Manual differential (elevated cmd): re-run one package's install command by hand from its work dir under $WorkRoot - if it installs by hand, the block is specific to the CCMExec-spawned context.") -Severity 3
     }
     Write-Log "DriverUpdates summary (Lenovo engine): $Successful succeeded, $AlreadyInst already-installed, $NotApply not-applicable (target hardware absent), $Quarantined quarantined (persistent vendor failures, skipped), $Failed failed$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
     if ($Failed -gt 0) {
