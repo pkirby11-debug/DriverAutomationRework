@@ -198,3 +198,267 @@ Describe 'ConfigManager' {
         }
     }
 }
+
+Describe 'Get-DATLenovoMachineTypeScript' {
+    # The Global Condition script runs on clients and must report the same
+    # machine-type derivation Get-DATDeviceIdentity uses at apply time:
+    # uppercased first 4 chars of Win32_ComputerSystem.Model.
+    It 'Derives the machine type from the MTM string' {
+        function Get-CimInstance { param($ClassName, $ErrorAction) [PSCustomObject]@{ Model = ' 20x3S02D00 ' } }
+        $Output = & ([scriptblock]::Create((Get-DATLenovoMachineTypeScript)))
+        $Output | Should -Be '20X3'
+    }
+
+    It 'Returns a short model uppercased and untruncated' {
+        function Get-CimInstance { param($ClassName, $ErrorAction) [PSCustomObject]@{ Model = 'x1' } }
+        $Output = & ([scriptblock]::Create((Get-DATLenovoMachineTypeScript)))
+        $Output | Should -Be 'X1'
+    }
+
+    It 'Returns an empty string when the WMI query fails' {
+        function Get-CimInstance { param($ClassName, $ErrorAction) throw 'no WMI here' }
+        $Output = & ([scriptblock]::Create((Get-DATLenovoMachineTypeScript)))
+        $Output | Should -Be ''
+    }
+}
+
+Describe 'New-DATApplicationRequirementRules' {
+    BeforeAll {
+        # The ConfigMgr console module is absent on CI runners, so define a
+        # recording stub for the rule-builder cmdlet the code pipes into. It
+        # mimics the cmdlet's generated display name ("<GC name> <operator>
+        # {values}"), which the Lenovo repair matcher parses.
+        function script:New-CMRequirementRuleCommonValue {
+            [CmdletBinding()]
+            param(
+                [Parameter(ValueFromPipeline)] $InputObject,
+                $RuleOperator,
+                $Value1,
+                $Value2
+            )
+            process {
+                $script:RuleCalls.Add([PSCustomObject]@{
+                    Condition = $InputObject
+                    Operator  = $RuleOperator
+                    Value1    = @($Value1)
+                })
+                [PSCustomObject]@{ Name = "$($InputObject.Name) $RuleOperator {$(@($Value1) -join ', ')}" }
+            }
+        }
+
+        $script:FakeConditions = @{
+            SystemSKU           = [PSCustomObject]@{ Name = 'DAT - Computer SystemSKU' }
+            Manufacturer        = [PSCustomObject]@{ Name = 'DAT - Computer Manufacturer' }
+            ComputerModel       = [PSCustomObject]@{ Name = 'DAT - Computer Model' }
+            ComputerSystemModel = [PSCustomObject]@{ Name = 'DAT - Computer Model (System)' }
+            LenovoMachineType   = [PSCustomObject]@{ Name = 'DAT - Lenovo Machine Type' }
+        }
+    }
+
+    BeforeEach {
+        $script:RuleCalls = [System.Collections.Generic.List[object]]::new()
+        Mock Initialize-DATGlobalConditions { $script:FakeConditions }
+        # Write-DATLog touches WindowsPrincipal, which throws on non-Windows
+        # dev boxes; logging isn't under test here.
+        Mock Write-DATLog {}
+    }
+
+    It 'Binds the Lenovo machine-type rule to the script condition, never the friendly-name model condition' {
+        $Rules = New-DATApplicationRequirementRules -Manufacturer Lenovo -MachineType @(' 20x3 ', '20X4', '20X3')
+
+        # Manufacturer + VM exclusion + machine type
+        @($Rules).Count | Should -Be 3
+
+        $TypeCalls = @($script:RuleCalls | Where-Object { $_.Condition.Name -eq 'DAT - Lenovo Machine Type' })
+        $TypeCalls.Count | Should -Be 1
+        $TypeCalls[0].Operator | Should -Be 'OneOf'
+        # Trimmed, uppercased, de-duplicated to match the uppercased value the
+        # script Global Condition reports.
+        $TypeCalls[0].Value1 | Should -Be @('20X3', '20X4')
+
+        # The pre-2.20.1 bug: machine types matched against
+        # Win32_ComputerSystemProduct.Version (the friendly model name), which
+        # no real Lenovo device can satisfy - the app never surfaced in
+        # Software Center.
+        @($script:RuleCalls | Where-Object { $_.Condition.Name -eq 'DAT - Computer Model' }).Count | Should -Be 0
+
+        $MfrCalls = @($script:RuleCalls | Where-Object { $_.Condition.Name -eq 'DAT - Computer Manufacturer' })
+        $MfrCalls[0].Value1 | Should -Be @('LENOVO')
+    }
+
+    It 'Ignores SystemSKU for Lenovo (device SystemSKU embeds the type in a longer string; exact match is never true)' {
+        New-DATApplicationRequirementRules -Manufacturer Lenovo -MachineType @('21HD') -SystemSKU @('21HD') | Out-Null
+        @($script:RuleCalls | Where-Object { $_.Condition.Name -eq 'DAT - Computer SystemSKU' }).Count | Should -Be 0
+    }
+
+    It 'Keeps the Dell SystemSKU rule' {
+        New-DATApplicationRequirementRules -Manufacturer Dell -SystemSKU @('0D03', '0D04') | Out-Null
+        $SkuCalls = @($script:RuleCalls | Where-Object { $_.Condition.Name -eq 'DAT - Computer SystemSKU' })
+        $SkuCalls.Count | Should -Be 1
+        $SkuCalls[0].Operator | Should -Be 'OneOf'
+        $SkuCalls[0].Value1 | Should -Be @('0D03', '0D04')
+    }
+
+    It 'Still emits manufacturer and VM rules when the Lenovo machine-type condition is unavailable' {
+        Mock Initialize-DATGlobalConditions {
+            $Degraded = $script:FakeConditions.Clone()
+            $Degraded['LenovoMachineType'] = $null
+            $Degraded
+        }
+        $Rules = New-DATApplicationRequirementRules -Manufacturer Lenovo -MachineType @('20X3')
+        @($Rules).Count | Should -Be 2
+    }
+}
+
+Describe 'New-DATLenovoMachineTypeRequirementRule' {
+    It 'Returns $null for an empty or whitespace machine-type list without touching the site' {
+        # Reaching Initialize-DATGlobalConditions would throw 'Not connected'
+        # here, so a $null return also proves the early exit.
+        $script:CMConnected = $false
+        New-DATLenovoMachineTypeRequirementRule -MachineType @('', '   ') | Should -BeNullOrEmpty
+    }
+
+    It 'Throws when the machine-type Global Condition is unavailable' {
+        { New-DATLenovoMachineTypeRequirementRule -MachineType @('20X3') -Conditions @{ LenovoMachineType = $null } } |
+            Should -Throw '*not available*'
+    }
+}
+
+Describe 'Get-DATLenovoRequirementRepair' {
+    It 'Flags the unsatisfiable friendly-name model rule and requests the machine-type rule' {
+        $Reqs = @(
+            [PSCustomObject]@{ Name = 'DAT - Computer Manufacturer OneOf {LENOVO}' }
+            [PSCustomObject]@{ Name = 'DAT - Computer Model (System) NotContains {Virtual}' }
+            [PSCustomObject]@{ Name = 'DAT - Computer Model OneOf {20X3, 20X4}' }
+        )
+        $Repair = Get-DATLenovoRequirementRepair -Requirements $Reqs -MachineType @('20X3', '20X4')
+
+        @($Repair.RemoveRules).Count | Should -Be 1
+        $Repair.RemoveRules[0].Name | Should -Be 'DAT - Computer Model OneOf {20X3, 20X4}'
+        $Repair.AddNeeded | Should -BeTrue
+    }
+
+    It 'Leaves an already-repaired deployment type alone' {
+        $Reqs = @(
+            [PSCustomObject]@{ Name = 'DAT - Computer Manufacturer OneOf {LENOVO}' }
+            [PSCustomObject]@{ Name = 'DAT - Computer Model (System) NotContains {Virtual}' }
+            [PSCustomObject]@{ Name = 'DAT - Lenovo Machine Type OneOf {20X3, 20X4}' }
+        )
+        $Repair = Get-DATLenovoRequirementRepair -Requirements $Reqs -MachineType @('20X3', '20X4')
+
+        @($Repair.RemoveRules).Count | Should -Be 0
+        $Repair.AddNeeded | Should -BeFalse
+    }
+
+    It 'Adds the machine-type rule to a deployment type that has no hardware gate at all' {
+        $Reqs = @(
+            [PSCustomObject]@{ Name = 'DAT - Computer Manufacturer OneOf {LENOVO}' }
+        )
+        $Repair = Get-DATLenovoRequirementRepair -Requirements $Reqs -MachineType @('21HD')
+
+        @($Repair.RemoveRules).Count | Should -Be 0
+        $Repair.AddNeeded | Should -BeTrue
+    }
+
+    It 'Does not request a machine-type rule when no machine types are known' {
+        $Reqs = @(
+            [PSCustomObject]@{ Name = 'DAT - Computer Model OneOf {20X3}' }
+        )
+        $Repair = Get-DATLenovoRequirementRepair -Requirements $Reqs -MachineType @()
+
+        # The unsatisfiable rule is still removed - manufacturer/VM gating
+        # remains - but nothing is added without types to add.
+        @($Repair.RemoveRules).Count | Should -Be 1
+        $Repair.AddNeeded | Should -BeFalse
+    }
+}
+
+Describe 'Set-DATResultObjectProperty' {
+    # The indexer-StringValue mechanism needs a real AdminUI SDK object and is
+    # exercised only on a live console; these cover the method-present path,
+    # the fallback chain landing on plain assignment, and the all-fail error.
+    It 'Uses SetPropertyValue when the object exposes it' {
+        $Obj = [PSCustomObject]@{ SDMPackageXML = 'old' }
+        $Obj | Add-Member -MemberType ScriptMethod -Name SetPropertyValue -Value {
+            param($Name, $NewValue)
+            $this.$Name = "via-method:$NewValue"
+        }
+
+        Set-DATResultObjectProperty -ResultObject $Obj -PropertyName 'SDMPackageXML' -Value 'new-xml'
+        $Obj.SDMPackageXML | Should -Be 'via-method:new-xml'
+    }
+
+    It 'Falls back to property assignment when SetPropertyValue does not exist' {
+        $Obj = [PSCustomObject]@{ SDMPackageXML = 'old' }
+
+        Set-DATResultObjectProperty -ResultObject $Obj -PropertyName 'SDMPackageXML' -Value 'new-xml'
+        $Obj.SDMPackageXML | Should -Be 'new-xml'
+    }
+
+    It 'Throws with every attempted mechanism when nothing can set the property' {
+        $Obj = [PSCustomObject]@{}
+        { Set-DATResultObjectProperty -ResultObject $Obj -PropertyName 'SDMPackageXML' -Value 'x' } |
+            Should -Throw "*Could not set 'SDMPackageXML'*"
+    }
+}
+
+Describe 'Get-DATDetectionScript - BIOS reboot-pending grace' {
+    BeforeAll {
+        $script:BiosDetectSb = [scriptblock]::Create((Get-DATDetectionScript -Mode BIOS -ExpectedVersion '1.74'))
+
+        # Runs the generated client-side detection with the live BIOS and marker
+        # values stubbed. The overrides live inside this helper's scope (visible
+        # to the invoked scriptblock, invisible to the It's assertions). Returns
+        # the detection output string, or $null when the app is not detected.
+        function Invoke-DATBiosDetect {
+            param($LiveBios, $MarkerVersion, $MarkerStatus, $MarkerAnchor, $InstalledOn)
+            function Get-CimInstance { param($ClassName, $ErrorAction) [PSCustomObject]@{ SMBIOSBIOSVersion = $LiveBios } }
+            function Test-Path { param($Path, $ErrorAction) $true }
+            function Get-ItemProperty { param($Path, $Name, $ErrorAction) [PSCustomObject]@{ Version = $MarkerVersion; Status = $MarkerStatus; BIOSAtMarker = $MarkerAnchor; InstalledOn = $InstalledOn } }
+            & $script:BiosDetectSb
+        }
+
+        function Get-DATTestStamp { param([double]$HoursAgo) (Get-Date).AddHours(-$HoursAgo).ToString('yyyy-MM-dd HH:mm:ss') }
+    }
+
+    It 'Reports installed once the firmware actually reaches target (post-reboot)' {
+        Invoke-DATBiosDetect -LiveBios 'R1JET74W (1.74 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET74W (1.74 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'Reports installed during the reboot-pending window (staged flash, live BIOS still old)' {
+        # The core fix: WINUPTP exit 1 / Flash64W exit 2 staged the flash and
+        # exited 3010; ConfigMgr runs detection before the ROM-applying reboot,
+        # so live BIOS is still below target. Must NOT read as Failed.
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'Stops trusting the marker once the grace window elapses (re-flash a stuck device)' {
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 100) |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Ignores the grace when the live BIOS diverged from the recorded anchor' {
+        # Firmware changed to something other than what we staged - detection
+        # must be hardware-based again, not grace-covered.
+        Invoke-DATBiosDetect -LiveBios 'R1JET70W (1.70 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Does not grace a device that was never flashed toward this target' {
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.60' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET60W (1.60 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Still honors NotApplicable against the exact anchor' {
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.74' -MarkerStatus 'NotApplicable' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -Not -BeNullOrEmpty
+    }
+}
