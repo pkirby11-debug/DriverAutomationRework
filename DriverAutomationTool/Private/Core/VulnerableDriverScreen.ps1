@@ -266,6 +266,189 @@ function Invoke-DATDupVulnerabilityScreen {
     }
 }
 
+function Invoke-DATLenovoVulnerabilityScreen {
+    <#
+    .SYNOPSIS
+        Screens one staged Lenovo update package: scans any driver binaries it
+        ships raw, extracts its payload with the package's own ExtractCommand,
+        and tests every .sys file against the vulnerable-driver blocklist.
+    .DESCRIPTION
+        Mirrors Invoke-DATDupVulnerabilityScreen for Lenovo's package format.
+        The package files are COPIED to a temp dir and extraction runs there
+        with %PACKAGEPATH% pointed at that same directory - the one-directory
+        contract Lenovo's own tooling implements (the extractor is the payload
+        exe itself; extraction output lands beside it). No install occurs:
+        only the ExtractCommand runs, which for Lenovo packages is the
+        documented extract-only invocation (/EXTRACT="YES" style).
+
+        Verdict semantics match the Dell screen:
+          - Defender intervening during the extraction window = Vulnerable by
+            Defender's own verdict.
+          - Any extracted .sys matching a blocklist filename rule = Vulnerable.
+          - Extraction failing with no .sys visible anywhere = Unscreenable
+            (never fails the sync; the apply-side Defender correlator is the
+            net). A package with no ExtractCommand is scanned as-shipped.
+    .OUTPUTS
+        Hashtable: @{ Status = 'Clean'|'Vulnerable'|'Unscreenable'; Matches = @(...); Detail = '' }
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$PackageDir,
+
+        [string]$PrimaryFileName,
+
+        [string]$ExtractCommand,
+
+        [Parameter(Mandatory)]
+        $Blocklist
+    )
+
+    $AsrVulnGuid = '56a863a9-875e-4185-98a7-b882c64b5ce5'
+    $TempDir = Get-DATTempPath -Prefix 'VulnScreenLnv'
+    $Started = Get-Date
+    try {
+        $WorkDir = Join-Path $TempDir 'pkg'
+        New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null
+        try {
+            Get-ChildItem -Path $PackageDir -File -ErrorAction Stop |
+                Copy-Item -Destination $WorkDir -Force -ErrorAction Stop
+        } catch {
+            return @{ Status = 'Unscreenable'; Matches = @(); Detail = "could not copy package for screening: $($_.Exception.Message)" }
+        }
+
+        $ExtractRan = $false
+        if ("$ExtractCommand".Trim()) {
+            $ExtractParts = "$ExtractCommand".Trim() -split '\s+', 2
+            $ExtractExeName = if ($PrimaryFileName) { $PrimaryFileName } else { $ExtractParts[0] }
+            $ExtractExe = Join-Path $WorkDir $ExtractExeName
+            $ExtractArgs = if ($ExtractParts.Count -gt 1) { $ExtractParts[1] } else { '' }
+            $ExtractArgs = $ExtractArgs -replace '%PACKAGEPATH%', $WorkDir
+            if (Test-Path $ExtractExe) {
+                try {
+                    $SpParams = @{
+                        FilePath         = $ExtractExe
+                        WorkingDirectory = $WorkDir
+                        NoNewWindow      = $true
+                        PassThru         = $true
+                        ErrorAction      = 'Stop'
+                    }
+                    if ($ExtractArgs) { $SpParams['ArgumentList'] = $ExtractArgs }
+                    $Proc = Start-Process @SpParams
+                    $null = $Proc.Handle
+                    if (-not $Proc.WaitForExit(300000)) {
+                        try { $Proc.Kill() } catch { }
+                        return @{ Status = 'Unscreenable'; Matches = @(); Detail = 'screening extraction timed out after 5 minutes' }
+                    }
+                    $ExtractRan = $true
+                } catch {
+                    Write-DATLog -Message "  Screening extraction launch failed for $ExtractExeName ($($_.Exception.Message)) - scanning package files as shipped" -Severity 2
+                }
+            }
+        }
+
+        # Defender intervening during extraction = vulnerable by Defender's
+        # own verdict, even if the .sys never landed on disk to be read.
+        try {
+            $Events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = @(1121, 1117); StartTime = $Started } -ErrorAction Stop)
+            foreach ($Ev in $Events) {
+                $X = ''
+                try { $X = $Ev.ToXml() } catch { }
+                if ($X -and $X.IndexOf($WorkDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $RuleNote = if ($X -match $AsrVulnGuid) { 'ASR vulnerable-driver rule' } else { "Defender event $($Ev.Id)" }
+                    return @{ Status = 'Vulnerable'; Matches = @("payload write blocked during screening extraction ($RuleNote)"); Detail = 'Defender blocked the extraction itself' }
+                }
+            }
+        } catch { }
+
+        $SysFiles = @(Get-ChildItem -Path $WorkDir -Recurse -Filter '*.sys' -File -ErrorAction SilentlyContinue)
+        if ($SysFiles.Count -eq 0) {
+            if ($ExtractRan) {
+                # Extraction worked and the payload simply carries no kernel
+                # drivers (utility/software packages) - genuinely clean.
+                return @{ Status = 'Clean'; Matches = @(); Detail = 'no .sys files in extracted payload' }
+            }
+            # Nothing extractable and nothing visible - not proven clean.
+            return @{ Status = 'Unscreenable'; Matches = @(); Detail = 'payload not extractable and no driver binaries visible as shipped' }
+        }
+
+        $AllMatches = @()
+        foreach ($Sys in $SysFiles) {
+            $AllMatches += @(Test-DATFileAgainstBlocklist -File $Sys -Blocklist $Blocklist)
+        }
+        if ($AllMatches.Count -gt 0) {
+            return @{ Status = 'Vulnerable'; Matches = @($AllMatches | Select-Object -Unique); Detail = "$($SysFiles.Count) driver file(s) scanned" }
+        }
+        return @{ Status = 'Clean'; Matches = @(); Detail = "$($SysFiles.Count) driver file(s) scanned" }
+    } finally {
+        # The extraction may have written blocklisted binaries - remove promptly.
+        Remove-DATTempPath -Path $TempDir
+    }
+}
+
+function Get-DATLenovoScreenVerdict {
+    <#
+    .SYNOPSIS
+        Cached wrapper around Invoke-DATLenovoVulnerabilityScreen.
+    .DESCRIPTION
+        Shares the Dell verdict cache file and invalidation rule (whole cache
+        drops when the blocklist version changes). Keys are
+        '<filename>|<sha256>' - Lenovo descriptors publish a SHA-256 CRC per
+        payload, so the key changes whenever the payload does. Steady-state
+        syncs re-screen nothing.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$PackageDir,
+
+        [Parameter(Mandatory)]
+        [string]$FileName,
+
+        [string]$HashSHA256,
+
+        [string]$ExtractCommand,
+
+        [Parameter(Mandatory)]
+        $Blocklist,
+
+        [switch]$ForceRescreen
+    )
+
+    $CacheFile = Join-Path $script:CachePath 'VulnDriverVerdicts.json'
+    if ($null -eq $script:DATVulnVerdictCache) {
+        $script:DATVulnVerdictCache = @{ blocklistVersion = [string]$Blocklist.Version; verdicts = @{} }
+        if (Test-Path $CacheFile) {
+            try {
+                $Loaded = Get-Content -Path $CacheFile -Raw | ConvertFrom-Json -AsHashtable
+                if ($Loaded.blocklistVersion -eq [string]$Blocklist.Version -and $Loaded.verdicts) {
+                    $script:DATVulnVerdictCache = $Loaded
+                } else {
+                    Write-DATLog -Message "Blocklist version changed ($($Loaded.blocklistVersion) -> $($Blocklist.Version)) - all packages will be re-screened" -Severity 1
+                }
+            } catch { }
+        }
+    }
+
+    if (-not $HashSHA256) {
+        $PayloadPath = Join-Path $PackageDir $FileName
+        try { $HashSHA256 = (Get-FileHash -Path $PayloadPath -Algorithm SHA256).Hash } catch { $HashSHA256 = 'nohash' }
+    }
+    $Key = '{0}|{1}' -f $FileName.ToLowerInvariant(), $HashSHA256.ToLowerInvariant()
+
+    if (-not $ForceRescreen -and $script:DATVulnVerdictCache.verdicts.ContainsKey($Key)) {
+        return $script:DATVulnVerdictCache.verdicts[$Key]
+    }
+
+    $Verdict = Invoke-DATLenovoVulnerabilityScreen -PackageDir $PackageDir -PrimaryFileName $FileName -ExtractCommand $ExtractCommand -Blocklist $Blocklist
+    $Verdict['screenedAt'] = (Get-Date).ToString('o')
+    $script:DATVulnVerdictCache.verdicts[$Key] = $Verdict
+    try {
+        $script:DATVulnVerdictCache | ConvertTo-Json -Depth 5 | Set-Content -Path $CacheFile -Encoding UTF8
+    } catch { }
+    return $Verdict
+}
+
 function Get-DATDupScreenVerdict {
     <#
     .SYNOPSIS

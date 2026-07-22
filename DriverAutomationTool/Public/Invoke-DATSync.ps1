@@ -151,14 +151,21 @@ function Invoke-DATSync {
         # driver never reaches a client by any engine.
         [string[]]$ExcludeDrivers = @(),
 
-        # Screen each DriverUpdates DUP against the Microsoft Vulnerable
-        # Driver Blocklist before staging (the list the Defender ASR rule
-        # "Block abuse of in-the-wild exploited vulnerable signed drivers"
-        # enforces). Advisory: matches are logged loudly with the exact
-        # exclusion to add, but the DUP still ships until the admin excludes
-        # it. Verdicts are cached per DUP, so only new/changed DUPs and
-        # blocklist updates cost extraction time.
+        # Screen each DriverUpdates payload (Dell DUPs and Lenovo catalog
+        # packages) against the Microsoft Vulnerable Driver Blocklist before
+        # staging (the list the Defender ASR rule "Block abuse of in-the-wild
+        # exploited vulnerable signed drivers" enforces). Verdicts are cached
+        # per payload, so only new/changed payloads and blocklist updates cost
+        # extraction time.
         [bool]$ScreenVulnerableDrivers = $true,
+
+        # What a screening HIT does. $true (default): the driver is added to
+        # the persistent exclusion ledger (see Add-DATDriverExclusion) and
+        # skipped - it never ships, on this sync or any future one, without
+        # the admin touching the exclusion list. $false: legacy advisory
+        # behavior - the hit is logged loudly with the exact exclusion to add,
+        # but the payload still ships until excluded by hand.
+        [bool]$AutoExcludeVulnerableDrivers = $true,
 
         [switch]$VerifyDownloadHash,
 
@@ -177,11 +184,13 @@ function Invoke-DATSync {
     $ErrorCount = 0
 
     # Vulnerable-driver screening state. The blocklist loads lazily on the
-    # first DriverUpdates DUP so non-DriverUpdates syncs never pay for it;
-    # vulnerable findings accumulate here for the end-of-sync summary.
+    # first DriverUpdates payload so non-DriverUpdates syncs never pay for it;
+    # findings accumulate here for the end-of-sync summaries. Both lists are
+    # mutated (.Add) from Invoke-DATSyncSinglePackage via parent-scope reads.
     $VulnBlocklist = $null
     $VulnBlocklistLoaded = $false
     $VulnerableFound = [System.Collections.Generic.List[string]]::new()
+    $AutoExcludedDrivers = [System.Collections.Generic.List[string]]::new()
 
     # Stages Dell's Inventory Collector (invcol) into a DriverUpdates package
     # and returns the catalog reference for Write-DATDCUCatalog. DCU downloads
@@ -241,6 +250,7 @@ function Invoke-DATSync {
         if ($null -ne $Config.options.wimExcludeDirs)  { $WimExcludeDirs  = @($Config.options.wimExcludeDirs) }
         if ($null -ne $Config.options.excludeDrivers)  { $ExcludeDrivers  = @($Config.options.excludeDrivers) }
         if ($null -ne $Config.options.screenVulnerableDrivers) { $ScreenVulnerableDrivers = [bool]$Config.options.screenVulnerableDrivers }
+        if ($null -ne $Config.options.autoExcludeVulnerableDrivers) { $AutoExcludeVulnerableDrivers = [bool]$Config.options.autoExcludeVulnerableDrivers }
         $WimOptimizeExport = [switch]$Config.options.wimOptimizeExport
         $WebhookUrl = $Config.logging.webhookUrl
 
@@ -252,6 +262,16 @@ function Invoke-DATSync {
     Write-DATLog -Message "Manufacturers: $($Manufacturer -join ', ')" -Severity 1
     Write-DATLog -Message "OS: $OperatingSystem ($Architecture)" -Severity 1
     Write-DATLog -Message "Models: $(if ($Models) { $Models -join ', ' } else { 'All available' })" -Severity 1
+    # Merge the persistent exclusion ledger (auto-added by vulnerable-driver
+    # screening + Add-DATDriverExclusion) into the admin-typed patterns.
+    # Everything downstream - Dell and Lenovo resolvers, smart-check
+    # fingerprints and staging - reads $ExcludeDrivers, so this single merge
+    # point keeps every pass consistent.
+    $LedgerPatterns = @(Get-DATDriverExclusion | ForEach-Object { $_.Pattern } | Where-Object { $_ })
+    if ($LedgerPatterns.Count -gt 0) {
+        Write-DATLog -Message "Driver exclusion ledger active: $($LedgerPatterns.Count) pattern(s) ($($LedgerPatterns -join '; ')) - see Get-DATDriverExclusion" -Severity 1
+        $ExcludeDrivers = @(@($ExcludeDrivers) + $LedgerPatterns | Where-Object { $_ } | Select-Object -Unique)
+    }
     if ($ExcludeDrivers.Count -gt 0) {
         Write-DATLog -Message "Driver exclusions active: $($ExcludeDrivers -join '; ')" -Severity 1
     }
@@ -541,8 +561,12 @@ function Invoke-DATSync {
     $SkipCount = ($SyncResults | Where-Object { $_.Status -eq 'Skipped' }).Count
 
     if ($VulnerableFound.Count -gt 0) {
-        Write-DATLog -Message ("VULNERABLE-DRIVER SUMMARY: $($VulnerableFound.Count) packaged DUP(s) match Microsoft's vulnerable-driver blocklist and will trip Defender ASR fleet-wide: " +
+        Write-DATLog -Message ("VULNERABLE-DRIVER SUMMARY: $($VulnerableFound.Count) packaged payload(s) match Microsoft's vulnerable-driver blocklist and will trip Defender ASR fleet-wide: " +
             ($VulnerableFound -join '; ') + ". Add these to Driver exclusions and re-sync to stop the alerts at the source.") -Severity 3
+    }
+    if ($AutoExcludedDrivers.Count -gt 0) {
+        Write-DATLog -Message ("AUTO-EXCLUDED VULNERABLE DRIVERS: $($AutoExcludedDrivers.Count) payload(s) matched Microsoft's vulnerable-driver blocklist, were added to the exclusion ledger, and were left out of today's package(s): " +
+            ($AutoExcludedDrivers -join '; ') + ". They stay excluded on every future sync (review with Get-DATDriverExclusion; undo with Remove-DATDriverExclusion). Package versions settle on the next sync.") -Severity 3
     }
     Write-DATLog -Message "======== Sync Complete ========" -Severity 1
     Write-DATLog -Message "Duration: $([math]::Round($Duration.TotalMinutes, 1)) minutes" -Severity 1
@@ -1442,10 +1466,6 @@ function Invoke-DATSyncSinglePackage {
                 throw "No eligible Lenovo catalog updates resolved for $ModelName - cannot build catalog-only Driver Updates package"
             }
 
-            if ($ScreenVulnerableDrivers) {
-                Write-DATLog -Message "Vulnerable-driver screening currently supports Dell DUP payloads only - Lenovo packages stage unscreened" -Severity 2
-            }
-
             $ManifestEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
             foreach ($Upd in $LenovoUpdates) {
                 Write-DATLog -Message "  [UPDATE] Staging: $($Upd.Category) - $($Upd.Name) v$($Upd.Version) ($($Upd.ReleaseDate))" -Severity 1
@@ -1497,6 +1517,44 @@ function Invoke-DATSyncSinglePackage {
                     Set-Content -Path (Join-Path $PkgDir "$($Upd.Id).xml") -Value $Upd.DescriptorXml -Encoding UTF8
                 } catch {
                     Write-DATLog -Message "    Could not stage descriptor XML for $($Upd.Id): $($_.Exception.Message)" -Severity 2
+                }
+
+                # Vulnerable-driver screening - same blocklist and policy as
+                # the Dell branch, against the Lenovo payload's extracted
+                # driver binaries. With AutoExcludeVulnerableDrivers (default)
+                # a hit lands in the exclusion ledger and the package is
+                # dropped before it can enter the manifest; otherwise the
+                # legacy advisory applies.
+                if ($ScreenVulnerableDrivers) {
+                    if (-not $VulnBlocklistLoaded) {
+                        $VulnBlocklistLoaded = $true
+                        $VulnBlocklist = Update-DATVulnerableDriverBlocklist
+                        if (-not $VulnBlocklist) {
+                            Write-DATLog -Message "Vulnerable-driver screening unavailable this run (no blocklist) - Lenovo packages stage unscreened" -Severity 2
+                        }
+                    }
+                    if ($VulnBlocklist) {
+                        $Verdict = Get-DATLenovoScreenVerdict -PackageDir $PkgDir -FileName $Upd.FileName -HashSHA256 $Upd.HashSHA256 -ExtractCommand $Upd.ExtractCommand -Blocklist $VulnBlocklist
+                        if ($Verdict.Status -eq 'Vulnerable') {
+                            $Entry = "$($Upd.Name) [$ModelName]"
+                            if ($AutoExcludeVulnerableDrivers) {
+                                Write-DATLog -Message ("VULNERABLE DRIVER AUTO-EXCLUDED: '$($Upd.Name)' ($($Upd.FileName)) - $(@($Verdict.Matches) -join '; '). " +
+                                    "Added to the exclusion ledger and NOT packaged; it stays out of every future sync (Remove-DATDriverExclusion to undo). " +
+                                    "The package version settles on the next sync.") -Severity 3
+                                Add-DATDriverExclusion -Pattern $Upd.Name -Source 'sync-screen' -Manufacturer $Make -Model $ModelName `
+                                    -Reason ("Microsoft vulnerable-driver blocklist: " + (@($Verdict.Matches) -join '; '))
+                                if (-not $AutoExcludedDrivers.Contains($Entry)) { $AutoExcludedDrivers.Add($Entry) }
+                                Remove-Item -Path $PkgDir -Recurse -Force -ErrorAction SilentlyContinue
+                                continue
+                            }
+                            Write-DATLog -Message ("VULNERABLE DRIVER: '$($Upd.Name)' ($($Upd.FileName)) - $(@($Verdict.Matches) -join '; '). " +
+                                "Defender's ASR vulnerable-driver rule will block this on every enforcing device. The package is still being staged - " +
+                                "add '$($Upd.Name)' to Driver exclusions (Models tab > Options, or -ExcludeDrivers) and re-sync to stop deploying it.") -Severity 3
+                            if (-not $VulnerableFound.Contains($Entry)) { $VulnerableFound.Add($Entry) }
+                        } elseif ($Verdict.Status -eq 'Unscreenable') {
+                            Write-DATLog -Message "  Could not screen $($Upd.FileName) for vulnerable drivers: $($Verdict.Detail)" -Severity 2
+                        }
+                    }
                 }
 
                 $StagedSize = (Get-ChildItem -Path $PkgDir -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
@@ -1895,11 +1953,14 @@ function Invoke-DATSyncSinglePackage {
                                 # vendor-tested install path that DCU uses) instead of trying to
                                 # feed extracted INFs through pnputil.
                                 if ($Type -eq 'DriverUpdates') {
-                                    # Vulnerable-driver screening: warn BEFORE the DUP ships if its
-                                    # payload matches the Microsoft blocklist that Defender's ASR
-                                    # vulnerable-driver rule enforces - those installs get blocked
-                                    # on every device and page the security team. Advisory only:
-                                    # the DUP still stages; the admin decides via Driver exclusions.
+                                    # Vulnerable-driver screening: catch a payload that matches the
+                                    # Microsoft blocklist BEFORE it ships - those installs get
+                                    # blocked by Defender's ASR vulnerable-driver rule on every
+                                    # enforcing device and page the security team. With
+                                    # AutoExcludeVulnerableDrivers (default) a hit is added to the
+                                    # persistent exclusion ledger and the DUP is skipped here and
+                                    # on every future sync; otherwise the legacy advisory applies
+                                    # (log loudly, stage anyway, admin excludes by hand).
                                     if ($ScreenVulnerableDrivers) {
                                         if (-not $VulnBlocklistLoaded) {
                                             $VulnBlocklistLoaded = $true
@@ -1911,10 +1972,19 @@ function Invoke-DATSyncSinglePackage {
                                         if ($VulnBlocklist) {
                                             $Verdict = Get-DATDupScreenVerdict -DupPath $DriverExePath -FileName $IndvDriver.FileName -HashMD5 $IndvDriver.HashMD5 -Blocklist $VulnBlocklist
                                             if ($Verdict.Status -eq 'Vulnerable') {
+                                                $Entry = "$($IndvDriver.Name) [$ModelName]"
+                                                if ($AutoExcludeVulnerableDrivers) {
+                                                    Write-DATLog -Message ("VULNERABLE DRIVER AUTO-EXCLUDED: '$($IndvDriver.Name)' ($($IndvDriver.FileName)) - $(@($Verdict.Matches) -join '; '). " +
+                                                        "Added to the exclusion ledger and NOT packaged; it stays out of every future sync (Remove-DATDriverExclusion to undo). " +
+                                                        "The package version settles on the next sync.") -Severity 3
+                                                    Add-DATDriverExclusion -Pattern $IndvDriver.Name -Source 'sync-screen' -Manufacturer $Make -Model $ModelName `
+                                                        -Reason ("Microsoft vulnerable-driver blocklist: " + (@($Verdict.Matches) -join '; '))
+                                                    if (-not $AutoExcludedDrivers.Contains($Entry)) { $AutoExcludedDrivers.Add($Entry) }
+                                                    continue
+                                                }
                                                 Write-DATLog -Message ("VULNERABLE DRIVER: '$($IndvDriver.Name)' ($($IndvDriver.FileName)) - $(@($Verdict.Matches) -join '; '). " +
                                                     "Defender's ASR vulnerable-driver rule will block this on every enforcing device. The DUP is still being packaged - " +
                                                     "add '$($IndvDriver.Name)' to Driver exclusions (Models tab > Options, or -ExcludeDrivers) and re-sync to stop deploying it.") -Severity 3
-                                                $Entry = "$($IndvDriver.Name) [$ModelName]"
                                                 if (-not $VulnerableFound.Contains($Entry)) { $VulnerableFound.Add($Entry) }
                                             } elseif ($Verdict.Status -eq 'Unscreenable') {
                                                 Write-DATLog -Message "  Could not screen $($IndvDriver.FileName) for vulnerable drivers: $($Verdict.Detail)" -Severity 2

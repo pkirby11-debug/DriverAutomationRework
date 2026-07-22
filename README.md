@@ -322,17 +322,29 @@ catalog (the same feed Lenovo System Update / Thin Installer consume):
 **Driver exclusions.** A configurable list (Models tab → *Driver exclusions*,
 `options.excludeDrivers`, or `-ExcludeDrivers`) of name/filename patterns dropped at the
 catalog-match level — so an excluded driver never enters the package, the manifest, the
-allowlist, or the DCU catalog, and can't be installed by *either* engine. Adding/removing a
-pattern changes the package fingerprint and rebuilds the model once. Primary use: keep a
-DUP that trips Defender's ASR vulnerable-driver rule out of the fleet entirely.
+allowlist, or the DCU catalog, and can't be installed by *any* engine, Dell or Lenovo.
+Adding/removing a pattern changes the package fingerprint and rebuilds the model once.
 
-**Vulnerable-driver screening.** Every Dell DUP is screened at sync time against the
-**Microsoft Vulnerable Driver Blocklist** (the list Defender's *"Block abuse of in-the-wild
-exploited vulnerable signed drivers"* ASR rule enforces). DUPs are extracted (no install)
-and their `.sys` files matched on name + file version; a match logs a red warning naming the
-exact exclusion to add, plus an end-of-sync summary. Verdicts are cached per DUP. Controlled
-by `-ScreenVulnerableDrivers` (default on). The standalone cmdlet
-**`Test-DATVulnerableDrivers -Path <folder>`** audits any existing package on demand.
+**The exclusion ledger.** On top of the typed list, the tool keeps its own persistent
+ledger (`Settings\DriverExclusions.json`), merged into the effective exclusions at every
+sync start and managed with **`Get-DATDriverExclusion`** / **`Add-DATDriverExclusion`** /
+**`Remove-DATDriverExclusion`**. Screening hits land here automatically (below), and
+`Add-DATDriverExclusion -Pattern 'X' -Reason '...'` is the one-command response when a
+*client's* `DATApply.log` Defender correlator flags a driver — no GUI editing, and the
+entry records why and where it was seen.
+
+**Vulnerable-driver screening + auto-exclusion.** Every Driver Updates payload — Dell DUPs
+*and* Lenovo catalog packages — is screened at sync time against the **Microsoft Vulnerable
+Driver Blocklist** (the list Defender's *"Block abuse of in-the-wild exploited vulnerable
+signed drivers"* ASR rule enforces). Payloads are extracted (no install; Lenovo packages via
+their own `ExtractCommand`) and their `.sys` files matched on name + file version; verdicts
+are cached per payload hash. A match is **auto-excluded by default**: added to the ledger
+and dropped before it enters the manifest, on that sync and every future one, with a red
+per-hit log line and an end-of-sync summary. `-AutoExcludeVulnerableDrivers:$false`
+(`options.autoExcludeVulnerableDrivers`) restores the old advisory-only behavior (log and
+ship until excluded by hand); `-ScreenVulnerableDrivers` (default on) controls screening
+itself. The standalone cmdlet **`Test-DATVulnerableDrivers -Path <folder>`** audits any
+existing package on demand.
 
 **Apply-side Defender correlator.** After every DUP run (success or failure — a DUP can
 exit 0 while Defender silently blocks its driver write), the client checks the Defender
