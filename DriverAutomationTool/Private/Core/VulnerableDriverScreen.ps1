@@ -183,7 +183,11 @@ function Test-DATFileAgainstBlocklist {
             $Matches_ += ('{0} v{1} matches blocklist rule [{2}] (range {3}){4}' -f $File.Name, $(if ($FileVer) { $FileVer } else { '?' }), $(if ($Rule.FriendlyName) { $Rule.FriendlyName } else { $Rule.FileName }), $Range, $Note)
         }
     }
-    return ,$Matches_
+    # Emit enumerated (no ,-wrapper): every caller collects with @(...), and
+    # a no-enumerate return lands there as ONE element even when the match
+    # list is EMPTY - which made every scanned .sys count as a hit and every
+    # payload with any driver binary screen as Vulnerable.
+    return $Matches_
 }
 
 function Invoke-DATDupVulnerabilityScreen {
