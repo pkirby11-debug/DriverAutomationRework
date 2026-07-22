@@ -333,18 +333,29 @@ sync start and managed with **`Get-DATDriverExclusion`** / **`Add-DATDriverExclu
 *client's* `DATApply.log` Defender correlator flags a driver — no GUI editing, and the
 entry records why and where it was seen.
 
-**Vulnerable-driver screening + auto-exclusion.** Every Driver Updates payload — Dell DUPs
-*and* Lenovo catalog packages — is screened at sync time against the **Microsoft Vulnerable
-Driver Blocklist** (the list Defender's *"Block abuse of in-the-wild exploited vulnerable
-signed drivers"* ASR rule enforces). Payloads are extracted (no install; Lenovo packages via
-their own `ExtractCommand`) and their `.sys` files matched on name + file version; verdicts
-are cached per payload hash. A match is **auto-excluded by default**: added to the ledger
-and dropped before it enters the manifest, on that sync and every future one, with a red
-per-hit log line and an end-of-sync summary. `-AutoExcludeVulnerableDrivers:$false`
-(`options.autoExcludeVulnerableDrivers`) restores the old advisory-only behavior (log and
+**Vulnerable-driver screening + auto-exclusion.** Driver content is screened at sync time
+against the **Microsoft Vulnerable Driver Blocklist** (the list Defender's *"Block abuse of
+in-the-wild exploited vulnerable signed drivers"* ASR rule enforces) across all three makes:
+
+- **Driver Updates payloads** (Dell DUPs, Lenovo catalog packages) are extracted (no
+  install; Lenovo via their own `ExtractCommand`) and their `.sys` files matched on name +
+  file version, with verdicts cached per payload hash. A match is **auto-excluded by
+  default**: added to the ledger and dropped before it enters the manifest, on that sync
+  and every future one.
+- **Base Drivers packs** — Dell CAB, Lenovo pack, and **Surface MSI** (the only shape
+  Surface ships in, and what OSD task sequences consume) — are scanned after the pack tree
+  is fully assembled, and each matching driver's folder is **pruned from the package
+  source** so neither `pnputil` (online) nor `dism` (offline OSD) can install it.
+  Enforcement is the per-sync scan itself; rebuilds re-prune deterministically.
+
+Every hit logs a red line plus an end-of-sync summary. `-AutoExcludeVulnerableDrivers:$false`
+(`options.autoExcludeVulnerableDrivers`) downgrades both behaviors to advisory-only (log and
 ship until excluded by hand); `-ScreenVulnerableDrivers` (default on) controls screening
 itself. The standalone cmdlet **`Test-DATVulnerableDrivers -Path <folder>`** audits any
-existing package on demand.
+existing package on demand. One residual gap: the blocklist's hash-only entries can't be
+evaluated without installing — the apply-side Defender correlator remains the net for those,
+and `Add-DATDriverExclusion` turns a client-log flag into a permanent exclusion with one
+command.
 
 **Apply-side Defender correlator.** After every DUP run (success or failure — a DUP can
 exit 0 while Defender silently blocks its driver write), the client checks the Defender

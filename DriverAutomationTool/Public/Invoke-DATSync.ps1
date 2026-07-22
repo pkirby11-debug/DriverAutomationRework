@@ -151,12 +151,15 @@ function Invoke-DATSync {
         # driver never reaches a client by any engine.
         [string[]]$ExcludeDrivers = @(),
 
-        # Screen each DriverUpdates payload (Dell DUPs and Lenovo catalog
-        # packages) against the Microsoft Vulnerable Driver Blocklist before
-        # staging (the list the Defender ASR rule "Block abuse of in-the-wild
-        # exploited vulnerable signed drivers" enforces). Verdicts are cached
-        # per payload, so only new/changed payloads and blocklist updates cost
-        # extraction time.
+        # Screen driver content against the Microsoft Vulnerable Driver
+        # Blocklist (the list the Defender ASR rule "Block abuse of
+        # in-the-wild exploited vulnerable signed drivers" enforces):
+        # DriverUpdates payloads (Dell DUPs and Lenovo catalog packages)
+        # before staging, and the extracted base Drivers packs of every make
+        # (Dell CAB / Lenovo pack / Surface MSI) before packaging. Update
+        # verdicts are cached per payload, so only new/changed payloads and
+        # blocklist updates cost extraction time; base-pack scans read the
+        # already-extracted tree.
         [bool]$ScreenVulnerableDrivers = $true,
 
         # What a screening HIT does. $true (default): the driver is added to
@@ -2224,6 +2227,55 @@ function Invoke-DATSyncSinglePackage {
                     throw
                 }
                 Write-DATLog -Message "Individual driver overlay failed: $($_.Exception.Message) - continuing with base driver pack" -Severity 2
+            }
+        }
+
+        # --- Base-pack vulnerable-driver screening (all makes) ---
+        # DriverUpdates payloads are screened at staging; the monolithic
+        # Drivers packs (Dell CAB / Lenovo pack / Surface MSI - the only shape
+        # Surface ships in) were the remaining unscreened path. The full
+        # extracted tree exists exactly here (base pack plus any Dell overlay,
+        # before optional compression and INF-cache trimming), so scan every
+        # .sys against the same Microsoft blocklist and prune each match's
+        # driver folder so neither pnputil online nor dism offline can install
+        # it. Enforcement is the per-sync scan itself - packs re-extract from
+        # vendor content and re-prune deterministically - so no ledger entry
+        # is written (a raw .sys-name pattern could cross-match unrelated
+        # update packages).
+        if ($Type -eq 'Drivers' -and $ScreenVulnerableDrivers) {
+            if (-not $VulnBlocklistLoaded) {
+                $VulnBlocklistLoaded = $true
+                $VulnBlocklist = Update-DATVulnerableDriverBlocklist
+                if (-not $VulnBlocklist) {
+                    Write-DATLog -Message "Vulnerable-driver screening unavailable this run (no blocklist) - base pack ships unscreened" -Severity 2
+                }
+            }
+            if ($VulnBlocklist) {
+                $PruneResults = @(Invoke-DATDriverPackVulnerabilityPrune -PackageSourceDir $PackageSourceDir `
+                    -Blocklist $VulnBlocklist -AutoPrune $AutoExcludeVulnerableDrivers)
+                foreach ($Prune in $PruneResults) {
+                    $Entry = "$($Prune.Name) [base pack, $ModelName]"
+                    switch ($Prune.Action) {
+                        'Pruned' {
+                            Write-DATLog -Message ("VULNERABLE DRIVER PRUNED from base pack: '$($Prune.Removed)' - $(@($Prune.Matches) -join '; '). " +
+                                "Removed before packaging; every future rebuild re-applies this automatically.") -Severity 3
+                            if (-not $AutoExcludedDrivers.Contains($Entry)) { $AutoExcludedDrivers.Add($Entry) }
+                        }
+                        'Flagged' {
+                            Write-DATLog -Message ("VULNERABLE DRIVER in base pack: $($Prune.SysFile) - $(@($Prune.Matches) -join '; '). " +
+                                "Still packaged (AutoExcludeVulnerableDrivers is off) - Defender's ASR vulnerable-driver rule will block it on every enforcing device.") -Severity 3
+                            if (-not $VulnerableFound.Contains($Entry)) { $VulnerableFound.Add($Entry) }
+                        }
+                        'PruneFailed' {
+                            Write-DATLog -Message ("VULNERABLE DRIVER in base pack could NOT be pruned: $($Prune.SysFile) ($($Prune.Detail)) - still packaged; " +
+                                "Defender's ASR rule will block it on enforcing devices.") -Severity 3
+                            if (-not $VulnerableFound.Contains($Entry)) { $VulnerableFound.Add($Entry) }
+                        }
+                    }
+                }
+                if ($PruneResults.Count -eq 0) {
+                    Write-DATLog -Message "Base-pack vulnerable-driver scan: clean" -Severity 1
+                }
             }
         }
 

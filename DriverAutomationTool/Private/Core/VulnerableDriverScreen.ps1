@@ -266,6 +266,90 @@ function Invoke-DATDupVulnerabilityScreen {
     }
 }
 
+function Invoke-DATDriverPackVulnerabilityPrune {
+    <#
+    .SYNOPSIS
+        Scans an extracted driver-pack tree for .sys files matching the
+        vulnerable-driver blocklist and (optionally) prunes each match's
+        driver folder before the pack is packaged.
+    .DESCRIPTION
+        Covers the monolithic Drivers-type packages for every make - the tree
+        is already extracted on disk at sync time (Dell CAB, Lenovo SCCM
+        pack, Surface MSI via msiexec /a), so this is a read-and-delete pass
+        with no payload extraction of its own. Pruning removes the matching
+        .sys file's CONTAINING FOLDER (the INF driver package directory) so
+        neither pnputil online nor dism offline can ever install it; a match
+        sitting at the pack root prunes just the file, never the root.
+
+        Unlike the DriverUpdates ledger flow, enforcement here is the
+        per-sync scan itself: packs re-extract from vendor content on every
+        rebuild and are re-pruned deterministically, so no ledger entry is
+        written (a raw .sys-name pattern in the ledger could also
+        cross-match unrelated update packages). Callers own all logging.
+    .PARAMETER AutoPrune
+        $true: delete matches (Action 'Pruned'). $false: report only
+        (Action 'Flagged').
+    .OUTPUTS
+        Array of result objects: Name (sys leaf), SysFile (full path),
+        Removed (path deleted, when pruned), Matches (blocklist rule
+        descriptions), Action ('Pruned'|'Flagged'|'PruneFailed'), Detail.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$PackageSourceDir,
+
+        [Parameter(Mandatory)]
+        $Blocklist,
+
+        [bool]$AutoPrune = $true
+    )
+
+    $Results = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $Root = (Get-Item -Path $PackageSourceDir).FullName.TrimEnd('\', '/')
+
+    foreach ($Sys in @(Get-ChildItem -Path $PackageSourceDir -Recurse -Filter '*.sys' -File -ErrorAction SilentlyContinue)) {
+        # A folder pruned for an earlier sibling match takes its remaining
+        # .sys files with it - skip entries that no longer exist.
+        if (-not (Test-Path -LiteralPath $Sys.FullName)) { continue }
+
+        $Matches_ = @(Test-DATFileAgainstBlocklist -File $Sys -Blocklist $Blocklist)
+        if ($Matches_.Count -eq 0) { continue }
+
+        $Container = $Sys.Directory.FullName.TrimEnd('\', '/')
+        $Action = 'Flagged'
+        $Removed = $null
+        $Detail = ''
+        if ($AutoPrune) {
+            try {
+                if ($Container -eq $Root) {
+                    # Never delete the pack root - prune the file alone.
+                    Remove-Item -LiteralPath $Sys.FullName -Force -ErrorAction Stop
+                    $Removed = $Sys.FullName
+                } else {
+                    Remove-Item -LiteralPath $Container -Recurse -Force -ErrorAction Stop
+                    $Removed = $Container
+                }
+                $Action = 'Pruned'
+            } catch {
+                $Action = 'PruneFailed'
+                $Detail = $_.Exception.Message
+            }
+        }
+
+        $Results.Add([PSCustomObject]@{
+            Name    = $Sys.Name
+            SysFile = $Sys.FullName
+            Removed = $Removed
+            Matches = @($Matches_)
+            Action  = $Action
+            Detail  = $Detail
+        })
+    }
+
+    return @($Results)
+}
+
 function Invoke-DATLenovoVulnerabilityScreen {
     <#
     .SYNOPSIS
