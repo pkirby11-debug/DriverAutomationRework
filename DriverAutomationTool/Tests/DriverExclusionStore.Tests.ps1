@@ -12,13 +12,15 @@ BeforeAll {
     New-Item -Path $script:LogPath -ItemType Directory -Force | Out-Null
 }
 
-BeforeEach {
-    # Fresh isolated ledger per test.
-    $script:SettingsPath = Join-Path $TestDrive ("Settings_{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
-    New-Item -Path $script:SettingsPath -ItemType Directory -Force | Out-Null
-}
-
 Describe 'Driver exclusion ledger' {
+    BeforeEach {
+        # Fresh isolated ledger per test. Lives inside the Describe because
+        # Pester 6 rejects BeforeEach at file root ("Each test setup is not
+        # supported in root").
+        $script:SettingsPath = Join-Path $TestDrive ("Settings_{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+        New-Item -Path $script:SettingsPath -ItemType Directory -Force | Out-Null
+    }
+
     It 'Starts empty and Add creates a full entry' {
         @(Get-DATDriverExclusion).Count | Should -Be 0
 
