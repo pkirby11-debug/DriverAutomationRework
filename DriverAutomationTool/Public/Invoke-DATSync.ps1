@@ -1432,9 +1432,11 @@ function Invoke-DATSyncSinglePackage {
             # (@($null).Count is 1, which would skip the resolve).
             $LenovoUpdates = @($CachedIndividualDrivers | Where-Object { $_ })
             if ($LenovoUpdates.Count -eq 0) {
+                # Where-Object also strips the $null the resolver returns when
+                # it cannot resolve machine types (@($null).Count would be 1).
                 $LenovoUpdates = @(Get-LenovoIndividualUpdates -Model $ModelName `
                     -MachineTypes @(($PackageInfo.AllMachineTypes -split ';') | Where-Object { $_ }) `
-                    -OperatingSystem $PackageInfo.OS -ExcludeDrivers $ExcludeDrivers)
+                    -OperatingSystem $PackageInfo.OS -ExcludeDrivers $ExcludeDrivers | Where-Object { $_ })
             }
             if ($LenovoUpdates.Count -eq 0) {
                 throw "No eligible Lenovo catalog updates resolved for $ModelName - cannot build catalog-only Driver Updates package"

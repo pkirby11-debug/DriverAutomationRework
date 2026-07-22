@@ -104,10 +104,10 @@ Describe 'Get-DATLenovoPackagePnPIDs' {
         $Ids | Should -Not -Contain 'PCI\VEN_AAAA&DEV_BBBB'
     }
 
-    It 'Returns an empty array when no Dependencies PnPIDs exist' {
+    It 'Emits nothing when no Dependencies PnPIDs exist' {
         $Xml = [xml]'<Package id="x" version="1"><Dependencies><_Os><OS>WIN11</OS></_Os></Dependencies></Package>'
         $Ids = Get-DATLenovoPackagePnPIDs -PackageXml $Xml
-        @($Ids).Count | Should -Be 0
+        $Ids | Should -BeNullOrEmpty
     }
 }
 

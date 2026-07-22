@@ -508,10 +508,11 @@ function Get-DATLenovoPackagePnPIDs {
         (XPath is case-sensitive and Lenovo's exact casing is not contractual)
         by walking every element and its ancestors.
     .OUTPUTS
-        Array of hardware ID strings (e.g. 'PCI\VEN_8086&DEV_51F1',
-        'USB\VID_8087&PID_0033'), upper-cased, trailing wildcards stripped.
-        Empty array when the package declares no positive PnPID dependency
-        (callers must then treat it as applicable everywhere).
+        Hardware ID strings (e.g. 'PCI\VEN_8086&DEV_51F1',
+        'USB\VID_8087&PID_0033'), upper-cased, trailing wildcards stripped,
+        emitted one per pipeline item - collect with @(). Nothing when the
+        package declares no positive PnPID dependency (callers must then
+        treat it as applicable everywhere).
     #>
     [CmdletBinding()]
     param(
@@ -542,7 +543,9 @@ function Get-DATLenovoPackagePnPIDs {
         if ($Value -and -not $Ids.Contains($Value)) { $Ids.Add($Value) }
     }
 
-    return ,@($Ids)
+    # Emit enumerated (no ,@() wrapper): every caller collects with @(...),
+    # and a no-enumerate return would land there as ONE nested array element.
+    return $Ids.ToArray()
 }
 
 function ConvertFrom-DATLenovoUpdateDescriptor {
@@ -927,7 +930,10 @@ function Get-LenovoIndividualUpdates {
     Write-DATLog -Message ("Lenovo updates resolved for {0}: {1} eligible driver package(s) ({2} non-driver, {3} forced-reboot, {4} excluded by pattern)" -f `
         $Model, $Updates.Count, $SkippedType, $SkippedReboot, $SkippedExcluded) -Severity 1
 
-    return ,@($Updates | Sort-Object Category, Name)
+    # Emit enumerated (no ,@() wrapper): callers collect with @(...), and a
+    # no-enumerate return would land there as ONE nested array element -
+    # every count and per-item property read downstream would be wrong.
+    return @($Updates | Sort-Object Category, Name)
 }
 
 function ConvertTo-LenovoOSPattern {
