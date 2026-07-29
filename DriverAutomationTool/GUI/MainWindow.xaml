@@ -807,10 +807,58 @@
                         <ProgressBar x:Name="ProgressBar" Height="24" Minimum="0" Maximum="100" />
                         <TextBlock x:Name="StatusLabel" Text="Ready" FontSize="13" Margin="0,8,0,0" Foreground="{DynamicResource Fg}" />
                     </StackPanel>
-                    <ListBox x:Name="LogListBox" FontFamily="Consolas" FontSize="12"
-                             Background="#FF1E1E1E" Foreground="#FFC8C8C8" BorderBrush="{DynamicResource BorderClr}"
-                             ScrollViewer.HorizontalScrollBarVisibility="Auto"
-                             ScrollViewer.VerticalScrollBarVisibility="Auto" />
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <!-- End-of-sync per-model report. Hidden until a sync finishes
+                             with results; Show-DATSyncReport fills it errors-first. -->
+                        <GroupBox x:Name="SyncReportGroup" Grid.Row="0" Header="Sync Report" Visibility="Collapsed">
+                            <DataGrid x:Name="SyncReportGrid" IsReadOnly="True" MaxHeight="230"
+                                      ScrollViewer.VerticalScrollBarVisibility="Auto">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="Status" Width="80" Binding="{Binding Status}">
+                                        <DataGridTextColumn.ElementStyle>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="FontWeight" Value="SemiBold" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding Status}" Value="Success">
+                                                        <Setter Property="Foreground" Value="#FF3FB950" />
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Status}" Value="Error">
+                                                        <Setter Property="Foreground" Value="#FFF85149" />
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Status}" Value="Warning">
+                                                        <Setter Property="Foreground" Value="#FFD29922" />
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Status}" Value="Skipped">
+                                                        <Setter Property="Foreground" Value="{DynamicResource SubtleFg}" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </DataGridTextColumn.ElementStyle>
+                                    </DataGridTextColumn>
+                                    <DataGridTextColumn Header="Manufacturer" Width="100" Binding="{Binding Manufacturer}" />
+                                    <DataGridTextColumn Header="Model" Width="190" Binding="{Binding Model}" />
+                                    <DataGridTextColumn Header="Type" Width="100" Binding="{Binding Type}" />
+                                    <DataGridTextColumn Header="Version" Width="110" Binding="{Binding Version}" />
+                                    <DataGridTextColumn Header="Package ID" Width="90" Binding="{Binding PackageID}" />
+                                    <DataGridTextColumn Header="Details" Width="*" Binding="{Binding Message}">
+                                        <DataGridTextColumn.ElementStyle>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="ToolTip" Value="{Binding Message}" />
+                                            </Style>
+                                        </DataGridTextColumn.ElementStyle>
+                                    </DataGridTextColumn>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </GroupBox>
+                        <ListBox x:Name="LogListBox" Grid.Row="1" FontFamily="Consolas" FontSize="12"
+                                 Background="#FF1E1E1E" Foreground="#FFC8C8C8" BorderBrush="{DynamicResource BorderClr}"
+                                 ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                 ScrollViewer.VerticalScrollBarVisibility="Auto" />
+                    </Grid>
                 </DockPanel>
             </TabItem>
 

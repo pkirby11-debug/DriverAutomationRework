@@ -418,6 +418,72 @@ function Update-DATLogListFromQueue {
     }
 }
 
+function Show-DATSyncReport {
+    <#
+    .SYNOPSIS
+        Fills the Progress-tab Sync Report grid from Invoke-DATSync's result
+        objects and reveals it. Rows are ordered worst-first (Error, Warning,
+        Success, Skipped) so failures never hide below the fold; the GroupBox
+        header carries the per-status counts.
+    #>
+    param($Controls, $Results)
+
+    $Table = $Controls['SyncReportGridData']
+    if ($null -eq $Table) { return }
+    $Table.Rows.Clear()
+
+    $Rank = @{ 'Error' = 0; 'Warning' = 1; 'Success' = 2; 'Skipped' = 3 }
+    $Sorted = @($Results) | Sort-Object `
+        @{ Expression = { $s = [string]$_.Status; if ($Rank.ContainsKey($s)) { $Rank[$s] } else { 4 } } },
+        @{ Expression = { [string]$_.Manufacturer } },
+        @{ Expression = { [string]$_.Model } }
+
+    foreach ($R in $Sorted) {
+        $Row = $Table.NewRow()
+        $Row['Status']       = [string]$R.Status
+        $Row['Manufacturer'] = [string]$R.Manufacturer
+        $Row['Model']        = [string]$R.Model
+        $Row['Type']         = [string]$R.Type
+        $Row['Version']      = [string]$R.Version
+        $Row['PackageID']    = [string]$R.PackageID
+        $Row['Message']      = [string]$R.Message
+        $Table.Rows.Add($Row)
+    }
+
+    $Counts = @{}
+    foreach ($R in @($Results)) {
+        $s = [string]$R.Status
+        $Counts[$s] = 1 + $(if ($Counts.ContainsKey($s)) { $Counts[$s] } else { 0 })
+    }
+    $Parts = [System.Collections.Generic.List[string]]::new()
+    if ($Counts['Success']) { $Parts.Add("$($Counts['Success']) updated") }
+    if ($Counts['Skipped']) { $Parts.Add("$($Counts['Skipped']) already current") }
+    if ($Counts['Warning']) { $Parts.Add("$($Counts['Warning']) nothing to package") }
+    if ($Counts['Error'])   { $Parts.Add("$($Counts['Error']) failed") }
+    $Header = 'Sync Report'
+    if ($Parts.Count -gt 0) { $Header += ' - ' + ($Parts -join ', ') }
+
+    $Controls['SyncReportGroup'].Header = $Header
+    $Controls['SyncReportGroup'].Visibility = [System.Windows.Visibility]::Visible
+}
+
+function Hide-DATSyncReport {
+    <#
+    .SYNOPSIS
+        Collapses and clears the Sync Report grid (called when a new sync
+        starts so a stale report never sits above a fresh log).
+    #>
+    param($Controls)
+
+    if ($Controls['SyncReportGroup']) {
+        $Controls['SyncReportGroup'].Visibility = [System.Windows.Visibility]::Collapsed
+        $Controls['SyncReportGroup'].Header = 'Sync Report'
+    }
+    if ($Controls['SyncReportGridData']) {
+        $Controls['SyncReportGridData'].Rows.Clear()
+    }
+}
+
 function Invoke-DATClick {
     <#
     .SYNOPSIS

@@ -132,6 +132,12 @@ Live, color-coded log of the running sync (INFO / WARN / ERROR), plus a progress
 final `Success / Skipped / Errors` summary line. This is the admin-side equivalent of
 `DriverAutomationTool.log`.
 
+When the sync finishes, a **Sync Report** grid appears above the log: one row per
+model/package attempted, color-coded by outcome — updated (with the new version and
+package ID), already current, nothing to package (e.g. no driver pack published for the
+model/OS), or failed (with the error message) — errors sorted to the top, so there is no
+need to comb the log to see what happened.
+
 <a name="tab-package-management"></a>
 ### Package Management
 
