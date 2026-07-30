@@ -75,6 +75,9 @@ function New-DATMainWindow {
     $Controls['DeployAppsGridData'] = New-DATGridTable -Columns @('Name', 'Version', 'Manufacturer', 'Kind', 'LastModified')
     $Controls['DeployAppsGrid'].ItemsSource = $Controls['DeployAppsGridData'].DefaultView
 
+    $Controls['SyncReportGridData'] = New-DATGridTable -Columns @('Status', 'Manufacturer', 'Model', 'Type', 'Version', 'PackageID', 'Message')
+    $Controls['SyncReportGrid'].ItemsSource = $Controls['SyncReportGridData'].DefaultView
+
     # --- Date/time picker defaults (DatePicker + HH:mm TextBox pairs) ---
     Set-DATDateTimeValue -DatePicker $Controls['DeployAvailablePicker'] -TimeBox $Controls['DeployAvailableTime'] -Value (Get-Date)
     Set-DATDateTimeValue -DatePicker $Controls['DeployDeadlinePicker'] -TimeBox $Controls['DeployDeadlineTime'] -Value (Get-Date).AddHours(24)
@@ -575,6 +578,7 @@ function Initialize-DATMainWindow {
         # Switch to progress tab
         $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
         $Controls['LogListBox'].Items.Clear()
+        Hide-DATSyncReport -Controls $Controls
 
         $Controls['StartButton'].IsEnabled = $false
         $Controls['StopButton'].IsEnabled = $true
@@ -673,15 +677,20 @@ function Initialize-DATMainWindow {
                     $Controls['ProgressBar'].IsIndeterminate = $false
                     $Controls['ProgressBar'].Value = $Controls['ProgressBar'].Maximum
 
+                    # Per-model report above the log: which packages were
+                    # updated, skipped, or failed - no combing the log needed.
+                    Show-DATSyncReport -Controls $Controls -Results $Results
+                    $ReportHint = "`n`nSee the Sync Report on the Progress page for per-model results."
+
                     if ($ErrorCount -gt 0 -and $SuccessCount -eq 0) {
-                        $Controls['StatusLabel'].Text = "Sync failed - $ErrorCount error(s)"
-                        Show-DATWindowMessage -Message "Sync failed!`n`nErrors: $ErrorCount`nSkipped: $SkipCount" -Type Error
+                        $Controls['StatusLabel'].Text = "Sync failed - $ErrorCount error(s) - see report below"
+                        Show-DATWindowMessage -Message "Sync failed!`n`nErrors: $ErrorCount`nSkipped: $SkipCount$ReportHint" -Type Error
                     } elseif ($ErrorCount -gt 0) {
-                        $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $ErrorCount error(s)"
-                        Show-DATWindowMessage -Message "Sync complete with warnings.`n`nSuccess: $SuccessCount`nSkipped: $SkipCount`nErrors: $ErrorCount" -Type Warning
+                        $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $ErrorCount error(s) - see report below"
+                        Show-DATWindowMessage -Message "Sync complete with warnings.`n`nSuccess: $SuccessCount`nSkipped: $SkipCount`nErrors: $ErrorCount$ReportHint" -Type Warning
                     } else {
-                        $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $SkipCount skipped"
-                        Show-DATWindowMessage -Message "Sync complete!`n`nSuccess: $SuccessCount`nSkipped: $SkipCount" -Type Information
+                        $Controls['StatusLabel'].Text = "Sync complete - $SuccessCount succeeded, $SkipCount skipped - see report below"
+                        Show-DATWindowMessage -Message "Sync complete!`n`nSuccess: $SuccessCount`nSkipped: $SkipCount$ReportHint" -Type Information
                     }
                 } else {
                     $RunspaceErrors = $G.SyncRunspace.Streams.Error
@@ -1431,6 +1440,7 @@ function Initialize-DATMainWindow {
 
         $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
         $Controls['LogListBox'].Items.Clear()
+        Hide-DATSyncReport -Controls $Controls
 
         $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
@@ -1723,6 +1733,7 @@ function Initialize-DATMainWindow {
 
         $Controls['TabControl'].SelectedItem = $Controls['ProgressTab']
         $Controls['LogListBox'].Items.Clear()
+        Hide-DATSyncReport -Controls $Controls
         $Controls['StatusLabel'].Text = "Publishing '$Name' to Intune..."
         $Controls['ProgressBar'].IsIndeterminate = $true
         $Controls['IntunePublishButton'].IsEnabled = $false

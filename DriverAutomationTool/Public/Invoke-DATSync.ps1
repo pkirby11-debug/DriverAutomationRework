@@ -55,6 +55,15 @@ function Invoke-DATSync {
         Force refresh of cached catalogs.
     .PARAMETER WebhookUrl
         URL for Teams/Slack notification on completion.
+    .OUTPUTS
+        One result object per model/type combination attempted:
+        Manufacturer, Model, Type, Version, PackageID, Status, Message.
+        Status is 'Success' (package created/updated/refreshed), 'Skipped'
+        (already current), 'Warning' (nothing to package - e.g. no driver
+        pack published for the model/OS), or 'Error' (processing failed;
+        Message carries the exception). Every selected model appears in the
+        output, so the caller - the GUI sync report included - gets a full
+        accounting without reading the log.
     .EXAMPLE
         Invoke-DATSync -ConfigFile "C:\DAT\sync-config.json"
     .EXAMPLE
@@ -185,6 +194,24 @@ function Invoke-DATSync {
     $StartTime = Get-Date
     $SyncResults = [System.Collections.Generic.List[PSCustomObject]]::new()
     $ErrorCount = 0
+
+    # Records a per-model outcome that produced no package (Error, or Warning
+    # for "nothing published to package") so $SyncResults accounts for every
+    # selected model, not just the ones that produced a package. The GUI sync
+    # report renders these rows; without them a failed model is only visible
+    # by combing the log.
+    $AddOutcome = {
+        param([string]$Mfr, [string]$Mdl, [string]$PkgType, [string]$OutcomeStatus, [string]$Msg)
+        $SyncResults.Add([PSCustomObject]@{
+            Manufacturer = $Mfr
+            Model        = $Mdl
+            Type         = $PkgType
+            Version      = $null
+            PackageID    = $null
+            Status       = $OutcomeStatus
+            Message      = $Msg
+        })
+    }
 
     # Vulnerable-driver screening state. The blocklist loads lazily on the
     # first DriverUpdates payload so non-DriverUpdates syncs never pay for it;
@@ -347,10 +374,12 @@ function Invoke-DATSync {
                         $SyncResults.Add($DriverResult)
                     } else {
                         Write-DATLog -Message "No driver pack found for $Make $ModelName / $OperatingSystem" -Severity 2
+                        & $AddOutcome $Make $ModelName 'Drivers' 'Warning' "No driver pack found for $OperatingSystem"
                     }
                 } catch {
                     $ErrorCount++
                     Write-DATLog -Message "Error processing drivers for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
+                    & $AddOutcome $Make $ModelName 'Drivers' 'Error' $_.Exception.Message
                 }
             }
 
@@ -370,6 +399,7 @@ function Invoke-DATSync {
                         $MTypes = @(Find-LenovoMachineType -Model $ModelName)
                         if (-not $MTypes -or $MTypes.Count -eq 0) {
                             Write-DATLog -Message "Cannot resolve machine types for Lenovo $ModelName - skipping catalog-only Driver Updates" -Severity 2
+                            & $AddOutcome $Make $ModelName 'DriverUpdates' 'Warning' 'Cannot resolve Lenovo machine types for catalog lookup'
                         } else {
                             $UpdatesInfo = [PSCustomObject]@{
                                 Manufacturer    = 'Lenovo'
@@ -405,9 +435,11 @@ function Invoke-DATSync {
                     } catch {
                         $ErrorCount++
                         Write-DATLog -Message "Error processing driver updates for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
+                        & $AddOutcome $Make $ModelName 'DriverUpdates' 'Error' $_.Exception.Message
                     }
                 } elseif ($Make -ne 'Dell') {
                     Write-DATLog -Message "Driver Updates (catalog-only) supports Dell and Lenovo - skipping $Make $ModelName" -Severity 2
+                    & $AddOutcome $Make $ModelName 'DriverUpdates' 'Warning' 'Driver Updates (catalog-only) supports Dell and Lenovo only'
                 } else {
                     try {
                         # Reuse Get-DellDriverPack purely to derive SystemID/MachineType for
@@ -415,6 +447,7 @@ function Invoke-DATSync {
                         $DriverPackInfo = Get-DellDriverPack -Model $ModelName -OperatingSystem $OperatingSystem -Architecture $Architecture -ForceRefresh:$ForceRefresh
                         if (-not $DriverPackInfo) {
                             Write-DATLog -Message "No Dell driver pack metadata found for $ModelName / $OperatingSystem - cannot derive SystemID for catalog-only updates" -Severity 2
+                            & $AddOutcome $Make $ModelName 'DriverUpdates' 'Warning' "No Dell driver pack metadata found for $OperatingSystem - cannot derive SystemID"
                         } else {
                             $UpdatesInfo = [PSCustomObject]@{
                                 Manufacturer    = $DriverPackInfo.Manufacturer
@@ -451,6 +484,7 @@ function Invoke-DATSync {
                     } catch {
                         $ErrorCount++
                         Write-DATLog -Message "Error processing driver updates for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
+                        & $AddOutcome $Make $ModelName 'DriverUpdates' 'Error' $_.Exception.Message
                     }
                 }
             }
@@ -481,10 +515,12 @@ function Invoke-DATSync {
                         $SyncResults.Add($BiosResult)
                     } else {
                         Write-DATLog -Message "No BIOS update found for $Make $ModelName" -Severity 2
+                        & $AddOutcome $Make $ModelName 'BIOS' 'Warning' 'No BIOS update found'
                     }
                 } catch {
                     $ErrorCount++
                     Write-DATLog -Message "Error processing BIOS for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
+                    & $AddOutcome $Make $ModelName 'BIOS' 'Error' $_.Exception.Message
                 }
             }
 
@@ -494,6 +530,7 @@ function Invoke-DATSync {
             if ($IncludeBIOSDCU) {
                 if ($Make -ne 'Dell') {
                     Write-DATLog -Message "BIOS Updates (DCU) is currently Dell-only - skipping $Make $ModelName" -Severity 2
+                    & $AddOutcome $Make $ModelName 'BIOSDCU' 'Warning' 'BIOS Updates (DCU) is currently Dell-only'
                 } else {
                     try {
                         $BiosUpdate = Get-DellBIOSUpdate -Model $ModelName -ForceRefresh:$ForceRefresh
@@ -514,10 +551,12 @@ function Invoke-DATSync {
                             $SyncResults.Add($BiosDcuResult)
                         } else {
                             Write-DATLog -Message "No BIOS update found for Dell $ModelName" -Severity 2
+                            & $AddOutcome $Make $ModelName 'BIOSDCU' 'Warning' 'No BIOS update found'
                         }
                     } catch {
                         $ErrorCount++
                         Write-DATLog -Message "Error processing BIOS (DCU) for $Make $ModelName`: $($_.Exception.Message)" -Severity 3
+                        & $AddOutcome $Make $ModelName 'BIOSDCU' 'Error' $_.Exception.Message
                     }
                 }
             }
@@ -562,6 +601,7 @@ function Invoke-DATSync {
     $Duration = (Get-Date) - $StartTime
     $SuccessCount = ($SyncResults | Where-Object { $_.Status -eq 'Success' }).Count
     $SkipCount = ($SyncResults | Where-Object { $_.Status -eq 'Skipped' }).Count
+    $WarnCount = ($SyncResults | Where-Object { $_.Status -eq 'Warning' }).Count
 
     if ($VulnerableFound.Count -gt 0) {
         Write-DATLog -Message ("VULNERABLE-DRIVER SUMMARY: $($VulnerableFound.Count) packaged payload(s) match Microsoft's vulnerable-driver blocklist and will trip Defender ASR fleet-wide: " +
@@ -573,7 +613,7 @@ function Invoke-DATSync {
     }
     Write-DATLog -Message "======== Sync Complete ========" -Severity 1
     Write-DATLog -Message "Duration: $([math]::Round($Duration.TotalMinutes, 1)) minutes" -Severity 1
-    Write-DATLog -Message "Success: $SuccessCount | Skipped: $SkipCount | Errors: $ErrorCount" -Severity 1
+    Write-DATLog -Message "Success: $SuccessCount | Skipped: $SkipCount | Nothing to package: $WarnCount | Errors: $ErrorCount" -Severity 1
 
     # Send webhook notification
     if ($WebhookUrl) {
