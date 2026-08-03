@@ -1523,7 +1523,7 @@ function Get-DellInventoryComponent {
         $ModelCatalogPaths = @(Update-DellModelCatalog -SystemID $SystemID -ForceRefresh:$ForceRefresh)
         foreach ($P in $ModelCatalogPaths) {
             $Xml = Read-DATXml -Path $P
-            $Nodes = @($Xml.SelectNodes("//*[local-name()='InventoryComponent']"))
+            $Nodes = @($Xml.GetElementsByTagName('InventoryComponent'))
             $Inspected.Add(("{0}: root=<{1}>, InventoryComponent nodes={2}" -f (Split-Path $P -Leaf), $Xml.DocumentElement.LocalName, $Nodes.Count))
             $Node = $Nodes | Where-Object { $_.GetAttribute('path') } | Select-Object -First 1
             if ($Node) {
@@ -1545,12 +1545,22 @@ function Get-DellInventoryComponent {
                 $FallbackPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
             }
             if ($FallbackPath) {
-                $Xml = Read-DATXml -Path $FallbackPath
-                $Nodes = @($Xml.SelectNodes("//*[local-name()='InventoryComponent']"))
-                $Inspected.Add(("CatalogPC.xml (master): root=<{0}>, InventoryComponent nodes={1}" -f $Xml.DocumentElement.LocalName, $Nodes.Count))
-                $Node = $Nodes | Where-Object { $_.GetAttribute('path') } | Select-Object -First 1
-                if ($Node) {
-                    $Found = $Node
+                $InvCount = 0
+                $FoundNode = $null
+                Read-DATXmlStreaming -Path $FallbackPath -ElementName 'InventoryComponent' -ProcessBlock {
+                    param($Reader)
+                    $script:InvCount++
+                    if (-not $script:FoundNode) {
+                        $PathAttr = $Reader.GetAttribute('path')
+                        if ($PathAttr) {
+                            $XmlSub = [xml]$Reader.ReadOuterXml()
+                            $script:FoundNode = $XmlSub.DocumentElement
+                        }
+                    }
+                }
+                $Inspected.Add(("CatalogPC.xml (master): InventoryComponent nodes={0}" -f $InvCount))
+                if ($FoundNode) {
+                    $Found = $FoundNode
                     $FoundBase = $Sources.dell.baseUrl
                 }
             } else {

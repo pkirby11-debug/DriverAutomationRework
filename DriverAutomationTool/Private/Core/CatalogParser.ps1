@@ -92,8 +92,23 @@ function Read-DATXml {
     }
 
     try {
-        $Content = Get-Content -Path $Path -Raw -Encoding UTF8
-        [xml]$Xml = $Content
+        $Xml = [System.Xml.XmlDocument]::new()
+        $Xml.XmlResolver = $null
+        $ReaderSettings = [System.Xml.XmlReaderSettings]::new()
+        $ReaderSettings.DtdProcessing = [System.Xml.DtdProcessing]::Ignore
+        $ReaderSettings.XmlResolver = $null
+
+        $Stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $Reader = [System.Xml.XmlReader]::Create($Stream, $ReaderSettings)
+            try {
+                $Xml.Load($Reader)
+            } finally {
+                $Reader.Dispose()
+            }
+        } finally {
+            $Stream.Dispose()
+        }
         return $Xml
     } catch {
         # Try default encoding as fallback
@@ -104,6 +119,52 @@ function Read-DATXml {
             Write-DATLog -Message "Failed to parse XML file $Path`: $($_.Exception.Message)" -Severity 3
             throw
         }
+    }
+}
+
+function Read-DATXmlStreaming {
+    <#
+    .SYNOPSIS
+        Memory-efficient XML streaming reader that invokes a scriptblock for matching element nodes.
+    .PARAMETER Path
+        Path to the XML file.
+    .PARAMETER ElementName
+        Local name of the XML element to process.
+    .PARAMETER ProcessBlock
+        ScriptBlock called with ($Reader) for each matching element.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [string]$ElementName,
+        [Parameter(Mandatory)]
+        [scriptblock]$ProcessBlock
+    )
+
+    if (-not (Test-Path $Path)) {
+        throw "XML file not found: $Path"
+    }
+
+    $ReaderSettings = [System.Xml.XmlReaderSettings]::new()
+    $ReaderSettings.DtdProcessing = [System.Xml.DtdProcessing]::Ignore
+    $ReaderSettings.XmlResolver = $null
+
+    $Stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $Reader = [System.Xml.XmlReader]::Create($Stream, $ReaderSettings)
+        try {
+            while ($Reader.Read()) {
+                if ($Reader.NodeType -eq [System.Xml.XmlNodeType]::Element -and $Reader.LocalName -eq $ElementName) {
+                    & $ProcessBlock $Reader
+                }
+            }
+        } finally {
+            $Reader.Dispose()
+        }
+    } finally {
+        $Stream.Dispose()
     }
 }
 
