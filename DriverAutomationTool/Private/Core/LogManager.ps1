@@ -46,8 +46,10 @@ function Write-DATLog {
     $Bias = if ($OffsetMinutes -le 0) { '+{0}' -f (-$OffsetMinutes) } else { '-{0}' -f $OffsetMinutes }
     $TimeStr = '{0}{1}' -f $Now.ToString('HH:mm:ss.fff', $Inv), $Bias
 
-    $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $Context = if ($Identity) { $Identity.Name } else { $env:USERNAME }
+    $Identity = if ($IsWindows) {
+        try { [Security.Principal.WindowsIdentity]::GetCurrent() } catch { $null }
+    } else { $null }
+    $Context = if ($Identity) { $Identity.Name } elseif ($env:USERNAME) { $env:USERNAME } else { $env:USER }
     $Thread = [System.Threading.Thread]::CurrentThread.ManagedThreadId
 
     # CMTrace format

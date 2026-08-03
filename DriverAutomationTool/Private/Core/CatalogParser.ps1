@@ -129,7 +129,8 @@ function Get-DATStagingRoot {
     if ([string]::IsNullOrWhiteSpace($Documents)) {
         # GetFolderPath returns empty for some service / SYSTEM contexts that have
         # no loaded user profile. Fall back to the literal profile Documents path.
-        $Documents = Join-Path $env:USERPROFILE 'Documents'
+        $Profile = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($env:HOME) { $env:HOME } else { [System.IO.Path]::GetTempPath() }
+        $Documents = Join-Path $Profile 'Documents'
     }
 
     $Root = Join-Path $Documents 'DriverAutomationTool\Staging'

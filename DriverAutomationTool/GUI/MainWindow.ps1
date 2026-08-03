@@ -177,11 +177,15 @@ function Initialize-DATMainWindow {
     # PowerShell line and a snapshot of the GUI state), and keep the window open.
     $Window.Dispatcher.add_UnhandledException({
         param($DSender, $DArgs)
-        $Lines = @("$($DArgs.Exception.Message)")
+        $Ex = $DArgs.Exception
         try {
-            if ($DArgs.Exception -is [System.Management.Automation.IContainsErrorRecord]) {
+            Write-DATLog -Message "Unhandled GUI Exception: $($Ex.Message)" -Severity 3
+        } catch { }
+        $Lines = @("$($Ex.Message)")
+        try {
+            if ($Ex -is [System.Management.Automation.IContainsErrorRecord]) {
                 $Lines += ''
-                $Lines += $DArgs.Exception.ErrorRecord.InvocationInfo.PositionMessage
+                $Lines += $Ex.ErrorRecord.InvocationInfo.PositionMessage
             }
         } catch { }
         try {
@@ -365,7 +369,10 @@ function Initialize-DATMainWindow {
                 Show-DATWindowMessage -Message "Error loading models: $($_.Exception.Message)" -Type Error
                 $Controls['StatusStripLabel'].Text = 'Error loading models'
             } finally {
-                if ($G.ModelRunspace) { $G.ModelRunspace.Dispose(); $G.ModelRunspace = $null }
+                if ($G.ModelRunspace) {
+                    try { $G.ModelRunspace.Dispose() } catch { }
+                    $G.ModelRunspace = $null
+                }
                 $G.ModelHandle = $null
                 $Controls['ModelProgress'].IsIndeterminate = $false
                 $Controls['ModelProgress'].Visibility = [System.Windows.Visibility]::Collapsed
@@ -708,7 +715,7 @@ function Initialize-DATMainWindow {
                 Show-DATWindowMessage -Message "Sync failed: $($_.Exception.Message)" -Type Error
             } finally {
                 if ($G.SyncRunspace) {
-                    $G.SyncRunspace.Dispose()
+                    try { $G.SyncRunspace.Dispose() } catch { }
                     $G.SyncRunspace = $null
                 }
                 $G.SyncHandle = $null
@@ -728,11 +735,15 @@ function Initialize-DATMainWindow {
         if ($G.SyncRunspace -and $G.SyncHandle -and -not $G.SyncHandle.IsCompleted) {
             Write-DATLog -Message 'Sync operation cancelled by user' -Severity 2
 
-            $G.SyncRunspace.Stop()
-            if ($G.SyncTimer) { $G.SyncTimer.Stop() }
+            try { $G.SyncRunspace.Stop() } catch { }
+            if ($G.SyncTimer) { try { $G.SyncTimer.Stop() } catch { } }
 
-            $G.SyncRunspace.Dispose()
-            $G.SyncRunspace = $null
+            try { Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue } catch { }
+
+            if ($G.SyncRunspace) {
+                try { $G.SyncRunspace.Dispose() } catch { }
+                $G.SyncRunspace = $null
+            }
             $G.SyncHandle = $null
             $G.LogQueue = $null
 
@@ -942,16 +953,15 @@ function Initialize-DATMainWindow {
 
             try {
                 $Results   = $G.DeleteRunspace.EndInvoke($G.DeleteHandle)
+                $RsErrors  = @($G.DeleteRunspace.Streams.Error)
                 $Succeeded = @($Results | Where-Object { $_.Status -eq 'Success' })
                 $Failed    = @($Results | Where-Object { $_.Status -eq 'Failed' })
-
-                $G.DeleteRunspace.Dispose()
 
                 $Controls['PkgSearchBox'].Text = ''
                 Invoke-DATClick $Controls['PkgRefreshButton']
                 $Controls['StatusStripLabel'].Text = "Removed $($Succeeded.Count) package(s)"
 
-                if ($Failed.Count -eq 0) {
+                if ($Failed.Count -eq 0 -and $RsErrors.Count -eq 0) {
                     Show-DATWindowMessage -Message "Removed $($Succeeded.Count) package(s) successfully." -Type Information
                 } elseif ($Succeeded.Count -eq 0) {
                     $FailList = ($Failed | ForEach-Object { "$($_.ID) ($($_.Name)): $($_.Error)" }) -join "`n"
@@ -964,7 +974,15 @@ function Initialize-DATMainWindow {
                 $Controls['StatusStripLabel'].Text = 'Package removal failed'
                 Show-DATWindowMessage -Message "Package removal failed: $($_.Exception.Message)" -Type Error
             } finally {
+                if ($G.DeleteRunspace) {
+                    try { $G.DeleteRunspace.Dispose() } catch { }
+                    $G.DeleteRunspace = $null
+                }
                 $G.DeleteHandle = $null
+                $G.LogQueue = $null
+                $Controls['PkgDeleteButton'].IsEnabled  = $true
+                $Controls['PkgRefreshButton'].IsEnabled = $true
+                $Controls['PkgApplyButton'].IsEnabled   = $true
             }
         })
 
@@ -1025,8 +1043,6 @@ function Initialize-DATMainWindow {
 
             try {
                 $Candidates = @($G.OverlayDiscoveryRunspace.EndInvoke($G.OverlayDiscoveryHandle))
-                $G.OverlayDiscoveryRunspace.Dispose()
-                $G.OverlayDiscoveryHandle = $null
 
                 if ($Candidates.Count -eq 0) {
                     & $ReEnable
@@ -1087,16 +1103,8 @@ function Initialize-DATMainWindow {
                     if ($null -eq $G.OverlayRemoveHandle -or -not $G.OverlayRemoveHandle.IsCompleted) { return }
                     $G.OverlayRemoveTimer.Stop()
 
-                    $Controls['PkgCleanupOverlayButton'].IsEnabled = $true
-                    $Controls['PkgDeleteButton'].IsEnabled         = $true
-                    $Controls['PkgRefreshButton'].IsEnabled        = $true
-                    $Controls['PkgApplyButton'].IsEnabled          = $true
-
                     try {
                         $Results = @($G.OverlayRemoveRunspace.EndInvoke($G.OverlayRemoveHandle))
-                        $G.OverlayRemoveRunspace.Dispose()
-                        $G.OverlayRemoveHandle = $null
-
                         $Removed = @($Results | Where-Object { $_.Status -eq 'Removed' }).Count
                         $Failed  = @($Results | Where-Object { $_.Status -eq 'Failed'  })
 
@@ -1111,15 +1119,29 @@ function Initialize-DATMainWindow {
                             Show-DATWindowMessage -Message "Cleanup finished.`n`nRemoved: $Removed`nFailed: $($Failed.Count)`n`n$FailList" -Type Warning
                         }
                     } catch {
-                        $Controls['StatusStripLabel'].Text = 'Cleanup failed'
+                        $Controls['StatusStripLabel'].Text = 'Overlay cleanup failed'
                         Show-DATWindowMessage -Message "Cleanup failed: $($_.Exception.Message)" -Type Error
+                    } finally {
+                        if ($G.OverlayRemoveRunspace) {
+                            try { $G.OverlayRemoveRunspace.Dispose() } catch { }
+                            $G.OverlayRemoveRunspace = $null
+                        }
+                        $G.OverlayRemoveHandle = $null
+                        & $ReEnable
                     }
                 })
+
                 $G.OverlayRemoveTimer.Start()
             } catch {
-                & $ReEnable
-                $Controls['StatusStripLabel'].Text = 'Discovery failed'
+                $Controls['StatusStripLabel'].Text = 'Overlay discovery failed'
                 Show-DATWindowMessage -Message "Overlay package discovery failed: $($_.Exception.Message)" -Type Error
+                & $ReEnable
+            } finally {
+                if ($G.OverlayDiscoveryRunspace) {
+                    try { $G.OverlayDiscoveryRunspace.Dispose() } catch { }
+                    $G.OverlayDiscoveryRunspace = $null
+                }
+                $G.OverlayDiscoveryHandle = $null
             }
         })
         $G.OverlayDiscoveryTimer.Start()
@@ -1930,6 +1952,36 @@ function Initialize-DATMainWindow {
         }
 
         $Controls['UpdateIndividualCheckBox'].IsEnabled = [bool]$Controls['DellCheckBox'].IsChecked
+
+        # Safe Window Closing Cleanup: Stop & dispose any background runspaces and timers
+        $Window.Add_Closing({
+            param($Sender, $Args)
+            $gui = Get-DATGui
+            if ($null -eq $gui -or $null -eq $gui.G) { return }
+            $G = $gui.G
+
+            try { Write-DATLog -Message "GUI window closing - stopping background tasks" -Severity 1 } catch { }
+
+            $TasksToStop = @(
+                @{ Name='Sync';             RS=$G.SyncRunspace;             Timer=$G.SyncTimer }
+                @{ Name='Model';            RS=$G.ModelRunspace;            Timer=$G.ModelTimer }
+                @{ Name='Delete';           RS=$G.DeleteRunspace;           Timer=$G.DeleteTimer }
+                @{ Name='OverlayDiscovery'; RS=$G.OverlayDiscoveryRunspace; Timer=$G.OverlayDiscoveryTimer }
+                @{ Name='OverlayRemove';    RS=$G.OverlayRemoveRunspace;    Timer=$G.OverlayRemoveTimer }
+                @{ Name='Deploy';           RS=$G.DeployRunspace;           Timer=$G.DeployTimer }
+                @{ Name='IntunePublish';    RS=$G.IntunePublishRunspace;    Timer=$G.IntunePublishTimer }
+            )
+
+            foreach ($Item in $TasksToStop) {
+                if ($Item.Timer) { try { $Item.Timer.Stop() } catch { } }
+                if ($Item.RS) {
+                    try {
+                        $Item.RS.Stop()
+                        $Item.RS.Dispose()
+                    } catch { }
+                }
+            }
+        })
 
         # Enable event handlers now that initialization is complete
         $G.Initializing = $false
