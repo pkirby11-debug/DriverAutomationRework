@@ -193,7 +193,10 @@ function Resolve-DATIntuneCertificate {
                     if ($Cert.Thumbprint -eq $Clean) { return $Cert }
                 }
             } finally { $Store.Close() }
-        } catch { }
+        } catch {
+        # Handled exception
+        Write-Verbose "Ignored non-fatal exception: $($_.Exception.Message)"
+    }
     }
     throw "Certificate with thumbprint '$Thumbprint' not found in Cert:\CurrentUser\My or Cert:\LocalMachine\My (it must have a private key)."
 }
@@ -483,7 +486,10 @@ function Import-DATIntuneSession {
         $script:IntuneClientSecret = ConvertTo-SecureString $Session.ClientSecretPlain -AsPlainText -Force
     }
     if ($Session.CertThumbprint) {
-        try { $script:IntuneClientCertificate = Resolve-DATIntuneCertificate -Thumbprint $Session.CertThumbprint } catch { }
+        try { $script:IntuneClientCertificate = Resolve-DATIntuneCertificate -Thumbprint $Session.CertThumbprint } catch {
+        # Handled exception
+        Write-Verbose "Ignored non-fatal exception: $($_.Exception.Message)"
+    }
     }
 }
 
@@ -599,6 +605,7 @@ function Get-DATGraphErrorCode {
         }
     } catch {
         # Best-effort parsing — fall through to return $null.
+        Write-Verbose "Failed to parse JSON error details: $($_.Exception.Message)"
     }
     return $null
 }

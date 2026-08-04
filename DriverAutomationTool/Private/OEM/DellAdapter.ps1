@@ -1284,7 +1284,10 @@ function Get-DATBasePackCategories {
                 if (-not $InfDriverDate -and $Line -match '^\s*DriverVer\s*=\s*(\d{1,2}/\d{1,2}/\d{4})') {
                     try {
                         $InfDriverDate = [datetime]::Parse($Matches[1])
-                    } catch { }
+                    } catch {
+        # Handled exception
+        Write-Verbose "Ignored non-fatal exception: $($_.Exception.Message)"
+    }
                 }
 
                 # Stop once we have both
@@ -1299,6 +1302,7 @@ function Get-DATBasePackCategories {
             }
         } catch {
             # Skip unreadable INF files
+            Write-Verbose "Skipped unreadable INF file: $($_.Exception.Message)"
         }
     }
 

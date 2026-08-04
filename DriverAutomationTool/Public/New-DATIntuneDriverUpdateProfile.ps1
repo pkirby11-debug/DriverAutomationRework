@@ -42,11 +42,11 @@ function New-DATIntuneDriverUpdateProfile {
         -ApprovalType $ApprovalType.ToLowerInvariant() -DeploymentDeferralInDays $DeploymentDeferralInDays
 
     Write-DATLog -Message "Creating Windows driver-update profile '$DisplayName' ($ApprovalType)" -Severity 1 -Component 'Intune'
-    $Profile = Invoke-DATGraphRequest -RelativeUri '/deviceManagement/windowsDriverUpdateProfiles' -Method POST -Body $Body
+    $DriverProfile = Invoke-DATGraphRequest -RelativeUri '/deviceManagement/windowsDriverUpdateProfiles' -Method POST -Body $Body
 
     if ($Assignment) {
-        Set-DATIntuneDriverUpdateProfileAssignment -ProfileId $Profile.id -Assignments @($Assignment)
+        Set-DATIntuneDriverUpdateProfileAssignment -ProfileId $DriverProfile.id -Assignments @($Assignment)
     }
 
-    return $Profile
+    return $DriverProfile
 }

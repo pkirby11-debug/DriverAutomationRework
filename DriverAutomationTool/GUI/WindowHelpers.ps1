@@ -40,7 +40,12 @@ function Get-DATSystemUsesLightTheme {
                 return $true
             }
         }
-    } catch { }
+    } catch {
+        # Non-fatal exception
+        [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+    }
+    }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
+    } }
     return $null
 }
 
@@ -279,7 +284,12 @@ function Complete-DATGridEdit {
     try {
         [void]$Grid.CommitEdit([System.Windows.Controls.DataGridEditingUnit]::Cell, $true)
         [void]$Grid.CommitEdit([System.Windows.Controls.DataGridEditingUnit]::Row, $true)
-    } catch { }
+    } catch {
+        # Non-fatal exception
+        [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+    }
+    }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
+    } }
 }
 
 function Get-DATGridSelectedRows {
@@ -395,7 +405,12 @@ function Add-DATWindowLogEntry {
                 $LogListBox.ScrollIntoView($LogListBox.Items[$LogListBox.Items.Count - 1])
             }
         })
-    } catch { }
+    } catch {
+        # Non-fatal exception
+        [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+    }
+    }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
+    } }
 }
 
 function Update-DATLogListFromQueue {

@@ -62,7 +62,10 @@ function Start-DATGui {
             Show-DATMainWindow   # blocks until the window closes
         } catch {
             $Detail = "{0}`r`n{1}`r`n{2}" -f $_.Exception.Message, $_.ScriptStackTrace, ($_ | Out-String)
-            try { Set-Content -LiteralPath $StartupLog -Value $Detail -ErrorAction SilentlyContinue } catch { }
+            try { Set-Content -LiteralPath $StartupLog -Value $Detail -ErrorAction SilentlyContinue } catch {
+            try { Set-Content -LiteralPath $StartupLog -Value $Detail -ErrorAction SilentlyContinue }     # Non-fatal exception suppressed safely
+            try { Set-Content -LiteralPath $StartupLog -Value $Detail -ErrorAction SilentlyContinue }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
+            try { Set-Content -LiteralPath $StartupLog -Value $Detail -ErrorAction SilentlyContinue } }
             throw
         }
     }).AddArgument($ManifestPath).AddArgument($Psm1Path).AddArgument($ModuleRoot).AddArgument($StartupLog)

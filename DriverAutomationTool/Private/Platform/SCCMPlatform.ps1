@@ -127,8 +127,8 @@ function Get-DATSiteCode {
     )
 
     try {
-        $SiteInfo = Get-WmiObject -ComputerName $SiteServer -Namespace 'root\SMS' `
-            -Class SMS_ProviderLocation -ErrorAction Stop |
+        $SiteInfo = Get-CimInstance -ComputerName $SiteServer -Namespace 'root\SMS' `
+            -ClassName SMS_ProviderLocation -ErrorAction Stop |
             Select-Object -First 1
 
         $Code = $SiteInfo.SiteCode.Trim()
@@ -678,7 +678,7 @@ function Distribute-DATContent {
             if (-not $RefreshSucceeded) {
                 try {
                     Write-DATLog -Message "Attempting WMI RefreshPkgSource fallback for $PackageID" -Severity 2
-                    $DPInstances = Get-WmiObject -ComputerName $script:CMSiteServer `
+                    $DPInstances = Get-CimInstance -ComputerName $script:CMSiteServer `
                         -Namespace $WmiNamespace `
                         -Query "SELECT * FROM SMS_DistributionPoint WHERE PackageID='$PackageID'" `
                         -ErrorAction Stop
@@ -760,9 +760,9 @@ function Get-DATDistributionPoints {
 
     Assert-DATConfigMgrConnected
 
-    $DPs = Get-WmiObject -ComputerName $script:CMSiteServer `
+    $DPs = Get-CimInstance -ComputerName $script:CMSiteServer `
         -Namespace "Root\SMS\Site_$($script:CMSiteCode)" `
-        -Class SMS_SystemResourceList |
+        -ClassName SMS_SystemResourceList |
         Where-Object { $_.RoleName -match 'Distribution' } |
         Select-Object -ExpandProperty ServerName -Unique |
         Sort-Object
@@ -780,7 +780,7 @@ function Get-DATDistributionPointGroups {
 
     Assert-DATConfigMgrConnected
 
-    $DPGs = Get-WmiObject -ComputerName $script:CMSiteServer `
+    $DPGs = Get-CimInstance -ComputerName $script:CMSiteServer `
         -Namespace "Root\SMS\Site_$($script:CMSiteCode)" `
         -Query "SELECT Distinct Name FROM SMS_DistributionPointGroup" |
         Select-Object -ExpandProperty Name |
@@ -806,7 +806,7 @@ function Get-DATDeviceCollections {
     Assert-DATConfigMgrConnected
 
     # SMS_Collection.CollectionType: 1 = User, 2 = Device, 0 = Other (root only)
-    $Names = Get-WmiObject -ComputerName $script:CMSiteServer `
+    $Names = Get-CimInstance -ComputerName $script:CMSiteServer `
         -Namespace "Root\SMS\Site_$($script:CMSiteCode)" `
         -Query "SELECT Name FROM SMS_Collection WHERE CollectionType = 2" -ErrorAction Stop |
         Select-Object -ExpandProperty Name |
@@ -977,7 +977,7 @@ function Get-DATKnownModels {
             $DellQuery = "Select Distinct Model from SMS_G_System_COMPUTER_SYSTEM " +
                 "Where Manufacturer = 'Dell Inc.'"
 
-            $DellWmiModels = @(Get-WmiObject -ComputerName $script:CMSiteServer `
+            $DellWmiModels = @(Get-CimInstance -ComputerName $script:CMSiteServer `
                 -Namespace $WmiNamespace -Query $DellQuery -ErrorAction Stop |
                 Select-Object -ExpandProperty Model -Unique |
                 Sort-Object)
@@ -994,7 +994,7 @@ function Get-DATKnownModels {
             $DellSKUQuery = "Select Distinct SystemSKU from SMS_G_System_MS_SystemInformation " +
                 "Where BaseBoardManufacturer = 'Dell Inc.'"
 
-            $DellSKUs = @(Get-WmiObject -ComputerName $script:CMSiteServer `
+            $DellSKUs = @(Get-CimInstance -ComputerName $script:CMSiteServer `
                 -Namespace $WmiNamespace -Query $DellSKUQuery -ErrorAction SilentlyContinue |
                 Select-Object -ExpandProperty SystemSKU -Unique |
                 Sort-Object)
@@ -1015,7 +1015,7 @@ function Get-DATKnownModels {
             $LenovoQuery = "Select Distinct Manufacturer, Model from SMS_G_System_COMPUTER_SYSTEM " +
                 "Where Manufacturer = 'Lenovo'"
 
-            $LenovoWmiModels = @(Get-WmiObject -ComputerName $script:CMSiteServer `
+            $LenovoWmiModels = @(Get-CimInstance -ComputerName $script:CMSiteServer `
                 -Namespace $WmiNamespace -Query $LenovoQuery -ErrorAction Stop |
                 Select-Object -ExpandProperty Model -Unique |
                 Sort-Object)
@@ -1188,9 +1188,9 @@ function Invoke-DATReleaseStaleLock {
     foreach ($ObjPath in $ObjectPaths) {
         try {
             Write-DATLog -Message "  Attempting WMI ReleaseLock for $ObjPath..." -Severity 1
-            Invoke-WmiMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
-                -Class SMS_ObjectLockRequest -Name ReleaseLock `
-                -ArgumentList @($ObjPath) -ErrorAction Stop | Out-Null
+            Invoke-CimMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
+                -ClassName SMS_ObjectLockRequest -MethodName ReleaseLock `
+                -Arguments @{ ObjectPath = $ObjPath } -ErrorAction Stop | Out-Null
             Write-DATLog -Message "  Released via SMS_ObjectLockRequest: $ObjPath" -Severity 1
             $WmiReleased = $true
         } catch {
@@ -1200,8 +1200,8 @@ function Invoke-DATReleaseStaleLock {
 
     if (-not $WmiReleased) {
         try {
-            Invoke-WmiMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
-                -Class SMS_ObjectLockRequest -Name ReleaseAllLocks -ErrorAction Stop | Out-Null
+            Invoke-CimMethod -ComputerName $SiteServer -Namespace $WmiNamespace `
+                -ClassName SMS_ObjectLockRequest -MethodName ReleaseAllLocks -ErrorAction Stop | Out-Null
             Write-DATLog -Message "  Called ReleaseAllLocks on SMS_ObjectLockRequest" -Severity 1
             $WmiReleased = $true
         } catch {
@@ -1386,17 +1386,17 @@ function Remove-DATLegacyPackage {
                         Write-DATLog -Message "  All CM cmdlet attempts failed. Trying direct WMI package deletion..." -Severity 2
                         try {
                             $WmiClass = if ($PackageType -eq 'DriverPackage') { 'SMS_DriverPackage' } else { 'SMS_Package' }
-                            $WmiPkg = Get-WmiObject -ComputerName $SiteServer `
-                                -Namespace $WmiNamespace -Class $WmiClass `
+                            $WmiPkg = Get-CimInstance -ComputerName $SiteServer `
+                                -Namespace $WmiNamespace -ClassName $WmiClass `
                                 -Filter "PackageID = '$PackageID'" -ErrorAction Stop
                             if (-not $WmiPkg -and $WmiClass -eq 'SMS_Package') {
                                 # Fallback: try driver package class in case type detection was wrong
-                                $WmiPkg = Get-WmiObject -ComputerName $SiteServer `
-                                    -Namespace $WmiNamespace -Class 'SMS_DriverPackage' `
+                                $WmiPkg = Get-CimInstance -ComputerName $SiteServer `
+                                    -Namespace $WmiNamespace -ClassName 'SMS_DriverPackage' `
                                     -Filter "PackageID = '$PackageID'" -ErrorAction Stop
                             }
                             if ($WmiPkg) {
-                                $WmiPkg.Delete() | Out-Null
+                                Remove-CimInstance -InputObject $WmiPkg -ErrorAction Stop | Out-Null
                                 Write-DATLog -Message "  Package removed via direct WMI deletion ($WmiClass)" -Severity 1
                                 $Removed = $true
                             } else {
@@ -1985,7 +1985,10 @@ function Invoke-DATPatchPackage {
                 }
             } catch {
                 # Attempt to discard changes on failure
-                try { Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue } catch { }
+                try { Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue } catch {
+        # Handled exception
+        Write-Verbose "Ignored non-fatal exception: $($_.Exception.Message)"
+    }
                 throw
             } finally {
                 if (Test-Path $MountDir) {
@@ -2421,7 +2424,10 @@ function Get-DATDetectionScript {
 `$Path = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation\$SubKey'
 `$Target = '$EscapedVersion'
 `$Current = `$null
-try { `$Current = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SMBIOSBIOSVersion } catch { }
+try { `$Current = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SMBIOSBIOSVersion } catch {
+        # Handled exception
+        Write-Verbose "Ignored non-fatal exception: $($_.Exception.Message)"
+    }
 if (-not `$Current) { return }
 
 function Compare-DATBIOSVersion {
@@ -2689,7 +2695,10 @@ function Initialize-DATConfigMgrSDKTypes {
         param([string]$FullName)
         foreach ($Assembly in [System.AppDomain]::CurrentDomain.GetAssemblies()) {
             $Resolved = $null
-            try { $Resolved = $Assembly.GetType($FullName, $false) } catch { }
+            try { $Resolved = $Assembly.GetType($FullName, $false) } catch {
+        # Handled exception
+        Write-Verbose "Ignored non-fatal exception: $($_.Exception.Message)"
+    }
             if ($Resolved) { return $Resolved }
         }
         return $null
@@ -2725,7 +2734,10 @@ function Initialize-DATConfigMgrSDKTypes {
 
         $Dlls = @(Get-ChildItem -Path $BinDir -Filter "$AsmShortName*.dll" -ErrorAction SilentlyContinue)
         foreach ($Dll in $Dlls) {
-            try { [void][System.Reflection.Assembly]::LoadFrom($Dll.FullName) } catch { }
+            try { [void][System.Reflection.Assembly]::LoadFrom($Dll.FullName) } catch {
+        # Handled exception
+        Write-Verbose "Ignored non-fatal exception: $($_.Exception.Message)"
+    }
         }
         Write-DATLog -Message "Loaded ConfigMgr ApplicationManagement SDK assemblies from $BinDir ($($Dlls.Count) file(s))" -Severity 1
 

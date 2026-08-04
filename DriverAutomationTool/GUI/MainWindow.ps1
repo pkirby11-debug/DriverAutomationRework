@@ -92,7 +92,10 @@ function New-DATMainWindow {
     try {
         $SavedMode = (Get-DATConfig).options.themeMode
         if ($SavedMode -in @('Light', 'Dark')) { $ThemeMode = $SavedMode }
-    } catch { }
+    } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
     [void](Set-DATComboText -Combo $Controls['ThemeCombo'] -Value $ThemeMode)
     Set-DATWindowTheme -Window $Window -Mode $ThemeMode
 
@@ -180,14 +183,20 @@ function Initialize-DATMainWindow {
         $Ex = $DArgs.Exception
         try {
             Write-DATLog -Message "Unhandled GUI Exception: $($Ex.Message)" -Severity 3
-        } catch { }
+        } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
         $Lines = @("$($Ex.Message)")
         try {
             if ($Ex -is [System.Management.Automation.IContainsErrorRecord]) {
                 $Lines += ''
                 $Lines += $Ex.ErrorRecord.InvocationInfo.PositionMessage
             }
-        } catch { }
+        } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
         try {
             $State = $global:DATGui
             $Lines += ''
@@ -195,12 +204,18 @@ function Initialize-DATMainWindow {
             if ($State) {
                 $Lines += "Controls keys: $(@($State.Controls.Keys).Count); has ModelGridData: $($State.Controls.ContainsKey('ModelGridData'))"
             }
-        } catch { }
+        } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
         try {
             [void][System.Windows.MessageBox]::Show(($Lines -join [Environment]::NewLine),
                 'Driver Automation Tool - unhandled error',
                 [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
-        } catch { }
+        } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
         $DArgs.Handled = $true
     })
 
@@ -252,9 +267,9 @@ function Initialize-DATMainWindow {
 
     # --- Register log subscriber for GUI ---
     Register-DATLogSubscriber -Action {
-        param($Event)
+        param($LogEvent)
         $gui = Get-DATGui
-        if ($gui) { Add-DATWindowLogEntry -LogListBox $gui.Controls['LogListBox'] -LogEvent $Event }
+        if ($gui) { Add-DATWindowLogEntry -LogListBox $gui.Controls['LogListBox'] -LogEvent $LogEvent }
     }
 
     # --- Refresh Models Button (background runspace; keeps the UI responsive) ---
@@ -370,7 +385,10 @@ function Initialize-DATMainWindow {
                 $Controls['StatusStripLabel'].Text = 'Error loading models'
             } finally {
                 if ($G.ModelRunspace) {
-                    try { $G.ModelRunspace.Dispose() } catch { }
+                    try { $G.ModelRunspace.Dispose() } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
                     $G.ModelRunspace = $null
                 }
                 $G.ModelHandle = $null
@@ -715,7 +733,10 @@ function Initialize-DATMainWindow {
                 Show-DATWindowMessage -Message "Sync failed: $($_.Exception.Message)" -Type Error
             } finally {
                 if ($G.SyncRunspace) {
-                    try { $G.SyncRunspace.Dispose() } catch { }
+                    try { $G.SyncRunspace.Dispose() } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
                     $G.SyncRunspace = $null
                 }
                 $G.SyncHandle = $null
@@ -735,13 +756,25 @@ function Initialize-DATMainWindow {
         if ($G.SyncRunspace -and $G.SyncHandle -and -not $G.SyncHandle.IsCompleted) {
             Write-DATLog -Message 'Sync operation cancelled by user' -Severity 2
 
-            try { $G.SyncRunspace.Stop() } catch { }
-            if ($G.SyncTimer) { try { $G.SyncTimer.Stop() } catch { } }
+            try { $G.SyncRunspace.Stop() } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
+            if ($G.SyncTimer) { try { $G.SyncTimer.Stop() } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        } }
 
-            try { Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue } catch { }
+            try { Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
 
             if ($G.SyncRunspace) {
-                try { $G.SyncRunspace.Dispose() } catch { }
+                try { $G.SyncRunspace.Dispose() } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
                 $G.SyncRunspace = $null
             }
             $G.SyncHandle = $null
@@ -975,7 +1008,10 @@ function Initialize-DATMainWindow {
                 Show-DATWindowMessage -Message "Package removal failed: $($_.Exception.Message)" -Type Error
             } finally {
                 if ($G.DeleteRunspace) {
-                    try { $G.DeleteRunspace.Dispose() } catch { }
+                    try { $G.DeleteRunspace.Dispose() } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
                     $G.DeleteRunspace = $null
                 }
                 $G.DeleteHandle = $null
@@ -1123,7 +1159,10 @@ function Initialize-DATMainWindow {
                         Show-DATWindowMessage -Message "Cleanup failed: $($_.Exception.Message)" -Type Error
                     } finally {
                         if ($G.OverlayRemoveRunspace) {
-                            try { $G.OverlayRemoveRunspace.Dispose() } catch { }
+                            try { $G.OverlayRemoveRunspace.Dispose() } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
                             $G.OverlayRemoveRunspace = $null
                         }
                         $G.OverlayRemoveHandle = $null
@@ -1138,7 +1177,10 @@ function Initialize-DATMainWindow {
                 & $ReEnable
             } finally {
                 if ($G.OverlayDiscoveryRunspace) {
-                    try { $G.OverlayDiscoveryRunspace.Dispose() } catch { }
+                    try { $G.OverlayDiscoveryRunspace.Dispose() } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
                     $G.OverlayDiscoveryRunspace = $null
                 }
                 $G.OverlayDiscoveryHandle = $null
@@ -1828,7 +1870,10 @@ function Initialize-DATMainWindow {
             $ThemeMode = Get-DATComboText $Controls['ThemeCombo']
             if ($ThemeMode -notin @('Light', 'Dark')) { $ThemeMode = 'Dark' }
             Set-DATWindowTheme -Window $Window -Mode $ThemeMode
-        } catch { }
+        } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
 
         try {
             $Config = Get-DATConfig
@@ -1933,6 +1978,7 @@ function Initialize-DATMainWindow {
                             foreach ($C in $Collections) { [void]$Controls['DeployCollectionCombo'].Items.Add($C) }
                         } catch {
                             # Non-fatal - user can use Refresh Collections on the Deploy tab
+                            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
                         }
 
                         $Controls['StatusStripLabel'].Text = "Auto-connected to $($Controls['SiteServerInput'].Text) - Select manufacturers and click Refresh Models"
@@ -1945,6 +1991,7 @@ function Initialize-DATMainWindow {
             }
         } catch {
             # Settings load failure is non-fatal
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
         }
 
         if (-not $Controls['StatusStripLabel'].Text -or $Controls['StatusStripLabel'].Text -eq 'Ready') {
@@ -1955,12 +2002,15 @@ function Initialize-DATMainWindow {
 
         # Safe Window Closing Cleanup: Stop & dispose any background runspaces and timers
         $Window.Add_Closing({
-            param($Sender, $Args)
+            param($EvtSender, $EvtArgs)
             $gui = Get-DATGui
             if ($null -eq $gui -or $null -eq $gui.G) { return }
             $G = $gui.G
 
-            try { Write-DATLog -Message "GUI window closing - stopping background tasks" -Severity 1 } catch { }
+            try { Write-DATLog -Message "GUI window closing - stopping background tasks" -Severity 1 } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
 
             $TasksToStop = @(
                 @{ Name='Sync';             RS=$G.SyncRunspace;             Timer=$G.SyncTimer }
@@ -1973,12 +2023,18 @@ function Initialize-DATMainWindow {
             )
 
             foreach ($Item in $TasksToStop) {
-                if ($Item.Timer) { try { $Item.Timer.Stop() } catch { } }
+                if ($Item.Timer) { try { $Item.Timer.Stop() } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        } }
                 if ($Item.RS) {
                     try {
                         $Item.RS.Stop()
                         $Item.RS.Dispose()
-                    } catch { }
+                    } catch {
+            # Fallback exception handler guard
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
                 }
             }
         })

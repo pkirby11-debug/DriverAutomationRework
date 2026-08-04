@@ -80,7 +80,7 @@ function Write-DATLog {
             Component = $Component
         }
         foreach ($Subscriber in $script:LogEventSubscribers) {
-            try { & $Subscriber $EventData } catch { }
+            try { & $Subscriber $EventData } catch { Write-Verbose "Log subscriber invocation failed: $($_.Exception.Message)" }
         }
     }
 }

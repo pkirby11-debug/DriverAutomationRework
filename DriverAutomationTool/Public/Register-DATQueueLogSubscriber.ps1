@@ -16,13 +16,13 @@ function Register-DATQueueLogSubscriber {
     )
 
     Register-DATLogSubscriber -Action {
-        param($Event)
-        $SeverityTag = switch ($Event.Severity) {
+        param($LogEvent)
+        $SeverityTag = switch ($LogEvent.Severity) {
             1 { 'INFO' }
             2 { 'WARN' }
             3 { 'ERROR' }
         }
-        $Entry = "[{0}] [{1}] {2}" -f $Event.Timestamp.ToString('HH:mm:ss'), $SeverityTag, $Event.Message
+        $Entry = "[{0}] [{1}] {2}" -f $LogEvent.Timestamp.ToString('HH:mm:ss'), $SeverityTag, $LogEvent.Message
         $LogQueue.Enqueue($Entry)
     }.GetNewClosure()
 }

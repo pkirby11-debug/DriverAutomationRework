@@ -238,7 +238,10 @@ function Get-LenovoDriverPack {
 
                 $PackDate = [datetime]::MinValue
                 if ($Pack.date) {
-                    try { $PackDate = [datetime]::Parse($Pack.date) } catch { }
+                    try { $PackDate = [datetime]::Parse($Pack.date) } catch {
+        # Handled exception
+        Write-Verbose "Ignored non-fatal exception: $($_.Exception.Message)"
+    }
                 }
 
                 # Check if this pack has a matching version attribute

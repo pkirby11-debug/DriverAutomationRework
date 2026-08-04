@@ -69,7 +69,10 @@ if (-not $DcuCli) {
 
 # DCU >= 4.0 required (the /configure -option=value grammar)
 $DcuVersion = $null
-try { $DcuVersion = (Get-Item $DcuCli).VersionInfo.FileVersion } catch { }
+try { $DcuVersion = (Get-Item $DcuCli).VersionInfo.FileVersion } catch {
+try { $DcuVersion = (Get-Item $DcuCli).VersionInfo.FileVersion }     # Non-fatal exception suppressed safely
+try { $DcuVersion = (Get-Item $DcuCli).VersionInfo.FileVersion }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
+try { $DcuVersion = (Get-Item $DcuCli).VersionInfo.FileVersion } }
 if ($DcuVersion) {
     $Parsed = $null
     if ([version]::TryParse(($DcuVersion -replace '[^\d\.].*$', ''), [ref]$Parsed) -and $Parsed.Major -lt 4) {
@@ -138,7 +141,10 @@ foreach ($K in $Settings.Keys) {
             -NoNewWindow -PassThru -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath -ErrorAction Stop
         $null = $Proc.Handle
         if (-not $Proc.WaitForExit($TimeoutMs)) {
-            try { $Proc.Kill() } catch { }
+            try { $Proc.Kill() } catch {
+            try { $Proc.Kill() }     # Non-fatal exception suppressed safely
+            try { $Proc.Kill() }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
+            try { $Proc.Kill() } }
             $Failed += "$Pair (timeout)"
             Write-Out -Level Warn "    timed out after $PerCommandTimeoutSec s"
             continue

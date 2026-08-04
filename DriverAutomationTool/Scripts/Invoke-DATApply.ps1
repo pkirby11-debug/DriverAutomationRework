@@ -242,6 +242,7 @@ function Invoke-LogRollover {
         Move-Item -Path $Path -Destination $Rolled -Force -ErrorAction Stop
     } catch {
         # Locked/unreadable - leave it and keep appending; next run will retry.
+        Write-Verbose "Log rotation skipped: $($_.Exception.Message)"
     }
 }
 
@@ -261,7 +262,10 @@ trap {
             $_.InvocationInfo.PositionMessage.Trim(),
             $_.ScriptStackTrace
         Add-Content -Path $script:FailsafeLogPath -Value (Format-CMTraceLine -Message $TrapMsg -Severity 3) -ErrorAction SilentlyContinue
-    } catch { }
+    } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
     exit 1
 }
 
@@ -279,7 +283,10 @@ try {
     if ($PSCommandPath) {
         $script:ScriptRev = (Get-FileHash -Path $PSCommandPath -Algorithm SHA256 -ErrorAction Stop).Hash.Substring(0, 8).ToLower()
     }
-} catch { }
+} catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
 
 # Startup marker - writes before any other logic runs so we can confirm the
 # script survived param binding and attribute processing.
@@ -287,7 +294,10 @@ try {
     $StartupMsg = '[START] PID={0} PS={1} Rev={2} Mode={3} Version={4} Package=''{5}''' -f `
         $PID, $PSVersionTable.PSVersion, $script:ScriptRev, $Mode, $Version, $PackageName
     Add-Content -Path $script:FailsafeLogPath -Value (Format-CMTraceLine -Message $StartupMsg -Severity 1) -ErrorAction SilentlyContinue
-} catch { }
+} catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
 
 # -------------------------------------------------------------------------
 # Logging
@@ -352,7 +362,10 @@ function Write-DetectionMarker {
         # they stay marker-only.
         if ($Mode -eq 'BIOS' -or $Mode -eq 'BIOSDCU') {
             $LiveBios = $null
-            try { $LiveBios = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SMBIOSBIOSVersion } catch { }
+            try { $LiveBios = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SMBIOSBIOSVersion } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
             if ($LiveBios) {
                 New-ItemProperty -Path $MarkerPath -Name 'BIOSAtMarker' -Value $LiveBios -PropertyType String -Force | Out-Null
             }
@@ -498,7 +511,10 @@ function Get-PresentGpuVendors {
                 elseif ($HwId -match 'VEN_1002') { [void]$Vendors.Add('AMD') }
             }
         }
-    } catch { }
+    } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
 
     return $Vendors
 }
@@ -1003,7 +1019,10 @@ function Find-DATPackageViaAdminService {
         [switch]$SkipCertificateCheck
     )
 
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
     $RestoreCertCallback = $false
     if ($SkipCertificateCheck) {
         [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
@@ -1114,8 +1133,14 @@ function Invoke-DATContentDownload {
         Write-Log 'Not running in a task sequence - cannot download package content. Run inside an OSD TS, or pre-stage content and pass -ContentPath.' -Severity 3
         return $null
     }
-    try { $TSEnv.Value('DATDriverPackageID')   = $PackageID } catch { }
-    try { $TSEnv.Value('DATDriverPackageName') = "$PackageName" } catch { }
+    try { $TSEnv.Value('DATDriverPackageID')   = $PackageID } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
+    try { $TSEnv.Value('DATDriverPackageName') = "$PackageName" } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
 
     $Agent = $null
     foreach ($Root in @($env:_SMSTSMDataPath, "$env:SystemDrive\_SMSTaskSequence", 'X:\sms\bin', "$env:WINDIR\ccm")) {
@@ -1186,9 +1211,18 @@ function Resolve-DATDriverPackageViaAdminService {
 
     $TSEnv = $null
     try { $TSEnv = New-Object -ComObject Microsoft.SMS.TSEnvironment -ErrorAction Stop } catch { $TSEnv = $null }
-    if (-not $Server   -and $TSEnv) { try { $Server   = $TSEnv.Value('DATAdminServiceServer') }   catch { } }
-    if (-not $User     -and $TSEnv) { try { $User     = $TSEnv.Value('DATAdminServiceUser') }     catch { } }
-    if (-not $Password -and $TSEnv) { try { $Password = $TSEnv.Value('DATAdminServicePassword') } catch { } }
+    if (-not $Server   -and $TSEnv) { try { $Server   = $TSEnv.Value('DATAdminServiceServer') }   catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    } }
+    if (-not $User     -and $TSEnv) { try { $User     = $TSEnv.Value('DATAdminServiceUser') }     catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    } }
+    if (-not $Password -and $TSEnv) { try { $Password = $TSEnv.Value('DATAdminServicePassword') } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    } }
     if (-not $Server) {
         Write-Log 'AdminService discovery requested but no server given (-AdminServiceServer or TS variable DATAdminServiceServer).' -Severity 3
         return $null
@@ -1281,7 +1315,10 @@ function Invoke-DCUDriverUpdates {
         if ($MissingRefs.Count -gt 0) {
             Write-Log ("Package catalog references $($MissingRefs.Count) file(s) MISSING from this content: " + (($MissingRefs | Select-Object -First 5) -join '; ') + "$(if ($MissingRefs.Count -gt 5) { ' ...' }). The content copy is incomplete or stale - if testing from a manual folder, re-copy the ENTIRE share (e.g. robocopy /MIR); under CM, let the content refresh finish. DCU will fail on the missing pieces (inventory included, if the Inventory Collector is among them)." ) -Severity 2
         }
-    } catch { }
+    } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
 
     # Allowlist for the fail-closed scan gate: every update DCU proposes must
     # be one of the package's staged DUPs. Field evidence made this mandatory:
@@ -1295,7 +1332,10 @@ function Invoke-DCUDriverUpdates {
         foreach ($N in @($MfDoc.drivers | ForEach-Object { $_.FileName })) {
             if ($N) { [void]$ManifestNames.Add([string]$N) }
         }
-    } catch { }
+    } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
     if ($ManifestNames.Count -eq 0) {
         Write-Log "Could not build the update allowlist from manifest.json - cannot verify DCU scan results, using built-in DUP engine" -Severity 2
         return $null
@@ -1335,7 +1375,10 @@ function Invoke-DCUDriverUpdates {
     # DCU 3.x has an entirely different CLI grammar (no /configure -option=value
     # commands) - every call would fail input validation. Gate on 4.0+.
     $DcuVersion = $null
-    try { $DcuVersion = (Get-Item $DcuCli -ErrorAction Stop).VersionInfo.FileVersion } catch { }
+    try { $DcuVersion = (Get-Item $DcuCli -ErrorAction Stop).VersionInfo.FileVersion } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
     if ($DcuVersion) {
         $ParsedVer = $null
         if ([version]::TryParse(($DcuVersion -replace '[^\d\.].*$', ''), [ref]$ParsedVer) -and $ParsedVer.Major -lt 4) {
@@ -1386,7 +1429,10 @@ function Invoke-DCUDriverUpdates {
             $null = $P.Handle
             if (-not $P.WaitForExit($TimeoutMs)) {
                 Write-Log "dcu-cli $Label timed out after $([int]($TimeoutMs/60000)) minutes - killing" -Severity 2
-                try { $P.Kill() } catch { }
+                try { $P.Kill() } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                 return $null
             }
             if ($P.ExitCode -eq 2) { $script:DcuFatalErrorCount++ }
@@ -1409,7 +1455,10 @@ function Invoke-DCUDriverUpdates {
                         Write-Log ("  dcu-cli $Label console: " + (($Lines | ForEach-Object { $_.Trim() }) -join ' / ')) -Severity 2
                     }
                 }
-            } catch { }
+            } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         }
     }
 
@@ -1427,7 +1476,10 @@ function Invoke-DCUDriverUpdates {
                     $Txt = Get-Content -Path $F -Raw -ErrorAction Stop
                     if ($Txt -and $Txt -match $CatalogFailurePattern) { return $true }
                 }
-            } catch { }
+            } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         }
         return $false
     }
@@ -1447,7 +1499,10 @@ function Invoke-DCUDriverUpdates {
                     $Txt = Get-Content -Path $F -Raw -ErrorAction Stop
                     if ($Txt -and $Txt -match 'Unable to retrieve system inventory') { return $true }
                 }
-            } catch { }
+            } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         }
         return $false
     }
@@ -1463,7 +1518,10 @@ function Invoke-DCUDriverUpdates {
                     Write-Log ("  dcu log tail: " + (($Lines | ForEach-Object { $_.Trim() }) -join ' / ')) -Severity 2
                 }
             }
-        } catch { }
+        } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
     }
 
     # Build the local repository OUTSIDE the Windows tree. ccmcache lives under
@@ -1533,14 +1591,20 @@ function Invoke-DCUDriverUpdates {
         [System.IO.File]::WriteAllText($LocalCatalogXml, $CatXml, [System.Text.Encoding]::Unicode)
     } catch {
         Write-Log "Could not localize DCU catalog ($($_.Exception.Message)) - using built-in DUP engine" -Severity 2
-        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         return $null
     }
 
     $MakeCab = Join-Path $env:WINDIR 'System32\makecab.exe'
     if (-not (Test-Path $MakeCab)) {
         Write-Log "makecab.exe not found at $MakeCab (needed to package the catalog as .cab for DCU 5.x) - using built-in DUP engine" -Severity 2
-        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         return $null
     }
     try {
@@ -1555,13 +1619,19 @@ function Invoke-DCUDriverUpdates {
             -RedirectStandardOutput $CabOut -RedirectStandardError $CabErr -ErrorAction Stop
         if ($CabProc.ExitCode -ne 0 -or -not (Test-Path $LocalCatalog)) {
             Write-Log "makecab.exe exited $($CabProc.ExitCode) packaging the catalog (output: $CabOut) - using built-in DUP engine" -Severity 2
-            try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+            try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
             return $null
         }
         Write-Log "Packaged DCU catalog: $LocalCatalog (CAB with CatalogPC.xml; baseLocation=$BaseLocation)"
     } catch {
         Write-Log "makecab.exe launch failed: $($_.Exception.Message) - using built-in DUP engine" -Severity 2
-        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         return $null
     }
 
@@ -1613,7 +1683,10 @@ function Invoke-DCUDriverUpdates {
     # Per-run scan purity via -defaultSourceLocation=disable applies to all
     # modes.
     $DcuManagedMode = $null
-    try { $DcuManagedMode = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation' -Name 'DcuManagedMode' -ErrorAction Stop).DcuManagedMode } catch { }
+    try { $DcuManagedMode = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation' -Name 'DcuManagedMode' -ErrorAction Stop).DcuManagedMode } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
     # Sequence trimmed to what 5.6.0.17's named-key results proved viable:
     # - defaultSourceLocation is NOT here: DCU rejects disabling its default
     #   source while no custom catalog is configured (field exit 107 on every
@@ -1673,7 +1746,10 @@ function Invoke-DCUDriverUpdates {
             if (-not (Test-Path $MgKey)) { New-Item -Path $MgKey -Force | Out-Null }
             Set-ItemProperty -Path $MgKey -Name 'DcuManagedMode' -Value 'DATManaged' -Type String -Force
             Set-ItemProperty -Path $MgKey -Name 'DcuManagedModeSetAt' -Value (Get-Date).ToString('o') -Type String -Force
-        } catch { }
+        } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
     }
     try {
         New-Item -Path $SettingsBackupDir -ItemType Directory -Force | Out-Null
@@ -1695,7 +1771,10 @@ function Invoke-DCUDriverUpdates {
             if ($BackupHijacked) {
                 Write-Log "Exported DCU settings still point at a previous run's session catalog (an earlier restore failed) - the pristine copy stays the restore source" -Severity 2
             } else {
-                try { Copy-Item -Path $SettingsBackupFile -Destination $PristineSettings -Force } catch { }
+                try { Copy-Item -Path $SettingsBackupFile -Destination $PristineSettings -Force } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
             }
         } else {
             if ($ExportCode -eq 5) {
@@ -1846,12 +1925,18 @@ function Invoke-DCUDriverUpdates {
                         NodeXml = $NodeXml
                     }
                 }
-            } catch { }
+            } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
             return ,$Items
         }
 
         $ReportDir = Join-Path $SessionDir 'scan-report'
-        try { New-Item -Path $ReportDir -ItemType Directory -Force | Out-Null } catch { }
+        try { New-Item -Path $ReportDir -ItemType Directory -Force | Out-Null } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         $ScanLog = Join-Path $SessionDir 'dcu-scan.log'
         $ScanCode = & $RunDcu @('/scan', "-report=$ReportDir", "-outputLog=$ScanLog") 1800000 'scan'
 
@@ -1972,7 +2057,10 @@ function Invoke-DCUDriverUpdates {
             Write-Log "DCU's scan included $($ForeignProposed.Count) Dell system update(s) outside this package's catalog ($ForeignDesc) - fencing them out with -updateType=$TypeFilter and re-verifying"
 
             $ReportDir2 = Join-Path $SessionDir 'scan-report-2'
-            try { New-Item -Path $ReportDir2 -ItemType Directory -Force | Out-Null } catch { }
+            try { New-Item -Path $ReportDir2 -ItemType Directory -Force | Out-Null } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
             $ScanLog2 = Join-Path $SessionDir 'dcu-scan2.log'
             $ScanCode2 = & $RunDcu @('/scan', "-updateType=$TypeFilter", "-report=$ReportDir2", "-outputLog=$ScanLog2") 1800000 'scan2'
 
@@ -2235,7 +2323,10 @@ function Invoke-DCUDriverUpdates {
         # Drop the staged repo (hardlinks cost nothing, but a copy fallback
         # would otherwise leave GBs on disk; originals in ccmcache are
         # untouched either way).
-        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Item -Path $RepoDir -Recurse -Force -ErrorAction SilentlyContinue } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
     }
 }
 
@@ -2404,7 +2495,10 @@ function Install-DriverUpdates {
             $vi = [version]$Installed
             $vt = [version]$Target
             return $vi.CompareTo($vt)  # -1 / 0 / +1
-        } catch { }
+        } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         # Fall back to Dell's "A05" / "1.1.4.38" style mix - normalize and string-compare.
         $ni = ($Installed -replace '[^A-Za-z0-9.]', '').ToUpperInvariant()
         $nt = ($Target    -replace '[^A-Za-z0-9.]', '').ToUpperInvariant()
@@ -2468,7 +2562,10 @@ function Install-DriverUpdates {
             $Events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = @(1121, 1117); StartTime = $Since } -ErrorAction Stop)
             foreach ($Ev in $Events) {
                 $X = ''
-                try { $X = $Ev.ToXml() } catch { }
+                try { $X = $Ev.ToXml() } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                 $EvPath = if ($X -match "Name='Path'>([^<]+)") { $Matches[1] } else { '' }
                 $Flags += [PSCustomObject]@{
                     Id                    = $Ev.Id
@@ -2476,7 +2573,10 @@ function Install-DriverUpdates {
                     VulnerableDriverRule  = [bool]($X -match $AsrVulnDriverGuid)
                 }
             }
-        } catch { }
+        } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         return ,$Flags
     }
     $DefenderFlagged = 0
@@ -2606,7 +2706,10 @@ function Install-DriverUpdates {
                     $AlreadyInst++
                     continue
                 }
-            } catch { }
+            } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         }
 
         # Persistent-failure quarantine (see $QuarantineThreshold above): this
@@ -2624,7 +2727,10 @@ function Install-DriverUpdates {
                     $Quarantined++
                     continue
                 }
-            } catch { }
+            } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         }
 
         if (-not (Test-Path $DriverExe)) {
@@ -2700,7 +2806,10 @@ function Install-DriverUpdates {
             $Completed = $Proc.WaitForExit($PerDupTimeoutMs)
             if (-not $Completed) {
                 Write-Log "$DriverLabel - timed out after 15 minutes - killing" -Severity 2
-                try { $Proc.Kill() } catch { }
+                try { $Proc.Kill() } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                 $Failed++
                 $FailureLines.Add(("{0} (timeout)" -f $Drv.FileName))
                 continue
@@ -2747,7 +2856,10 @@ function Install-DriverUpdates {
         # Install-InfTree.
         if ($DupCode -eq 1 -and $DupTempDir -and $DupFwLog -and (Test-Path $DupFwLog)) {
             $FwRaw = ''
-            try { $FwRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction Stop } catch { }
+            try { $FwRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction Stop } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
             if ($FwRaw -and $FwRaw -match 'Error locating default extractpath') {
                 Write-Log "$DriverLabel - framework could not resolve its default extract path; retrying as extract (/e=) + pnputil" -Severity 2
                 $FbExtract = Join-Path $DupTempDir 'fallback-extract'
@@ -2756,7 +2868,10 @@ function Install-DriverUpdates {
                     $FbProc = Start-Process -FilePath $DriverExe -ArgumentList '/s', "/e=$FbExtract" -WorkingDirectory $Path -NoNewWindow -PassThru -ErrorAction Stop
                     $null = $FbProc.Handle
                     if (-not $FbProc.WaitForExit(300000)) {
-                        try { $FbProc.Kill() } catch { }
+                        try { $FbProc.Kill() } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                         throw 'extraction timed out after 5 minutes'
                     }
                     $FbInfs = @(Get-ChildItem -Path $FbExtract -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
@@ -2842,7 +2957,10 @@ function Install-DriverUpdates {
                             $PrevFailVer = $Prev.FailedVersion
                             $PrevCount = [int]$Prev.FailCount
                         }
-                    } catch { }
+                    } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                     $NewCount = if ($PrevFailVer -eq $Drv.Version) { $PrevCount + 1 } else { 1 }
                     New-ItemProperty -Path $CompKeyPath -Name 'FailedVersion' -Value $Drv.Version -PropertyType String -Force | Out-Null
                     New-ItemProperty -Path $CompKeyPath -Name 'FailCount'     -Value $NewCount     -PropertyType DWord  -Force | Out-Null
@@ -2851,7 +2969,10 @@ function Install-DriverUpdates {
                     if ($NewCount -ge $QuarantineThreshold) {
                         Write-Log "$DriverLabel - v$($Drv.Version) has now failed $NewCount consecutive time(s) on this device; future runs will QUARANTINE (skip) it until a newer version ships, so this one DUP stops failing the application" -Severity 2
                     }
-                } catch { }
+                } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                 # Pull the verdict out of Dell's framework log so the apply log
                 # itself says why. No framework log after a failure = the process
                 # was killed before Dell's framework initialized (AV/EDR pattern).
@@ -2876,7 +2997,10 @@ function Install-DriverUpdates {
                             if ($Tail.Count -gt 0) {
                                 $FwHint += ' | last lines: ' + ($Tail -join ' / ')
                             }
-                        } catch { }
+                        } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                     } else {
                         $FwHint = "no framework log written - the process died before Dell's DUP framework initialized (typical when AV/EDR terminates the installer at launch)"
                     }
@@ -3047,7 +3171,10 @@ function Install-LenovoDriverUpdates {
             $vi = [version]$Installed
             $vt = [version]$Target
             return $vi.CompareTo($vt)  # -1 / 0 / +1
-        } catch { }
+        } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         # Tagged forms ("2.3.94.0 (Build)") - normalize and compare as
         # equality only; unknown ordering means "needs install".
         $ni = ($Installed -replace '[^A-Za-z0-9.]', '').ToUpperInvariant()
@@ -3084,7 +3211,10 @@ function Install-LenovoDriverUpdates {
             $Events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = @(1121, 1117); StartTime = $Since } -ErrorAction Stop)
             foreach ($Ev in $Events) {
                 $X = ''
-                try { $X = $Ev.ToXml() } catch { }
+                try { $X = $Ev.ToXml() } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                 $EvPath = if ($X -match "Name='Path'>([^<]+)") { $Matches[1] } else { '' }
                 $Flags += [PSCustomObject]@{
                     Id                   = $Ev.Id
@@ -3092,7 +3222,10 @@ function Install-LenovoDriverUpdates {
                     VulnerableDriverRule = [bool]($X -match $AsrVulnDriverGuid)
                 }
             }
-        } catch { }
+        } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         return ,$Flags
     }
     $DefenderFlagged = 0
@@ -3136,7 +3269,10 @@ function Install-LenovoDriverUpdates {
                     $AlreadyInst++
                     continue
                 }
-            } catch { }
+            } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         }
 
         # Persistent-failure quarantine: this exact version has repeatedly
@@ -3152,7 +3288,10 @@ function Install-LenovoDriverUpdates {
                     $Quarantined++
                     continue
                 }
-            } catch { }
+            } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
         }
 
         # Lenovo applicability gate (see function doc). Only positive
@@ -3245,7 +3384,10 @@ function Install-LenovoDriverUpdates {
                 # .Handle keeps PS 5.1's ExitCode readable after WaitForExit.
                 $null = $ExtractProc.Handle
                 if (-not $ExtractProc.WaitForExit($PerPkgTimeoutMs)) {
-                    try { $ExtractProc.Kill() } catch { }
+                    try { $ExtractProc.Kill() } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                     $ExtractTimedOut = $true
                     throw 'extraction timed out after 15 minutes'
                 }
@@ -3321,7 +3463,10 @@ function Install-LenovoDriverUpdates {
                 $null = $Proc.Handle
                 if (-not $Proc.WaitForExit($PerPkgTimeoutMs)) {
                     Write-Log "$DriverLabel - timed out after 15 minutes - killing" -Severity 2
-                    try { $Proc.Kill() } catch { }
+                    try { $Proc.Kill() } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                     $Failed++
                     $FailureLines.Add(("{0} (timeout)" -f $Drv.FileName))
                     continue
@@ -3406,7 +3551,10 @@ function Install-LenovoDriverUpdates {
                         $PrevFailVer = $Prev.FailedVersion
                         $PrevCount = [int]$Prev.FailCount
                     }
-                } catch { }
+                } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
                 $NewCount = if ($PrevFailVer -eq $Drv.Version) { $PrevCount + 1 } else { 1 }
                 New-ItemProperty -Path $CompKeyPath -Name 'FailedVersion' -Value $Drv.Version   -PropertyType String -Force | Out-Null
                 New-ItemProperty -Path $CompKeyPath -Name 'FailCount'     -Value $NewCount       -PropertyType DWord  -Force | Out-Null
@@ -3415,7 +3563,10 @@ function Install-LenovoDriverUpdates {
                 if ($NewCount -ge $QuarantineThreshold) {
                     Write-Log "$DriverLabel - v$($Drv.Version) has now failed $NewCount consecutive time(s) on this device; future runs will QUARANTINE (skip) it until a newer version ships, so this one package stops failing the application" -Severity 2
                 }
-            } catch { }
+            } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
             Write-Log "$DriverLabel - exit $PkgCode (FAILED) in ${Elapsed}s (success codes for this package: $($SuccessCodes -join ','))" -Severity 2
         }
     }
@@ -3943,6 +4094,9 @@ try {
 } catch {
     Write-Log "Unhandled error: $($_.Exception.Message)" -Severity 3
     Write-Log $_.ScriptStackTrace -Severity 3
-    try { Write-DetectionMarker -Status 'Failed' } catch { }
+    try { Write-DetectionMarker -Status 'Failed' } catch {
+        # Non-fatal hardware or registry probe error
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
     exit 1
 }

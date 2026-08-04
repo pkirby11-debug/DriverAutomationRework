@@ -2169,7 +2169,12 @@ function Invoke-DATSyncSinglePackage {
                                             if ($HeadStr -match '<html|<!DOCTYPE|<HTML') {
                                                 Write-DATLog -Message "  WARNING: Downloaded file appears to be HTML, not an EXE - URL may be incorrect" -Severity 3
                                             }
-                                        } catch { }
+                                        } catch {
+        # Non-fatal exception
+        [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+    }
+                                        }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
+                                        } }
                                     }
                                 }
                             } catch {

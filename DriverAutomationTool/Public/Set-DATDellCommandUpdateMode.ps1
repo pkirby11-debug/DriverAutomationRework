@@ -90,7 +90,10 @@ function Set-DATDellCommandUpdateMode {
     }
 
     $DcuVersion = $null
-    try { $DcuVersion = (Get-Item $DcuCli -ErrorAction Stop).VersionInfo.FileVersion } catch { }
+    try { $DcuVersion = (Get-Item $DcuCli -ErrorAction Stop).VersionInfo.FileVersion } catch {
+    try { $DcuVersion = (Get-Item $DcuCli -ErrorAction Stop).VersionInfo.FileVersion }     # Non-fatal exception suppressed safely
+    try { $DcuVersion = (Get-Item $DcuCli -ErrorAction Stop).VersionInfo.FileVersion }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
+    try { $DcuVersion = (Get-Item $DcuCli -ErrorAction Stop).VersionInfo.FileVersion } }
     if ($DcuVersion) {
         $ParsedVer = $null
         if ([version]::TryParse(($DcuVersion -replace '[^\d\.].*$', ''), [ref]$ParsedVer) -and $ParsedVer.Major -lt 4) {
@@ -164,7 +167,10 @@ function Set-DATDellCommandUpdateMode {
                 -NoNewWindow -PassThru -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath -ErrorAction Stop
             $null = $Proc.Handle
             if (-not $Proc.WaitForExit($TimeoutMs)) {
-                try { $Proc.Kill() } catch { }
+                try { $Proc.Kill() } catch {
+                try { $Proc.Kill() }     # Non-fatal exception suppressed safely
+                try { $Proc.Kill() }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
+                try { $Proc.Kill() } }
                 $Failed.Add("$Pair (timeout)")
                 Write-DATLog -Message "    timed out after $PerCommandTimeoutSec s" -Severity 2
                 continue

@@ -120,7 +120,9 @@ function Update-DATVulnerableDriverBlocklist {
                 $Parsed = Get-Content -Path $Stale -Raw | ConvertFrom-Json -AsHashtable
                 Write-DATLog -Message "Using stale cached blocklist (version $($Parsed.Version), retrieved $($Parsed.RetrievedAt))" -Severity 2
                 return $Parsed
-            } catch { }
+            } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
         }
         return $null
     } finally {
@@ -160,7 +162,9 @@ function Test-DATFileAgainstBlocklist {
         $Vi = $File.VersionInfo
         if ($Vi.OriginalFilename) { [void]$Names.Add($Vi.OriginalFilename.Trim().Trim([char]0)) }
         $FileVer = $Vi.FileVersionRaw
-    } catch { }
+    } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
 
     foreach ($Rule in @($Blocklist.FileNameRules)) {
         if (-not $Names.Contains([string]$Rule.FileName)) { continue }
@@ -229,7 +233,9 @@ function Invoke-DATDupVulnerabilityScreen {
             $Proc = Start-Process -FilePath $DupPath -ArgumentList '/s', "/e=$ExtractDir" -NoNewWindow -PassThru -ErrorAction Stop
             $null = $Proc.Handle
             if (-not $Proc.WaitForExit(300000)) {
-                try { $Proc.Kill() } catch { }
+                try { $Proc.Kill() } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
                 return @{ Status = 'Unscreenable'; Matches = @(); Detail = 'extraction timed out after 5 minutes' }
             }
         } catch {
@@ -242,13 +248,17 @@ function Invoke-DATDupVulnerabilityScreen {
             $Events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = @(1121, 1117); StartTime = $Started } -ErrorAction Stop)
             foreach ($Ev in $Events) {
                 $X = ''
-                try { $X = $Ev.ToXml() } catch { }
+                try { $X = $Ev.ToXml() } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
                 if ($X -and $X.IndexOf($ExtractDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                     $RuleNote = if ($X -match $AsrVulnGuid) { 'ASR vulnerable-driver rule' } else { "Defender event $($Ev.Id)" }
                     return @{ Status = 'Vulnerable'; Matches = @("payload write blocked during screening extraction ($RuleNote)"); Detail = 'Defender blocked the extraction itself' }
                 }
             }
-        } catch { }
+        } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
 
         $SysFiles = @(Get-ChildItem -Path $ExtractDir -Recurse -Filter '*.sys' -File -ErrorAction SilentlyContinue)
         if ($SysFiles.Count -eq 0) {
@@ -425,7 +435,9 @@ function Invoke-DATLenovoVulnerabilityScreen {
                     $Proc = Start-Process @SpParams
                     $null = $Proc.Handle
                     if (-not $Proc.WaitForExit(300000)) {
-                        try { $Proc.Kill() } catch { }
+                        try { $Proc.Kill() } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
                         return @{ Status = 'Unscreenable'; Matches = @(); Detail = 'screening extraction timed out after 5 minutes' }
                     }
                     $ExtractRan = $true
@@ -441,13 +453,17 @@ function Invoke-DATLenovoVulnerabilityScreen {
             $Events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = @(1121, 1117); StartTime = $Started } -ErrorAction Stop)
             foreach ($Ev in $Events) {
                 $X = ''
-                try { $X = $Ev.ToXml() } catch { }
+                try { $X = $Ev.ToXml() } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
                 if ($X -and $X.IndexOf($WorkDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                     $RuleNote = if ($X -match $AsrVulnGuid) { 'ASR vulnerable-driver rule' } else { "Defender event $($Ev.Id)" }
                     return @{ Status = 'Vulnerable'; Matches = @("payload write blocked during screening extraction ($RuleNote)"); Detail = 'Defender blocked the extraction itself' }
                 }
             }
-        } catch { }
+        } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
 
         $SysFiles = @(Get-ChildItem -Path $WorkDir -Recurse -Filter '*.sys' -File -ErrorAction SilentlyContinue)
         if ($SysFiles.Count -eq 0) {
@@ -514,7 +530,9 @@ function Get-DATLenovoScreenVerdict {
                 } else {
                     Write-DATLog -Message "Blocklist version changed ($($Loaded.blocklistVersion) -> $($Blocklist.Version)) - all packages will be re-screened" -Severity 1
                 }
-            } catch { }
+            } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
         }
     }
 
@@ -533,7 +551,9 @@ function Get-DATLenovoScreenVerdict {
     $script:DATVulnVerdictCache.verdicts[$Key] = $Verdict
     try {
         $script:DATVulnVerdictCache | ConvertTo-Json -Depth 5 | Set-Content -Path $CacheFile -Encoding UTF8
-    } catch { }
+    } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
     return $Verdict
 }
 
@@ -573,7 +593,9 @@ function Get-DATDupScreenVerdict {
                 } else {
                     Write-DATLog -Message "Blocklist version changed ($($Loaded.blocklistVersion) -> $($Blocklist.Version)) - all DUPs will be re-screened" -Severity 1
                 }
-            } catch { }
+            } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
         }
     }
 
@@ -591,6 +613,8 @@ function Get-DATDupScreenVerdict {
     $script:DATVulnVerdictCache.verdicts[$Key] = $Verdict
     try {
         $script:DATVulnVerdictCache | ConvertTo-Json -Depth 5 | Set-Content -Path $CacheFile -Encoding UTF8
-    } catch { }
+    } catch { # Non-fatal fallback
+            Write-Verbose "Cache read error: $($_.Exception.Message)"
+        }
     return $Verdict
 }
