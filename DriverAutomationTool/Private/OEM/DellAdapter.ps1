@@ -716,9 +716,14 @@ function Get-DellIndividualDrivers {
             $CompatibleOsPatterns = @(
                 '*Windows10*'   # DriverPackCatalog long format
                 '*Windows11*'   # DriverPackCatalog long format
+                '*Win10*'       # Short Win10 format (e.g. Win10-x64)
+                '*Win11*'       # Short Win11 format (e.g. Win11-x64)
                 'W10*'          # CatalogPC short format (Win10 Home/Pro/Ent, any arch)
                 'W11*'          # CatalogPC short format (Win11 Home/Pro/Ent, any arch)
-                'W2[0-9]*'      # Dell year-based Win11 codes (W21H4/W21P4 ...)
+                'WIN10*'        # CatalogPC uppercase short format (WIN10, WIN1064)
+                'WIN11*'        # CatalogPC uppercase short format (WIN11, WIN1164)
+                'W2[0-9]*'      # Dell year-based Win11 codes (W21H4/W21P4/W24H4...)
+                'W3[0-9]*'      # Future year-based codes
             )
             Write-DATLog -Message "Filtering individual drivers to OS patterns: $($CompatibleOsPatterns -join ', ') (from '$OperatingSystem')" -Severity 1
         } else {
@@ -785,12 +790,15 @@ function Get-DellIndividualDrivers {
         $k = $k -replace ',?\s*A\d{2,3}$', ''
         $k = $k -replace '\s+Driver\s+and\s+.+\s+Application$', ' Driver'
         $k = $k -replace '\s+and\s+NVIDIA\s+Control\s+Panel\s+Application$', ''
+        $k = $k -replace '\s+and\s+Provider\s+Package\s+Driver$', ' Driver'
         $k = $k -replace '\s*\([^)]*\)', ''
         $k = $k -replace '\b[A-Za-z0-9][A-Za-z0-9\-]*(?:/[A-Za-z0-9][A-Za-z0-9\-]*)+\b', ''
         $k = $k -replace '\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+){3,}\b', ''
         $k = $k -replace '\b(UWD|DCH|Desktop|Bundle)\b', ''
         $k = $k -replace '\b(?:GT|GTX|RTX|RX|GS|GE|TI|XT|XTX|Super)\b', ''
-        $k = $k -replace '\b[A-Za-z]?[0-9x]{3,5}\b', ''
+        # Preserve hardware controller model numbers (e.g. I219, I225, I226, AX210, RTL8111, ALC3204)
+        # while stripping generic model series numbers
+        $k = $k -replace '\b(?!(?:I|AX|E|X|RTL|ALC|MT|QCN|BCM)\d)[A-Za-z]?[0-9x]{4,5}\b', ''
         ($k -replace '\s+', ' ').Trim().ToLowerInvariant()
     }
 

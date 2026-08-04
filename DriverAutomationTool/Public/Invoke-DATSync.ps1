@@ -872,7 +872,14 @@ function Invoke-DATSyncSinglePackage {
                 if ($Existing -is [array]) { $Existing[0] } else { $Existing }
             } else { $null }
 
-            if ($Make -eq 'Lenovo') {
+            if ($Type -eq 'DriverUpdates') {
+                # Catalog-only mode (DriverUpdates): no base pack and no INF files exist in source.
+                # All categories are treated as missing so the catalog resolver checks every category.
+                $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input', 'Other')
+                $SmartCheckMissing = $AllCategories
+                $SourceScanComplete = $true
+                Write-DATLog -Message "Smart check: catalog-only mode (DriverUpdates) - checking all categories in OEM catalog" -Severity 1
+            } elseif ($Make -eq 'Lenovo') {
                 # Lenovo: no base pack and no INF categories to scan - the
                 # resolved catalog list below is authoritative on its own, so
                 # the no-change skip is safe without a source scan.
@@ -1689,17 +1696,21 @@ function Invoke-DATSyncSinglePackage {
                 # "Other" is always treated as missing since INF scans can't detect it -
                 # this ensures unclassified drivers from the Dell catalog are always checked.
                 $AllCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input', 'Other')
-                $InfScanResult = Get-DATBasePackCategories -Path $PackageSourceDir
-                $PresentCategories = $InfScanResult.Categories
-                $PackCategoryDates = $InfScanResult.CategoryDates
-                $MissingCats = @($AllCategories | Where-Object { $_ -notin $PresentCategories })
-                $StandardMissing = @($MissingCats | Where-Object { $_ -ne 'Other' })
                 if ($Type -eq 'DriverUpdates') {
+                    # Catalog-only mode: no base pack extracted; pull latest driver in every category
+                    $MissingCats = $AllCategories
                     Write-DATLog -Message "Catalog-only mode: pulling latest driver in every category from Dell per-model catalog" -Severity 1
-                } elseif ($StandardMissing.Count -gt 0) {
-                    Write-DATLog -Message "Base pack is missing standard driver categories: $($StandardMissing -join ', ')" -Severity 2
                 } else {
-                    Write-DATLog -Message "Base pack covers all standard driver categories (also checking 'Other' for unclassified drivers)" -Severity 1
+                    $InfScanResult = Get-DATBasePackCategories -Path $PackageSourceDir
+                    $PresentCategories = $InfScanResult.Categories
+                    $PackCategoryDates = $InfScanResult.CategoryDates
+                    $MissingCats = @($AllCategories | Where-Object { $_ -notin $PresentCategories })
+                    $StandardMissing = @($MissingCats | Where-Object { $_ -ne 'Other' })
+                    if ($StandardMissing.Count -gt 0) {
+                        Write-DATLog -Message "Base pack is missing standard driver categories: $($StandardMissing -join ', ')" -Severity 2
+                    } else {
+                        Write-DATLog -Message "Base pack covers all standard driver categories (also checking 'Other' for unclassified drivers)" -Severity 1
+                    }
                 }
 
                 # Use cached results from smart check if available and category detection matches
