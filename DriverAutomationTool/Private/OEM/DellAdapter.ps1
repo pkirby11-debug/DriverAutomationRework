@@ -1431,6 +1431,8 @@ function Write-DATDCUCatalog {
         [Parameter(Mandatory)]
         [object[]]$Drivers,
 
+        [string]$SystemID,
+
         # Raw <InventoryComponent> OuterXml from Dell's catalog + the staged
         # collector filename. DCU downloads the Inventory Collector FROM THE
         # CATALOG SOURCE to run its system-inventory phase; without this entry
@@ -1465,10 +1467,29 @@ function Write-DATDCUCatalog {
             $InventoryXml = ($InventoryComponentXml -replace '\bpath\s*=\s*"[^"]*"', ('path="{0}"' -f $InventoryFileName)) + "`r`n"
         }
 
+        $SupportedSystemsXml = ''
+        if ($SystemID) {
+            $SysIDNodes = ($SystemID.Split(';') | Where-Object { $_ -and $_.Trim() } | ForEach-Object {
+                "      <systemID>$($_.Trim().ToUpper())</systemID>"
+            }) -join "`r`n"
+            if ($SysIDNodes) {
+                $SupportedSystemsXml = @"
+  <SupportedSystems>
+    <Brand>
+      <Model>
+        <Display>Dell System</Display>
+$SysIDNodes
+      </Model>
+    </Brand>
+  </SupportedSystems>
+"@ + "`r`n"
+            }
+        }
+
         $NewContent = @"
 <?xml version="1.0" encoding="utf-16"?>
 <Manifest xmlns="openmanifest" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" baseLocation="" baseLocationAccessProtocols="" identifier="DAT-DriverUpdates" releaseID="DAT" version="1.0" predecessorID="">
-$InventoryXml$ComponentsXml
+$SupportedSystemsXml$InventoryXml$ComponentsXml
 </Manifest>
 "@
 

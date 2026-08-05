@@ -1024,7 +1024,7 @@ function Invoke-DATSyncSinglePackage {
                             $_.FileName -and (Test-Path (Join-Path $ExistingToCheck.SourcePath $_.FileName))
                         })
                         if ($OnDisk.Count -gt 0) {
-                            $DcuCatParams = @{ PackageSourceDir = $ExistingToCheck.SourcePath; Drivers = $OnDisk }
+                            $DcuCatParams = @{ PackageSourceDir = $ExistingToCheck.SourcePath; Drivers = $OnDisk; SystemID = $PackageInfo.SystemID }
                             $InvComp = $null
                             try {
                                 $InvComp = & $AddDellInventoryToPackage $ExistingToCheck.SourcePath $PackageInfo.SystemID
@@ -1373,7 +1373,7 @@ function Invoke-DATSyncSinglePackage {
                         ComponentXml = $PackageInfo.ComponentXml
                     }
                 )
-                $DcuCatParams = @{ PackageSourceDir = $PackageSourceDir; Drivers = $BiosForCatalog }
+                $DcuCatParams = @{ PackageSourceDir = $PackageSourceDir; Drivers = $BiosForCatalog; SystemID = $PackageInfo.SystemID }
                 $InvComp = $null
                 try {
                     $InvComp = & $AddDellInventoryToPackage $PackageSourceDir $PackageInfo.SystemID
@@ -2224,7 +2224,7 @@ function Invoke-DATSyncSinglePackage {
                             # report a download failure.
                             $StagedNames = @($ManifestEntries | ForEach-Object { $_.FileName })
                             $StagedForCatalog = @($IndividualDrivers | Where-Object { $StagedNames -contains $_.FileName })
-                            $DcuCatParams = @{ PackageSourceDir = $PackageSourceDir; Drivers = $StagedForCatalog }
+                            $DcuCatParams = @{ PackageSourceDir = $PackageSourceDir; Drivers = $StagedForCatalog; SystemID = $PackageInfo.SystemID }
                             $InvComp = $null
                             try {
                                 $InvComp = & $AddDellInventoryToPackage $PackageSourceDir $PackageInfo.SystemID

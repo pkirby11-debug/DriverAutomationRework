@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.3'
+    ModuleVersion     = '2.25.4'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.3 - Fixes InventoryComponent collector embedding in Dell DCUCatalog.xml by replacing cross-module script block variable scope lookup in Get-DellInventoryComponent with direct XmlReader stream processing against master CatalogPC.xml; ensures DCU local system inventory collector binary is included in catalog packages.'
+    Description       = '2.25.4 - Fixes DCU catalog validation error ("system is not supported by available catalogs") by embedding top-level <SupportedSystems> SystemIDs into generated DCUCatalog.xml manifest; allows dcu-cli /scan to recognize target hardware during local catalog evaluation.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
