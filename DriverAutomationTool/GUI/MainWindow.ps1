@@ -656,6 +656,7 @@ function Initialize-DATMainWindow {
         }
         if ($Controls['UpdateIndividualCheckBox'].IsChecked) { $SyncParams['UpdateIndividualDrivers'] = $true }
         if ($Controls['VerifyHashCheckBox'].IsChecked) { $SyncParams['VerifyDownloadHash'] = $true }
+        if ($Controls['ForceRefreshCheckBox'].IsChecked) { $SyncParams['ForceRefresh'] = $true }
         $ExclPatterns = @(($Controls['ExcludeDriversInput'].Text -split ';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         if ($ExclPatterns.Count -gt 0) { $SyncParams['ExcludeDrivers'] = $ExclPatterns }
 
@@ -840,6 +841,7 @@ function Initialize-DATMainWindow {
                     cleanDownloads = [bool]$Controls['CleanDownloadsCheckBox'].IsChecked
                     updateIndividualDrivers = [bool]$Controls['UpdateIndividualCheckBox'].IsChecked
                     verifyDownloadHash = [bool]$Controls['VerifyHashCheckBox'].IsChecked
+                    forceRefresh = [bool]$Controls['ForceRefreshCheckBox'].IsChecked
                     excludeDrivers = @(($Controls['ExcludeDriversInput'].Text -split ';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
                     deploymentPlatform = (Get-DATComboText $Controls['DeployPlatformCombo'])
                     compressPackage = [bool]$Controls['CompressPackageCheckBox'].IsChecked
@@ -1888,6 +1890,7 @@ function Initialize-DATMainWindow {
                 if ($Config.options.cleanDownloads) { $Controls['CleanDownloadsCheckBox'].IsChecked = $true }
                 if ($Config.options.updateIndividualDrivers) { $Controls['UpdateIndividualCheckBox'].IsChecked = $true }
                 if ($Config.options.verifyDownloadHash) { $Controls['VerifyHashCheckBox'].IsChecked = $true }
+                if ($Config.options.forceRefresh) { $Controls['ForceRefreshCheckBox'].IsChecked = $true }
                 if ($Config.options.excludeDrivers) { $Controls['ExcludeDriversInput'].Text = (@($Config.options.excludeDrivers) -join '; ') }
 
                 if ($Config.options.deploymentPlatform) {

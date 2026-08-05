@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.4'
+    ModuleVersion     = '2.25.5'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.4 - Fixes DCU catalog validation error ("system is not supported by available catalogs") by embedding top-level <SupportedSystems> SystemIDs into generated DCUCatalog.xml manifest; allows dcu-cli /scan to recognize target hardware during local catalog evaluation.'
+    Description       = '2.25.5 - Adds "Force catalog refresh" checkbox option to GUI under Options tab, enabling admins to bypass local catalog cache TTLs directly from the WPF interface; passes -ForceRefresh to Invoke-DATSync.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

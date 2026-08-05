@@ -928,6 +928,7 @@
                                     <CheckBox x:Name="CleanUnusedCheckBox" Content="Clean up unused drivers" IsEnabled="False" Width="230" />
                                     <CheckBox x:Name="UpdateIndividualCheckBox" Content="Update individual drivers (Dell)" IsEnabled="False" Width="290" />
                                     <CheckBox x:Name="VerifyHashCheckBox" Content="Verify download hash (Dell)" Width="250" />
+                                    <CheckBox x:Name="ForceRefreshCheckBox" Content="Force catalog refresh" Width="230" ToolTip="Force re-download of OEM XML catalogs regardless of local cache age" />
                                 </WrapPanel>
                                 <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                                     <Label Content="Driver exclusions:" Width="150" />
