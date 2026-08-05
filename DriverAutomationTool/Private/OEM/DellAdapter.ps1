@@ -1556,25 +1556,31 @@ function Get-DellInventoryComponent {
                 Update-DellCatalogCache
                 $FallbackPath = Get-DATCachedItem -Key 'Dell_CatalogPC.xml'
             }
-            if ($FallbackPath) {
-                $InvCount = 0
-                $FoundNode = $null
-                Read-DATXmlStreaming -Path $FallbackPath -ElementName 'InventoryComponent' -ProcessBlock {
-                    param($Reader)
-                    $script:InvCount++
-                    if (-not $script:FoundNode) {
-                        $PathAttr = $Reader.GetAttribute('path')
-                        if ($PathAttr) {
-                            $XmlSub = [xml]$Reader.ReadOuterXml()
-                            $script:FoundNode = $XmlSub.DocumentElement
+            if ($FallbackPath -and (Test-Path $FallbackPath)) {
+                $ReaderSettings = [System.Xml.XmlReaderSettings]::new()
+                $ReaderSettings.DtdProcessing = [System.Xml.DtdProcessing]::Ignore
+                $Stream = [System.IO.File]::OpenRead($FallbackPath)
+                try {
+                    $Reader = [System.Xml.XmlReader]::Create($Stream, $ReaderSettings)
+                    try {
+                        while ($Reader.Read()) {
+                            if ($Reader.NodeType -eq [System.Xml.XmlNodeType]::Element -and $Reader.LocalName -eq 'InventoryComponent') {
+                                $PathAttr = $Reader.GetAttribute('path')
+                                if ($PathAttr) {
+                                    $XmlSub = [xml]$Reader.ReadOuterXml()
+                                    $Found = $XmlSub.DocumentElement
+                                    $FoundBase = $Sources.dell.baseUrl
+                                    break
+                                }
+                            }
                         }
+                    } finally {
+                        $Reader.Dispose()
                     }
+                } finally {
+                    $Stream.Dispose()
                 }
-                $Inspected.Add(("CatalogPC.xml (master): InventoryComponent nodes={0}" -f $InvCount))
-                if ($FoundNode) {
-                    $Found = $FoundNode
-                    $FoundBase = $Sources.dell.baseUrl
-                }
+                $Inspected.Add(("CatalogPC.xml (master): InventoryComponent found={0}" -f [bool]$Found))
             } else {
                 $Inspected.Add('CatalogPC.xml (master): not available in cache and re-download failed')
             }

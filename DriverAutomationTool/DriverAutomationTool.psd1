@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.2'
+    ModuleVersion     = '2.25.3'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.2 - Fixes syntax corruption across 5 PowerShell scripts (Invoke-DATSync.ps1, Set-DATDellCommandUpdateMode.ps1, Start-DATGui.ps1, WindowHelpers.ps1, Set-DATDcuManaged.ps1) caused by invalid /usr/bin/bash interpolation in try/catch blocks; restores clean PowerShell try/catch error handling and valid parser syntax.'
+    Description       = '2.25.3 - Fixes InventoryComponent collector embedding in Dell DCUCatalog.xml by replacing cross-module script block variable scope lookup in Get-DellInventoryComponent with direct XmlReader stream processing against master CatalogPC.xml; ensures DCU local system inventory collector binary is included in catalog packages.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
