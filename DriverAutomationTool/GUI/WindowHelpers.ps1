@@ -44,8 +44,6 @@ function Get-DATSystemUsesLightTheme {
         # Non-fatal exception
         [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
     }
-    }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
-    } }
     return $null
 }
 
@@ -288,8 +286,6 @@ function Complete-DATGridEdit {
         # Non-fatal exception
         [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
     }
-    }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
-    } }
 }
 
 function Get-DATGridSelectedRows {
@@ -409,8 +405,6 @@ function Add-DATWindowLogEntry {
         # Non-fatal exception
         [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
     }
-    }     [System.Diagnostics.Debug]::WriteLine(/usr/bin/bash.Exception.Message)
-    } }
 }
 
 function Update-DATLogListFromQueue {

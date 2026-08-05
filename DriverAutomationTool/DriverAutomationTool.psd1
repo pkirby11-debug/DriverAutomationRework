@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.1'
+    ModuleVersion     = '2.25.2'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.1 - Fixes Dell catalog update driver resolution issues for catalog-only (DriverUpdates) applications: (1) Refines $GetFamilyKey regex to preserve controller model designations (I219, I225, I226, AX210, RTL8111, etc.) preventing multi-controller deduplication collisions, (2) Forces all driver categories missing for DriverUpdates mode during smart check and post-download resolution so INF-less DUP packages check every category in Dell per-model catalog, (3) Expands OS code matching patterns (WIN10*, WIN11*, W3[0-9]*) to prevent DUPs tagged with uppercase or new year codes from being skipped.'
+    Description       = '2.25.2 - Fixes syntax corruption across 5 PowerShell scripts (Invoke-DATSync.ps1, Set-DATDellCommandUpdateMode.ps1, Start-DATGui.ps1, WindowHelpers.ps1, Set-DATDcuManaged.ps1) caused by invalid /usr/bin/bash interpolation in try/catch blocks; restores clean PowerShell try/catch error handling and valid parser syntax.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
