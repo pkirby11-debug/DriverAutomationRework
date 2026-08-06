@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.6'
+    ModuleVersion     = '2.25.7'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.6 - Fixes ConfigMgr application deployment type idempotency check: detects file modifications in package source folder (manifest.json, DCUCatalog.xml, DUPs) or when ForceRefresh is set, forcing a deployment type revision bump in ConfigMgr so Update-CMDistributionPoint pushes the updated content to Distribution Points.'
+    Description       = '2.25.7 - Fixes DCU catalog XML schema validation for <SupportedSystems>: generates <Model systemID="..."> attributes matching Dell openmanifest XML specification so dcu-cli /scan recognizes local machine SystemIDs without throwing exit 500 ("System is not supported by available catalog(s)"). Also expands SystemID attribute/element extraction in Get-DellIndividualDrivers.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

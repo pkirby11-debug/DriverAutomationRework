@@ -948,9 +948,16 @@ function Get-DellIndividualDrivers {
                 if ($UserExcluded) { $SkippedUserExcluded++; continue }
             }
 
-            # Check SystemID match (case-insensitive)
-            $ComponentSystems = @($Component.SupportedSystems.Brand.Model.SystemID) |
-                ForEach-Object { if ($_) { $_.Trim().ToUpper() } }
+            # Check SystemID match (case-insensitive) - extract systemID from model attributes and child elements
+            $ComponentSystems = @()
+            if ($Component.SupportedSystems) {
+                foreach ($B in @($Component.SupportedSystems.Brand)) {
+                    foreach ($M in @($B.Model)) {
+                        if ($M.systemID) { $ComponentSystems += $M.systemID.ToString().Trim().ToUpper() }
+                        if ($M.SystemID) { $ComponentSystems += $M.SystemID.ToString().Trim().ToUpper() }
+                    }
+                }
+            }
 
             $SysMatch = $false
             foreach ($SysID in $SystemIDs) {
@@ -1470,16 +1477,14 @@ function Write-DATDCUCatalog {
         $SupportedSystemsXml = ''
         if ($SystemID) {
             $SysIDNodes = ($SystemID.Split(';') | Where-Object { $_ -and $_.Trim() } | ForEach-Object {
-                "      <systemID>$($_.Trim().ToUpper())</systemID>"
+                "        <Model systemID=""$($_.Trim().ToUpper())"">`r`n          <Display lang=""en"">Dell System</Display>`r`n        </Model>"
             }) -join "`r`n"
             if ($SysIDNodes) {
                 $SupportedSystemsXml = @"
   <SupportedSystems>
-    <Brand>
-      <Model>
-        <Display>Dell System</Display>
+    <Brand key="1" prefix="DELL">
+      <Display lang="en">Dell System</Display>
 $SysIDNodes
-      </Model>
     </Brand>
   </SupportedSystems>
 "@ + "`r`n"
