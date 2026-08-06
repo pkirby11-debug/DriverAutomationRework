@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.5'
+    ModuleVersion     = '2.25.6'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.5 - Adds "Force catalog refresh" checkbox option to GUI under Options tab, enabling admins to bypass local catalog cache TTLs directly from the WPF interface; passes -ForceRefresh to Invoke-DATSync.'
+    Description       = '2.25.6 - Fixes ConfigMgr application deployment type idempotency check: detects file modifications in package source folder (manifest.json, DCUCatalog.xml, DUPs) or when ForceRefresh is set, forcing a deployment type revision bump in ConfigMgr so Update-CMDistributionPoint pushes the updated content to Distribution Points.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

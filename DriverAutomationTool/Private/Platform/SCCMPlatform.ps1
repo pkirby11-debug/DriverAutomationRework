@@ -3094,7 +3094,9 @@ function New-DATConfigMgrApplication {
 
         [string]$FolderPath,
 
-        [string]$Description
+        [string]$Description,
+
+        [switch]$ForceContentRefresh
     )
 
     Assert-DATConfigMgrConnected
@@ -3252,6 +3254,15 @@ function New-DATConfigMgrApplication {
                 $DTDiffs = @()
                 $EDT = $null
                 if ($ScriptChanged) { $DTDiffs += 'StagedScript' }
+                if ($ForceContentRefresh) { $DTDiffs += 'ForceContentRefresh' }
+
+                if (Test-Path $SourcePath) {
+                    $RecentContent = Get-ChildItem -Path $SourcePath -File -ErrorAction SilentlyContinue |
+                        Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-1) }
+                    if ($RecentContent.Count -gt 0) {
+                        $DTDiffs += "SourceContentChanged($($RecentContent.Count) files)"
+                    }
+                }
                 try {
                     $FullApp = Get-CMApplication -Name $Name -ErrorAction Stop | Select-Object -First 1
                     if ($FullApp -and $FullApp.SDMPackageXML) {

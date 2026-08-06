@@ -774,6 +774,7 @@ function Invoke-DATSyncSinglePackage {
         if ($AppSystemSKU.Count -gt 0)   { $AppParams['SystemSKU']   = $AppSystemSKU }
         if ($AppMachineType.Count -gt 0) { $AppParams['MachineType'] = $AppMachineType }
         if (($Type -eq 'BIOS' -or $Type -eq 'BIOSDCU') -and $BIOSPassword) { $AppParams['BIOSPassword'] = $BIOSPassword }
+        if ($ForceRefresh) { $AppParams['ForceContentRefresh'] = $true }
 
         try {
             $PkgResult = New-DATConfigMgrApplication @AppParams
@@ -2439,6 +2440,7 @@ function Invoke-DATSyncSinglePackage {
             if ($AppSystemSKU.Count -gt 0)   { $AppParams['SystemSKU']   = $AppSystemSKU }
             if ($AppMachineType.Count -gt 0) { $AppParams['MachineType'] = $AppMachineType }
             if (($Type -eq 'BIOS' -or $Type -eq 'BIOSDCU') -and $BIOSPassword) { $AppParams['BIOSPassword'] = $BIOSPassword }
+            if ($ForceRefresh) { $AppParams['ForceContentRefresh'] = $true }
 
             $PkgResult = New-DATConfigMgrApplication @AppParams
         } elseif ($IsDriverPkg) {
