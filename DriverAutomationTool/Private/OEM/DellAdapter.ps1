@@ -473,9 +473,11 @@ function Get-DellDriverPack {
     $DownloadPath = $Best.path -replace '^/', ''
     $DownloadUrl = '{0}/{1}' -f $Sources.dell.baseUrl.TrimEnd('/'), $DownloadPath
 
-    # Get SystemID(s) for this driver pack - expanded via CatalogIndexPC for multi-gen/micro models
-    $BaseSystemIDs = @($Best.SupportedSystems.Brand.Model.SystemID) -join ';'
-    $SystemIDs = Get-DellAllModelSystemIDs -Model $Model -BaseSystemIDs $BaseSystemIDs
+    # Get SystemID(s) for this specific driver pack (e.g. 0BE3;0BE4;0BE5;0BE6 for OptiPlex 7010 Micro)
+    $SystemIDs = @($Best.SupportedSystems.Brand.Model.SystemID) -join ';'
+    if (-not $SystemIDs) {
+        $SystemIDs = Get-DellAllModelSystemIDs -Model $Model
+    }
 
     $Result = [PSCustomObject]@{
         Manufacturer = 'Dell'
