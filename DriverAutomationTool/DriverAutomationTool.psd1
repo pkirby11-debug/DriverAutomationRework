@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.7'
+    ModuleVersion     = '2.25.8'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.7 - Fixes DCU catalog XML schema validation for <SupportedSystems>: generates <Model systemID="..."> attributes matching Dell openmanifest XML specification so dcu-cli /scan recognizes local machine SystemIDs without throwing exit 500 ("System is not supported by available catalog(s)"). Also expands SystemID attribute/element extraction in Get-DellIndividualDrivers.'
+    Description       = '2.25.8 - Fixes Dell model SystemID resolution for multi-generation and form-factor models (OptiPlex 7010 Micro, SFF, Tower): expands BaseSystemIDs from DriverPackCatalog by querying CatalogIndexPC.xml to discover all modern SystemIDs (0BCC, 0CDB, 0CF3, 0CF4, etc.) so DCUCatalog.xml contains the workstation SystemID and dcu-cli /scan succeeds.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

@@ -316,6 +316,64 @@ function Get-DellModelList {
     return ($Models | Sort-Object Model)
 }
 
+function Get-DellAllModelSystemIDs {
+    <#
+    .SYNOPSIS
+        Discovers all SystemIDs associated with a Dell model name by querying
+        both DriverPackCatalog.xml and CatalogIndexPC.xml.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Model,
+
+        [string]$BaseSystemIDs
+    )
+
+    $SystemIDSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    if ($BaseSystemIDs) {
+        foreach ($Sid in ($BaseSystemIDs -split ';' | Where-Object { $_ -and $_.Trim() })) {
+            $null = $SystemIDSet.Add($Sid.Trim().ToUpper())
+        }
+    }
+
+    try {
+        $IndexCacheKey = 'Dell_CatalogIndexPC.xml'
+        $CachedIndex = Get-DATCachedItem -Key $IndexCacheKey
+        if (-not $CachedIndex) {
+            $null = Update-DellCatalogCache -SystemID '0BCC'
+            $CachedIndex = Get-DATCachedItem -Key $IndexCacheKey
+        }
+        if ($CachedIndex) {
+            $IndexXml = Read-DATXml -Path $CachedIndex
+            $ModelTokens = @($Model)
+            if ($Model -match '(\d{4})') { $ModelTokens += $Matches[1] }
+
+            foreach ($GroupManifest in $IndexXml.ManifestIndex.GroupManifest) {
+                foreach ($B in @($GroupManifest.SupportedSystems.Brand)) {
+                    foreach ($M in @($B.Model)) {
+                        $MName = if ($M.Display.InnerText) { $M.Display.InnerText } elseif ($M.Display) { $M.Display } else { '' }
+                        $MSid  = if ($M.systemID) { $M.systemID.ToString() } elseif ($M.SystemID) { $M.SystemID.ToString() } else { '' }
+                        if ($MSid) {
+                            foreach ($Tok in $ModelTokens) {
+                                if ($MName -and ($MName -eq $Tok -or $MName -like "*$Tok*")) {
+                                    $null = $SystemIDSet.Add($MSid.Trim().ToUpper())
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-DATLog -Message "CatalogIndexPC SystemID expansion warning: $($_.Exception.Message)" -Severity 2
+    }
+
+    return (@($SystemIDSet) -join ';')
+}
+
 function Get-DellDriverPack {
     <#
     .SYNOPSIS
@@ -415,8 +473,9 @@ function Get-DellDriverPack {
     $DownloadPath = $Best.path -replace '^/', ''
     $DownloadUrl = '{0}/{1}' -f $Sources.dell.baseUrl.TrimEnd('/'), $DownloadPath
 
-    # Get SystemID(s) for this driver pack - needed for SCCM package Description
-    $SystemIDs = @($Best.SupportedSystems.Brand.Model.SystemID) -join ';'
+    # Get SystemID(s) for this driver pack - expanded via CatalogIndexPC for multi-gen/micro models
+    $BaseSystemIDs = @($Best.SupportedSystems.Brand.Model.SystemID) -join ';'
+    $SystemIDs = Get-DellAllModelSystemIDs -Model $Model -BaseSystemIDs $BaseSystemIDs
 
     $Result = [PSCustomObject]@{
         Manufacturer = 'Dell'
