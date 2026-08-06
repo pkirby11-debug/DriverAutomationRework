@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.8'
+    ModuleVersion     = '2.25.9'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.8 - Fixes Dell model SystemID resolution for multi-generation and form-factor models (OptiPlex 7010 Micro, SFF, Tower): expands BaseSystemIDs from DriverPackCatalog by querying CatalogIndexPC.xml to discover all modern SystemIDs (0BCC, 0CDB, 0CF3, 0CF4, etc.) so DCUCatalog.xml contains the workstation SystemID and dcu-cli /scan succeeds.'
+    Description       = '2.25.9 - Fixes DCU catalog XML namespace on <SupportedSystems>: adds explicit xmlns="openmanage/cm/dm" namespace declaration to <SupportedSystems> element so dcu-cli XML reader parses <Model systemID="..."> under the required Dell openmanage namespace context.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

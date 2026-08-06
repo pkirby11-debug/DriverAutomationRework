@@ -1540,7 +1540,7 @@ function Write-DATDCUCatalog {
             }) -join "`r`n"
             if ($SysIDNodes) {
                 $SupportedSystemsXml = @"
-  <SupportedSystems>
+  <SupportedSystems xmlns="openmanage/cm/dm">
     <Brand key="1" prefix="DELL">
       <Display lang="en">Dell System</Display>
 $SysIDNodes
