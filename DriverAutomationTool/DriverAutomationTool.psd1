@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.11'
+    ModuleVersion     = '2.25.12'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.11 - Fixes Dell SystemID lookup for models with empty SystemIDs in DriverPackCatalog (such as Latitude 5540): queries CatalogIndexPC.xml to resolve SystemID 0C05 and load per-model catalog Latitude_0C05.xml, discovering all 210+ individual driver updates (Wi-Fi, Ethernet, Audio, Graphics, Chipset).'
+    Description       = '2.25.12 - Disables AutoExcludeVulnerableDrivers by default to prevent automatic addition of core drivers (Wi-Fi, Ethernet, Audio, Graphics) to the persistent exclusion ledger; adds Clear-DATDriverExclusion cmdlet to clear all saved exclusions in DriverExclusions.json.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
@@ -30,6 +30,7 @@
         'Get-DATDriverExclusion'
         'Add-DATDriverExclusion'
         'Remove-DATDriverExclusion'
+        'Clear-DATDriverExclusion'
         'Set-DATDellCommandUpdateMode'
         'New-DATIntuneWin32App'
         'Get-DATIntuneRequiredPermission'

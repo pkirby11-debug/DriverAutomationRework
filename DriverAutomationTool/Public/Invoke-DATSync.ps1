@@ -171,13 +171,11 @@ function Invoke-DATSync {
         # already-extracted tree.
         [bool]$ScreenVulnerableDrivers = $true,
 
-        # What a screening HIT does. $true (default): the driver is added to
-        # the persistent exclusion ledger (see Add-DATDriverExclusion) and
-        # skipped - it never ships, on this sync or any future one, without
-        # the admin touching the exclusion list. $false: legacy advisory
+        # What a screening HIT does. $false (default): legacy advisory
         # behavior - the hit is logged loudly with the exact exclusion to add,
-        # but the payload still ships until excluded by hand.
-        [bool]$AutoExcludeVulnerableDrivers = $true,
+        # but the payload still ships until excluded by hand. $true: the driver
+        # is added to the persistent exclusion ledger and skipped.
+        [bool]$AutoExcludeVulnerableDrivers = $false,
 
         [switch]$VerifyDownloadHash,
 
