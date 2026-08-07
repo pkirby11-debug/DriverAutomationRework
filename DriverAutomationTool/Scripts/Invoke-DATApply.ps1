@@ -2004,6 +2004,31 @@ function Invoke-DCUDriverUpdates {
                 return $null
             }
 
+            # Check if any catalog component carries empty/missing <SupportedDevices> metadata
+            $Uncheckables = @()
+            if (Test-Path $LocalCatalogXml) {
+                try {
+                    [xml]$CatXmlDoc = Get-Content -Path $LocalCatalogXml -Raw -ErrorAction Stop
+                    foreach ($Sc in @($CatXmlDoc.Manifest.SoftwareComponent)) {
+                        $DevNodes = @($Sc.SupportedDevices.Brand.Model.Device) + @($Sc.SupportedDevices.Device) | Where-Object { $_ }
+                        if ($DevNodes.Count -eq 0) {
+                            $ScName = if ($Sc.Name.Display) { $Sc.Name.Display } else { $Sc.path }
+                            $Uncheckables += $ScName
+                        }
+                    }
+                } catch {
+                    Write-Verbose "Ignored exception: $($_.Exception.Message)"
+                }
+            }
+
+            if ($Uncheckables.Count -gt 0) {
+                $UDesc = @($Uncheckables | Select-Object -First 5) -join '; '
+                Write-Log "DCU scan exit 500 ('no applicable updates') BUT $($Uncheckables.Count) catalog component(s) carry empty <SupportedDevices> metadata in Dell's XML ($UDesc): dcu-cli cannot evaluate offline hardware applicability for these items. Distrusting the verdict - falling back to the built-in DUP engine." -Severity 2
+                & $TailConsole 'scan'
+                & $TailLog $ScanLog
+                return $null
+            }
+
             Write-Log "DCU scan: no applicable updates from the package catalog (scan report lists none of this package's DUPs, so the verdict is corroborated) - everything current"
             & $TailConsole 'scan'
             & $TailLog $ScanLog

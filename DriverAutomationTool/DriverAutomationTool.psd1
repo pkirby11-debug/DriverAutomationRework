@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.13'
+    ModuleVersion     = '2.25.14'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.13 - Fixes Int32 integer overflow in deduplication statistics summary calculation when total package driver sizes exceed 2.14 GB (2,147,483,647 bytes); explicitly casts byte counts to Int64.'
+    Description       = '2.25.14 - Solves Dell catalog metadata issue where Dell publishes SoftwareComponents (such as Intel PCIe Ethernet Controller Driver PGN38) with empty <SupportedDevices> tags: injects wildcard device fallback into DCUCatalog.xml during sync and triggers built-in DUP engine fallback during apply when empty SupportedDevices tags are detected.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

@@ -1526,8 +1526,24 @@ function Write-DATDCUCatalog {
         # namespace. Built as a string template because XmlDocument fragment
         # insertion would strip the inherited namespace context.
         $Sorted = @($Usable | Sort-Object FileName)
+        $SysIDDeviceNodes = if ($SystemID) {
+            ($SystemID.Split(';') | Where-Object { $_ -and $_.Trim() } | ForEach-Object {
+                "<Model systemID=""$($_.Trim().ToUpper())""><Device componentID=""*""><Display lang=""en"">All Devices</Display></Device></Model>"
+            }) -join ''
+        } else {
+            '<Model><Device componentID="*"><Display lang="en">All Devices</Display></Device></Model>'
+        }
+        $FallbackSupportedDevices = "<SupportedDevices><Brand key=""1"" prefix=""DELL"">$SysIDDeviceNodes</Brand></SupportedDevices>"
+
         $ComponentsXml = ($Sorted | ForEach-Object {
-            ($_.ComponentXml -replace '\bpath\s*=\s*"[^"]*"', ('path="{0}"' -f $_.FileName))
+            $CXml = ($_.ComponentXml -replace '\bpath\s*=\s*"[^"]*"', ('path="{0}"' -f $_.FileName))
+            if ($CXml -notmatch '<Device\b') {
+                $CXml = $CXml -replace '<SupportedDevices\s*/>|<SupportedDevices\s*>\s*</SupportedDevices>', $FallbackSupportedDevices
+                if ($CXml -notmatch '<SupportedDevices\b') {
+                    $CXml = $CXml -replace '</SoftwareComponent>', "$FallbackSupportedDevices`r`n</SoftwareComponent>"
+                }
+            }
+            $CXml
         }) -join "`r`n"
 
         $InventoryXml = ''
