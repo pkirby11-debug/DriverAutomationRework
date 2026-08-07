@@ -183,7 +183,7 @@ function Invoke-DATIntuneBlobUpload {
             $Expiry     = if ($Renewed.azureStorageUriExpirationDateTime) { [datetime]$Renewed.azureStorageUriExpirationDateTime } else { [datetime]::MaxValue }
         }
 
-        $Size  = [Math]::Min($BlockSizeBytes, $Total - $Offset)
+        $Size  = [int]([Math]::Min([int64]$BlockSizeBytes, [int64]($Total - $Offset)))
         $Chunk = [byte[]]::new($Size)
         [System.Buffer]::BlockCopy($Content, $Offset, $Chunk, 0, $Size)
 

@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.12'
+    ModuleVersion     = '2.25.13'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.12 - Disables AutoExcludeVulnerableDrivers by default to prevent automatic addition of core drivers (Wi-Fi, Ethernet, Audio, Graphics) to the persistent exclusion ledger; adds Clear-DATDriverExclusion cmdlet to clear all saved exclusions in DriverExclusions.json.'
+    Description       = '2.25.13 - Fixes Int32 integer overflow in deduplication statistics summary calculation when total package driver sizes exceed 2.14 GB (2,147,483,647 bytes); explicitly casts byte counts to Int64.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

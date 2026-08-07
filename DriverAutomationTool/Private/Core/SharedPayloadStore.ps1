@@ -176,7 +176,7 @@ function Get-DATDeduplicationSummary {
     $Stats = $script:DATDeduplicationStats
     $TotalMB = [math]::Round($Stats.TotalBytes / 1MB, 2)
     $UniqueMB = [math]::Round($Stats.UniqueBytes / 1MB, 2)
-    $SavedBytes = [math]::Max(0, $Stats.TotalBytes - $Stats.UniqueBytes)
+    $SavedBytes = [math]::Max([int64]0, [int64]($Stats.TotalBytes - $Stats.UniqueBytes))
     $SavedMB = [math]::Round($SavedBytes / 1MB, 2)
     $SavedPct = if ($Stats.TotalBytes -gt 0) { [math]::Round(($SavedBytes / $Stats.TotalBytes) * 100, 1) } else { 0 }
 
