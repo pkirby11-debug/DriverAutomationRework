@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.10'
+    ModuleVersion     = '2.25.11'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.10 - Restores strict model-specific SystemIDs (0BE3;0BE4;0BE5;0BE6) for OptiPlex 7010 Micro to prevent package bloat from unrelated Tower/SFF form-factors, while retaining the openmanage XML namespace fix on <SupportedSystems> so dcu-cli /scan parses SystemSKU 0BE5 cleanly.'
+    Description       = '2.25.11 - Fixes Dell SystemID lookup for models with empty SystemIDs in DriverPackCatalog (such as Latitude 5540): queries CatalogIndexPC.xml to resolve SystemID 0C05 and load per-model catalog Latitude_0C05.xml, discovering all 210+ individual driver updates (Wi-Fi, Ethernet, Audio, Graphics, Chipset).'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

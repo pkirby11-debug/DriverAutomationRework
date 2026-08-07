@@ -357,7 +357,7 @@ function Get-DellAllModelSystemIDs {
                         $MSid  = if ($M.systemID) { $M.systemID.ToString() } elseif ($M.SystemID) { $M.SystemID.ToString() } else { '' }
                         if ($MSid) {
                             foreach ($Tok in $ModelTokens) {
-                                if ($MName -and ($MName -eq $Tok -or $MName -like "*$Tok*")) {
+                                if ($MName -and ($MName.Trim() -eq $Tok.Trim() -or $MName.Trim() -like "*$Tok*")) {
                                     $null = $SystemIDSet.Add($MSid.Trim().ToUpper())
                                     break
                                 }
