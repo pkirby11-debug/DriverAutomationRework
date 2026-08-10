@@ -204,14 +204,28 @@ function Invoke-DATDeployApplications {
                     RebootOutsideServiceWindow   = $RebootOutsideServiceWindow
                     ErrorAction                  = 'Stop'
                 }
-                if ($SuppressAutoRestart) {
-                    $DeployParams['SuppressAutoRestart'] = @('Workstation')
-                }
                 if ($DeployPurpose -eq 'Required') {
                     $DeployParams['DeadlineDateTime'] = $EffectiveDeadline
                 }
 
                 New-CMApplicationDeployment @DeployParams | Out-Null
+
+                # Post-deployment: set SuppressAutoRestart on the SMS_ApplicationAssignment WMI instance
+                if ($SuppressAutoRestart) {
+                    try {
+                        $SmsNamespace = "root\sms\site_$($script:CMSiteCode)"
+                        $Assignment = Get-CimInstance -ComputerName $script:CMSiteServer -Namespace $SmsNamespace -ClassName "SMS_ApplicationAssignment" -Filter "TargetCollectionID = '$($Collection.CollectionID)' AND ApplicationName = '$($App.ModelName)'" -ErrorAction SilentlyContinue | Select-Object -First 1
+                        if (-not $Assignment) {
+                            $Assignment = Get-CimInstance -ComputerName $script:CMSiteServer -Namespace $SmsNamespace -ClassName "SMS_ApplicationAssignment" -Filter "TargetCollectionID = '$($Collection.CollectionID)'" -ErrorAction SilentlyContinue | Where-Object { $_.AssignmentName -like "*$AppName*" } | Select-Object -First 1
+                        }
+                        if ($Assignment) {
+                            Set-CimInstance -InputObject $Assignment -Property @{ SuppressAutoRestart = 1 } -ErrorAction SilentlyContinue
+                            Write-DATLog -Message "Suppressed workstation system restarts for deployment '$AppName'" -Severity 1
+                        }
+                    } catch {
+                        Write-DATLog -Message "Notice applying restart suppression to '$AppName': $($_.Exception.Message)" -Severity 2
+                    }
+                }
 
                 Write-DATLog -Message "Deployed '$AppName' to '$CollectionName' ($DeployPurpose / $DeployAction)" -Severity 1
                 $Results.Add(@{ Name = $AppName; Status = 'Created' })

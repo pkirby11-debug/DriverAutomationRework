@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.26.0'
+    ModuleVersion     = '2.26.1'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.26.0 - Adds Suppress System Restart option to GUI and Invoke-DATDeployApplications for workstation reboot protection in healthcare and enterprise deployments.'
+    Description       = '2.26.1 - Fixes SuppressAutoRestart parameter binding by applying reboot suppression via SMS_ApplicationAssignment WMI instance post-deployment.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
