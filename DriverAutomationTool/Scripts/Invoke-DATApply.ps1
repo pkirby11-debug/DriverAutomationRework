@@ -1362,10 +1362,10 @@ function Invoke-DCUDriverUpdates {
     $SessionDir = Join-Path $WorkRoot ('DCU\{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     try {
         New-Item -Path $SessionDir -ItemType Directory -Force | Out-Null
-        # C:\Temp has no automatic cleanup - prune sessions older than 7 days
-        # so repeated runs don't accumulate logs/catalog copies forever.
+        # C:\Temp has no automatic cleanup - prune sessions older than 24 hours
+        # so repeated runs don't accumulate logs/catalog copies on disk.
         Get-ChildItem -Path (Join-Path $WorkRoot 'DCU') -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -ne $SessionDir -and $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+            Where-Object { $_.FullName -ne $SessionDir -and $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     } catch {
         Write-Log "Could not create DCU session dir '$SessionDir' ($($_.Exception.Message)) - using built-in DUP engine" -Severity 2

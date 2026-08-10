@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.14'
+    ModuleVersion     = '2.25.15'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.14 - Solves Dell catalog metadata issue where Dell publishes SoftwareComponents (such as Intel PCIe Ethernet Controller Driver PGN38) with empty <SupportedDevices> tags: injects wildcard device fallback into DCUCatalog.xml during sync and triggers built-in DUP engine fallback during apply when empty SupportedDevices tags are detected.'
+    Description       = '2.25.15 - Tightens temporary DCU session directory retention in Invoke-DATApply.ps1 from 7 days to 24 hours to preserve client disk space; documents enterprise ccmcache retention best practices.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
