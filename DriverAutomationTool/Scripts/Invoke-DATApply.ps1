@@ -179,7 +179,15 @@ param(
     [string]$Architecture,
 
     # Skip TLS certificate validation for the AdminService (self-signed PKI).
-    [switch]$SkipCertificateCheck
+    [switch]$SkipCertificateCheck,
+
+    # Active user safety deferral: checks for active user sessions during background/required runs.
+    # If a user is actively working (and workstation is not locked), returns exit 1618 (Fast Retry)
+    # to defer installation until off-hours or locked state.
+    [switch]$DeferOnActiveUser,
+
+    # Force interactive execution (bypasses active user deferral check, e.g. when user clicks Install in Software Center).
+    [switch]$Interactive
 )
 
 # -------------------------------------------------------------------------
@@ -3972,6 +3980,24 @@ function Invoke-LenovoBIOSFlash {
 try {
     Write-Log '==================================================================='
     Write-Log "DATApply starting - ScriptRev=$($script:ScriptRev), Mode=$Mode, Package='$PackageName', Version=$Version"
+
+    # -------------------------------------------------------------------------
+    # Active User Session Deferral Guard (Healthcare / Enterprise MW Safety)
+    # -------------------------------------------------------------------------
+    if ($DeferOnActiveUser -and -not $Interactive -and -not $Offline) {
+        $LoggedOnUser = try { (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName } catch { $null }
+        if (-not [string]::IsNullOrWhiteSpace($LoggedOnUser)) {
+            $IsLocked = [bool](Get-Process -Name 'logonui' -ErrorAction SilentlyContinue)
+            if ($IsLocked) {
+                Write-Log "Active user '$LoggedOnUser' is logged on, but workstation is LOCKED. Proceeding with driver update."
+            } else {
+                Write-Log "Active user '$LoggedOnUser' detected on $env:COMPUTERNAME and workstation is ACTIVE. -DeferOnActiveUser is enabled. Deferring installation (Exit Code 1618 - Fast Retry) to prevent clinical/workday disruption." -Severity 2
+                exit 1618
+            }
+        } else {
+            Write-Log "No active user logged on to $env:COMPUTERNAME. Proceeding with driver update."
+        }
+    }
 
     # Resolve ContentPath with a fallback chain. $PSScriptRoot as a param default
     # has been seen to be empty under CCMExec when the script is launched with

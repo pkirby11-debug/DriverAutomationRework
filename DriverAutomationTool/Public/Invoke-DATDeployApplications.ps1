@@ -101,6 +101,9 @@ function Invoke-DATDeployApplications {
         [Alias('RebootOutsideOfServiceWindow')]
         [bool]$RebootOutsideServiceWindow = $false,
 
+        # Suppress system restarts on workstations (prevents forced reboots after driver/BIOS updates).
+        [bool]$SuppressAutoRestart = $true,
+
         # Optional: create/ensure a maintenance window on the target collection before
         # deploying, so a reboot the install script signals (exit 3010) is deferred to
         # it. Idempotent by MWName. The window is general (ApplyTo=Any), so it also
@@ -200,6 +203,9 @@ function Invoke-DATDeployApplications {
                     OverrideServiceWindow        = $OverrideServiceWindow
                     RebootOutsideServiceWindow   = $RebootOutsideServiceWindow
                     ErrorAction                  = 'Stop'
+                }
+                if ($SuppressAutoRestart) {
+                    $DeployParams['SuppressAutoRestart'] = @('Workstation')
                 }
                 if ($DeployPurpose -eq 'Required') {
                     $DeployParams['DeadlineDateTime'] = $EffectiveDeadline

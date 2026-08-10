@@ -1437,6 +1437,7 @@ function Initialize-DATMainWindow {
         $UserNotif     = Get-DATComboText $Controls['DeployUserNotifCombo']
         $OverrideSW       = [bool]$Controls['DeployOverrideSWCheck'].IsChecked
         $RebootOutsideSW  = [bool]$Controls['DeployRebootOutsideSWCheck'].IsChecked
+        $SuppressRestart  = [bool]$Controls['DeploySuppressRestartCheck'].IsChecked
 
         # Maintenance-window creation (optional).
         $CreateMW   = [bool]$Controls['DeployCreateMWCheck'].IsChecked
@@ -1480,7 +1481,7 @@ function Initialize-DATMainWindow {
                 if ($DeployPurpose -eq 'Required') { "`nDeadline: $($DeadlineAt.ToString('yyyy-MM-dd HH:mm'))" } else { '' })
         } else { 'Available immediately' }
 
-        $MWSummary = "Install outside MW: $(if ($OverrideSW) { 'Yes' } else { 'No (confined to MW)' })`nRestart outside MW: $(if ($RebootOutsideSW) { 'Yes' } else { 'No (deferred to MW)' })"
+        $MWSummary = "Install outside MW: $(if ($OverrideSW) { 'Yes' } else { 'No (confined to MW)' })`nRestart outside MW: $(if ($RebootOutsideSW) { 'Yes' } else { 'No (deferred to MW)' })`nSuppress Restarts: $(if ($SuppressRestart) { 'Yes (Workstations)' } else { 'No' })"
 
         $MWCreateSummary = if ($CreateMW) {
             $Rec = if ($MWRecur -eq 'Weekly') { "Weekly ($MWDay)" } else { $MWRecur }
@@ -1511,7 +1512,7 @@ function Initialize-DATMainWindow {
         $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
         $DeployScript = {
-            param($ModulePath, $ConnParams, $AppNames, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $AvailableAt, $DeadlineAt, $OverrideSW, $RebootOutsideSW, $CreateMW, $MWStart, $MWDuration, $MWRecur, $MWDay, $LogQueue)
+            param($ModulePath, $ConnParams, $AppNames, $CollectionName, $DeployPurpose, $DeployAction, $UserNotif, $AvailableAt, $DeadlineAt, $OverrideSW, $RebootOutsideSW, $SuppressRestart, $CreateMW, $MWStart, $MWDuration, $MWRecur, $MWDay, $LogQueue)
 
             Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
             Register-DATQueueLogSubscriber -LogQueue $LogQueue
@@ -1524,6 +1525,7 @@ function Initialize-DATMainWindow {
                 UserNotification             = $UserNotif
                 OverrideServiceWindow        = $OverrideSW
                 RebootOutsideServiceWindow   = $RebootOutsideSW
+                SuppressAutoRestart          = $SuppressRestart
             }
             if ($AvailableAt) { $DeployArgs['AvailableDateTime'] = $AvailableAt }
             if ($DeadlineAt)  { $DeployArgs['DeadlineDateTime']  = $DeadlineAt  }
@@ -1551,6 +1553,7 @@ function Initialize-DATMainWindow {
             AddArgument($DeadlineAt).
             AddArgument($OverrideSW).
             AddArgument($RebootOutsideSW).
+            AddArgument($SuppressRestart).
             AddArgument($CreateMW).
             AddArgument($MWStart).
             AddArgument($MWDuration).

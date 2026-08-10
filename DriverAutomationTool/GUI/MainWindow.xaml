@@ -598,7 +598,8 @@
                                     <!-- MW behavior -->
                                     <WrapPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
                                         <CheckBox x:Name="DeployOverrideSWCheck" Content="Install outside maintenance window" Margin="0,4,18,4" />
-                                        <CheckBox x:Name="DeployRebootOutsideSWCheck" Content="Restart outside maintenance window" />
+                                        <CheckBox x:Name="DeployRebootOutsideSWCheck" Content="Restart outside maintenance window" Margin="0,4,18,4" />
+                                        <CheckBox x:Name="DeploySuppressRestartCheck" Content="Suppress system restart (Workstations)" IsChecked="True" Margin="0,4,0,4" />
                                     </WrapPanel>
 
                                     <!-- Create MW -->

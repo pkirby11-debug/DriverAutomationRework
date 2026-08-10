@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.25.16'
+    ModuleVersion     = '2.26.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.25.16 - Adds automatic self-cleaning ccmcache purge to Invoke-DATApply.ps1 upon successful installation; immediately erases the application payload from ccmcache to preserve disk space on 256 GB SSD endpoints.'
+    Description       = '2.26.0 - Adds Suppress System Restart option to GUI and Invoke-DATDeployApplications for workstation reboot protection in healthcare and enterprise deployments.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
