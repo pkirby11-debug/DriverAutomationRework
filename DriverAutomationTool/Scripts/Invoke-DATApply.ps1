@@ -330,9 +330,36 @@ function Write-Log {
     Write-Host $StdLine
 }
 
-# -------------------------------------------------------------------------
-# Detection marker
-# -------------------------------------------------------------------------
+function Clear-DATSelfCache {
+    <#
+    .SYNOPSIS
+        Purges the active application's ccmcache folder upon successful installation
+        to reclaim disk space on SSD-constrained endpoints (e.g. 256 GB drives).
+    #>
+    try {
+        if ([string]::IsNullOrWhiteSpace($ContentPath)) { return }
+        $CacheDirName = ([System.IO.Path]::GetFileName($ContentPath.TrimEnd('\/'))).ToLower()
+        if (-not ($CacheDirName -match '^[0-9a-fA-F]+$')) {
+            # Only target standard ccmcache hex subfolder names (e.g. 20, 2c, 1a)
+            return
+        }
+
+        # Query ConfigMgr CacheInfo via WMI
+        $CacheInfo = Get-CimInstance -Namespace 'root\ccm\softmgmtagent' -ClassName 'CacheInfo' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Location -and ($_.Location.ToLower() -like "*\$CacheDirName") } |
+            Select-Object -First 1
+
+        if ($CacheInfo) {
+            Write-Log "Self-cleaning ConfigMgr client cache element '$($CacheInfo.CacheElementID)' ($($CacheInfo.Location))..."
+            $UIResource = New-Object -ComObject "UIResource.UIResourceControl" -ErrorAction Stop
+            $UIResource.GetCacheElement().DeleteCacheElement($CacheInfo.CacheElementID)
+            Write-Log "ConfigMgr cache folder '$CacheDirName' purged successfully - reclaimed SSD disk space."
+        }
+    } catch {
+        # Non-fatal: if COM API is unavailable, background purge will handle it later
+        Write-Verbose "Self cache cleanup skipped: $($_.Exception.Message)"
+    }
+}
 $MarkerRoot = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation'
 $MarkerSubKey = switch ($Mode) {
     'Driver'        { 'Drivers' }
@@ -4108,6 +4135,10 @@ try {
     }
 
     Write-DetectionMarker -Status 'Installed'
+
+    # Auto-purge this application's ccmcache folder upon successful install
+    # so 256 GB SSDs stay clean with 0 MB residual cache footprint.
+    Clear-DATSelfCache
 
     if ($script:RebootRequired) {
         Write-Log 'Success - reboot required (exiting 3010)'
