@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.26.1'
+    ModuleVersion     = '2.26.2'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.26.1 - Fixes SuppressAutoRestart parameter binding by applying reboot suppression via SMS_ApplicationAssignment WMI instance post-deployment.'
+    Description       = '2.26.2 - Adds /f forced-silent switch to Dell DUP execution and parses framework logs for unrequired hardware messages (such as Thunderbolt "Your system does not require this driver") to classify exit 1 as NotApplicable instead of a failure.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

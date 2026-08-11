@@ -2827,7 +2827,7 @@ function Install-DriverUpdates {
         # /l=<file> is Dell's documented universal DUP switch for the framework
         # log - the only place a DUP records WHY it failed.
         $DupFwLog = if ($DupLogDir) { Join-Path $DupLogDir ($SafeName + '.dup.log') } else { $null }
-        $DupArgs = if ($DupFwLog) { @('/s', "/l=$DupFwLog") } else { @('/s') }
+        $DupArgs = if ($DupFwLog) { @('/s', '/f', "/l=$DupFwLog") } else { @('/s', '/f') }
 
         # Per-DUP extract dir. The DUP's framework calls GetTempPath() at startup
         # and uses that to unpack its payload before installing - if it can't, the
@@ -2985,19 +2985,34 @@ function Install-DriverUpdates {
             $NotApply++
             Write-Log "$DriverLabel - exit $DupCode (not applicable to this device) in ${Elapsed}s"
         } else {
-            # Forgive a graphics DUP that errored for a GPU brand we can't confirm is
-            # present. Dell ships every model's GPU DUPs and non-matching NVIDIA/AMD
-            # installers often report "no compatible hardware" as a generic exit 1
-            # rather than a clean not-applicable code (3/4/5). We treat that as
-            # not-applicable so one inapplicable graphics DUP can't fail the whole
-            # deployment. A Video DUP whose brand IS present that fails is a real
-            # failure and still counts (so genuine graphics-driver breakage surfaces).
-            $GpuVendorPresent = ($DupVendor -and $PresentGpuVendors.Contains($DupVendor))
-            if ($Drv.Category -eq 'Video' -and -not $GpuVendorPresent) {
+            # Check if Dell framework log confirms the driver is not required on this system
+            $FwLogRaw = ''
+            if ($DupFwLog -and (Test-Path $DupFwLog)) {
+                try { $FwLogRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction SilentlyContinue } catch {}
+            }
+
+            if ($FwLogRaw -and ($FwLogRaw -match 'not require this driver|not supported on this system|no compatible hardware|minimum requirements|not applicable|does not meet the requirements')) {
                 $NotApply++
-                $VendorNote = if ($DupVendor) { "no $DupVendor GPU confirmed" } else { 'GPU brand undeterminable' }
-                Write-Log "$DriverLabel - exit $DupCode (graphics DUP, $VendorNote - treating as not applicable) in ${Elapsed}s" -Severity 2
+                Write-Log "$DriverLabel - exit $DupCode (DUP framework log confirms driver is not required on this system) - treating as not applicable" -Severity 2
+                try {
+                    foreach ($FProp in 'FailedVersion', 'FailCount', 'LastFailExit', 'LastFailAt') {
+                        Remove-ItemProperty -Path $CompKeyPath -Name $FProp -ErrorAction SilentlyContinue
+                    }
+                } catch {}
             } else {
+                # Forgive a graphics DUP that errored for a GPU brand we can't confirm is
+                # present. Dell ships every model's GPU DUPs and non-matching NVIDIA/AMD
+                # installers often report "no compatible hardware" as a generic exit 1
+                # rather than a clean not-applicable code (3/4/5). We treat that as
+                # not-applicable so one inapplicable graphics DUP can't fail the whole
+                # deployment. A Video DUP whose brand IS present that fails is a real
+                # failure and still counts (so genuine graphics-driver breakage surfaces).
+                $GpuVendorPresent = ($DupVendor -and $PresentGpuVendors.Contains($DupVendor))
+                if ($Drv.Category -eq 'Video' -and -not $GpuVendorPresent) {
+                    $NotApply++
+                    $VendorNote = if ($DupVendor) { "no $DupVendor GPU confirmed" } else { 'GPU brand undeterminable' }
+                    Write-Log "$DriverLabel - exit $DupCode (graphics DUP, $VendorNote - treating as not applicable) in ${Elapsed}s" -Severity 2
+                } else {
                 $Failed++
                 $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
                 if ($Elapsed -lt 2) { $InstantFailed++ }
