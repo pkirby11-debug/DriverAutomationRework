@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.26.4'
+    ModuleVersion     = '2.26.5'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.26.4 - Fixes missing closing curly brace in Invoke-DATApply.ps1 DUP framework log evaluation block that caused a ParseException / MissingEndCurlyBrace error on client execution.'
+    Description       = '2.26.5 - Cleanly formats try/catch/else block structure in Install-DriverUpdates so PowerShell 5.1/7 parses if-else branch conditions cleanly.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

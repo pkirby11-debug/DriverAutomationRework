@@ -2988,7 +2988,11 @@ function Install-DriverUpdates {
             # Check if Dell framework log confirms the driver is not required on this system
             $FwLogRaw = ''
             if ($DupFwLog -and (Test-Path $DupFwLog)) {
-                try { $FwLogRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction SilentlyContinue } catch {}
+                try {
+                    $FwLogRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction SilentlyContinue
+                } catch {
+                    $FwLogRaw = ''
+                }
             }
 
             if ($FwLogRaw -and ($FwLogRaw -match 'not require this driver|not supported on this system|no compatible hardware|minimum requirements|not applicable|does not meet the requirements')) {
@@ -2998,8 +3002,10 @@ function Install-DriverUpdates {
                     foreach ($FProp in 'FailedVersion', 'FailCount', 'LastFailExit', 'LastFailAt') {
                         Remove-ItemProperty -Path $CompKeyPath -Name $FProp -ErrorAction SilentlyContinue
                     }
-                } catch {}
-            } } else {
+                } catch {
+                    # Non-fatal cleanup
+                }
+            } else {
                 # Forgive a graphics DUP that errored for a GPU brand we can't confirm is
                 # present. Dell ships every model's GPU DUPs and non-matching NVIDIA/AMD
                 # installers often report "no compatible hardware" as a generic exit 1
