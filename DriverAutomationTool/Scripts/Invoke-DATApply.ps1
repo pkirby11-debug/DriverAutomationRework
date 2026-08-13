@@ -2999,7 +2999,7 @@ function Install-DriverUpdates {
                         Remove-ItemProperty -Path $CompKeyPath -Name $FProp -ErrorAction SilentlyContinue
                     }
                 } catch {}
-            } else {
+            } } else {
                 # Forgive a graphics DUP that errored for a GPU brand we can't confirm is
                 # present. Dell ships every model's GPU DUPs and non-matching NVIDIA/AMD
                 # installers often report "no compatible hardware" as a generic exit 1
