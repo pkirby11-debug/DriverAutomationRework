@@ -4058,7 +4058,9 @@ try {
     Write-Log "Detected manufacturer: $DeviceMfr"
 
     if ($SafetyManufacturer -and $DeviceMfr -ne $SafetyManufacturer) {
-        throw "Safety check failed: expected manufacturer '$SafetyManufacturer' but device is '$DeviceMfr'. Requirement Rules should have caught this - check your Application configuration."
+        Write-Log "Safety check: expected manufacturer '$SafetyManufacturer' but device is '$DeviceMfr'. OEM driver updates do not apply to this manufacturer - reporting NotApplicable." -Severity 2
+        Write-DetectionMarker -Status 'NotApplicable'
+        exit 0
     }
 
     # -------------------------------------------------------------------------
