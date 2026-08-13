@@ -3155,6 +3155,7 @@ function Install-DriverUpdates {
     if ($Failed -gt 0) { return 1 }
     return 0
 }
+}
 
 function Install-LenovoDriverUpdates {
     <#
