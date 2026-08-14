@@ -3752,69 +3752,80 @@ function Suspend-BitLockerForFlash {
 function Invoke-DellBIOSFlash {
     param([string]$Path)
 
-    $FlashUtil = Get-ChildItem -Path $Path -Filter 'Flash64W.exe' -File -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $FlashUtil) {
-        throw "Flash64W.exe not found in $Path - Dell BIOS package is incomplete."
-    }
-
-    # BIOSDCU packages also stage Dell's Inventory Collector (InvColPC_*.exe)
-    # for DCU's offline scan - it's NOT a flashable firmware. Exclude it here so
-    # the Flash64W fallback can't mistake it for the BIOS DUP.
+    # BIOSDCU packages stage the Dell BIOS DUP (e.g. Precision_3630_2.40.0.exe)
+    # plus InvColPC_*.exe and Flash64W.exe.
     $BiosExe = Get-ChildItem -Path $Path -Filter '*.exe' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notlike 'Flash64W*' -and $_.Name -notlike 'InvColPC*' } |
         Select-Object -First 1
     if (-not $BiosExe) {
-        throw "No BIOS firmware .exe found alongside Flash64W.exe in $Path"
+        throw "No BIOS firmware .exe found in $Path"
     }
-    Write-Log "Dell BIOS firmware: $($BiosExe.FullName)"
-    Write-Log "Dell flash utility: $($FlashUtil.FullName)"
 
-    $FlashArgs = @("/b=`"$($BiosExe.FullName)`"", '/s', '/f')
+    $FlashUtil = Get-ChildItem -Path $Path -Filter 'Flash64W.exe' -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+
+    Write-Log "Dell BIOS firmware: $($BiosExe.FullName)"
+    if ($FlashUtil) { Write-Log "Dell flash utility: $($FlashUtil.FullName)" }
+
+    # Strategy 1: Direct DUP execution (Dell's official installer wrapper).
+    # Running the BIOS DUP directly with /s /f stages the UEFI NVRAM capsule directly
+    # in Windows, guaranteeing the UEFI firmware update executes on reboot.
+    $ExeArgs = @('/s', '/f')
     if ($BIOSPassword) {
-        $FlashArgs += "/p=`"$BIOSPassword`""
+        $ExeArgs += "/p=`"$BIOSPassword`""
     }
 
     if ($DebugMode) {
-        Write-Log "DebugMode - would run: Flash64W.exe $($FlashArgs -join ' ')"
+        Write-Log "DebugMode - would run: $($BiosExe.Name) $($ExeArgs -join ' ')"
         return 0
     }
 
-    Write-Log "Running: Flash64W.exe $($FlashArgs -replace '/p=".+"', '/p="***"' -join ' ')"
-    $Proc = Start-Process -FilePath $FlashUtil.FullName -ArgumentList $FlashArgs `
+    Write-Log "Executing BIOS DUP directly: $($BiosExe.Name) $($ExeArgs -replace '/p=".+"', '/p="***"' -join ' ')"
+    $Proc = Start-Process -FilePath $BiosExe.FullName -ArgumentList $ExeArgs `
         -PassThru -NoNewWindow -WorkingDirectory $Path
-    # Touching .Handle forces PS 5.1's Start-Process to retain the OS handle so
-    # $Proc.ExitCode reads correctly after WaitForExit under CCMExec / SYSTEM.
-    # Without this, ExitCode can read as $null and the default-branch below
-    # propagates $null up to the main exit, which SCCM logs as a literal "2" /
-    # binding-style failure with no DATApply lines preceding it.
     $null = $Proc.Handle
     $Proc.WaitForExit()
     $ExitCode = $Proc.ExitCode
-    Write-Log "Flash64W.exe exit code: $ExitCode"
+    Write-Log "BIOS DUP direct exit code: $ExitCode"
 
-    if ($null -eq $ExitCode) {
-        Write-Log 'Flash64W.exe ExitCode came back null - treating as soft-reboot success per Dell convention (BIOS most likely flashed; let SCCM reboot and re-detect).' -Severity 2
+    # Dell DUP return codes:
+    # 0 = success (no reboot)
+    # 2 = success (reboot required, UEFI NVRAM capsule staged)
+    # 6 = rebooting system
+    if ($ExitCode -in @(0, 2, 6) -or $null -eq $ExitCode) {
+        Write-Log "BIOS DUP successfully staged UEFI NVRAM capsule (exit code $ExitCode) - reboot required"
         $script:RebootRequired = $true
         return 0
     }
 
-    # Dell Flash64W / BIOS DUP convention:
-    #   0     = success, no reboot
-    #   2     = success, reboot required
-    #   3/4/5 = not applicable (dependency / qualification mismatch) - the BIOS
-    #           did NOT flash and the firmware version is unchanged. Signalled
-    #           up to the main flow via $script:BIOSNotApplicable so the
-    #           detection marker is written as NotApplicable instead of the
-    #           old "Installed" lie that trapped devices in false-compliant.
-    #   6     = rebooting now
+    # Strategy 2: Fallback to Flash64W if direct DUP returned non-success / non-reboot code
+    if ($FlashUtil) {
+        Write-Log "Direct DUP exit $ExitCode - attempting Flash64W fallback..." -Severity 2
+        $FlashArgs = @("/b=`"$($BiosExe.FullName)`"", '/s', '/f')
+        if ($BIOSPassword) {
+            $FlashArgs += "/p=`"$BIOSPassword`""
+        }
+
+        Write-Log "Running: Flash64W.exe $($FlashArgs -replace '/p=".+"', '/p="***"' -join ' ')"
+        $FProc = Start-Process -FilePath $FlashUtil.FullName -ArgumentList $FlashArgs `
+            -PassThru -NoNewWindow -WorkingDirectory $Path
+        $null = $FProc.Handle
+        $FProc.WaitForExit()
+        $FExitCode = $FProc.ExitCode
+        Write-Log "Flash64W.exe exit code: $FExitCode"
+
+        if ($FExitCode -in @(0, 2, 6) -or $null -eq $FExitCode) {
+            $script:RebootRequired = $true
+            return 0
+        }
+        $ExitCode = $FExitCode
+    }
+
+    # Handle error / not-applicable codes
     switch ($ExitCode) {
-        0 { return 0 }
-        2 { $script:RebootRequired = $true; return 0 }
-        3 { Write-Log 'Flash64W returned 3 (dependency soft error / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
-        4 { Write-Log 'Flash64W returned 4 (dependency hard error / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
-        5 { Write-Log 'Flash64W returned 5 (qualification mismatch / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
-        6 { $script:RebootRequired = $true; return 0 }
+        3 { Write-Log 'Returned 3 (dependency soft error / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
+        4 { Write-Log 'Returned 4 (dependency hard error / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
+        5 { Write-Log 'Returned 5 (qualification mismatch / not applicable) - BIOS was NOT flashed' -Severity 2; $script:BIOSNotApplicable = $true; return 0 }
         default { return $ExitCode }
     }
 }

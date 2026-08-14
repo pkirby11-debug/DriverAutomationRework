@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.26.6'
+    ModuleVersion     = '2.26.7'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.26.6 - Closes Install-DriverUpdates function definition block before Install-LenovoDriverUpdates declaration, resolving ParseException / MissingEndCurlyBrace at line 2440.'
+    Description       = '2.26.7 - Executes Dell BIOS DUP executable directly (/s /f) to stage the UEFI NVRAM capsule in Windows before falling back to Flash64W, ensuring the BIOS flash triggers on reboot.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
