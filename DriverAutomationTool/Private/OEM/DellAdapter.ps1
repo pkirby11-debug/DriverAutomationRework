@@ -1537,6 +1537,8 @@ function Write-DATDCUCatalog {
 
         $ComponentsXml = ($Sorted | ForEach-Object {
             $CXml = ($_.ComponentXml -replace '\bpath\s*=\s*"[^"]*"', ('path="{0}"' -f $_.FileName))
+            # Always ensure componentID is wildcarded so DCU matches the model/system regardless of PCI vendor quirks
+            $CXml = $CXml -replace 'componentID="[^"]*"', 'componentID="*"'
             if ($CXml -notmatch '<Device\b') {
                 $CXml = $CXml -replace '<SupportedDevices\s*/>|<SupportedDevices\s*>\s*</SupportedDevices>', $FallbackSupportedDevices
                 if ($CXml -notmatch '<SupportedDevices\b') {

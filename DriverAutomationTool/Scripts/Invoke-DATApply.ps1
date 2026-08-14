@@ -3767,6 +3767,11 @@ function Invoke-DellBIOSFlash {
     Write-Log "Dell BIOS firmware: $($BiosExe.FullName)"
     if ($FlashUtil) { Write-Log "Dell flash utility: $($FlashUtil.FullName)" }
 
+    # Guarantee BitLocker protection is explicitly suspended immediately before staging the BIOS update.
+    # When DCU's scan finishes or exits, DCU restores pristine settings and re-enables BitLocker.
+    # Direct DUP capsule staging fails if BitLocker is active on C:.
+    Suspend-BitLockerForFlash
+
     # Strategy 1: Direct DUP execution (Dell's official installer wrapper).
     # Running the BIOS DUP directly with /s /f stages the UEFI NVRAM capsule directly
     # in Windows, guaranteeing the UEFI firmware update executes on reboot.
@@ -3787,6 +3792,21 @@ function Invoke-DellBIOSFlash {
     $Proc.WaitForExit()
     $ExitCode = $Proc.ExitCode
     Write-Log "BIOS DUP direct exit code: $ExitCode"
+
+    # Capture vendor DUP log output from C:\ProgramData\Dell\UpdatePackage\log if written
+    try {
+        $DupLogDir = 'C:\ProgramData\Dell\UpdatePackage\log'
+        if (Test-Path $DupLogDir) {
+            $LatestDupLog = Get-ChildItem -Path $DupLogDir -Filter '*.log' -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($LatestDupLog) {
+                $DupLines = Get-Content -Path $LatestDupLog.FullName -Tail 10 -ErrorAction SilentlyContinue
+                if ($DupLines) {
+                    Write-Log "Dell DUP vendor log tail ($($LatestDupLog.Name)): $($DupLines -join ' | ')"
+                }
+            }
+        }
+    } catch {}
 
     # Dell DUP return codes:
     # 0 = success (no reboot)

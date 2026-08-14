@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.26.7'
+    ModuleVersion     = '2.26.8'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.26.7 - Executes Dell BIOS DUP executable directly (/s /f) to stage the UEFI NVRAM capsule in Windows before falling back to Flash64W, ensuring the BIOS flash triggers on reboot.'
+    Description       = '2.26.8 - Explicitly suspends BitLocker immediately before direct BIOS DUP execution, ensuring BitLocker is not re-enabled when DCU restores pristine settings on exit 500, allowing UEFI NVRAM capsule staging.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
