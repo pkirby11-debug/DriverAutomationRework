@@ -410,9 +410,20 @@ Describe 'Get-DATDetectionScript - BIOS reboot-pending grace' {
         # values stubbed. The overrides live inside this helper's scope (visible
         # to the invoked scriptblock, invisible to the It's assertions). Returns
         # the detection output string, or $null when the app is not detected.
+        #
+        # BootTimeStub is deliberately NOT named $BootedAt: the generated script
+        # declares its own $BootedAt before calling Get-CimInstance, and the stub
+        # resolves free variables from the caller's scope - which is the script's,
+        # not this helper's - so a same-named parameter reads back as $null.
+        # Left unset it stays $null, which is how the script behaves on a box
+        # where the boot time can't be read.
         function Invoke-DATBiosDetect {
-            param($LiveBios, $MarkerVersion, $MarkerStatus, $MarkerAnchor, $InstalledOn)
-            function Get-CimInstance { param($ClassName, $ErrorAction) [PSCustomObject]@{ SMBIOSBIOSVersion = $LiveBios } }
+            param($LiveBios, $MarkerVersion, $MarkerStatus, $MarkerAnchor, $InstalledOn, $BootTimeStub)
+            function Get-CimInstance {
+                param($ClassName, $ErrorAction)
+                if ($ClassName -eq 'Win32_OperatingSystem') { return [PSCustomObject]@{ LastBootUpTime = $BootTimeStub } }
+                [PSCustomObject]@{ SMBIOSBIOSVersion = $LiveBios }
+            }
             function Test-Path { param($Path, $ErrorAction) $true }
             function Get-ItemProperty { param($Path, $Name, $ErrorAction) [PSCustomObject]@{ Version = $MarkerVersion; Status = $MarkerStatus; BIOSAtMarker = $MarkerAnchor; InstalledOn = $InstalledOn } }
             & $script:BiosDetectSb
@@ -459,6 +470,35 @@ Describe 'Get-DATDetectionScript - BIOS reboot-pending grace' {
     It 'Still honors NotApplicable against the exact anchor' {
         Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.74' -MarkerStatus 'NotApplicable' `
             -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 1) |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'Stops reporting installed once the device rebooted and the firmware did not move' {
+        # The silent-failure case: a vendor utility returned success without
+        # staging anything (a deprecated Flash64W no-op, a DCU applyUpdates that
+        # quietly declined). The box has since rebooted, so a staged capsule
+        # would have been written at POST - the BIOS still reading the old
+        # version proves nothing was staged. Reporting compliant here is what
+        # makes a device sit on old firmware while the console shows success.
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 2) `
+            -BootTimeStub (Get-Date).AddHours(-1) |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Keeps the grace while the reboot is still pending' {
+        # Same marker, but the last boot PREDATES the flash - the capsule has
+        # not had its POST yet, so this is the legitimate pending window.
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 2) `
+            -BootTimeStub (Get-Date).AddHours(-5) |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'Falls back to the time window when the boot time cannot be read' {
+        Invoke-DATBiosDetect -LiveBios 'R1JET66W (1.66 )' -MarkerVersion '1.74' -MarkerStatus 'Installed' `
+            -MarkerAnchor 'R1JET66W (1.66 )' -InstalledOn (Get-DATTestStamp -HoursAgo 2) `
+            -BootTimeStub $null |
             Should -Not -BeNullOrEmpty
     }
 }

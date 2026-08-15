@@ -2510,9 +2510,27 @@ if (Test-Path `$Path) {
             # its first act is this same version check). A device legitimately
             # waiting on a maintenance-window reboot longer than the window just
             # re-stages at that window.
+            #
+            # The grace is also cut short by the machine actually rebooting. A
+            # staged capsule is written by the firmware at POST, so once the box
+            # has booted since the marker was written, the flash has had its
+            # chance - and the live BIOS still reading the OLD version means it
+            # did not take. That is the silent-failure case worth catching:
+            # a vendor utility that returns success without staging anything
+            # (a deprecated Flash64W no-op, a DCU applyUpdates that quietly
+            # declined) would otherwise be reported compliant for the whole
+            # window while the device sits on old firmware. Checking the boot
+            # time turns that into an honest "not installed" on the very next
+            # evaluation, so ConfigMgr retries and the failure is visible.
             `$FlashedAt = [datetime]::MinValue
             if ([datetime]::TryParseExact("`$(`$Marker.InstalledOn)", 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]`$FlashedAt)) {
-                if (((Get-Date) - `$FlashedAt).TotalHours -lt $BIOSRebootGraceHours) {
+                `$BootedAt = `$null
+                try { `$BootedAt = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch {
+                    # Boot time unavailable - fall back to the time window alone.
+                    `$BootedAt = `$null
+                }
+                `$RebootedSinceFlash = (`$BootedAt -is [datetime]) -and (`$BootedAt -gt `$FlashedAt)
+                if (-not `$RebootedSinceFlash -and ((Get-Date) - `$FlashedAt).TotalHours -lt $BIOSRebootGraceHours) {
                     Write-Output `$Current
                     return
                 }

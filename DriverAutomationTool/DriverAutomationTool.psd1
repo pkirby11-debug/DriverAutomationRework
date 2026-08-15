@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.26.13'
+    ModuleVersion     = '2.27.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.26.13 - Corrects the rationale recorded for the package-scoped NotApplicable detection: DriverUpdates versions are content fingerprints (Cat.<hash>), not the literal placeholder string. Behaviour unchanged.'
+    Description       = '2.27.0 - BIOS detection now ends the reboot-pending grace as soon as the device has actually rebooted, so a flash that reported success but never wrote the firmware (deprecated Flash64W no-op, DCU applyUpdates decline) reports not-installed and re-runs instead of showing compliant on old firmware.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
