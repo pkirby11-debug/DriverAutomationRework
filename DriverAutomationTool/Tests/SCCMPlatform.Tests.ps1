@@ -612,6 +612,18 @@ Describe 'DAT custom return codes' {
         $script:DATCustomReturnCodes.Code | Should -Not -Contain 1
     }
 
+    It 'Names the client-BIOS refusal codes without turning them into successes' {
+        # 7/8/10 come from Dell KB 000148745. They must be present (so the
+        # console shows WHY a flash was refused) and must stay failures - a
+        # password rejection reported as Success is the false-compliance trap.
+        foreach ($Code in 7, 8, 10) {
+            $Def = $script:DATCustomReturnCodes | Where-Object { $_.Code -eq $Code }
+            $Def | Should -Not -BeNullOrEmpty -Because "exit $Code reaches ConfigMgr and should be named"
+            $Def.Class | Should -Be 'Failure'
+            $Def.Name  | Should -Not -BeNullOrEmpty
+        }
+    }
+
     It 'Uses only documented ExitCodeClass names' {
         # Set-DATInstallerReturnCodes parses these against the live SDK enum.
         foreach ($Def in $script:DATCustomReturnCodes) {

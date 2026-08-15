@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.29.3'
+    ModuleVersion     = '2.30.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.29.3 - Logs the device SystemSKU alongside the reported BIOS version before a flash, so a package can be checked against Dell''s published list for that exact SKU. Builds on 2.29.2''s BIOS DUP framework log.'
+    Description       = '2.30.0 - Reads the firmware''s own record of the last capsule it was offered (ESRT LastAttemptStatus) into the apply log, so a BIOS that discards a staged update at POST says why instead of failing silently. Names the client-BIOS refusal codes 7/8/10 on ConfigMgr deployment types, and stops a password or downgrade refusal falling through to Flash64W where a 0 would be recorded as success.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

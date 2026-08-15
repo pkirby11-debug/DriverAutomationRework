@@ -99,3 +99,63 @@ Describe 'Install-DriverUpdates - per-driver loop scoping' {
             Should -BeLessThan $script:InstallFn.Extent.EndLineNumber
     }
 }
+
+Describe 'Firmware update status (ESRT) reader' {
+    BeforeAll {
+        $script:EsrtFn  = Get-DATFunctionAst -Name 'Get-DATFirmwareUpdateStatus'
+        $script:EsrtLog = Get-DATFunctionAst -Name 'Write-DATFirmwareUpdateStatus'
+    }
+
+    It 'Defines both the reader and its logging wrapper' {
+        $script:EsrtFn  | Should -Not -BeNullOrEmpty
+        $script:EsrtLog | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Defines them before the BIOS path calls them' {
+        # Invoke-DATApply.ps1 is a plain script, not a module: a function must be
+        # defined ABOVE its call site or the call fails at runtime. Nothing else
+        # in the suite executes this script, so only line order proves it.
+        $Calls = $script:ApplyAst.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.GetCommandName() -eq 'Write-DATFirmwareUpdateStatus'
+        }, $true)
+
+        $Calls | Should -Not -BeNullOrEmpty -Because 'the BIOS path should log the firmware status'
+        foreach ($Call in $Calls) {
+            $Call.Extent.StartLineNumber |
+                Should -BeGreaterThan $script:EsrtLog.Extent.EndLineNumber
+        }
+        $script:EsrtLog.Extent.StartLineNumber |
+            Should -BeGreaterThan $script:EsrtFn.Extent.EndLineNumber
+    }
+
+    It 'Compares the status as a hex string, never as a raw number' {
+        # LastAttemptStatus is a REG_DWORD, so PowerShell hands it back as a
+        # SIGNED Int32: 0xC0000059 reads as -1073741735 and every numeric
+        # comparison against the documented value silently fails. Formatting to
+        # two's-complement hex first is what keeps the sign out of it.
+        $script:EsrtFn.Extent.Text | Should -Match "0x\{0:X8\}' -f"
+        $script:EsrtFn.Extent.Text | Should -Not -Match '-eq\s+0xC0'
+    }
+
+    It 'Documents the NTSTATUS values Microsoft publishes for a refused capsule' {
+        # These are NTSTATUS codes translated by the OS loader, NOT the small
+        # 0-7 status the UEFI spec defines for the ESRT field itself.
+        foreach ($Status in '0x00000000', '0xC0000022', '0xC0000059', '0xC000007B', '0xC00002DE') {
+            $script:EsrtFn.Extent.Text | Should -Match ([regex]::Escape($Status))
+        }
+    }
+
+    It 'Reads the resource entries under the documented registry root' {
+        $script:EsrtFn.Extent.Text |
+            Should -Match 'CurrentControlSet\\Control\\FirmwareResources'
+    }
+
+    It 'Never lets a diagnostic read break the flash' {
+        # This runs immediately before a BIOS flash. It reports; it must not be
+        # able to throw the run away.
+        $script:EsrtLog.Extent.Text | Should -Match 'try\s*\{'
+        $script:EsrtLog.Extent.Text | Should -Match 'catch\s*\{'
+    }
+}
