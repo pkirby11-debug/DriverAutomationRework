@@ -573,10 +573,22 @@ function Get-DATFirmwareUpdateStatus {
         A BIOS DUP exits 2 once it has STAGED a capsule. It cannot report what
         the firmware then did with that capsule at POST, so a device that stages
         every cycle and never updates produces a clean apply log and no evidence
-        at all. The ESRT is the one place the refusal is written down: the entry
-        is updated on each UpdateCapsule() attempt, is non-volatile, and so
-        survives the reboot we are asking about. Windows' OS loader mirrors it
-        to HKLM:\SYSTEM\CurrentControlSet\Control\FirmwareResources\{<GUID>}.
+        at all. Where a status IS recorded, it lands in
+        HKLM:\SYSTEM\CurrentControlSet\Control\FirmwareResources\{<GUID>},
+        non-volatile and surviving the reboot we are asking about.
+
+        KNOW THE LIMIT OF THIS SIGNAL. Windows records that status for updates
+        delivered through ITS firmware-update platform - an INF firmware driver
+        package, where Windows itself calls UpdateCapsule() and the OS loader
+        writes the result back. A vendor DUP that stages a capsule through its
+        own mechanism bypasses that call, so on a device whose BIOS is managed
+        by Dell DUPs the key is routinely ABSENT no matter how the flash went.
+        Field-confirmed on a Precision 3630: UEFI boot, GPT, Secure Boot on,
+        PCR7 bound, the System Firmware ESRT device present - and no
+        FirmwareResources key at all, on a box that had definitely staged a
+        capsule. So an absent or empty result here is NOT evidence that nothing
+        was attempted, and must never be reported as such. It is a strong signal
+        when it is PRESENT and non-zero, and no signal at all when it is missing.
 
         Two traps in reading it:
 
@@ -667,7 +679,7 @@ function Get-DATFirmwareUpdateStatus {
                 # The case that matters: nothing was ever processed, so this row
                 # is not evidence of anything having been applied.
                 $State = 'NoAttempt'
-                $Meaning = 'no capsule attempt recorded by the firmware - status 0 is also the never-attempted default, so this is NOT evidence that a staged capsule was applied'
+                $Meaning = 'no capsule attempt recorded here - status 0 is also the never-attempted default, and a vendor DUP stages outside the Windows update path so it may never record at all. NOT evidence that a staged capsule was applied, and NOT evidence that none was attempted'
             }
         } else {
             $State = 'Failed'
@@ -722,7 +734,12 @@ function Write-DATFirmwareUpdateStatus {
     try {
         $Entries = @(Get-DATFirmwareUpdateStatus)
         if ($Entries.Count -eq 0) {
-            Write-Log 'No ESRT firmware-update status recorded on this device (the platform exposes no firmware resources)'
+            # Expected on a DUP-managed device: Windows only records here for
+            # capsules IT submitted via a firmware driver package. Say so, so
+            # nobody reads the absence as "no flash was ever attempted".
+            Write-Log ('No ESRT firmware-update status recorded on this device. This is normal where BIOS updates come from ' +
+                'vendor DUPs rather than the Windows firmware-update platform, and says NOTHING about whether a flash was ' +
+                'attempted or how it went - use the vendor framework log below for that.')
             return
         }
         foreach ($Entry in $Entries) {
@@ -4536,15 +4553,18 @@ try {
                                 "looping until the cause is cleared. Check, in order: (1) the BIOS Setup option that blocks flashing to " +
                                 "a different revision - Dell calls it 'Allow BIOS Downgrade'. Some firmware misclassifies an UPGRADE as " +
                                 "a rollback and refuses it while that option is off; Dell fixed exactly that on the Precision 3630 in " +
-                                "BIOS 2.19.0, so a device on an older build is a candidate. An ESRT status of 0xC0000059 on the SYSTEM " +
-                                "firmware row above confirms it - a status on a device-firmware row belongs to a dock or retimer and " +
-                                "means nothing here. (2) UEFI Capsule Firmware Updates disabled in BIOS Setup, which stops the firmware " +
-                                "processing a staged capsule at all; expect the SYSTEM firmware row to report no attempt recorded. " +
+                                "BIOS 2.19.0, so a device on an older build is a candidate. If an ESRT status was logged above at all, " +
+                                "0xC0000059 on the SYSTEM firmware row confirms it - but note the ESRT is usually SILENT for a " +
+                                "DUP-staged capsule, so its absence rules nothing in or out. (2) UEFI Capsule Firmware Updates " +
+                                "disabled in BIOS Setup, which stops the firmware processing a staged capsule at all. " +
                                 "(3) A BIOS setup/admin password with no -BIOSPassword supplied - an ESRT status " +
-                                "of 0xC0000022 points here. (4) BitLocker enabled on a system not bound to PCR7, which Microsoft " +
-                                "documents as blocking UEFI capsule updates outright (msinfo32 reports PCR7 Configuration). (5) The ESRT " +
-                                "status logged above and the vendor framework log quoted below. Also compare '$CurrentBIOS' against the " +
-                                "vendor's published list for this SystemSKU: a withdrawn build sits on no supported upgrade path.") -Severity 3
+                                "of 0xC0000022 points here. (4) No display attached: on this platform generation a staged capsule is " +
+                                "reported not to be processed at POST on a headless machine, which is the shape of a device in a " +
+                                "remote rack. (5) BitLocker enabled on a system not bound to PCR7, which Microsoft " +
+                                "documents as blocking UEFI capsule updates outright (msinfo32 reports PCR7 Configuration). (6) The " +
+                                "vendor framework log quoted below, which is the authoritative record for a DUP-staged flash. Also " +
+                                "compare '$CurrentBIOS' against the vendor's published list for this SystemSKU: a withdrawn build " +
+                                "sits on no supported upgrade path.") -Severity 3
                         }
                     } catch {
                         Write-Verbose "Ignored exception: $($_.Exception.Message)"

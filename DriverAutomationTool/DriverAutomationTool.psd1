@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.33.0'
+    ModuleVersion     = '2.33.1'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.33.0 - Adds Scripts\Get-DATCapsuleAttemptHistory.ps1, which separates "the flash was refused" from "the flash never ran" - the two possibilities every earlier check conflated. Reports the ESRT device''s hardware ID and encoded firmware revision, DAT detection markers, apply and Dell DUP logs, ConfigMgr AppEnforce BIOS entries, and Windows Update firmware history. Companion to 2.32.0''s Get-DATCapsulePathState and 2.31.0''s Get-DATBiosFlashBlocker.'
+    Description       = '2.33.1 - Corrects what the ESRT reader claims. Windows records firmware-update status only for capsules IT submitted through a firmware driver package; a vendor DUP stages outside that path, so on a DUP-managed device the key is routinely absent however the flash went. Field-confirmed on a healthy Precision 3630 (UEFI/GPT/Secure Boot/PCR7 bound, System Firmware device present, no FirmwareResources key) that had definitely staged a capsule. An absent result is no longer reported as though nothing was attempted, and the loop-detector ranks causes accordingly, adding the headless-at-POST case.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
