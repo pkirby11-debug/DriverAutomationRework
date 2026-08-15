@@ -588,39 +588,124 @@ function Get-DATFirmwareUpdateStatus {
           two's-complement hex string rather than the number, which keeps the
           sign out of the comparison entirely.
 
-        Returns one object per firmware resource; an empty array when the
-        platform exposes no ESRT or has never been offered a capsule.
+        Status 0 needs care. It is BOTH "the last attempt succeeded" and the
+        never-attempted default, because the ESRT is only rewritten when the
+        firmware actually PROCESSES a capsule. A capsule discarded at POST
+        without being processed therefore leaves 0 behind - so reporting 0 as
+        "applied" would assert the exact opposite of the truth in the one case
+        this function exists to diagnose. LastAttemptVersion disambiguates: it
+        is 0 when no attempt was ever recorded.
+
+        Returns one object per firmware resource carrying a StatusHex, a State
+        of Succeeded / NoAttempt / Failed, and a ReadError list; an empty array
+        when the platform exposes no ESRT.
     #>
     [CmdletBinding()]
     param()
 
     $RootKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\FirmwareResources'
-    if (-not (Test-Path $RootKey)) { return @() }
+    if (-not (Test-Path $RootKey -ErrorAction SilentlyContinue)) { return @() }
 
-    # The NTSTATUS values Microsoft documents for a refused capsule.
+    # Microsoft's complete ESRT LastAttemptStatus -> NTSTATUS translation, all
+    # eight rows. A partial table is worse than none here: the fallback text
+    # tells the reader the value is undocumented, which for a value Microsoft
+    # does document is the dead end this function exists to remove.
     $StatusMeaning = @{
-        '0x00000000' = 'STATUS_SUCCESS - the last capsule offered was applied'
-        '0xC0000022' = 'STATUS_ACCESS_DENIED - firmware rejected the payload as unauthorized (signing or platform policy)'
-        '0xC0000059' = 'STATUS_REVISION_MISMATCH - firmware refused the image as a rollback, below its LowestSupportedFirmwareVersion'
+        '0x00000000' = 'Success'
+        '0xC0000001' = 'STATUS_UNSUCCESSFUL - firmware reported a generic failure applying the capsule'
+        '0xC000009A' = 'STATUS_INSUFFICIENT_RESOURCES - firmware lacked the resources to apply the capsule'
+        '0xC0000059' = 'STATUS_REVISION_MISMATCH - incorrect version; firmware refused the image, typically as a rollback below its LowestSupportedFirmwareVersion'
         '0xC000007B' = 'STATUS_INVALID_IMAGE_FORMAT - the capsule payload was malformed or corrupt'
-        '0xC00002DE' = 'STATUS_INSUFFICIENT_POWER - firmware declined to flash on the power available'
+        '0xC0000022' = 'STATUS_ACCESS_DENIED - authentication error; firmware rejected the payload as unauthorized'
+        '0xC00002D3' = 'STATUS_POWER_STATE_INVALID - power event: AC not connected'
+        '0xC00002DE' = 'STATUS_INSUFFICIENT_POWER - power event: insufficient battery'
+    }
+
+    # Friendly names for the resource GUIDs. A box can expose a dozen firmware
+    # resources (dock, retimer, TPM, ME) and a stale DEVICE-firmware failure
+    # carries the same status a BIOS refusal would, so an unlabelled row invites
+    # confirming a diagnosis off the wrong resource. The firmware device nodes
+    # enumerate as UEFI\RES_{GUID} under the Firmware setup class.
+    $NameByGuid = @{}
+    try {
+        $FwClassGuid = '{f2e7dd72-6468-4e36-b6f1-6488f42c1b52}'
+        foreach ($Dev in @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "ClassGuid='$FwClassGuid'" -ErrorAction SilentlyContinue)) {
+            foreach ($HwId in @($Dev.HardwareID)) {
+                if ("$HwId" -match 'UEFI\\RES_(\{[0-9A-Fa-f-]+\})') {
+                    $NameByGuid[$Matches[1].ToUpperInvariant()] = $Dev.Name
+                }
+            }
+        }
+    } catch {
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
     }
 
     $Results = @()
-    foreach ($Key in @(Get-ChildItem -Path $RootKey -ErrorAction SilentlyContinue)) {
-        $Props = Get-ItemProperty -Path $Key.PSPath -ErrorAction SilentlyContinue
+    $ReadErrors = @()
+    foreach ($Key in @(Get-ChildItem -Path $RootKey -ErrorAction SilentlyContinue -ErrorVariable +ReadErrors)) {
+        $Props = Get-ItemProperty -Path $Key.PSPath -ErrorAction SilentlyContinue -ErrorVariable +ReadErrors
         if (-not $Props -or $null -eq $Props.LastAttemptStatus) { continue }
 
         $Hex = '0x{0:X8}' -f [int]$Props.LastAttemptStatus
-        $Meaning = 'undocumented status - look it up as an NTSTATUS value'
-        if ($StatusMeaning.ContainsKey($Hex)) { $Meaning = $StatusMeaning[$Hex] }
+
+        # LastAttemptVersion is a REG_DWORD holding a vendor-packed UINT32, and
+        # carries the same signed-Int32 trap as the status - so format it the
+        # same way rather than printing an opaque (possibly negative) decimal.
+        $VerRaw = $Props.LastAttemptVersion
+        $VerHex = 'none recorded'
+        $Attempted = $false
+        if ($null -ne $VerRaw) {
+            $VerHex = '0x{0:X8}' -f [int]$VerRaw
+            $Attempted = (0 -ne [int]$VerRaw)
+        }
+
+        if ($Hex -eq '0x00000000') {
+            if ($Attempted) {
+                $State = 'Succeeded'
+                $Meaning = "STATUS_SUCCESS - the firmware applied the capsule it recorded an attempt for ($VerHex, ESRT-encoded)"
+            } else {
+                # The case that matters: nothing was ever processed, so this row
+                # is not evidence of anything having been applied.
+                $State = 'NoAttempt'
+                $Meaning = 'no capsule attempt recorded by the firmware - status 0 is also the never-attempted default, so this is NOT evidence that a staged capsule was applied'
+            }
+        } else {
+            $State = 'Failed'
+            $Meaning = 'unrecognised NTSTATUS - not one of the eight values Microsoft documents for this field'
+            if ($StatusMeaning.ContainsKey($Hex)) { $Meaning = $StatusMeaning[$Hex] }
+        }
+
+        $Guid = "$($Key.PSChildName)".ToUpperInvariant()
+        $Name = 'unidentified firmware resource'
+        if ($NameByGuid.ContainsKey($Guid)) { $Name = $NameByGuid[$Guid] }
 
         $Results += New-Object PSObject -Property @{
             Resource         = $Key.PSChildName
+            ResourceName     = $Name
+            IsSystemFirmware = ($Name -match 'System\s*Firmware')
             StatusHex        = $Hex
-            Succeeded        = ($Hex -eq '0x00000000')
+            State            = $State
             Meaning          = $Meaning
-            AttemptedVersion = $Props.LastAttemptVersion
+            AttemptedVersion = $VerHex
+            ReadErrors       = @()
+        }
+    }
+
+    # A resource-less result and a result we were denied are different answers.
+    # Surface the difference so the caller never reports "no status" when the
+    # truth is "could not read it". Emitted whenever anything failed to read,
+    # not only on a total failure - a partially readable ESRT can hide the one
+    # row that mattered, and silence there reads as a clean bill of health.
+    if ($ReadErrors.Count -gt 0) {
+        $Results += New-Object PSObject -Property @{
+            Resource         = $null
+            ResourceName     = $null
+            IsSystemFirmware = $false
+            StatusHex        = $null
+            State            = 'Unreadable'
+            Meaning          = 'the firmware resource keys could not be read'
+            AttemptedVersion = $null
+            ReadErrors       = @($ReadErrors | ForEach-Object { $_.Exception.Message })
         }
     }
     return $Results
@@ -637,19 +722,36 @@ function Write-DATFirmwareUpdateStatus {
     try {
         $Entries = @(Get-DATFirmwareUpdateStatus)
         if ($Entries.Count -eq 0) {
-            Write-Log 'No ESRT firmware-update status recorded on this device (the platform exposes none, or no capsule has ever been offered)'
+            Write-Log 'No ESRT firmware-update status recorded on this device (the platform exposes no firmware resources)'
             return
         }
         foreach ($Entry in $Entries) {
-            $Line = "ESRT $($Entry.Resource): LastAttemptStatus=$($Entry.StatusHex) - $($Entry.Meaning); LastAttemptVersion=$($Entry.AttemptedVersion)"
-            if ($Entry.Succeeded) {
-                Write-Log $Line
-            } else {
+            if ($Entry.State -eq 'Unreadable') {
+                Write-Log ("ESRT firmware-update status could not be read: $($Entry.ReadErrors -join '; ') - " +
+                    'this is not the same as the device having no status, so it is NOT evidence either way') -Severity 2
+                continue
+            }
+
+            $Scope = 'device firmware'
+            if ($Entry.IsSystemFirmware) { $Scope = 'SYSTEM firmware' }
+            $Line = ("ESRT [$Scope] $($Entry.ResourceName) $($Entry.Resource): LastAttemptStatus=$($Entry.StatusHex) - " +
+                "$($Entry.Meaning); LastAttemptVersion=$($Entry.AttemptedVersion)")
+
+            if ($Entry.State -eq 'Failed') {
                 Write-Log $Line -Severity 2
+            } elseif ($Entry.State -eq 'NoAttempt' -and $Entry.IsSystemFirmware) {
+                # Normal on most device firmware, but on the SYSTEM firmware row
+                # right after a capsule was staged it says the firmware never
+                # processed it - which is the finding, not background noise.
+                Write-Log $Line -Severity 2
+            } else {
+                Write-Log $Line
             }
         }
     } catch {
-        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+        # Diagnostic only - must not throw a flash away - but staying silent
+        # would leave the reader assuming the check simply found nothing.
+        Write-Log "Could not read the ESRT firmware-update status: $($_.Exception.Message)" -Severity 2
     }
 }
 
@@ -3998,24 +4100,30 @@ function Invoke-DellBIOSFlash {
         return 0
     }
 
-    # 7 and 8 are client-BIOS codes (Dell KB 000148745) and are settled verdicts,
-    # not transient errors: 7 means the BIOS password was missing or wrong, 8 that
-    # the flash was refused as a rollback. Neither changes on a second pass, and
-    # letting Flash64W run is actively unsafe - its exit 0 is returned here as
-    # success and the main flow then writes the marker Installed, which is the
-    # same false-compliance trap the 3/4/5 skip closes. These are real failures
-    # though, so they propagate rather than setting $script:BIOSNotApplicable.
-    # 10 (embedded-controller error) can be transient and keeps the fallback.
-    if ($ExitCode -eq 7 -or $ExitCode -eq 8) {
+    # 7, 8 and 10 are the client-BIOS codes (Dell KB 000148745) and all describe
+    # a device-side condition the payload cannot argue with: 7 the BIOS password
+    # was missing or wrong, 8 the flash was refused as a rollback, 10 an embedded
+    # controller error. None changes on a second pass, and letting Flash64W run
+    # is actively unsafe - its exit 0 is returned here as success and the main
+    # flow then writes the marker Installed, the same false-compliance trap the
+    # 3/4/5 skip closes. Worse, the fallback OVERWRITES $ExitCode with Flash64W's
+    # own code, so the DUP's verdict never reaches ConfigMgr at all. These are
+    # real failures, so they propagate rather than setting
+    # $script:BIOSNotApplicable, which would report the device compliant.
+    if ($ExitCode -eq 7 -or $ExitCode -eq 8 -or $ExitCode -eq 10) {
         if ($ExitCode -eq 7) {
             Write-Log ("BIOS DUP returned 7 (password validation error) - this device has a BIOS setup password and none was supplied, " +
                 "or the one supplied was wrong. The BIOS was NOT flashed; skipping the Flash64W fallback, which hits the same gate and " +
                 "can mask it by returning 0. Supply -BIOSPassword, or clear the password on the device.") -Severity 3
-        } else {
+        } elseif ($ExitCode -eq 8) {
             Write-Log ("BIOS DUP returned 8 (downgrade banned) - the firmware refused this image as a rollback. When the target is " +
                 "NEWER than the installed BIOS (the version comparison logged above), this is usually the 'Allow BIOS Downgrade' " +
                 "BIOS Setup option disabled on firmware that misclassifies the upgrade. The BIOS was NOT flashed; skipping the " +
                 "Flash64W fallback.") -Severity 3
+        } else {
+            Write-Log ("BIOS DUP returned 10 (embedded controller error) - a device-side fault, not a packaging problem. The BIOS was " +
+                "NOT flashed; skipping the Flash64W fallback, which cannot clear an EC fault and would mask it by returning 0. A full " +
+                "power-off (AC removed, ~10 minutes) is the usual way to clear stuck EC state.") -Severity 3
         }
         return $ExitCode
     }
@@ -4428,9 +4536,11 @@ try {
                                 "looping until the cause is cleared. Check, in order: (1) the BIOS Setup option that blocks flashing to " +
                                 "a different revision - Dell calls it 'Allow BIOS Downgrade'. Some firmware misclassifies an UPGRADE as " +
                                 "a rollback and refuses it while that option is off; Dell fixed exactly that on the Precision 3630 in " +
-                                "BIOS 2.19.0, so a device on an older build is a candidate. An ESRT status of 0xC0000059 above confirms " +
-                                "it. (2) UEFI Capsule Firmware Updates disabled in BIOS Setup, which stops the firmware processing a " +
-                                "staged capsule at all. (3) A BIOS setup/admin password with no -BIOSPassword supplied - an ESRT status " +
+                                "BIOS 2.19.0, so a device on an older build is a candidate. An ESRT status of 0xC0000059 on the SYSTEM " +
+                                "firmware row above confirms it - a status on a device-firmware row belongs to a dock or retimer and " +
+                                "means nothing here. (2) UEFI Capsule Firmware Updates disabled in BIOS Setup, which stops the firmware " +
+                                "processing a staged capsule at all; expect the SYSTEM firmware row to report no attempt recorded. " +
+                                "(3) A BIOS setup/admin password with no -BIOSPassword supplied - an ESRT status " +
                                 "of 0xC0000022 points here. (4) BitLocker enabled on a system not bound to PCR7, which Microsoft " +
                                 "documents as blocking UEFI capsule updates outright (msinfo32 reports PCR7 Configuration). (5) The ESRT " +
                                 "status logged above and the vendor framework log quoted below. Also compare '$CurrentBIOS' against the " +
