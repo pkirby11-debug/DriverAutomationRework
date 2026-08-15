@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.29.2'
+    ModuleVersion     = '2.29.3'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.29.2 - Makes a BIOS flash diagnosable: passes /l= to the BIOS DUP and quotes Dell''s framework log, records when no BIOSPassword was supplied, and detects a capsule that was staged but never applied at POST instead of silently re-flashing on every cycle.'
+    Description       = '2.29.3 - Logs the device SystemSKU alongside the reported BIOS version before a flash, so a package can be checked against Dell''s published list for that exact SKU. Builds on 2.29.2''s BIOS DUP framework log.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

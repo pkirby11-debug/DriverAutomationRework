@@ -4264,6 +4264,19 @@ try {
         Write-Log "Current BIOS version: $CurrentBIOS"
         Write-Log "Target BIOS version:  $Version"
 
+        # SMBIOSBIOSVersion verbatim, plus the SystemSKU the firmware reports.
+        # Together these say WHICH box this is and WHICH build it is really on,
+        # which is what you need to check the package against Dell's published
+        # list for this exact SKU - a version Dell does not list (a withdrawn
+        # release, or a factory build) is worth knowing about before assuming
+        # the flash path is at fault.
+        try {
+            $BiosIdentity = Get-DATDeviceIdentity
+            Write-Log "Device identity for BIOS flash: Model='$($BiosIdentity.Model)', SystemSKU='$($BiosIdentity.SystemSKU)', reported BIOS='$CurrentBIOS'"
+        } catch {
+            Write-Verbose "Ignored exception: $($_.Exception.Message)"
+        }
+
         if (-not $CurrentBIOS) {
             Write-Log 'Current BIOS version unavailable - proceeding with flash' -Severity 2
         } else {
