@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.26.9'
+    ModuleVersion     = '2.26.10'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.26.9 - Passes /s /f /r to Dell BIOS DUPs so Dell DFU flasher triggers native hardware reset call (Exit 6) required for Intel CSME Management Engine firmware transitions during POST.'
+    Description       = '2.26.10 - Fixes Install-DriverUpdates returning after the first driver (misplaced brace put the function tail inside the per-driver loop) and makes detection honour the NotApplicable marker written by the manufacturer safety check.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

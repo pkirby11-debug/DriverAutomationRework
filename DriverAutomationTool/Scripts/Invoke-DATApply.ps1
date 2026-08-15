@@ -3019,74 +3019,75 @@ function Install-DriverUpdates {
                     $VendorNote = if ($DupVendor) { "no $DupVendor GPU confirmed" } else { 'GPU brand undeterminable' }
                     Write-Log "$DriverLabel - exit $DupCode (graphics DUP, $VendorNote - treating as not applicable) in ${Elapsed}s" -Severity 2
                 } else {
-                $Failed++
-                $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
-                if ($Elapsed -lt 2) { $InstantFailed++ }
+                    $Failed++
+                    $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
+                    if ($Elapsed -lt 2) { $InstantFailed++ }
 
-                # Persistent-failure ledger (consumed by the quarantine
-                # pre-check above). Same version failing again increments the
-                # count; a different version starts a fresh ledger.
-                try {
-                    if (-not (Test-Path $CompKeyPath)) {
-                        New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null
-                    }
-                    $PrevFailVer = $null
-                    $PrevCount = 0
+                    # Persistent-failure ledger (consumed by the quarantine
+                    # pre-check above). Same version failing again increments the
+                    # count; a different version starts a fresh ledger.
                     try {
-                        $Prev = Get-ItemProperty -Path $CompKeyPath -ErrorAction Stop
-                        if ($Prev.PSObject.Properties['FailedVersion']) {
-                            $PrevFailVer = $Prev.FailedVersion
-                            $PrevCount = [int]$Prev.FailCount
+                        if (-not (Test-Path $CompKeyPath)) {
+                            New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null
                         }
-                    } catch {
-        # Non-fatal hardware or registry probe error
-        Write-Verbose "Ignored exception: $($_.Exception.Message)"
-    }
-                    $NewCount = if ($PrevFailVer -eq $Drv.Version) { $PrevCount + 1 } else { 1 }
-                    New-ItemProperty -Path $CompKeyPath -Name 'FailedVersion' -Value $Drv.Version -PropertyType String -Force | Out-Null
-                    New-ItemProperty -Path $CompKeyPath -Name 'FailCount'     -Value $NewCount     -PropertyType DWord  -Force | Out-Null
-                    New-ItemProperty -Path $CompKeyPath -Name 'LastFailExit'  -Value $DupCode      -PropertyType DWord  -Force | Out-Null
-                    New-ItemProperty -Path $CompKeyPath -Name 'LastFailAt'    -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
-                    if ($NewCount -ge $QuarantineThreshold) {
-                        Write-Log "$DriverLabel - v$($Drv.Version) has now failed $NewCount consecutive time(s) on this device; future runs will QUARANTINE (skip) it until a newer version ships, so this one DUP stops failing the application" -Severity 2
-                    }
-                } catch {
-        # Non-fatal hardware or registry probe error
-        Write-Verbose "Ignored exception: $($_.Exception.Message)"
-    }
-                # Pull the verdict out of Dell's framework log so the apply log
-                # itself says why. No framework log after a failure = the process
-                # was killed before Dell's framework initialized (AV/EDR pattern).
-                $FwHint = 'no log capture this run'
-                if ($DupFwLog) {
-                    if ((Test-Path $DupFwLog) -and ((Get-Item $DupFwLog -ErrorAction SilentlyContinue).Length -gt 0)) {
-                        $FwHint = "framework log: $DupFwLog"
+                        $PrevFailVer = $null
+                        $PrevCount = 0
                         try {
-                            # The framework log ends with a fixed footer (Name of
-                            # Exit Code / Exit Code set to / Result / Execution
-                            # terminated / ######) that buries the actual error
-                            # line just above it. Strip per-line timestamps and
-                            # the footer so the REAL reason is what gets quoted.
-                            $Boilerplate = 'Name of Exit Code|Exit Code set to|^Result:|Execution terminated|^#+$'
-                            $Tail = @(Get-Content -Path $DupFwLog -ErrorAction Stop |
-                                ForEach-Object { ($_ -replace '^\[[^\]]*\]\s*', '').Trim() } |
-                                Where-Object { $_ -and $_ -notmatch $Boilerplate } |
-                                Select-Object -Last 4)
-                            if ($Tail.Count -eq 0) {
-                                $Tail = @(Get-Content -Path $DupFwLog -ErrorAction Stop | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3 | ForEach-Object { $_.Trim() })
-                            }
-                            if ($Tail.Count -gt 0) {
-                                $FwHint += ' | last lines: ' + ($Tail -join ' / ')
+                            $Prev = Get-ItemProperty -Path $CompKeyPath -ErrorAction Stop
+                            if ($Prev.PSObject.Properties['FailedVersion']) {
+                                $PrevFailVer = $Prev.FailedVersion
+                                $PrevCount = [int]$Prev.FailCount
                             }
                         } catch {
-        # Non-fatal hardware or registry probe error
-        Write-Verbose "Ignored exception: $($_.Exception.Message)"
-    }
-                    } else {
-                        $FwHint = "no framework log written - the process died before Dell's DUP framework initialized (typical when AV/EDR terminates the installer at launch)"
+                            # Non-fatal hardware or registry probe error
+                            Write-Verbose "Ignored exception: $($_.Exception.Message)"
+                        }
+                        $NewCount = if ($PrevFailVer -eq $Drv.Version) { $PrevCount + 1 } else { 1 }
+                        New-ItemProperty -Path $CompKeyPath -Name 'FailedVersion' -Value $Drv.Version -PropertyType String -Force | Out-Null
+                        New-ItemProperty -Path $CompKeyPath -Name 'FailCount'     -Value $NewCount     -PropertyType DWord  -Force | Out-Null
+                        New-ItemProperty -Path $CompKeyPath -Name 'LastFailExit'  -Value $DupCode      -PropertyType DWord  -Force | Out-Null
+                        New-ItemProperty -Path $CompKeyPath -Name 'LastFailAt'    -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
+                        if ($NewCount -ge $QuarantineThreshold) {
+                            Write-Log "$DriverLabel - v$($Drv.Version) has now failed $NewCount consecutive time(s) on this device; future runs will QUARANTINE (skip) it until a newer version ships, so this one DUP stops failing the application" -Severity 2
+                        }
+                    } catch {
+                        # Non-fatal hardware or registry probe error
+                        Write-Verbose "Ignored exception: $($_.Exception.Message)"
                     }
+                    # Pull the verdict out of Dell's framework log so the apply log
+                    # itself says why. No framework log after a failure = the process
+                    # was killed before Dell's framework initialized (AV/EDR pattern).
+                    $FwHint = 'no log capture this run'
+                    if ($DupFwLog) {
+                        if ((Test-Path $DupFwLog) -and ((Get-Item $DupFwLog -ErrorAction SilentlyContinue).Length -gt 0)) {
+                            $FwHint = "framework log: $DupFwLog"
+                            try {
+                                # The framework log ends with a fixed footer (Name of
+                                # Exit Code / Exit Code set to / Result / Execution
+                                # terminated / ######) that buries the actual error
+                                # line just above it. Strip per-line timestamps and
+                                # the footer so the REAL reason is what gets quoted.
+                                $Boilerplate = 'Name of Exit Code|Exit Code set to|^Result:|Execution terminated|^#+$'
+                                $Tail = @(Get-Content -Path $DupFwLog -ErrorAction Stop |
+                                    ForEach-Object { ($_ -replace '^\[[^\]]*\]\s*', '').Trim() } |
+                                    Where-Object { $_ -and $_ -notmatch $Boilerplate } |
+                                    Select-Object -Last 4)
+                                if ($Tail.Count -eq 0) {
+                                    $Tail = @(Get-Content -Path $DupFwLog -ErrorAction Stop | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 3 | ForEach-Object { $_.Trim() })
+                                }
+                                if ($Tail.Count -gt 0) {
+                                    $FwHint += ' | last lines: ' + ($Tail -join ' / ')
+                                }
+                            } catch {
+                                # Non-fatal hardware or registry probe error
+                                Write-Verbose "Ignored exception: $($_.Exception.Message)"
+                            }
+                        } else {
+                            $FwHint = "no framework log written - the process died before Dell's DUP framework initialized (typical when AV/EDR terminates the installer at launch)"
+                        }
+                    }
+                    Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s ($FwHint)" -Severity 2
                 }
-                Write-Log "$DriverLabel - exit $DupCode (FAILED) in ${Elapsed}s ($FwHint)" -Severity 2
             }
         }
     }
@@ -3154,7 +3155,6 @@ function Install-DriverUpdates {
     # state isn't claimed when graphics drivers actually didn't install.
     if ($Failed -gt 0) { return 1 }
     return 0
-}
 }
 
 function Install-LenovoDriverUpdates {
@@ -3807,7 +3807,10 @@ function Invoke-DellBIOSFlash {
                 }
             }
         }
-    } catch {}
+    } catch {
+        # Non-fatal - the vendor log is diagnostic only.
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
 
     # Dell DUP return codes:
     # 0 = success (no reboot)
@@ -3819,7 +3822,20 @@ function Invoke-DellBIOSFlash {
         return 0
     }
 
-    # Strategy 2: Fallback to Flash64W if direct DUP returned non-success / non-reboot code
+    # 3/4/5 = the DUP qualified this device and said no (dependency mismatch /
+    # wrong SKU or revision). The BIOS was NOT flashed, and re-running the same
+    # payload through Flash64W cannot change that verdict - it can only hide it,
+    # because a Flash64W exit 0 returns success here and the main flow then
+    # writes the marker as "Installed". That is the false-compliant trap
+    # $script:BIOSNotApplicable exists to close, so answer it here and skip the
+    # fallback. Genuine errors still fall through to Flash64W below.
+    if ($ExitCode -in @(3, 4, 5)) {
+        Write-Log "BIOS DUP returned $ExitCode (dependency / qualification mismatch - not applicable to this device) - BIOS was NOT flashed; skipping Flash64W fallback" -Severity 2
+        $script:BIOSNotApplicable = $true
+        return 0
+    }
+
+    # Strategy 2: Fallback to Flash64W if direct DUP returned a genuine error
     if ($FlashUtil) {
         Write-Log "Direct DUP exit $ExitCode - attempting Flash64W fallback..." -Severity 2
         $FlashArgs = @("/b=`"$($BiosExe.FullName)`"", '/s', '/f')
