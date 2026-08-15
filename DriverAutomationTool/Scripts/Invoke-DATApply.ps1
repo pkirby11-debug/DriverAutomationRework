@@ -3881,6 +3881,18 @@ function Invoke-DellBIOSFlash {
         Write-Log "Flash64W.exe exit code: $FExitCode"
 
         if ($FExitCode -in @(0, 2, 6) -or $null -eq $FExitCode) {
+            if ($FExitCode -eq 0) {
+                # Exit 0 from Flash64W means "success, no reboot needed", which
+                # for a firmware flash is a contradiction: the capsule is only
+                # written at POST, so a real staging returns 2. Dell deprecated
+                # Flash64W and newer BIOS packages make it return 0 immediately
+                # without doing anything - the exact shape of "the console said
+                # Installed and the device came back on the old BIOS". Request
+                # the reboot anyway; detection re-checks the live firmware after
+                # it and reports not-installed if nothing moved, so this can no
+                # longer sit as a false success.
+                Write-Log "Flash64W returned 0 (success, no reboot) - a real firmware staging returns 2. Flash64W is deprecated and returns 0 without flashing on newer BIOS packages, so treat this as UNVERIFIED: detection will re-check the live BIOS after the reboot and re-run this deployment if the firmware did not move." -Severity 2
+            }
             $script:RebootRequired = $true
             return 0
         }
