@@ -2533,11 +2533,17 @@ if (Test-Path `$Path) {
     # every evaluation cycle.
     #
     # The PackageName guard is what makes that safe. This marker key is per
-    # MODE, not per package, and catalog-only Driver Updates packages all carry
-    # the literal version string 'Catalog' - so version alone does not identify
-    # a package. Without the guard, the NotApplicable marker left by a
-    # wrong-manufacturer package would satisfy the CORRECT package's detection
-    # on the same device and its drivers would silently never install.
+    # MODE, not per package - every DriverUpdates package on the device shares
+    # one key - and a DriverUpdates version is a CONTENT fingerprint
+    # ("Cat.<hash>" over the sorted resolved driver list), so two packages that
+    # resolve the same drivers legitimately share a version.
+    #
+    # For an Installed marker that sharing is harmless, and is why the Installed
+    # branch below stays version-only: equal fingerprint means the very same
+    # drivers really are on the box. NotApplicable is the opposite - NOTHING was
+    # installed - so without the package check it would hand a free pass to any
+    # other package that happens to match, and those drivers would silently
+    # never install.
     $NotApplicableClause = if ($PackageName) {
         $EscapedPackage = $PackageName -replace "'", "''"
         " -or (`$Status -eq 'NotApplicable' -and `$Package -eq '$EscapedPackage')"

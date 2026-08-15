@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.26.12'
+    ModuleVersion     = '2.26.13'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.26.12 - Returns Dell reboots to ConfigMgr control (drops /r from the BIOS DUP), stops per-driver DUPs forcing past their own version checks (drops /f), narrows the framework-log not-applicable reclassification to exit 1 and keeps the quarantine ledger intact, and restores real per-device componentIDs in the generated DCU catalog.'
+    Description       = '2.26.13 - Corrects the rationale recorded for the package-scoped NotApplicable detection: DriverUpdates versions are content fingerprints (Cat.<hash>), not the literal placeholder string. Behaviour unchanged.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
