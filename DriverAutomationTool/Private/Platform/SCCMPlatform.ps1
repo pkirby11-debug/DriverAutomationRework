@@ -2693,15 +2693,41 @@ function Copy-DATApplyScript {
     return $true
 }
 
-# Vendor exit-code map used by DAT-managed deployment types. Each entry becomes
-# a CustomReturnCode on the script DT so SCCM stops treating vendor-native
-# "reboot required" / "not applicable" codes as execution failures.
+# Exit-code map applied to DAT-managed deployment types. Each entry becomes a
+# CustomReturnCode on the script DT so SCCM stops treating an exit code that
+# means "installed, restart to finish" as an execution failure.
 #
-# Dell Flash64W / Dell BIOS DUP / Dell driver DUP (per Dell DUP Reference Guide):
-#   0 SUCCESS, 1 ERROR, 2 REBOOT_REQUIRED, 3 DEP_SOFT_ERROR (N/A),
-#   4 DEP_HARD_ERROR (N/A), 5 QUAL_HARD_ERROR (N/A), 6 REBOOTING_SYSTEM.
-# Lenovo SRSETUP also uses 256 for reboot-required; we surface it here too.
+# THE STANDARD INSTALLER CODES ARE NOT OPTIONAL HERE. Add-CMScriptDeploymentType
+# creates the DT with a NULL CustomReturnCodes collection - unlike the console
+# wizard, it does not seed the 0/1641/3010/1618 set documented for a Script
+# Installer. Whatever this list does not name is an unmapped non-zero exit, and
+# ConfigMgr reports that as a failure.
+#
+# These are the codes Invoke-DATApply actually returns, and every successful
+# BIOS flash returns 3010. Leaving it out is what produced "Unable to make
+# changes to your software / 0xBC2(3010)" in Software Center on a run whose log
+# ended "BIOS DUP successfully staged UEFI NVRAM capsule (exit code 2) - reboot
+# required / Success - reboot required (exiting 3010)". The install had worked;
+# only the reporting was wrong - and because the DT never saw a soft reboot,
+# ConfigMgr never performed the restart that applies the staged capsule.
+#
+# 1618 is the -DeferOnActiveUser guard (2.26.0). Fast Retry is exactly its
+# intent: the client re-attempts later instead of burning the deployment.
+#
+# The vendor codes below still matter: Invoke-DellBIOSFlash's default branch
+# propagates a raw vendor exit code up to "exit $ExitCode", so they can reach
+# ConfigMgr directly. Per the Dell DUP Reference Guide: 0 SUCCESS, 1 ERROR,
+# 2 REBOOT_REQUIRED, 3 DEP_SOFT_ERROR (N/A), 4 DEP_HARD_ERROR (N/A),
+# 5 QUAL_HARD_ERROR (N/A), 6 REBOOTING_SYSTEM. Lenovo SRSETUP uses 256 for
+# reboot-required.
 $script:DATCustomReturnCodes = @(
+    # Standard installer contract - what Invoke-DATApply itself exits with.
+    @{ Code =     0; Class = 'Success';    Name = 'Success (no reboot)' }
+    @{ Code =  1707; Class = 'Success';    Name = 'Success (no reboot)' }
+    @{ Code =  3010; Class = 'SoftReboot'; Name = 'Success - restart required to complete' }
+    @{ Code =  1641; Class = 'HardReboot'; Name = 'Success - restart initiated' }
+    @{ Code =  1618; Class = 'FastRetry';  Name = 'Deferred - active user present, retry later' }
+    # Vendor-native codes, reachable via the raw exit-code passthrough.
     @{ Code =     2; Class = 'SoftReboot'; Name = 'Reboot required (Dell Flash64W / DUP)' }
     @{ Code =     3; Class = 'Success';    Name = 'Dependency soft error (not applicable)' }
     @{ Code =     4; Class = 'Success';    Name = 'Dependency hard error (not applicable)' }
@@ -2948,7 +2974,18 @@ function Set-DATInstallerReturnCodes {
     $Added = 0
     $Updated = 0
     foreach ($Def in $script:DATCustomReturnCodes) {
-        $ClassEnum = [System.Enum]::Parse($ErrorClassType, $Def.Class, $true)
+        # Documented ExitCodeClass values are Failure/Success/FastRetry/
+        # HardReboot/SoftReboot, but the enum is resolved off a live SDK object
+        # and console builds have surprised us before. Skip an entry this build
+        # cannot express rather than throwing - losing one mapping is a reporting
+        # wrinkle, losing the whole call fails application creation outright.
+        $ClassEnum = $null
+        try {
+            $ClassEnum = [System.Enum]::Parse($ErrorClassType, $Def.Class, $true)
+        } catch {
+            Write-DATLog -Message "Return code $($Def.Code): class '$($Def.Class)' is not valid for '$($ErrorClassType.FullName)' on this console - skipping this mapping" -Severity 2
+            continue
+        }
         $Existing = $ReturnCodes | Where-Object { $_.Code -eq [int]$Def.Code } | Select-Object -First 1
         if ($Existing) {
             if ($Existing.Class -ne $ClassEnum -or $Existing.Name -ne $Def.Name) {
