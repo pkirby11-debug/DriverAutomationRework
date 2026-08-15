@@ -465,41 +465,74 @@ Describe 'Get-DATDetectionScript - BIOS reboot-pending grace' {
 
 Describe 'Get-DATDetectionScript - Driver / DriverUpdates marker status' {
     BeforeAll {
+        # This marker key is per MODE, not per package, and every catalog-only
+        # Driver Updates package carries the literal version 'Catalog' - so two
+        # packages of the same mode are distinguished only by PackageName.
+        $script:DellApp   = 'Driver Updates - Dell Latitude 7430 - Windows 11 x64'
+        $script:LenovoApp = 'Driver Updates - Lenovo ThinkPad T14 - Windows 11 x64'
+
         # Runs the generated client-side detection with the marker values stubbed.
         function Invoke-DATMarkerDetect {
-            param($Mode, $Target, $MarkerVersion, $MarkerStatus)
-            $Sb = [scriptblock]::Create((Get-DATDetectionScript -Mode $Mode -ExpectedVersion $Target))
+            param($Mode, $Target, $AppName, $MarkerVersion, $MarkerStatus, $MarkerPackage)
+            $Params = @{ Mode = $Mode; ExpectedVersion = $Target }
+            if ($AppName) { $Params['PackageName'] = $AppName }
+            $Sb = [scriptblock]::Create((Get-DATDetectionScript @Params))
             function Test-Path { param($Path, $ErrorAction) $true }
-            function Get-ItemProperty { param($Path, $Name, $ErrorAction) [PSCustomObject]@{ Version = $MarkerVersion; Status = $MarkerStatus } }
+            function Get-ItemProperty { param($Path, $Name, $ErrorAction) [PSCustomObject]@{ Version = $MarkerVersion; Status = $MarkerStatus; PackageName = $MarkerPackage } }
             & $Sb
         }
     }
 
     It 'Reports installed for a normal successful install' {
-        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.5' -MarkerVersion '1.5' -MarkerStatus 'Installed' |
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target 'Catalog' -AppName $script:DellApp `
+            -MarkerVersion 'Catalog' -MarkerStatus 'Installed' -MarkerPackage $script:DellApp |
             Should -Not -BeNullOrEmpty
     }
 
-    It 'Reports installed for a NotApplicable marker at the target version' {
+    It 'Reports installed for its own NotApplicable marker at the target version' {
         # The manufacturer safety check (a Dell package that landed on a Lenovo
         # because requirement rules were missing) logs, writes a NotApplicable
         # marker and exits 0. Detection has to honor that status or the app
         # installs "successfully" and then fails detection on every cycle.
-        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.5' -MarkerVersion '1.5' -MarkerStatus 'NotApplicable' |
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target 'Catalog' -AppName $script:DellApp `
+            -MarkerVersion 'Catalog' -MarkerStatus 'NotApplicable' -MarkerPackage $script:DellApp |
             Should -Not -BeNullOrEmpty
-        Invoke-DATMarkerDetect -Mode Driver -Target '2.0' -MarkerVersion '2.0' -MarkerStatus 'NotApplicable' |
+        Invoke-DATMarkerDetect -Mode Driver -Target '2.0' -AppName $script:DellApp `
+            -MarkerVersion '2.0' -MarkerStatus 'NotApplicable' -MarkerPackage $script:DellApp |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'Does not let one package NotApplicable marker satisfy another package' {
+        # The Dell package was mis-targeted at a Lenovo device and skipped. The
+        # CORRECT Lenovo package must still install - sharing the mode key and
+        # the literal 'Catalog' version must not make it report compliant.
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target 'Catalog' -AppName $script:LenovoApp `
+            -MarkerVersion 'Catalog' -MarkerStatus 'NotApplicable' -MarkerPackage $script:DellApp |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Does not honor NotApplicable when no package name was baked in' {
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target 'Catalog' -AppName $null `
+            -MarkerVersion 'Catalog' -MarkerStatus 'NotApplicable' -MarkerPackage $script:DellApp |
+            Should -BeNullOrEmpty
+        # ...but a plain Installed marker still detects, as before.
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target 'Catalog' -AppName $null `
+            -MarkerVersion 'Catalog' -MarkerStatus 'Installed' -MarkerPackage $script:DellApp |
             Should -Not -BeNullOrEmpty
     }
 
     It 'Does not report installed for a Failed marker' {
-        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.5' -MarkerVersion '1.5' -MarkerStatus 'Failed' |
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target 'Catalog' -AppName $script:DellApp `
+            -MarkerVersion 'Catalog' -MarkerStatus 'Failed' -MarkerPackage $script:DellApp |
             Should -BeNullOrEmpty
     }
 
     It 'Does not report installed when the marker version is behind the target' {
-        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.6' -MarkerVersion '1.5' -MarkerStatus 'Installed' |
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.6' -AppName $script:DellApp `
+            -MarkerVersion '1.5' -MarkerStatus 'Installed' -MarkerPackage $script:DellApp |
             Should -BeNullOrEmpty
-        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.6' -MarkerVersion '1.5' -MarkerStatus 'NotApplicable' |
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.6' -AppName $script:DellApp `
+            -MarkerVersion '1.5' -MarkerStatus 'NotApplicable' -MarkerPackage $script:DellApp |
             Should -BeNullOrEmpty
     }
 }
