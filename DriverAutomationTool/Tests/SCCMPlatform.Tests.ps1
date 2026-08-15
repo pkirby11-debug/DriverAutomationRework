@@ -462,3 +462,44 @@ Describe 'Get-DATDetectionScript - BIOS reboot-pending grace' {
             Should -Not -BeNullOrEmpty
     }
 }
+
+Describe 'Get-DATDetectionScript - Driver / DriverUpdates marker status' {
+    BeforeAll {
+        # Runs the generated client-side detection with the marker values stubbed.
+        function Invoke-DATMarkerDetect {
+            param($Mode, $Target, $MarkerVersion, $MarkerStatus)
+            $Sb = [scriptblock]::Create((Get-DATDetectionScript -Mode $Mode -ExpectedVersion $Target))
+            function Test-Path { param($Path, $ErrorAction) $true }
+            function Get-ItemProperty { param($Path, $Name, $ErrorAction) [PSCustomObject]@{ Version = $MarkerVersion; Status = $MarkerStatus } }
+            & $Sb
+        }
+    }
+
+    It 'Reports installed for a normal successful install' {
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.5' -MarkerVersion '1.5' -MarkerStatus 'Installed' |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'Reports installed for a NotApplicable marker at the target version' {
+        # The manufacturer safety check (a Dell package that landed on a Lenovo
+        # because requirement rules were missing) logs, writes a NotApplicable
+        # marker and exits 0. Detection has to honor that status or the app
+        # installs "successfully" and then fails detection on every cycle.
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.5' -MarkerVersion '1.5' -MarkerStatus 'NotApplicable' |
+            Should -Not -BeNullOrEmpty
+        Invoke-DATMarkerDetect -Mode Driver -Target '2.0' -MarkerVersion '2.0' -MarkerStatus 'NotApplicable' |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'Does not report installed for a Failed marker' {
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.5' -MarkerVersion '1.5' -MarkerStatus 'Failed' |
+            Should -BeNullOrEmpty
+    }
+
+    It 'Does not report installed when the marker version is behind the target' {
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.6' -MarkerVersion '1.5' -MarkerStatus 'Installed' |
+            Should -BeNullOrEmpty
+        Invoke-DATMarkerDetect -Mode DriverUpdates -Target '1.6' -MarkerVersion '1.5' -MarkerStatus 'NotApplicable' |
+            Should -BeNullOrEmpty
+    }
+}

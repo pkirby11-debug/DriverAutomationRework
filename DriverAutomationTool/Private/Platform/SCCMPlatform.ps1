@@ -2518,12 +2518,18 @@ if (Test-Path `$Path) {
 "@
     }
 
+    # NotApplicable counts as compliant here. For Driver / DriverUpdates the
+    # apply script only writes that status from the manufacturer safety check
+    # (a Dell package that landed on a Lenovo, i.e. missing requirement rules).
+    # It exits 0, so without this the app installs "successfully" and then
+    # fails detection forever - "application was not detected after
+    # installation completed" - and retries every evaluation cycle.
     return @"
 `$Path = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation\$SubKey'
 if (-not (Test-Path `$Path)) { return }
 `$Installed = (Get-ItemProperty -Path `$Path -Name 'Version' -ErrorAction SilentlyContinue).Version
 `$Status    = (Get-ItemProperty -Path `$Path -Name 'Status'  -ErrorAction SilentlyContinue).Status
-if (`$Installed -eq '$EscapedVersion' -and `$Status -eq 'Installed') {
+if (`$Installed -eq '$EscapedVersion' -and (`$Status -eq 'Installed' -or `$Status -eq 'NotApplicable')) {
     Write-Output `$Installed
 }
 "@
