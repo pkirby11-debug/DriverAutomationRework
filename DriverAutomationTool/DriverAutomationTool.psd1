@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.28.0'
+    ModuleVersion     = '2.29.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.28.0 - Removes the SHA-256 shared-payload deduplication engine. Its canonical store sat on a different volume from the package share, so every hardlink fell back to a copy and each payload was written twice - net more disk, not less - while the summary reported savings that never happened. The ConfigMgr content library already single-instances content by hash before it reaches distribution points.'
+    Description       = '2.29.0 - Adds Invoke-DATMaintenance: sweeps staging directories orphaned by runs that died before their cleanup, rotates logs, prunes stale cache entries, and reports package source folders the ConfigMgr site no longer references. Reports by default, deletes only with -Force. Invoke-DATSync now sweeps stale staging orphans at start, and the Clean Downloads filter matches the folder name instead of the whole path.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
@@ -17,6 +17,7 @@
         'Register-DATQueueLogSubscriber'
         'Invoke-DATRemovePackages'
         'Invoke-DATCleanupOverlayPackages'
+        'Invoke-DATMaintenance'
         'Invoke-DATDeployApplications'
         'Invoke-DATRemoveDeployments'
         'New-DATDcuModeApplication'
