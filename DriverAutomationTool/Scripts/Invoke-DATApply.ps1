@@ -566,6 +566,93 @@ function Get-CurrentBIOSVersion {
     }
 }
 
+function Get-DATFirmwareUpdateStatus {
+    <#
+        Reads what the FIRMWARE recorded about the last capsule it was offered.
+
+        A BIOS DUP exits 2 once it has STAGED a capsule. It cannot report what
+        the firmware then did with that capsule at POST, so a device that stages
+        every cycle and never updates produces a clean apply log and no evidence
+        at all. The ESRT is the one place the refusal is written down: the entry
+        is updated on each UpdateCapsule() attempt, is non-volatile, and so
+        survives the reboot we are asking about. Windows' OS loader mirrors it
+        to HKLM:\SYSTEM\CurrentControlSet\Control\FirmwareResources\{<GUID>}.
+
+        Two traps in reading it:
+
+        - LastAttemptStatus here is an NTSTATUS, not the small 0-7 status the
+          UEFI spec defines for the ESRT field. The OS loader translates on the
+          way in, so the values are 0xC00000xx.
+        - It is a REG_DWORD, which PowerShell surfaces as a signed Int32, so
+          0xC0000059 reads back as -1073741735. Everything below keys off the
+          two's-complement hex string rather than the number, which keeps the
+          sign out of the comparison entirely.
+
+        Returns one object per firmware resource; an empty array when the
+        platform exposes no ESRT or has never been offered a capsule.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $RootKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\FirmwareResources'
+    if (-not (Test-Path $RootKey)) { return @() }
+
+    # The NTSTATUS values Microsoft documents for a refused capsule.
+    $StatusMeaning = @{
+        '0x00000000' = 'STATUS_SUCCESS - the last capsule offered was applied'
+        '0xC0000022' = 'STATUS_ACCESS_DENIED - firmware rejected the payload as unauthorized (signing or platform policy)'
+        '0xC0000059' = 'STATUS_REVISION_MISMATCH - firmware refused the image as a rollback, below its LowestSupportedFirmwareVersion'
+        '0xC000007B' = 'STATUS_INVALID_IMAGE_FORMAT - the capsule payload was malformed or corrupt'
+        '0xC00002DE' = 'STATUS_INSUFFICIENT_POWER - firmware declined to flash on the power available'
+    }
+
+    $Results = @()
+    foreach ($Key in @(Get-ChildItem -Path $RootKey -ErrorAction SilentlyContinue)) {
+        $Props = Get-ItemProperty -Path $Key.PSPath -ErrorAction SilentlyContinue
+        if (-not $Props -or $null -eq $Props.LastAttemptStatus) { continue }
+
+        $Hex = '0x{0:X8}' -f [int]$Props.LastAttemptStatus
+        $Meaning = 'undocumented status - look it up as an NTSTATUS value'
+        if ($StatusMeaning.ContainsKey($Hex)) { $Meaning = $StatusMeaning[$Hex] }
+
+        $Results += New-Object PSObject -Property @{
+            Resource         = $Key.PSChildName
+            StatusHex        = $Hex
+            Succeeded        = ($Hex -eq '0x00000000')
+            Meaning          = $Meaning
+            AttemptedVersion = $Props.LastAttemptVersion
+        }
+    }
+    return $Results
+}
+
+function Write-DATFirmwareUpdateStatus {
+    <#
+        Logs Get-DATFirmwareUpdateStatus. Diagnostic only - never throws, and
+        never affects whether a flash is attempted.
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $Entries = @(Get-DATFirmwareUpdateStatus)
+        if ($Entries.Count -eq 0) {
+            Write-Log 'No ESRT firmware-update status recorded on this device (the platform exposes none, or no capsule has ever been offered)'
+            return
+        }
+        foreach ($Entry in $Entries) {
+            $Line = "ESRT $($Entry.Resource): LastAttemptStatus=$($Entry.StatusHex) - $($Entry.Meaning); LastAttemptVersion=$($Entry.AttemptedVersion)"
+            if ($Entry.Succeeded) {
+                Write-Log $Line
+            } else {
+                Write-Log $Line -Severity 2
+            }
+        }
+    } catch {
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
+}
+
 function Compare-BIOSVersion {
     <#
         Returns one of: 'equal', 'lower', 'higher', 'unknown'.
@@ -3911,6 +3998,28 @@ function Invoke-DellBIOSFlash {
         return 0
     }
 
+    # 7 and 8 are client-BIOS codes (Dell KB 000148745) and are settled verdicts,
+    # not transient errors: 7 means the BIOS password was missing or wrong, 8 that
+    # the flash was refused as a rollback. Neither changes on a second pass, and
+    # letting Flash64W run is actively unsafe - its exit 0 is returned here as
+    # success and the main flow then writes the marker Installed, which is the
+    # same false-compliance trap the 3/4/5 skip closes. These are real failures
+    # though, so they propagate rather than setting $script:BIOSNotApplicable.
+    # 10 (embedded-controller error) can be transient and keeps the fallback.
+    if ($ExitCode -eq 7 -or $ExitCode -eq 8) {
+        if ($ExitCode -eq 7) {
+            Write-Log ("BIOS DUP returned 7 (password validation error) - this device has a BIOS setup password and none was supplied, " +
+                "or the one supplied was wrong. The BIOS was NOT flashed; skipping the Flash64W fallback, which hits the same gate and " +
+                "can mask it by returning 0. Supply -BIOSPassword, or clear the password on the device.") -Severity 3
+        } else {
+            Write-Log ("BIOS DUP returned 8 (downgrade banned) - the firmware refused this image as a rollback. When the target is " +
+                "NEWER than the installed BIOS (the version comparison logged above), this is usually the 'Allow BIOS Downgrade' " +
+                "BIOS Setup option disabled on firmware that misclassifies the upgrade. The BIOS was NOT flashed; skipping the " +
+                "Flash64W fallback.") -Severity 3
+        }
+        return $ExitCode
+    }
+
     # Strategy 2: Fallback to Flash64W if direct DUP returned a genuine error
     if ($FlashUtil) {
         Write-Log "Direct DUP exit $ExitCode - attempting Flash64W fallback..." -Severity 2
@@ -3931,14 +4040,16 @@ function Invoke-DellBIOSFlash {
             if ($FExitCode -eq 0) {
                 # Exit 0 from Flash64W means "success, no reboot needed", which
                 # for a firmware flash is a contradiction: the capsule is only
-                # written at POST, so a real staging returns 2. Dell deprecated
-                # Flash64W and newer BIOS packages make it return 0 immediately
-                # without doing anything - the exact shape of "the console said
-                # Installed and the device came back on the old BIOS". Request
-                # the reboot anyway; detection re-checks the live firmware after
-                # it and reports not-installed if nothing moved, so this can no
-                # longer sit as a false success.
-                Write-Log "Flash64W returned 0 (success, no reboot) - a real firmware staging returns 2. Flash64W is deprecated and returns 0 without flashing on newer BIOS packages, so treat this as UNVERIFIED: detection will re-check the live BIOS after the reboot and re-run this deployment if the firmware did not move." -Severity 2
+                # written at POST, so a real staging returns 2. Flash64W is
+                # stale rather than formally retired - Dell's KB 000147030 still
+                # documents it, but its last build is 3.3.11 A07 (Feb 2021) and
+                # newer BIOS packages run natively, with reports of it returning
+                # 0 immediately without flashing. That is the exact shape of "the
+                # console said Installed and the device came back on the old
+                # BIOS". Request the reboot anyway; detection re-checks the live
+                # firmware after it and reports not-installed if nothing moved,
+                # so this can no longer sit as a false success.
+                Write-Log "Flash64W returned 0 (success, no reboot) - a real firmware staging returns 2. Flash64W has not been rebuilt since 2021 and is reported to return 0 without flashing on newer BIOS packages, so treat this as UNVERIFIED: detection will re-check the live BIOS after the reboot and re-run this deployment if the firmware did not move." -Severity 2
             }
             $script:RebootRequired = $true
             return 0
@@ -4277,6 +4388,11 @@ try {
             Write-Verbose "Ignored exception: $($_.Exception.Message)"
         }
 
+        # What the firmware itself said about the last capsule it was offered.
+        # Logged on every BIOS run, not just a detected loop: it is the only
+        # record of a POST-time refusal, and it costs a registry read.
+        Write-DATFirmwareUpdateStatus
+
         if (-not $CurrentBIOS) {
             Write-Log 'Current BIOS version unavailable - proceeding with flash' -Severity 2
         } else {
@@ -4309,11 +4425,16 @@ try {
                             $PrevMarker.Version -eq $Version -and $PrevMarker.Status -eq 'Installed') {
                             Write-Log ("A previous attempt on $($PrevMarker.InstalledOn) reported the capsule staged for $Version, " +
                                 "but the firmware is still $CurrentBIOS. The capsule was not applied at POST. Re-flashing will keep " +
-                                "looping until the cause is cleared. Check, in order: (1) a BIOS setup/admin password is set and no " +
-                                "-BIOSPassword was supplied, so the firmware rejects the update; (2) UEFI Capsule Firmware Updates is " +
-                                "disabled in BIOS Setup (Update/Recovery) - Windows stages the capsule and the firmware discards it; " +
-                                "(3) the update needs an intermediate BIOS version before $Version; (4) the Dell framework log quoted " +
-                                "below reports a device-side error.") -Severity 3
+                                "looping until the cause is cleared. Check, in order: (1) the BIOS Setup option that blocks flashing to " +
+                                "a different revision - Dell calls it 'Allow BIOS Downgrade'. Some firmware misclassifies an UPGRADE as " +
+                                "a rollback and refuses it while that option is off; Dell fixed exactly that on the Precision 3630 in " +
+                                "BIOS 2.19.0, so a device on an older build is a candidate. An ESRT status of 0xC0000059 above confirms " +
+                                "it. (2) UEFI Capsule Firmware Updates disabled in BIOS Setup, which stops the firmware processing a " +
+                                "staged capsule at all. (3) A BIOS setup/admin password with no -BIOSPassword supplied - an ESRT status " +
+                                "of 0xC0000022 points here. (4) BitLocker enabled on a system not bound to PCR7, which Microsoft " +
+                                "documents as blocking UEFI capsule updates outright (msinfo32 reports PCR7 Configuration). (5) The ESRT " +
+                                "status logged above and the vendor framework log quoted below. Also compare '$CurrentBIOS' against the " +
+                                "vendor's published list for this SystemSKU: a withdrawn build sits on no supported upgrade path.") -Severity 3
                         }
                     } catch {
                         Write-Verbose "Ignored exception: $($_.Exception.Message)"
