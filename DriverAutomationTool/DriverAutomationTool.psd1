@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.27.0'
+    ModuleVersion     = '2.28.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.27.0 - BIOS detection now ends the reboot-pending grace as soon as the device has actually rebooted, so a flash that reported success but never wrote the firmware (deprecated Flash64W no-op, DCU applyUpdates decline) reports not-installed and re-runs instead of showing compliant on old firmware.'
+    Description       = '2.28.0 - Removes the SHA-256 shared-payload deduplication engine. Its canonical store sat on a different volume from the package share, so every hardlink fell back to a copy and each payload was written twice - net more disk, not less - while the summary reported savings that never happened. The ConfigMgr content library already single-instances content by hash before it reaches distribution points.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
