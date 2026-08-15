@@ -2735,11 +2735,13 @@ $script:DATCustomReturnCodes = @(
     @{ Code =     6; Class = 'SoftReboot'; Name = 'Rebooting system' }
     @{ Code =   256; Class = 'SoftReboot'; Name = 'Reboot required (Lenovo SRSETUP)' }
     # Client-BIOS DUP codes (Dell KB 000148745), which the server-side DUP
-    # framework guide does not list. Invoke-DellBIOSFlash returns 7 and 8
-    # directly and 10 via the raw passthrough. Class Failure, so the deployment
-    # still fails - the point is the NAME: unmapped, a refused flash reaches the
-    # console as a bare 0x7(7) with nothing saying the device has a BIOS
-    # password, or that the firmware called the upgrade a rollback.
+    # framework guide does not list. Invoke-DellBIOSFlash returns all three
+    # directly - it deliberately skips the Flash64W fallback for them, which
+    # would otherwise overwrite the DUP's verdict with Flash64W's own exit code
+    # and never let these reach ConfigMgr at all. Class Failure, so the
+    # deployment still fails - the point is the NAME: unmapped, a refused flash
+    # reaches the console as a bare 0x7(7) with nothing saying the device has a
+    # BIOS password, or that the firmware called the upgrade a rollback.
     @{ Code =     7; Class = 'Failure';    Name = 'BIOS password missing or incorrect' }
     @{ Code =     8; Class = 'Failure';    Name = 'Flash refused as a downgrade (check Allow BIOS Downgrade)' }
     @{ Code =    10; Class = 'Failure';    Name = 'Embedded controller error' }

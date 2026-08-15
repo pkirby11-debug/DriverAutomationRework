@@ -139,12 +139,51 @@ Describe 'Firmware update status (ESRT) reader' {
         $script:EsrtFn.Extent.Text | Should -Not -Match '-eq\s+0xC0'
     }
 
-    It 'Documents the NTSTATUS values Microsoft publishes for a refused capsule' {
+    It 'Documents all eight NTSTATUS values Microsoft publishes for this field' {
         # These are NTSTATUS codes translated by the OS loader, NOT the small
-        # 0-7 status the UEFI spec defines for the ESRT field itself.
-        foreach ($Status in '0x00000000', '0xC0000022', '0xC0000059', '0xC000007B', '0xC00002DE') {
+        # 0-7 status the UEFI spec defines for the ESRT field itself. The table
+        # must be COMPLETE: the fallback text says the value is undocumented,
+        # which for a value Microsoft does document is the dead end this
+        # function exists to remove. 0xC0000001 (generic failure) and
+        # 0xC00002D3 (AC not connected) are the ones most likely to be seen on
+        # a desktop that silently discarded a capsule.
+        foreach ($Status in '0x00000000', '0xC0000001', '0xC000009A', '0xC0000059',
+                            '0xC000007B', '0xC0000022', '0xC00002D3', '0xC00002DE') {
             $script:EsrtFn.Extent.Text | Should -Match ([regex]::Escape($Status))
         }
+    }
+
+    It 'Never reports status 0 as proof a capsule was applied' {
+        # 0 is BOTH "last attempt succeeded" and the never-attempted default,
+        # because the ESRT is only rewritten when the firmware actually
+        # processes a capsule. A capsule discarded at POST leaves 0 behind - so
+        # claiming "applied" here would assert the opposite of the truth in the
+        # exact scenario this function was written to diagnose.
+        $script:EsrtFn.Extent.Text | Should -Match 'NoAttempt'
+        $script:EsrtFn.Extent.Text | Should -Match 'LastAttemptVersion'
+        $script:EsrtFn.Extent.Text | Should -Match 'NOT evidence'
+    }
+
+    It 'Formats the attempted version rather than printing a raw REG_DWORD' {
+        # LastAttemptVersion carries the same signed-Int32 trap as the status:
+        # unformatted it prints as an opaque, possibly negative decimal.
+        $script:EsrtFn.Extent.Text | Should -Match "VerHex\s*=\s*'0x\{0:X8\}'\s*-f"
+    }
+
+    It 'Distinguishes the system firmware row from device firmware' {
+        # A box exposes many firmware resources. A stale dock/retimer failure
+        # carries the same status a BIOS refusal would, and the loop-detector
+        # message tells the reader a status "confirms" the diagnosis - so the
+        # rows must say which resource they belong to.
+        $script:EsrtFn.Extent.Text  | Should -Match 'IsSystemFirmware'
+        $script:EsrtLog.Extent.Text | Should -Match 'SYSTEM firmware'
+    }
+
+    It 'Reports an unreadable ESRT instead of calling it absent' {
+        # Access-denied must not surface as "no status recorded" - that is an
+        # affirmative conclusion the code has no evidence for.
+        $script:EsrtFn.Extent.Text  | Should -Match 'Unreadable'
+        $script:EsrtLog.Extent.Text | Should -Match 'could not be read'
     }
 
     It 'Reads the resource entries under the documented registry root' {
@@ -152,10 +191,13 @@ Describe 'Firmware update status (ESRT) reader' {
             Should -Match 'CurrentControlSet\\Control\\FirmwareResources'
     }
 
-    It 'Never lets a diagnostic read break the flash' {
+    It 'Never lets a diagnostic read break the flash, but never swallows it silently' {
         # This runs immediately before a BIOS flash. It reports; it must not be
-        # able to throw the run away.
+        # able to throw the run away - and it must not fail into the verbose
+        # stream, which goes nowhere in a ConfigMgr run.
         $script:EsrtLog.Extent.Text | Should -Match 'try\s*\{'
         $script:EsrtLog.Extent.Text | Should -Match 'catch\s*\{'
+        $Catch = $script:EsrtLog.Extent.Text -replace '(?s)^.*catch\s*\{', ''
+        $Catch | Should -Match 'Write-Log'
     }
 }
