@@ -3805,9 +3805,33 @@ function Invoke-DellBIOSFlash {
     # In-Service Update transition - is applied at POST on the next boot no
     # matter who initiates it. Exit 6 (REBOOTING_SYSTEM) is a consequence of
     # /r, not a prerequisite for staging.
+    #
+    # /l=<file> is Dell's documented universal DUP switch for the framework log,
+    # the only place a DUP records what it actually decided. The driver path has
+    # always passed it; the BIOS path did not, which left the single most
+    # important flash in the product undiagnosable - a run could report "capsule
+    # staged" and the firmware never move, with nothing anywhere saying why.
+    $BiosFwLog = $null
+    try {
+        $BiosLogDir = Join-Path $env:SystemRoot 'Temp\DATApply'
+        if (-not (Test-Path $BiosLogDir)) {
+            New-Item -Path $BiosLogDir -ItemType Directory -Force | Out-Null
+        }
+        $BiosFwLog = Join-Path $BiosLogDir ((($BiosExe.BaseName) -replace '[^\w\.\-]', '_') + '.bios.dup.log')
+        Remove-Item -Path $BiosFwLog -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Log "Could not prepare a BIOS DUP framework log path: $($_.Exception.Message)" -Severity 2
+        $BiosFwLog = $null
+    }
+
     $ExeArgs = @('/s', '/f')
+    if ($BiosFwLog) { $ExeArgs += "/l=$BiosFwLog" }
     if ($BIOSPassword) {
         $ExeArgs += "/p=`"$BIOSPassword`""
+    } else {
+        # A BIOS setup password with no /p= is a leading cause of "staged but
+        # never applied" - record that none was supplied so the log says so.
+        Write-Log 'No BIOSPassword supplied - if this device has a BIOS setup password, the firmware will reject the update at POST' -Severity 1
     }
 
     if ($DebugMode) {
@@ -3822,6 +3846,29 @@ function Invoke-DellBIOSFlash {
     $Proc.WaitForExit()
     $ExitCode = $Proc.ExitCode
     Write-Log "BIOS DUP direct exit code: $ExitCode"
+
+    # The /l= log we asked for is authoritative - it belongs to THIS run, unlike
+    # the shared ProgramData directory below which may hold another package's
+    # output. Quote the whole thing: a BIOS flash happens once and the reason it
+    # declined is worth more than the log space.
+    if ($BiosFwLog -and (Test-Path $BiosFwLog)) {
+        try {
+            $BiosLines = @(Get-Content -Path $BiosFwLog -ErrorAction Stop |
+                ForEach-Object { ($_ -replace '^\[[^\]]*\]\s*', '').Trim() } |
+                Where-Object { $_ })
+            if ($BiosLines.Count -gt 0) {
+                Write-Log "Dell BIOS DUP framework log ($BiosFwLog):"
+                foreach ($Line in $BiosLines) { Write-Log "    $Line" }
+            } else {
+                Write-Log "Dell BIOS DUP framework log at $BiosFwLog is empty" -Severity 2
+            }
+        } catch {
+            Write-Log "Could not read the BIOS DUP framework log: $($_.Exception.Message)" -Severity 2
+        }
+    } elseif ($BiosFwLog) {
+        Write-Log ("The BIOS DUP wrote no framework log at $BiosFwLog - it exited before its framework initialized " +
+            "(typical when AV/EDR terminates the installer at launch)") -Severity 2
+    }
 
     # Capture vendor DUP log output from C:\ProgramData\Dell\UpdatePackage\log if written
     try {
@@ -4235,6 +4282,29 @@ try {
                 }
                 'lower' {
                     Write-Log 'Device BIOS is older than target - proceeding with flash'
+
+                    # Did a previous attempt already stage a capsule that never
+                    # applied? The marker records the live BIOS at staging time
+                    # (BIOSAtMarker). If that still equals the live BIOS and we
+                    # are STILL below target, the device has booted since - the
+                    # firmware had its chance at POST and did not take it.
+                    # Re-flashing will loop unless the underlying block is
+                    # cleared, so say so loudly rather than silently retrying.
+                    try {
+                        $PrevMarker = Get-ItemProperty -Path $MarkerPath -ErrorAction SilentlyContinue
+                        if ($PrevMarker -and $PrevMarker.BIOSAtMarker -eq $CurrentBIOS -and
+                            $PrevMarker.Version -eq $Version -and $PrevMarker.Status -eq 'Installed') {
+                            Write-Log ("A previous attempt on $($PrevMarker.InstalledOn) reported the capsule staged for $Version, " +
+                                "but the firmware is still $CurrentBIOS. The capsule was not applied at POST. Re-flashing will keep " +
+                                "looping until the cause is cleared. Check, in order: (1) a BIOS setup/admin password is set and no " +
+                                "-BIOSPassword was supplied, so the firmware rejects the update; (2) UEFI Capsule Firmware Updates is " +
+                                "disabled in BIOS Setup (Update/Recovery) - Windows stages the capsule and the firmware discards it; " +
+                                "(3) the update needs an intermediate BIOS version before $Version; (4) the Dell framework log quoted " +
+                                "below reports a device-side error.") -Severity 3
+                        }
+                    } catch {
+                        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+                    }
                 }
                 'unknown' {
                     Write-Log 'Could not compare BIOS versions numerically - proceeding with flash' -Severity 2
