@@ -192,7 +192,6 @@ function Invoke-DATSync {
     $StartTime = Get-Date
     $SyncResults = [System.Collections.Generic.List[PSCustomObject]]::new()
     $ErrorCount = 0
-    Reset-DATDeduplicationStats
 
     # Records a per-model outcome that produced no package (Error, or Warning
     # for "nothing published to package") so $SyncResults accounts for every
@@ -1282,14 +1281,14 @@ function Invoke-DATSyncSinglePackage {
             $ExtractedCount = @(Get-ChildItem $PackageSourceDir -Recurse -File -ErrorAction SilentlyContinue).Count
             if ($ExtractedCount -eq 0) {
                 Write-DATLog -Message "Lenovo BIOS extraction produced no files - falling back to shipping the .exe (deployment script will need it pre-extracted)" -Severity 3
-                $null = Save-DATSharedPayload -SourceFilePath $DownloadDest -DestinationPath (Join-Path $PackageSourceDir $FileName) -Manufacturer $Make
+                Copy-Item -Path $DownloadDest -Destination (Join-Path $PackageSourceDir $FileName) -Force
             } else {
                 Write-DATLog -Message "Lenovo BIOS extracted: $ExtractedCount file(s) in $PackageSourceDir" -Severity 1
             }
         } else {
             # Dell BIOS .exe files are firmware update utilities, not self-extracting archives
             Write-DATLog -Message "Copying BIOS file $FileName to $PackageSourceDir" -Severity 1
-            $null = Save-DATSharedPayload -SourceFilePath $DownloadDest -DestinationPath (Join-Path $PackageSourceDir $FileName) -Manufacturer $Make
+            Copy-Item -Path $DownloadDest -Destination (Join-Path $PackageSourceDir $FileName) -Force
         }
 
         # For Dell BIOS: download Flash64W.exe utility (distributed as a ZIP archive)
@@ -1312,14 +1311,14 @@ function Invoke-DATSyncSinglePackage {
                         $FlashExe = Get-ChildItem -Path $FlashTempDir -Filter 'Flash64W.exe' -Recurse -File |
                             Select-Object -First 1
                         if ($FlashExe) {
-                            $null = Save-DATSharedPayload -SourceFilePath $FlashExe.FullName -DestinationPath (Join-Path $PackageSourceDir 'Flash64W.exe') -Manufacturer 'Dell'
+                            Copy-Item -Path $FlashExe.FullName -Destination (Join-Path $PackageSourceDir 'Flash64W.exe') -Force
                             Write-DATLog -Message "Flash64W.exe extracted and copied to package source" -Severity 1
                         } else {
                             Write-DATLog -Message "Flash64W.exe not found inside $FlashZipName" -Severity 2
                         }
                     } else {
                         # Direct .exe fallback (if URL format changes in future)
-                        $null = Save-DATSharedPayload -SourceFilePath $FlashZipDest -DestinationPath (Join-Path $PackageSourceDir 'Flash64W.exe') -Manufacturer 'Dell'
+                        Copy-Item -Path $FlashZipDest -Destination (Join-Path $PackageSourceDir 'Flash64W.exe') -Force
                         Write-DATLog -Message "Flash64W.exe downloaded to package source" -Severity 1
                     }
                 } catch {
@@ -2047,7 +2046,7 @@ function Invoke-DATSyncSinglePackage {
                                     }
 
                                     $StagedExe = Join-Path $PackageSourceDir $IndvDriver.FileName
-                                    $null = Save-DATSharedPayload -SourceFilePath $DriverExePath -DestinationPath $StagedExe -Manufacturer $Make
+                                    Copy-Item -Path $DriverExePath -Destination $StagedExe -Force
                                     $StagedSize = (Get-Item $StagedExe -ErrorAction SilentlyContinue).Length
                                     $ManifestEntries.Add([PSCustomObject]@{
                                         FileName    = $IndvDriver.FileName
@@ -2557,9 +2556,6 @@ function Invoke-DATSyncSinglePackage {
         -DownloadUrl $DownloadUrl -DownloadTimeSec $StopWatch.Elapsed.TotalSeconds
 
     Write-DATLog -Message "Successfully synced $Type for $Make $ModelName v$Version (Package: $($PkgResult.PackageID))" -Severity 1
-
-    $DedupSummary = Get-DATDeduplicationSummary
-    Write-DATLog -Message $DedupSummary -Severity 1
 
     return [PSCustomObject]@{
         Manufacturer = $Make
