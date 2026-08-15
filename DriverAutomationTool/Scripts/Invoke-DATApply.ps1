@@ -3773,9 +3773,10 @@ function Invoke-DellBIOSFlash {
     Suspend-BitLockerForFlash
 
     # Strategy 1: Direct DUP execution (Dell's official installer wrapper).
-    # Running the BIOS DUP directly with /s /f stages the UEFI NVRAM capsule directly
-    # in Windows, guaranteeing the UEFI firmware update executes on reboot.
-    $ExeArgs = @('/s', '/f')
+    # Passing /s /f /r allows Dell's DFU flasher to trigger its native system reboot call
+    # (Exit 6 / RBU), which is required on Coffee Lake/vPro platforms to force the Intel CSME
+    # (Management Engine) chip into In-Service Update mode during POST.
+    $ExeArgs = @('/s', '/f', '/r')
     if ($BIOSPassword) {
         $ExeArgs += "/p=`"$BIOSPassword`""
     }
