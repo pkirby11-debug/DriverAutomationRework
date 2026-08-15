@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.32.0'
+    ModuleVersion     = '2.33.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.32.0 - Adds Scripts\Get-DATCapsulePathState.ps1, which answers why a device exposes no ESRT at all: boot mode (a CSM/legacy-booted machine has no capsule path and can never take an OS-delivered BIOS update), whether the firmware-resources key is absent or merely empty, the Firmware-class device list, Secure Boot, and the PCR7 binding that Microsoft documents as blocking capsule updates on a BitLocker-enabled system. Companion to 2.31.0''s Get-DATBiosFlashBlocker.'
+    Description       = '2.33.0 - Adds Scripts\Get-DATCapsuleAttemptHistory.ps1, which separates "the flash was refused" from "the flash never ran" - the two possibilities every earlier check conflated. Reports the ESRT device''s hardware ID and encoded firmware revision, DAT detection markers, apply and Dell DUP logs, ConfigMgr AppEnforce BIOS entries, and Windows Update firmware history. Companion to 2.32.0''s Get-DATCapsulePathState and 2.31.0''s Get-DATBiosFlashBlocker.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
