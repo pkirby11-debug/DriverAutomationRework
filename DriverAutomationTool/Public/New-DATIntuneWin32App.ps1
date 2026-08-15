@@ -82,7 +82,7 @@ function New-DATIntuneWin32App {
     if ($Mode -eq 'BIOS' -and $BIOSPassword) { $InstallParams['BIOSPassword'] = $BIOSPassword }
     $InstallCommand = Get-DATInstallCommand @InstallParams
 
-    $DetectionScript = Get-DATDetectionScript -Mode $Mode -ExpectedVersion $Version
+    $DetectionScript = Get-DATDetectionScript -Mode $Mode -ExpectedVersion $Version -PackageName $DisplayName
     $Detection = New-DATIntuneWin32PowerShellDetection -ScriptText $DetectionScript
     $UninstallCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "exit 0"'
 

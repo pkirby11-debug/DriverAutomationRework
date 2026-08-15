@@ -2400,7 +2400,13 @@ function Get-DATDetectionScript {
         [string]$Mode,
 
         [Parameter(Mandatory)]
-        [string]$ExpectedVersion
+        [string]$ExpectedVersion,
+
+        # The application's name, matched against the marker's PackageName
+        # before a NotApplicable status is honored. Optional: without it the
+        # Driver / DriverUpdates script does not honor NotApplicable at all,
+        # which is the conservative pre-2.26.3 behavior.
+        [string]$PackageName
     )
 
     $SubKey = switch ($Mode) {
@@ -2518,18 +2524,34 @@ if (Test-Path `$Path) {
 "@
     }
 
-    # NotApplicable counts as compliant here. For Driver / DriverUpdates the
-    # apply script only writes that status from the manufacturer safety check
-    # (a Dell package that landed on a Lenovo, i.e. missing requirement rules).
-    # It exits 0, so without this the app installs "successfully" and then
-    # fails detection forever - "application was not detected after
-    # installation completed" - and retries every evaluation cycle.
+    # NotApplicable counts as compliant here, but ONLY for the package that
+    # wrote it. For Driver / DriverUpdates the apply script writes that status
+    # from the manufacturer safety check (a Dell package that landed on a
+    # Lenovo, i.e. missing requirement rules); it exits 0, so without this the
+    # app installs "successfully" and then fails detection forever -
+    # "application was not detected after installation completed" - retrying
+    # every evaluation cycle.
+    #
+    # The PackageName guard is what makes that safe. This marker key is per
+    # MODE, not per package, and catalog-only Driver Updates packages all carry
+    # the literal version string 'Catalog' - so version alone does not identify
+    # a package. Without the guard, the NotApplicable marker left by a
+    # wrong-manufacturer package would satisfy the CORRECT package's detection
+    # on the same device and its drivers would silently never install.
+    $NotApplicableClause = if ($PackageName) {
+        $EscapedPackage = $PackageName -replace "'", "''"
+        " -or (`$Status -eq 'NotApplicable' -and `$Package -eq '$EscapedPackage')"
+    } else {
+        ''
+    }
+
     return @"
 `$Path = 'HKLM:\SOFTWARE\MSEndpointMgr\DriverAutomation\$SubKey'
 if (-not (Test-Path `$Path)) { return }
-`$Installed = (Get-ItemProperty -Path `$Path -Name 'Version' -ErrorAction SilentlyContinue).Version
-`$Status    = (Get-ItemProperty -Path `$Path -Name 'Status'  -ErrorAction SilentlyContinue).Status
-if (`$Installed -eq '$EscapedVersion' -and (`$Status -eq 'Installed' -or `$Status -eq 'NotApplicable')) {
+`$Installed = (Get-ItemProperty -Path `$Path -Name 'Version'     -ErrorAction SilentlyContinue).Version
+`$Status    = (Get-ItemProperty -Path `$Path -Name 'Status'      -ErrorAction SilentlyContinue).Status
+`$Package   = (Get-ItemProperty -Path `$Path -Name 'PackageName' -ErrorAction SilentlyContinue).PackageName
+if (`$Installed -eq '$EscapedVersion' -and (`$Status -eq 'Installed'$NotApplicableClause)) {
     Write-Output `$Installed
 }
 "@
@@ -3184,7 +3206,7 @@ function New-DATConfigMgrApplication {
         $DTName = 'Install'
         $InstallCommand = Get-DATInstallCommand -Mode $Mode -Name $Name -Version $Version `
             -SafetyManufacturer $Manufacturer -BIOSPassword $BIOSPassword
-        $DetectionScript = Get-DATDetectionScript -Mode $Mode -ExpectedVersion $Version
+        $DetectionScript = Get-DATDetectionScript -Mode $Mode -ExpectedVersion $Version -PackageName $Name
 
         if ($PSCmdlet.ShouldProcess($Name, 'Configure deployment type')) {
             $Timeout   = switch ($Mode) {

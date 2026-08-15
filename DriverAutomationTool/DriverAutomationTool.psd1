@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.26.10'
+    ModuleVersion     = '2.26.11'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.26.10 - Fixes Install-DriverUpdates returning after the first driver (misplaced brace put the function tail inside the per-driver loop) and makes detection honour the NotApplicable marker written by the manufacturer safety check.'
+    Description       = '2.26.11 - Fixes Install-DriverUpdates returning after the first driver (misplaced brace put the function tail inside the per-driver loop) and makes detection honour the NotApplicable marker written by the manufacturer safety check, scoped to the package that wrote it.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
