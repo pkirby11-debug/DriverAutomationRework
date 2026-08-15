@@ -104,6 +104,25 @@ Describe 'Firmware update status (ESRT) reader' {
     BeforeAll {
         $script:EsrtFn  = Get-DATFunctionAst -Name 'Get-DATFirmwareUpdateStatus'
         $script:EsrtLog = Get-DATFunctionAst -Name 'Write-DATFirmwareUpdateStatus'
+
+        # String literals that appear in CODE. Matching a function's raw text
+        # also matches its comment-based help, so a text assertion can be
+        # satisfied entirely by prose - it would still pass with the code
+        # changed underneath it. Comments are not AST nodes, so pulling the
+        # literals out this way tests what the function actually does.
+        # Both literal and interpolated strings: they are sibling AST types, not
+        # parent/child, so checking only the constant kind silently misses every
+        # message built with a "$(...)" in it - which is most log lines.
+        function Get-DATCodeStringList {
+            param($Fn)
+            @($Fn.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+                $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
+            }, $true) | ForEach-Object { $_.Value })
+        }
+        $script:EsrtStrings = Get-DATCodeStringList -Fn $script:EsrtFn
+        $script:EsrtLogStrings = Get-DATCodeStringList -Fn $script:EsrtLog
     }
 
     It 'Defines both the reader and its logging wrapper' {
@@ -149,7 +168,7 @@ Describe 'Firmware update status (ESRT) reader' {
         # a desktop that silently discarded a capsule.
         foreach ($Status in '0x00000000', '0xC0000001', '0xC000009A', '0xC0000059',
                             '0xC000007B', '0xC0000022', '0xC00002D3', '0xC00002DE') {
-            $script:EsrtFn.Extent.Text | Should -Match ([regex]::Escape($Status))
+            $script:EsrtStrings | Should -Contain $Status -Because 'it is a documented ESRT status'
         }
     }
 
@@ -159,9 +178,11 @@ Describe 'Firmware update status (ESRT) reader' {
         # processes a capsule. A capsule discarded at POST leaves 0 behind - so
         # claiming "applied" here would assert the opposite of the truth in the
         # exact scenario this function was written to diagnose.
-        $script:EsrtFn.Extent.Text | Should -Match 'NoAttempt'
-        $script:EsrtFn.Extent.Text | Should -Match 'LastAttemptVersion'
-        $script:EsrtFn.Extent.Text | Should -Match 'NOT evidence'
+        $script:EsrtStrings | Should -Contain 'NoAttempt'
+        # The never-attempted branch must be driven by the version field, which
+        # is the only thing that distinguishes the two meanings of status 0.
+        $script:EsrtFn.Extent.Text | Should -Match '\$Props\.LastAttemptVersion'
+        ($script:EsrtStrings -match 'NOT evidence') | Should -Not -BeNullOrEmpty
     }
 
     It 'Formats the attempted version rather than printing a raw REG_DWORD' {
@@ -175,20 +196,30 @@ Describe 'Firmware update status (ESRT) reader' {
         # carries the same status a BIOS refusal would, and the loop-detector
         # message tells the reader a status "confirms" the diagnosis - so the
         # rows must say which resource they belong to.
-        $script:EsrtFn.Extent.Text  | Should -Match 'IsSystemFirmware'
-        $script:EsrtLog.Extent.Text | Should -Match 'SYSTEM firmware'
+        $script:EsrtStrings    | Should -Contain 'IsSystemFirmware'
+        ($script:EsrtLogStrings -match 'SYSTEM firmware') | Should -Not -BeNullOrEmpty
     }
 
     It 'Reports an unreadable ESRT instead of calling it absent' {
         # Access-denied must not surface as "no status recorded" - that is an
         # affirmative conclusion the code has no evidence for.
-        $script:EsrtFn.Extent.Text  | Should -Match 'Unreadable'
-        $script:EsrtLog.Extent.Text | Should -Match 'could not be read'
+        $script:EsrtStrings | Should -Contain 'Unreadable'
+        ($script:EsrtLogStrings -match 'could not be read') | Should -Not -BeNullOrEmpty
     }
 
     It 'Reads the resource entries under the documented registry root' {
-        $script:EsrtFn.Extent.Text |
-            Should -Match 'CurrentControlSet\\Control\\FirmwareResources'
+        # Assert the ASSIGNMENT, not the function text: the comment-based help
+        # quotes this same path, so a text match is satisfied by the docstring
+        # alone and would still pass with $RootKey pointing somewhere else.
+        $Assign = $script:EsrtFn.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -eq '$RootKey'
+        }, $true) | Select-Object -First 1
+
+        $Assign | Should -Not -BeNullOrEmpty -Because 'the registry root must be a single named assignment'
+        $Assign.Right.Extent.Text.Trim("'`"") |
+            Should -Be 'HKLM:\SYSTEM\CurrentControlSet\Control\FirmwareResources'
     }
 
     It 'Never lets a diagnostic read break the flash, but never swallows it silently' {
