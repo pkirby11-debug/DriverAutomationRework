@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.29.0'
+    ModuleVersion     = '2.29.1'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.29.0 - Adds Invoke-DATMaintenance: sweeps staging directories orphaned by runs that died before their cleanup, rotates logs, prunes stale cache entries, and reports package source folders the ConfigMgr site no longer references. Reports by default, deletes only with -Force. Invoke-DATSync now sweeps stale staging orphans at start, and the Clean Downloads filter matches the folder name instead of the whole path.'
+    Description       = '2.29.1 - Maps the standard installer exit codes (0/1707/3010/1641/1618) on DAT deployment types. Add-CMScriptDeploymentType does not seed them, so every successful BIOS flash - which exits 3010 - was reported as 0xBC2(3010) Failed, and ConfigMgr never ran the restart that applies the staged capsule.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

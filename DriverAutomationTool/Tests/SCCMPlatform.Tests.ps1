@@ -577,3 +577,45 @@ Describe 'Get-DATDetectionScript - Driver / DriverUpdates marker status' {
             Should -BeNullOrEmpty
     }
 }
+
+Describe 'DAT custom return codes' {
+    It 'Maps every exit code Invoke-DATApply can return' {
+        # Add-CMScriptDeploymentType creates the DT with a NULL CustomReturnCodes
+        # collection - it does NOT seed the 0/1641/3010/1618 set the console
+        # wizard gives a Script Installer. Anything missing here is an unmapped
+        # non-zero exit, which ConfigMgr reports as a failure.
+        $Apply = Join-Path (Split-Path $PSScriptRoot -Parent) 'Scripts\Invoke-DATApply.ps1'
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Apply, [ref]$null, [ref]$null)
+        $Literals = $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ExitStatementAst] }, $true) |
+            ForEach-Object { $_.Pipeline.Extent.Text } |
+            Where-Object { $_ -match '^\d+$' -and $_ -ne '1' } |
+            Sort-Object -Unique
+
+        $Literals | Should -Not -BeNullOrEmpty
+        foreach ($Code in $Literals) {
+            $script:DATCustomReturnCodes.Code | Should -Contain ([int]$Code) -Because "exit $Code reaches ConfigMgr and must be classified"
+        }
+    }
+
+    It 'Classifies 3010 as a soft reboot' {
+        # Every successful BIOS flash exits 3010. Unmapped, it surfaced as
+        # "Unable to make changes to your software / 0xBC2(3010)" and ConfigMgr
+        # never ran the restart that applies the staged capsule.
+        ($script:DATCustomReturnCodes | Where-Object { $_.Code -eq 3010 }).Class | Should -Be 'SoftReboot'
+    }
+
+    It 'Classifies the 1618 deferral as fast retry' {
+        ($script:DATCustomReturnCodes | Where-Object { $_.Code -eq 1618 }).Class | Should -Be 'FastRetry'
+    }
+
+    It 'Leaves exit 1 unmapped so genuine failures still fail' {
+        $script:DATCustomReturnCodes.Code | Should -Not -Contain 1
+    }
+
+    It 'Uses only documented ExitCodeClass names' {
+        # Set-DATInstallerReturnCodes parses these against the live SDK enum.
+        foreach ($Def in $script:DATCustomReturnCodes) {
+            $Def.Class | Should -BeIn @('Failure', 'Success', 'FastRetry', 'HardReboot', 'SoftReboot')
+        }
+    }
+}
