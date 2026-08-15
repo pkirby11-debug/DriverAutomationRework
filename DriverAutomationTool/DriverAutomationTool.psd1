@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.33.1'
+    ModuleVersion     = '2.34.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.33.1 - Corrects what the ESRT reader claims. Windows records firmware-update status only for capsules IT submitted through a firmware driver package; a vendor DUP stages outside that path, so on a DUP-managed device the key is routinely absent however the flash went. Field-confirmed on a healthy Precision 3630 (UEFI/GPT/Secure Boot/PCR7 bound, System Firmware device present, no FirmwareResources key) that had definitely staged a capsule. An absent result is no longer reported as though nothing was attempted, and the loop-detector ranks causes accordingly, adding the headless-at-POST case.'
+    Description       = '2.34.0 - Adds Scripts\Get-DATSecureBootCertState.ps1, which reports whether a device holds the 2023 Secure Boot certificates in db and KEK. The OEM BIOS is not the only delivery path - Windows Update services these on a Secure Boot enabled device - so a machine stuck on old firmware can still be current on certificates. This is the check that decides whether a deferred BIOS update is safe to defer.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
