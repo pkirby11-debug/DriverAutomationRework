@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.31.0'
+    ModuleVersion     = '2.32.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.31.0 - Adds Scripts\Get-DATBiosFlashBlocker.ps1, a read-only fleet diagnostic that reports why a device refused a staged BIOS capsule (ESRT verdict, display attached, BitLocker, and the Dell Command | Configure gates) over WinRM with nothing deployed to the target. Builds on 2.30.0, which reads the firmware''s own record of the last capsule offered (ESRT LastAttemptStatus, all eight documented NTSTATUS values) into the apply log, names the client-BIOS refusal codes 7/8/10 on ConfigMgr deployment types, and stops a password, downgrade or EC refusal falling through to Flash64W where a 0 would be recorded as success.'
+    Description       = '2.32.0 - Adds Scripts\Get-DATCapsulePathState.ps1, which answers why a device exposes no ESRT at all: boot mode (a CSM/legacy-booted machine has no capsule path and can never take an OS-delivered BIOS update), whether the firmware-resources key is absent or merely empty, the Firmware-class device list, Secure Boot, and the PCR7 binding that Microsoft documents as blocking capsule updates on a BitLocker-enabled system. Companion to 2.31.0''s Get-DATBiosFlashBlocker.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
