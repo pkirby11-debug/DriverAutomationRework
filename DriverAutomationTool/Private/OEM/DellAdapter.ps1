@@ -1537,8 +1537,12 @@ function Write-DATDCUCatalog {
 
         $ComponentsXml = ($Sorted | ForEach-Object {
             $CXml = ($_.ComponentXml -replace '\bpath\s*=\s*"[^"]*"', ('path="{0}"' -f $_.FileName))
-            # Always ensure componentID is wildcarded so DCU matches the model/system regardless of PCI vendor quirks
-            $CXml = $CXml -replace 'componentID="[^"]*"', 'componentID="*"'
+            # Real components keep the componentIDs Dell published. The
+            # componentID="*" wildcard below is only for the SYNTHESIZED
+            # fallback, where the component carried no <Device> data to keep -
+            # blanket-wildcarding real ones throws away the catalog's only
+            # per-device applicability key, so every component would claim to
+            # support every device.
             if ($CXml -notmatch '<Device\b') {
                 $CXml = $CXml -replace '<SupportedDevices\s*/>|<SupportedDevices\s*>\s*</SupportedDevices>', $FallbackSupportedDevices
                 if ($CXml -notmatch '<SupportedDevices\b') {
