@@ -2827,7 +2827,14 @@ function Install-DriverUpdates {
         # /l=<file> is Dell's documented universal DUP switch for the framework
         # log - the only place a DUP records WHY it failed.
         $DupFwLog = if ($DupLogDir) { Join-Path $DupLogDir ($SafeName + '.dup.log') } else { $null }
-        $DupArgs = if ($DupFwLog) { @('/s', '/f', "/l=$DupFwLog") } else { @('/s', '/f') }
+        # Deliberately no /f here. /f overrides the DUP's own soft dependency and
+        # qualification checks, which includes its version check - and the skip
+        # above compares against OUR marker, not the live installed driver, so a
+        # driver newer than the catalog (a Windows Update delivery, say) is
+        # invisible to us. With /f the DUP would stop refusing and roll it back.
+        # The framework log below is what makes failures diagnosable; that is /l=,
+        # not /f.
+        $DupArgs = if ($DupFwLog) { @('/s', "/l=$DupFwLog") } else { @('/s') }
 
         # Per-DUP extract dir. The DUP's framework calls GetTempPath() at startup
         # and uses that to unpack its payload before installing - if it can't, the
@@ -2985,9 +2992,28 @@ function Install-DriverUpdates {
             $NotApply++
             Write-Log "$DriverLabel - exit $DupCode (not applicable to this device) in ${Elapsed}s"
         } else {
-            # Check if Dell framework log confirms the driver is not required on this system
+            # Dell's framework sometimes reports "this system doesn't have the
+            # hardware" as a generic exit 1 instead of a clean not-applicable
+            # code (3/4/5). When the framework log says so in as many words,
+            # honour it rather than failing the whole deployment.
+            #
+            # Two deliberate constraints, because this branch is the difference
+            # between "SCCM reports Installed" and "SCCM reports Failed":
+            #
+            #  * Only exit 1 qualifies. Every other unexpected code is a real
+            #    error and stays a failure - a log phrase must not be able to
+            #    launder, say, an installer crash into a clean skip.
+            #  * The phrases are the unambiguous hardware-absence ones only.
+            #    'minimum requirements' and a bare 'not applicable' were too
+            #    loose: Dell logs print those in dependency preambles and in
+            #    per-component notes on runs that then genuinely fail.
+            #
+            # The failure ledger is deliberately NOT cleared here. Clearing it
+            # meant FailCount could never reach $QuarantineThreshold, so a DUP
+            # that fails every single run with a matching phrase would never
+            # quarantine - the safety valve would be permanently disabled.
             $FwLogRaw = ''
-            if ($DupFwLog -and (Test-Path $DupFwLog)) {
+            if ($DupCode -eq 1 -and $DupFwLog -and (Test-Path $DupFwLog)) {
                 try {
                     $FwLogRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction SilentlyContinue
                 } catch {
@@ -2995,16 +3021,9 @@ function Install-DriverUpdates {
                 }
             }
 
-            if ($FwLogRaw -and ($FwLogRaw -match 'not require this driver|not supported on this system|no compatible hardware|minimum requirements|not applicable|does not meet the requirements')) {
+            if ($FwLogRaw -and ($FwLogRaw -match 'not require this driver|not supported on this system|no compatible hardware|does not meet the requirements')) {
                 $NotApply++
-                Write-Log "$DriverLabel - exit $DupCode (DUP framework log confirms driver is not required on this system) - treating as not applicable" -Severity 2
-                try {
-                    foreach ($FProp in 'FailedVersion', 'FailCount', 'LastFailExit', 'LastFailAt') {
-                        Remove-ItemProperty -Path $CompKeyPath -Name $FProp -ErrorAction SilentlyContinue
-                    }
-                } catch {
-                    # Non-fatal cleanup
-                }
+                Write-Log "$DriverLabel - exit $DupCode (DUP framework log confirms the target hardware is not present) - treating as not applicable" -Severity 2
             } else {
                 # Forgive a graphics DUP that errored for a GPU brand we can't confirm is
                 # present. Dell ships every model's GPU DUPs and non-matching NVIDIA/AMD
@@ -3773,10 +3792,20 @@ function Invoke-DellBIOSFlash {
     Suspend-BitLockerForFlash
 
     # Strategy 1: Direct DUP execution (Dell's official installer wrapper).
-    # Passing /s /f /r allows Dell's DFU flasher to trigger its native system reboot call
-    # (Exit 6 / RBU), which is required on Coffee Lake/vPro platforms to force the Intel CSME
-    # (Management Engine) chip into In-Service Update mode during POST.
-    $ExeArgs = @('/s', '/f', '/r')
+    # /s silent, /f to push past soft dependency errors.
+    #
+    # Deliberately NOT /r. /r lets the DUP restart the machine itself, which
+    # bypasses the whole reboot contract: ConfigMgr owns restarts here via our
+    # 3010 exit, honouring maintenance windows, the -DeferOnActiveUser 1618
+    # guard and the Suppress System Restart deployment option. It also races
+    # the tail of this script, so the shutdown can land before
+    # Write-DetectionMarker runs and a flash that actually succeeded gets
+    # recorded as a failure. It buys nothing: the DUP stages the UEFI capsule
+    # and returns 2 (REBOOT_REQUIRED), and the capsule - including the CSME
+    # In-Service Update transition - is applied at POST on the next boot no
+    # matter who initiates it. Exit 6 (REBOOTING_SYSTEM) is a consequence of
+    # /r, not a prerequisite for staging.
+    $ExeArgs = @('/s', '/f')
     if ($BIOSPassword) {
         $ExeArgs += "/p=`"$BIOSPassword`""
     }
