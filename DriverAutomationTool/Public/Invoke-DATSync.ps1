@@ -193,6 +193,20 @@ function Invoke-DATSync {
     $SyncResults = [System.Collections.Generic.List[PSCustomObject]]::new()
     $ErrorCount = 0
 
+    # Sweep staging directories stranded by earlier runs before staging anything
+    # new. Remove-DATTempPath only runs in a finally block, so a crash, a killed
+    # GUI or a reboot mid-sync leaves an extracted pack behind for good. Bounded
+    # by age so a sync running concurrently on another host is never touched, and
+    # non-fatal: housekeeping must not be able to stop a sync.
+    try {
+        $StagingSweep = Clear-DATStagingOrphan -MaxAgeHours 24 -Confirm:$false
+        if ($StagingSweep.Removed -gt 0) {
+            Write-DATLog -Message "Staging cleanup: removed $($StagingSweep.Removed) orphaned directory(ies), freed $($StagingSweep.FreedMB) MB" -Severity 1
+        }
+    } catch {
+        Write-DATLog -Message "Staging cleanup skipped: $($_.Exception.Message)" -Severity 2
+    }
+
     # Records a per-model outcome that produced no package (Error, or Warning
     # for "nothing published to package") so $SyncResults accounts for every
     # selected model, not just the ones that produced a package. The GUI sync
@@ -575,8 +589,12 @@ function Invoke-DATSync {
         Write-DATLog -Message "======== Clean Up Download Files ========" -Severity 1
         try {
             # Remove manufacturer/model download subdirectories
+            # Match the directory NAME. Matching FullName meant a download root
+            # that merely contained one of these words (\\nas\Windows\Downloads,
+            # D:\Dell\Downloads) made EVERY subdirectory match, while a model
+            # folder that happened to contain none of them was never cleaned.
             $DownloadDirs = Get-ChildItem -Path $DownloadPath -Recurse -Directory -Depth 2 -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match 'Driver Cab|Windows|Dell|Lenovo|Microsoft|Surface|BIOS' }
+                Where-Object { $_.Name -match 'Driver Cab|Windows|Dell|Lenovo|Microsoft|Surface|BIOS' }
             foreach ($Dir in $DownloadDirs) {
                 if ((Test-Path $Dir.FullName)) {
                     Write-DATLog -Message "Removing download content: $($Dir.FullName)" -Severity 1
