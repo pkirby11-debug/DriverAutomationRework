@@ -31,6 +31,7 @@ the sole update source).
 - [Security features](#security)
 - [The client apply script](#apply-script)
 - [Public cmdlets / automation](#cmdlets)
+- [Compliance dashboard & reporting](#reporting)
 - [Logging & diagnostics](#logging)
 - [Requirements](#requirements)
 - [Lenovo & Microsoft support](#lenovo)
@@ -415,11 +416,65 @@ by the deployment type's `BasedOnExitCode` behavior.
 | `Invoke-DATRemovePackages` / `Invoke-DATCleanupOverlayPackages` | Package cleanup. |
 | `Test-DATVulnerableDrivers` | Screen a folder of DUPs / `.sys` files against the Microsoft blocklist. |
 | `Set-DATDellCommandUpdateMode` | Put DCU into DAT-managed (passive) mode, or revert/opt-out. |
-| `Export-DATReport` | Export a job/inventory report. |
+| `Export-DATReport` | Export a sync report (`HTML`/`CSV`) or a compliance dashboard (`Dashboard`/`Json`). |
+| `Get-DATComplianceSnapshot` | Collect driver-security and storage posture as one structured object. |
 | `Connect-DATIntune` / `Disconnect-DATIntune` / `Test-DATIntuneConnection` / `Get-DATIntuneWin32App` / `Find-DATIntuneEntraGroup` | Intune groundwork for upcoming Win32/driver-profile support. |
 
 Standalone scripts (module-free, deployment-ready): `Scripts\Deploy-DATApplications.ps1`,
 `Scripts\Set-DATDcuManaged.ps1`.
+
+---
+
+<a name="reporting"></a>
+## Compliance dashboard & reporting
+
+`Export-DATReport` has four formats. Two read the job-summary CSVs and describe
+what sync *did*; two are built from `Get-DATComplianceSnapshot` and describe
+what the estate *is*, so they work on a host that has never run a sync.
+
+| Format | What it produces |
+| --- | --- |
+| `HTML` | The job-summary activity table (the original report). |
+| `CSV` | The same rows, unformatted. |
+| `Dashboard` | A self-contained interactive HTML compliance dashboard. |
+| `Json` | The same snapshot as structured JSON, for Power BI. |
+
+```powershell
+# Full dashboard, including the package-share rollup
+Export-DATReport -OutputPath 'C:\Reports\Compliance.html' -Format Dashboard `
+    -PackagePath '\\nas01\DriverPackages'
+
+# Snapshot only - no share walk, no network, nothing mutated
+Get-DATComplianceSnapshot | Select-Object -ExpandProperty Exclusions
+```
+
+**What the dashboard shows.** Driver-security posture — the exclusion ledger
+broken down by source, manufacturer, model and age, with the entries whose
+`LastSeenAt` has gone quiet flagged as a review queue — plus vulnerable-driver
+screening coverage and how fresh the cached Microsoft blocklist is. Then storage
+consumption: package-share bytes by OEM, content type, production-vs-test
+channel and OS target, the largest individual package sources, and what the tool
+has accumulated on the admin host itself.
+
+**Self-contained by design.** No CDN, no external stylesheet, no chart library —
+charts are hand-built inline SVG. The file renders completely on a locked-down or
+air-gapped admin host, and survives being emailed. Every chart carries a table
+view underneath, so no value is reachable only by hovering, and the page prints.
+
+**Power BI.** Point a Power BI *folder* query at wherever you drop the JSON and
+refresh on a schedule; the schema is stable and carries a `SchemaVersion`. There
+is deliberately no OData endpoint — OData is an HTTP protocol needing a hosted
+service, not a file format, and a scheduled JSON drop on a share gets the same
+dashboards with no server to run, secure or patch.
+
+**Cost.** The snapshot never touches the network and never mutates state:
+blocklist metadata is read from the existing cache rather than refreshed. The
+only expensive part is the package-share walk, which is why it is opt-in behind
+`-PackagePath`. That walk is a single pass — every file is visited once and its
+bytes added to each bucket it belongs to.
+
+Screening runs are recorded to `Settings\ScreeningHistory.json` (capped, newest
+kept) so screening coverage survives the console scrollback.
 
 ---
 

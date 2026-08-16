@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.34.0'
+    ModuleVersion     = '2.35.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.34.0 - Adds Scripts\Get-DATSecureBootCertState.ps1, which reports whether a device holds the 2023 Secure Boot certificates in db and KEK. The OEM BIOS is not the only delivery path - Windows Update services these on a Secure Boot enabled device - so a machine stuck on old firmware can still be current on certificates. This is the check that decides whether a deferred BIOS update is safe to defer.'
+    Description       = '2.35.0 - Adds Get-DATComplianceSnapshot and two new Export-DATReport formats: Dashboard (a self-contained interactive HTML compliance dashboard with inline SVG charts, no external scripts or fonts) and Json (the same snapshot, for a Power BI folder query). Reports driver-security posture - the exclusion ledger by source, manufacturer, model and age, plus vulnerable-driver screening coverage and blocklist freshness - and storage consumption per OEM, content type, channel and OS target. Screening runs are now recorded to Settings\ScreeningHistory.json instead of being lost with the console. Also fixes two long-standing issues in the HTML report: cell values from vendor catalogs are now HTML-encoded, and the row loop uses a StringBuilder instead of quadratic string concatenation.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
@@ -14,6 +14,7 @@
         'Update-DATCatalogSources'
         'Start-DATGui'
         'Export-DATReport'
+        'Get-DATComplianceSnapshot'
         'Register-DATQueueLogSubscriber'
         'Invoke-DATRemovePackages'
         'Invoke-DATCleanupOverlayPackages'
