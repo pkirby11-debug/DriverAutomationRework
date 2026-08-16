@@ -31,6 +31,91 @@ Describe 'Assert-DATConfigMgrConnected' {
     }
 }
 
+Describe 'Test-DATManagedPackage' {
+    It 'Matches every prefixed package name Invoke-DATSync builds' {
+        Test-DATManagedPackage -Name 'Drivers - Dell Latitude 7430 - Windows 11 x64'        | Should -BeTrue
+        Test-DATManagedPackage -Name 'Driver Updates - Dell Latitude 7430 - Windows 11 x64' | Should -BeTrue
+        Test-DATManagedPackage -Name 'BIOS Update - Dell Latitude 7430'                     | Should -BeTrue
+        Test-DATManagedPackage -Name 'BIOS Update (DCU) - Dell Latitude 7430'               | Should -BeTrue
+    }
+
+    It 'Matches the "Test - " variants' {
+        Test-DATManagedPackage -Name 'Test - Drivers - Dell Latitude 7430 - Windows 11 x64' | Should -BeTrue
+        Test-DATManagedPackage -Name 'Test - BIOS Update (DCU) - Dell Latitude 7430'        | Should -BeTrue
+    }
+
+    It 'Matches the unprefixed Driver Package shape via its description' {
+        # "ConfigMgr - Driver Pkg" names are "<Make> <Model> - <OS> <Arch>" with
+        # no DAT prefix, so the description is the only signal. Refusing these
+        # would break the tool's own driver-package cleanup.
+        $Name = 'Dell Latitude 7430 - Windows 11 x64'
+        Test-DATManagedPackage -Name $Name | Should -BeFalse
+        Test-DATManagedPackage -Name $Name -Description '(Models included:0B0A)' | Should -BeTrue
+        Test-DATManagedPackage -Name $Name -Description 'Driver Pack - Dell Latitude 7430 - Version A01' | Should -BeTrue
+        Test-DATManagedPackage -Name $Name -Description 'Driver Pack (Driver Pkg) - Dell Latitude 7430 - Version A01' | Should -BeTrue
+    }
+
+    It 'Refuses packages this tool did not create' {
+        Test-DATManagedPackage -Name 'Configuration Manager Client Package' | Should -BeFalse
+        Test-DATManagedPackage -Name 'User State Migration Tool for Windows' | Should -BeFalse
+        Test-DATManagedPackage -Name 'Office 365 ProPlus' -Description 'Deployed by the apps team' | Should -BeFalse
+        Test-DATManagedPackage -Name '' -Description '' | Should -BeFalse
+    }
+
+    It 'Does not match a name that merely contains a DAT keyword' {
+        Test-DATManagedPackage -Name 'Legacy Drivers Archive'      | Should -BeFalse
+        Test-DATManagedPackage -Name 'Vendor BIOS Update Utility'  | Should -BeFalse
+    }
+}
+
+Describe 'Test-DATPathUnderRoot' {
+    It 'Accepts the root itself and paths beneath it' {
+        Test-DATPathUnderRoot -Path 'C:\DATSource'                  -Root 'C:\DATSource' | Should -BeTrue
+        Test-DATPathUnderRoot -Path 'C:\DATSource\'                 -Root 'C:\DATSource' | Should -BeTrue
+        Test-DATPathUnderRoot -Path 'C:\DATSource\Dell\Latitude'    -Root 'C:\DATSource' | Should -BeTrue
+    }
+
+    It 'Is case-insensitive, as Windows paths are' {
+        Test-DATPathUnderRoot -Path 'c:\datsource\dell' -Root 'C:\DATSource' | Should -BeTrue
+    }
+
+    It 'Handles UNC package shares, which is how this is actually deployed' {
+        Test-DATPathUnderRoot -Path '\\nas\DATSource\Dell\Latitude' -Root '\\nas\DATSource' | Should -BeTrue
+        Test-DATPathUnderRoot -Path '\\nas\DATSource'               -Root '\\nas\DATSource' | Should -BeTrue
+        Test-DATPathUnderRoot -Path '\\other\DATSource\Dell'        -Root '\\nas\DATSource' | Should -BeFalse
+        # A UNC path is not under a drive-letter root even if the tail matches.
+        Test-DATPathUnderRoot -Path '\\nas\DATSource\Dell'          -Root 'C:\DATSource'    | Should -BeFalse
+    }
+
+    It 'Rejects a sibling directory that shares the root prefix' {
+        # The bug a naive StartsWith would have: DATSource-Archive is not under DATSource.
+        Test-DATPathUnderRoot -Path 'C:\DATSource-Archive\Dell'  -Root 'C:\DATSource'    | Should -BeFalse
+        Test-DATPathUnderRoot -Path '\\nas\DATSource-Archive'    -Root '\\nas\DATSource' | Should -BeFalse
+    }
+
+    It 'Refuses to treat a share root as a containable root' {
+        # '\\nas' alone has no segments after the prefix - accepting it would
+        # authorize deleting anything on the server.
+        Test-DATPathUnderRoot -Path '\\nas\Anything' -Root '\\'   | Should -BeFalse
+        Test-DATPathUnderRoot -Path 'C:\Anything'    -Root 'C:\'  | Should -BeFalse
+    }
+
+    It 'Normalizes mixed separators and trailing slashes' {
+        Test-DATPathUnderRoot -Path 'C:/DATSource/Dell'   -Root 'C:\DATSource'  | Should -BeTrue
+        Test-DATPathUnderRoot -Path 'C:\DATSource\Dell\'  -Root 'C:\DATSource\' | Should -BeTrue
+    }
+
+    It 'Rejects paths outside the root, including via traversal' {
+        Test-DATPathUnderRoot -Path 'C:\Windows\System32'          -Root 'C:\DATSource' | Should -BeFalse
+        Test-DATPathUnderRoot -Path 'C:\DATSource\..\Windows'      -Root 'C:\DATSource' | Should -BeFalse
+    }
+
+    It 'Returns false rather than throwing on empty input' {
+        Test-DATPathUnderRoot -Path ''             -Root 'C:\DATSource' | Should -BeFalse
+        Test-DATPathUnderRoot -Path 'C:\DATSource' -Root ''             | Should -BeFalse
+    }
+}
+
 Describe 'Test-DATManagedApplicationName' {
     It 'Matches each DAT prefix under its own type' {
         Test-DATManagedApplicationName -Name 'Drivers - Dell Latitude 7430 - Windows 11 x64' -Type Drivers | Should -BeTrue

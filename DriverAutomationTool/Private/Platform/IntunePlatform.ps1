@@ -587,26 +587,98 @@ function Get-DATGraphErrorCode {
     #>
     param([Parameter(Mandatory)]$ErrorRecord)
 
+    $Content = Get-DATGraphErrorBody -ErrorRecord $ErrorRecord
+    if (-not $Content) { return $null }
+
     try {
-        $Response = $ErrorRecord.Exception.Response
-        if (-not $Response) { return $null }
-        $Stream = $Response.GetResponseStream()
-        if (-not $Stream) { return $null }
-        $Stream.Position = 0
-        $Reader = [System.IO.StreamReader]::new($Stream)
-        $Content = $Reader.ReadToEnd()
-        if ($Content) {
-            $Parsed = $Content | ConvertFrom-Json -ErrorAction SilentlyContinue
-            if ($Parsed -and $Parsed.error) {
-                # OAuth error responses: top-level 'error' is a string. Graph JSON: 'error' is an object with 'code'.
-                if ($Parsed.error -is [string]) { return $Parsed.error }
-                if ($Parsed.error.code)         { return $Parsed.error.code }
-            }
+        $Parsed = $Content | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($Parsed -and $Parsed.error) {
+            # OAuth error responses: top-level 'error' is a string. Graph JSON: 'error' is an object with 'code'.
+            if ($Parsed.error -is [string]) { return $Parsed.error }
+            if ($Parsed.error.code)         { return $Parsed.error.code }
         }
     } catch {
         # Best-effort parsing — fall through to return $null.
         Write-Verbose "Failed to parse JSON error details: $($_.Exception.Message)"
     }
+    return $null
+}
+
+function Get-DATGraphErrorBody {
+    <#
+    .SYNOPSIS
+        Returns the raw response body from a failed Invoke-RestMethod call, or
+        $null when it can't be recovered.
+    .DESCRIPTION
+        The body has to be read differently depending on which PowerShell threw
+        the error, and getting this wrong is silent: the caller sees $null and
+        concludes the server sent no error code.
+
+          * PowerShell 7 (what this module targets - the manifest pins 7.4 and
+            Core) throws Microsoft.PowerShell.Commands.HttpResponseException.
+            Its .Response is a System.Net.Http.HttpResponseMessage, which has
+            NO GetResponseStream() method, and its content stream has usually
+            already been consumed by the time we get here. The body is instead
+            on the ErrorRecord as .ErrorDetails.Message.
+          * Windows PowerShell 5.1 throws a WebException whose .Response is an
+            HttpWebResponse - the GetResponseStream() shape.
+
+        Order matters: ErrorDetails.Message is checked first because it is the
+        one that works on the edition this module actually runs on. The
+        HttpResponseMessage and HttpWebResponse readers follow as fallbacks,
+        each guarded so an absent method can't throw.
+
+        This is what makes the device-code flow work. Connect-DATIntuneDeviceCode
+        polls until the user finishes signing in, and every poll before that
+        returns HTTP 400 with error 'authorization_pending' - an expected,
+        keep-waiting response. When this function returns $null the poll's switch
+        falls to 'default' and throws, ending sign-in a few seconds after the
+        code is displayed.
+    #>
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    # 1. PowerShell 7 / Core: the body is pre-captured onto the ErrorRecord.
+    try {
+        $Details = $ErrorRecord.ErrorDetails
+        if ($Details -and $Details.Message) { return [string]$Details.Message }
+    } catch {
+        Write-Verbose "ErrorDetails unavailable: $($_.Exception.Message)"
+    }
+
+    $Response = $null
+    try { $Response = $ErrorRecord.Exception.Response } catch {
+        Write-Verbose "Exception.Response unavailable: $($_.Exception.Message)"
+    }
+    if (-not $Response) { return $null }
+
+    # 2. PowerShell 7 fallback: HttpResponseMessage.Content (already-read
+    #    content still returns from the buffered copy in most cases).
+    try {
+        if ($Response -is [System.Net.Http.HttpResponseMessage]) {
+            if ($Response.Content) {
+                $Task = $Response.Content.ReadAsStringAsync()
+                $Task.Wait()
+                if ($Task.Result) { return [string]$Task.Result }
+            }
+            return $null
+        }
+    } catch {
+        Write-Verbose "HttpResponseMessage content read failed: $($_.Exception.Message)"
+        return $null
+    }
+
+    # 3. Windows PowerShell 5.1: HttpWebResponse.GetResponseStream().
+    try {
+        if (-not $Response.PSObject.Methods['GetResponseStream']) { return $null }
+        $Stream = $Response.GetResponseStream()
+        if (-not $Stream) { return $null }
+        if ($Stream.CanSeek) { $Stream.Position = 0 }
+        $Reader = [System.IO.StreamReader]::new($Stream)
+        try { return [string]$Reader.ReadToEnd() } finally { $Reader.Dispose() }
+    } catch {
+        Write-Verbose "Response stream read failed: $($_.Exception.Message)"
+    }
+
     return $null
 }
 

@@ -108,6 +108,115 @@ Describe 'Connect-DATIntune - DeviceCode happy path' {
     }
 }
 
+Describe 'Get-DATGraphErrorBody / Get-DATGraphErrorCode' {
+    BeforeAll {
+        function Get-TestErrorRecord {
+            param([string]$DetailsMessage, $Response)
+            $Record = [System.Management.Automation.ErrorRecord]::new(
+                [System.Exception]::new('Response status code does not indicate success: 400 (Bad Request).'),
+                'WebCmdletWebResponseException',
+                [System.Management.Automation.ErrorCategory]::InvalidOperation,
+                $null)
+            if ($DetailsMessage) {
+                $Record.ErrorDetails = [System.Management.Automation.ErrorDetails]::new($DetailsMessage)
+            }
+            if ($Response) {
+                # Exception.Response is read-only on the real type; attach a stand-in
+                # so the fallback readers have something to look at.
+                $Record | Add-Member -NotePropertyName TestResponse -NotePropertyValue $Response -Force
+            }
+            return $Record
+        }
+    }
+
+    It 'Reads the body from ErrorDetails - the PowerShell 7 shape this module runs on' {
+        # PS7 throws HttpResponseException; its .Response is an HttpResponseMessage
+        # with no GetResponseStream(), so ErrorDetails is the only source.
+        $Record = Get-TestErrorRecord -DetailsMessage '{"error":"authorization_pending","error_description":"pending"}'
+        Get-DATGraphErrorBody -ErrorRecord $Record | Should -BeLike '*authorization_pending*'
+    }
+
+    It 'Extracts the OAuth string error code' {
+        $Record = Get-TestErrorRecord -DetailsMessage '{"error":"authorization_pending","error_description":"pending"}'
+        Get-DATGraphErrorCode -ErrorRecord $Record | Should -Be 'authorization_pending'
+    }
+
+    It 'Extracts the nested Graph error code' {
+        $Record = Get-TestErrorRecord -DetailsMessage '{"error":{"code":"ResourceNotFound","message":"Not found"}}'
+        Get-DATGraphErrorCode -ErrorRecord $Record | Should -Be 'ResourceNotFound'
+    }
+
+    It 'Returns null instead of throwing when there is no recoverable body' {
+        $Record = Get-TestErrorRecord
+        { Get-DATGraphErrorBody -ErrorRecord $Record } | Should -Not -Throw
+        Get-DATGraphErrorBody -ErrorRecord $Record | Should -BeNullOrEmpty
+        Get-DATGraphErrorCode -ErrorRecord $Record | Should -BeNullOrEmpty
+    }
+
+    It 'Returns null instead of throwing when the body is not JSON' {
+        $Record = Get-TestErrorRecord -DetailsMessage '<html>502 Bad Gateway</html>'
+        { Get-DATGraphErrorCode -ErrorRecord $Record } | Should -Not -Throw
+        Get-DATGraphErrorCode -ErrorRecord $Record | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Connect-DATIntune - DeviceCode polling' {
+    BeforeAll {
+        Mock Start-Sleep {} -ModuleName $null
+        Mock Write-Host {} -ModuleName $null
+
+        # The regression this covers: every poll before the user finishes signing
+        # in returns HTTP 400 with error 'authorization_pending'. If the error
+        # body can't be parsed, the poll's switch falls to 'default' and throws,
+        # ending sign-in seconds after the code is displayed.
+        $script:TokenCallCount = 0
+        Mock Invoke-RestMethod {
+            if ($Uri -like '*devicecode*') {
+                return [PSCustomObject]@{
+                    user_code        = 'ABC123'
+                    device_code      = 'dev-code-xyz'
+                    verification_uri = 'https://microsoft.com/devicelogin'
+                    expires_in       = 900
+                    interval         = 5
+                    message          = 'Enter code ABC123'
+                }
+            }
+            if ($Uri -like '*/token') {
+                $script:TokenCallCount++
+                if ($script:TokenCallCount -le 2) {
+                    $Record = [System.Management.Automation.ErrorRecord]::new(
+                        [System.Exception]::new('Response status code does not indicate success: 400 (Bad Request).'),
+                        'WebCmdletWebResponseException',
+                        [System.Management.Automation.ErrorCategory]::InvalidOperation,
+                        $null)
+                    $Record.ErrorDetails = [System.Management.Automation.ErrorDetails]::new(
+                        '{"error":"authorization_pending","error_description":"The user has not yet completed sign-in."}')
+                    throw $Record
+                }
+                return [PSCustomObject]@{
+                    access_token  = 'mock-access-token'
+                    refresh_token = 'mock-refresh-token'
+                    expires_in    = 3600
+                    token_type    = 'Bearer'
+                }
+            }
+            throw "Unexpected URI in test: $Uri"
+        }
+    }
+
+    It 'Keeps polling through authorization_pending instead of throwing' {
+        $Result = Connect-DATIntune -TenantId 'contoso.onmicrosoft.com'
+
+        $Result.Connected         | Should -Be $true
+        $script:TokenCallCount    | Should -Be 3
+        $script:IntuneAccessToken | Should -Be 'mock-access-token'
+    }
+
+    AfterAll {
+        Disconnect-DATIntune
+    }
+}
+
 Describe 'Invoke-DATGraphRequest' {
     BeforeAll {
         $script:IntuneConnected   = $true

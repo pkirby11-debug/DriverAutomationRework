@@ -280,6 +280,13 @@ trap {
 $ErrorActionPreference = 'Stop'
 $script:RebootRequired = $false
 
+# Set by Suspend-BitLockerForFlash when it actually suspends protection, so
+# every exit path that does NOT reboot can put it back. Suspend-BitLocker
+# -RebootCount only auto-resumes once the reboots it was promised happen; on a
+# path that exits without requesting one, nothing consumes the count and the
+# volume stays unprotected indefinitely.
+$script:BitLockerSuspended = $false
+
 # Self-identification: short SHA-256 of THIS file, logged in the startup
 # lines. Names the exact bytes that executed - the sync logs the same rev
 # when staging (Copy-DATApplyScript), so "which script version actually ran
@@ -3962,12 +3969,55 @@ function Suspend-BitLockerForFlash {
                 return
             }
             Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 2 -ErrorAction Stop | Out-Null
+            $script:BitLockerSuspended = $true
             Write-Log "BitLocker suspended on $($env:SystemDrive) for two reboots"
         } else {
             Write-Log "BitLocker is not active on $($env:SystemDrive) - no suspension needed"
         }
     } catch {
         Write-Log "BitLocker suspension check/suspend failed: $($_.Exception.Message)" -Severity 2
+    }
+}
+
+function Resume-BitLockerAfterFlash {
+    <#
+    .SYNOPSIS
+        Re-enables BitLocker protection if this run suspended it and no reboot
+        is going to happen.
+    .DESCRIPTION
+        Suspend-BitLocker -RebootCount 2 hands the resume back to Windows, but
+        only across the reboots it was told to expect. Every exit path that
+        returns without signalling 3010 - not-applicable (DUP 3/4/5), the
+        device-side failures (7/8/10), a flash that succeeded with no reboot
+        required, and the unhandled-error catch - leaves that count unconsumed,
+        so the volume stays suspended until something else reboots the machine
+        twice. On a deterministic failure such as DUP 7 (BIOS password set, none
+        supplied) each ConfigMgr retry re-suspends with a fresh count, so
+        protection never comes back on its own.
+
+        Deliberately NOT called on the reboot path: the staged UEFI capsule is
+        applied at POST and needs the suspension to survive that reboot.
+
+        Best-effort - a failure here is logged at Severity 3 and never changes
+        the exit code, because the install result is what ConfigMgr is waiting
+        on. The log line is what tells an admin to check the volume.
+    #>
+    param([string]$Reason = 'no reboot was requested')
+
+    if (-not $script:BitLockerSuspended) { return }
+
+    try {
+        if ($DebugMode) {
+            Write-Log "DebugMode - would resume BitLocker on $($env:SystemDrive)"
+            return
+        }
+        Resume-BitLocker -MountPoint $env:SystemDrive -ErrorAction Stop | Out-Null
+        $script:BitLockerSuspended = $false
+        Write-Log "BitLocker protection resumed on $($env:SystemDrive) ($Reason)"
+    } catch {
+        Write-Log ("BitLocker resume FAILED on $($env:SystemDrive): $($_.Exception.Message). Protection was suspended for a " +
+            "firmware flash that did not reboot, so this volume is UNPROTECTED until it is resumed. Run " +
+            "'Resume-BitLocker -MountPoint $($env:SystemDrive)' on the device.") -Severity 3
     }
 }
 
@@ -4590,6 +4640,7 @@ try {
 
     if ($ExitCode -ne 0) {
         Write-Log "Vendor utility returned non-zero exit code: $ExitCode" -Severity 3
+        Resume-BitLockerAfterFlash -Reason "flash failed with exit $ExitCode; no reboot requested"
         Write-DetectionMarker -Status 'Failed'
         exit $ExitCode
     }
@@ -4602,6 +4653,7 @@ try {
     # this revision) while still re-running if the live BIOS ever changes
     # to something other than what was recorded.
     if ($script:BIOSNotApplicable) {
+        Resume-BitLockerAfterFlash -Reason 'BIOS not applicable; firmware unchanged and no reboot requested'
         Write-DetectionMarker -Status 'NotApplicable'
         Write-Log 'BIOS DUP reported not-applicable - device firmware unchanged; marker = NotApplicable'
         exit 0
@@ -4618,11 +4670,15 @@ try {
         exit 3010
     }
 
+    Resume-BitLockerAfterFlash -Reason 'install completed without requesting a reboot'
     Write-Log 'Success - no reboot required'
     exit 0
 } catch {
     Write-Log "Unhandled error: $($_.Exception.Message)" -Severity 3
     Write-Log $_.ScriptStackTrace -Severity 3
+    try { Resume-BitLockerAfterFlash -Reason 'run ended in an unhandled error' } catch {
+        Write-Verbose "Ignored exception: $($_.Exception.Message)"
+    }
     try { Write-DetectionMarker -Status 'Failed' } catch {
         # Non-fatal hardware or registry probe error
         Write-Verbose "Ignored exception: $($_.Exception.Message)"
