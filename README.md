@@ -26,6 +26,7 @@ the sole update source).
   - [Progress](#tab-progress)
   - [Package Management](#tab-package-management)
   - [Deploy Applications](#tab-deploy-applications)
+  - [Reports](#tab-reports)
 - [Sync types & deployment platforms](#sync-types)
 - [The Driver Updates (DCU) engine](#dcu-engine)
 - [Security features](#security)
@@ -170,6 +171,23 @@ Bulk-deploy DAT-built **Applications** to collections without leaving the tool:
 The same bulk deployment (including the maintenance-window option) is available headless
 via `Invoke-DATDeployApplications` and the standalone `Scripts\Deploy-DATApplications.ps1`
 wrapper.
+
+<a name="tab-reports"></a>
+### Reports
+
+- **Current posture** — one click fills in active driver exclusions, how many are due for
+  review, the cached blocklist version and age, payloads flagged by screening, and the
+  local footprint. Reads local state only: no network, nothing written to disk.
+- **Compliance dashboard** — generates the self-contained HTML dashboard or the Power BI
+  JSON, with a save dialog and an *Open when finished* option. Package-share storage is
+  opt-in via a checkbox (it walks every file on the share); the path defaults to the one
+  configured on the SCCM Settings tab.
+- **Sync activity report** — the original job-summary HTML/CSV export.
+
+Exports run in a background runspace, so a share scan cannot freeze the window, and the
+tab reports plainly when a job-summary export finds nothing in the window rather than
+writing an empty file. Everything here is also available headless — see
+[Compliance dashboard & reporting](#reporting).
 
 ---
 
@@ -427,6 +445,9 @@ Standalone scripts (module-free, deployment-ready): `Scripts\Deploy-DATApplicati
 
 <a name="reporting"></a>
 ## Compliance dashboard & reporting
+
+All of this is reachable from the GUI's [Reports tab](#tab-reports); the cmdlets below are
+the headless equivalent.
 
 `Export-DATReport` has four formats. Two read the job-summary CSVs and describe
 what sync *did*; two are built from `Get-DATComplianceSnapshot` and describe

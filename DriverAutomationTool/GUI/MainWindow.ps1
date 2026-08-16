@@ -118,6 +118,189 @@ function Show-DATMainWindow {
     [void]$Controls['MainWindow'].ShowDialog()
 }
 
+function Get-DATReportDays {
+    <#
+    .SYNOPSIS
+        Parses a day-count textbox, falling back to a default on junk input.
+    .DESCRIPTION
+        The Reports tab takes two free-text day counts. A non-numeric or
+        negative value should quietly become the default rather than throwing
+        out of a click handler (which tears the window down).
+    #>
+    param(
+        [string]$Text,
+        [int]$Default = 30
+    )
+
+    $Value = 0
+    if ([int]::TryParse(([string]$Text).Trim(), [ref]$Value) -and $Value -gt 0) { return $Value }
+    return $Default
+}
+
+function Start-DATReportExport {
+    <#
+    .SYNOPSIS
+        Runs one Export-DATReport in the background and reports the outcome.
+    .DESCRIPTION
+        A module function rather than an inline scriptblock because the WPF
+        event context only resolves module functions reliably (see the header
+        note), and because all four report buttons want identical plumbing.
+
+        The work runs in a background runspace: with -PackagePath the snapshot
+        walks every file on the share, which is minutes on a real one, and a
+        synchronous call would freeze the window for the duration.
+    .PARAMETER Kind
+        Dashboard | Json | HTML | CSV - the -Format passed to Export-DATReport.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Dashboard', 'Json', 'HTML', 'CSV')]
+        [string]$Kind
+    )
+
+    $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+    if ($G.ReportHandle) { return }   # an export is already running
+
+    $IsSnapshot = $Kind -in @('Dashboard', 'Json')
+    $Stamp = Get-Date -Format 'yyyyMMdd-HHmm'
+    $Spec = switch ($Kind) {
+        'Dashboard' { @{ Ext = 'html'; Filter = 'HTML report|*.html'; Name = "DAT-Compliance-$Stamp.html" } }
+        'Json'      { @{ Ext = 'json'; Filter = 'JSON data|*.json';   Name = "DAT-Compliance-$Stamp.json" } }
+        'HTML'      { @{ Ext = 'html'; Filter = 'HTML report|*.html'; Name = "DAT-SyncReport-$Stamp.html" } }
+        'CSV'       { @{ Ext = 'csv';  Filter = 'CSV data|*.csv';     Name = "DAT-SyncReport-$Stamp.csv" } }
+    }
+
+    # Validate the share path BEFORE the save dialog - asking where to put a
+    # report and then refusing to write it is a poor order of operations.
+    $PackagePath = ''
+    if ($IsSnapshot -and $Controls['RptIncludeShareCheck'].IsChecked) {
+        $PackagePath = ([string]$Controls['RptPackagePathInput'].Text).Trim()
+        if ([string]::IsNullOrWhiteSpace($PackagePath)) {
+            Show-DATWindowMessage -Message 'Select a package share path, or clear the storage checkbox.' -Type Warning
+            return
+        }
+        if (-not (Test-Path $PackagePath)) {
+            Show-DATWindowMessage -Message "Package share not reachable:`n$PackagePath" -Type Warning
+            return
+        }
+    }
+
+    $OutputPath = Show-DATSaveFileDialog -Title "Save $Kind report" -Filter $Spec.Filter `
+        -DefaultFileName $Spec.Name -DefaultExtension $Spec.Ext
+    if (-not $OutputPath) { return }
+
+    $Params = @{
+        OutputPath = $OutputPath
+        Format     = $Kind
+        Days       = Get-DATReportDays -Text $Controls['RptDaysInput'].Text
+    }
+    if ($IsSnapshot) {
+        $Params['StaleExclusionDays'] = Get-DATReportDays -Text $Controls['RptStaleDaysInput'].Text -Default 90
+        if ($PackagePath) { $Params['PackagePath'] = $PackagePath }
+    }
+
+    $G.ReportOutputPath = $OutputPath
+    $G.ReportOpenAfter = [bool]$Controls['RptOpenAfterCheck'].IsChecked
+    $G.ReportKind = $Kind
+
+    Set-DATReportButtonsEnabled -Enabled $false
+    $Controls['RptProgress'].Visibility = [System.Windows.Visibility]::Visible
+    $Controls['RptProgress'].IsIndeterminate = $true
+    $Controls['RptStatusLabel'].Text = if ($PackagePath) {
+        'Generating - scanning the package share, this can take a few minutes...'
+    } else {
+        'Generating...'
+    }
+
+    $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+    $ReportScript = {
+        param($ModulePath, $Params)
+        Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+        # Export-DATReport is exported, so a plain import is enough here.
+        # It returns the output path, or nothing when a job-summary format
+        # finds no summaries in the window - the caller distinguishes those.
+        Export-DATReport @Params
+    }
+
+    $G.ReportRunspace = [System.Management.Automation.PowerShell]::Create()
+    $G.ReportRunspace.AddScript($ReportScript).AddArgument($ModulePath).AddArgument($Params) | Out-Null
+    $G.ReportHandle = $G.ReportRunspace.BeginInvoke()
+
+    if ($G.ReportTimer) { $G.ReportTimer.Stop() }
+    $G.ReportTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $G.ReportTimer.Interval = [timespan]::FromMilliseconds(400)
+
+    $G.ReportTimer.Add_Tick({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+        if ($null -eq $G.ReportHandle -or -not $G.ReportHandle.IsCompleted) { return }
+        $G.ReportTimer.Stop()
+
+        try {
+            $Result = @($G.ReportRunspace.EndInvoke($G.ReportHandle))
+            $RsErrors = @($G.ReportRunspace.Streams.Error)
+            $Written = @($Result | Where-Object { $_ }) | Select-Object -Last 1
+
+            if (-not $Written -and $RsErrors.Count -gt 0) {
+                throw $RsErrors[0].Exception.Message
+            }
+
+            if (-not $Written) {
+                # Export-DATReport's documented no-data path for HTML/CSV.
+                $Controls['RptStatusLabel'].Text = 'Nothing written - no job summaries in the selected window.'
+                Show-DATWindowMessage -Type Warning -Message (
+                    "No job-summary files were found for the last $(Get-DATReportDays -Text $Controls['RptDaysInput'].Text) days, so no report was written.`n`n" +
+                    'The compliance dashboard does not depend on sync history - use "Generate dashboard" instead.')
+            } elseif (-not (Test-Path $G.ReportOutputPath)) {
+                # Belt-and-braces: a returned path that is not on disk is a
+                # failure, not a success with a missing file.
+                throw "Export reported success but $($G.ReportOutputPath) does not exist."
+            } else {
+                $SizeKB = [math]::Round((Get-Item $G.ReportOutputPath).Length / 1KB, 1)
+                $Controls['RptStatusLabel'].Text = "$($G.ReportKind) report written to $($G.ReportOutputPath) ($SizeKB KB)."
+                if ($G.ReportOpenAfter) {
+                    try {
+                        Start-Process -FilePath $G.ReportOutputPath -ErrorAction Stop
+                    } catch {
+                        Write-DATLog -Message "Could not open $($G.ReportOutputPath): $($_.Exception.Message)" -Severity 2
+                        $Controls['RptStatusLabel'].Text += ' (could not open it automatically)'
+                    }
+                }
+            }
+        } catch {
+            Show-DATWindowMessage -Message "Report generation failed: $($_.Exception.Message)" -Type Error
+            $Controls['RptStatusLabel'].Text = 'Report generation failed.'
+        } finally {
+            if ($G.ReportRunspace) {
+                try { $G.ReportRunspace.Dispose() } catch {
+                    [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+                }
+                $G.ReportRunspace = $null
+            }
+            $G.ReportHandle = $null
+            $Controls['RptProgress'].IsIndeterminate = $false
+            $Controls['RptProgress'].Visibility = [System.Windows.Visibility]::Collapsed
+            Set-DATReportButtonsEnabled -Enabled $true
+        }
+    })
+    $G.ReportTimer.Start()
+}
+
+function Set-DATReportButtonsEnabled {
+    <#
+    .SYNOPSIS
+        Enables/disables every Reports-tab action while an export is running.
+    #>
+    param([Parameter(Mandatory)][bool]$Enabled)
+
+    $gui = Get-DATGui
+    if (-not $gui) { return }
+    $Controls = $gui.Controls
+    foreach ($Name in @('RptDashboardButton', 'RptJsonButton', 'RptActivityHtmlButton',
+                        'RptActivityCsvButton', 'RptRefreshSummaryButton')) {
+        if ($Controls[$Name]) { $Controls[$Name].IsEnabled = $Enabled }
+    }
+}
+
 function Initialize-DATMainWindow {
     <#
     .SYNOPSIS
@@ -163,6 +346,12 @@ function Initialize-DATMainWindow {
         DeployRunspace           = $null
         DeployHandle             = $null
         DeployTimer              = $null
+        ReportRunspace           = $null
+        ReportHandle             = $null
+        ReportTimer              = $null
+        ReportOutputPath         = ''
+        ReportOpenAfter          = $false
+        ReportKind               = ''
     }
 
     # Stash the whole GUI context in global scope. Every handler fetches it with
@@ -1864,6 +2053,73 @@ function Initialize-DATMainWindow {
         $G.IntunePublishTimer.Start()
     })
 
+    # ==================== Reports ====================
+    # The share walk visits every file on the package share, so the two report
+    # buttons run in a background runspace on the same pattern as the model
+    # load - a synchronous call would freeze the window for minutes on a real
+    # share. The posture summary skips the share entirely and stays inline.
+
+    $Controls['RptIncludeShareCheck'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        $On = [bool]$Controls['RptIncludeShareCheck'].IsChecked
+        $Controls['RptPackagePathInput'].IsEnabled = $On
+        $Controls['RptPackageBrowseButton'].IsEnabled = $On
+        # Default to the configured package path so the common case is one click.
+        if ($On -and [string]::IsNullOrWhiteSpace($Controls['RptPackagePathInput'].Text)) {
+            $Controls['RptPackagePathInput'].Text = $Controls['PackagePathInput'].Text
+        }
+    })
+
+    $Controls['RptPackageBrowseButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        $Path = Show-DATFolderDialog -Description 'Select the package share root' -InitialPath $Controls['RptPackagePathInput'].Text
+        if ($Path) { $Controls['RptPackagePathInput'].Text = $Path }
+    })
+
+    # --- Posture summary (inline: local files only, no share walk, no network) ---
+    $Controls['RptRefreshSummaryButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+
+        $Window.Cursor = $WaitCursor
+        try {
+            $Days = Get-DATReportDays -Text $Controls['RptDaysInput'].Text
+            $Stale = Get-DATReportDays -Text $Controls['RptStaleDaysInput'].Text -Default 90
+            $Snap = Get-DATComplianceSnapshot -Days $Days -StaleExclusionDays $Stale
+
+            $Controls['RptSumExclusions'].Text = [string]$Snap.Exclusions.TotalCount
+            $Controls['RptSumStale'].Text = '{0} (not re-seen in {1}+ days)' -f $Snap.Exclusions.StaleCount, $Snap.Exclusions.StaleAfterDays
+
+            $BL = $Snap.Screening.Blocklist
+            $Controls['RptSumBlocklist'].Text = if (-not $BL.Available) {
+                'None cached - nothing on this host has been screened yet'
+            } elseif ($null -ne $BL.AgeDays) {
+                'v{0} - cached {1} day(s) ago{2}' -f $BL.Version, $BL.AgeDays, $(if ($BL.IsStale) { ' (STALE)' } else { '' })
+            } else {
+                'v{0}' -f $BL.Version
+            }
+
+            $Controls['RptSumFlagged'].Text = '{0} across {1} item(s) in {2} screening run(s)' -f `
+                $Snap.Screening.TotalVulnerable, $Snap.Screening.TotalItems, $Snap.Screening.RunCount
+
+            $Controls['RptSumLocal'].Text = if ($Snap.LocalStorage.Available) {
+                '{0:N1} MB cache/logs/staging ({1} stale cache entr(ies))' -f ($Snap.LocalStorage.TotalBytes / 1MB), $Snap.LocalStorage.CacheStaleCount
+            } else { 'unavailable' }
+
+            $Controls['RptStatusLabel'].Text = "Summary refreshed $(Get-Date -Format 'HH:mm:ss')."
+        } catch {
+            Show-DATWindowMessage -Message "Could not read the compliance snapshot: $($_.Exception.Message)" -Type Error
+            $Controls['RptStatusLabel'].Text = 'Summary failed.'
+        } finally {
+            $Window.Cursor = $DefaultCursor
+        }
+    })
+
+    $Controls['RptDashboardButton'].Add_Click({ Start-DATReportExport -Kind 'Dashboard' })
+    $Controls['RptJsonButton'].Add_Click({ Start-DATReportExport -Kind 'Json' })
+    $Controls['RptActivityHtmlButton'].Add_Click({ Start-DATReportExport -Kind 'HTML' })
+    $Controls['RptActivityCsvButton'].Add_Click({ Start-DATReportExport -Kind 'CSV' })
+
     # --- Load saved settings on window load ---
     $Window.Add_Loaded({
         $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window; $G = $gui.G
@@ -2026,6 +2282,7 @@ function Initialize-DATMainWindow {
                 @{ Name='OverlayRemove';    RS=$G.OverlayRemoveRunspace;    Timer=$G.OverlayRemoveTimer }
                 @{ Name='Deploy';           RS=$G.DeployRunspace;           Timer=$G.DeployTimer }
                 @{ Name='IntunePublish';    RS=$G.IntunePublishRunspace;    Timer=$G.IntunePublishTimer }
+                @{ Name='Report';           RS=$G.ReportRunspace;           Timer=$G.ReportTimer }
             )
 
             foreach ($Item in $TasksToStop) {
