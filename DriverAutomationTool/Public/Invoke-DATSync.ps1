@@ -343,11 +343,23 @@ function Invoke-DATSync {
     foreach ($Make in $Manufacturer) {
         Write-DATLog -Message "======== Processing $Make ========" -Severity 1
 
-        # Refresh catalogs
-        switch ($Make) {
-            'Dell'      { Update-DellCatalogCache -ForceRefresh:$ForceRefresh }
-            'Lenovo'    { Update-LenovoCatalogCache -ForceRefresh:$ForceRefresh }
-            'Microsoft' { Update-SurfaceCatalogCache -ForceRefresh:$ForceRefresh }
+        # Refresh catalogs. All three refresh functions throw on a failed fetch,
+        # and this is the one step in the manufacturer loop that isn't guarded -
+        # so a vendor outage here unwinds the entire cmdlet: the remaining
+        # manufacturers never run, no per-model report is produced, the webhook
+        # never fires, and an unattended run dies with a single error. Contain it
+        # to the manufacturer that failed and carry on with the others.
+        try {
+            switch ($Make) {
+                'Dell'      { Update-DellCatalogCache -ForceRefresh:$ForceRefresh }
+                'Lenovo'    { Update-LenovoCatalogCache -ForceRefresh:$ForceRefresh }
+                'Microsoft' { Update-SurfaceCatalogCache -ForceRefresh:$ForceRefresh }
+            }
+        } catch {
+            $ErrorCount++
+            Write-DATLog -Message "Catalog refresh failed for $Make`: $($_.Exception.Message) - skipping $Make, continuing with any remaining manufacturers" -Severity 3
+            & $AddOutcome $Make '(catalog)' 'Catalog' 'Error' $_.Exception.Message
+            continue
         }
 
         # Get model list
@@ -1025,7 +1037,43 @@ function Invoke-DATSyncSinglePackage {
 
                 # Match either "<base>.OVL.<fp>" (Drivers overlay) or "Cat.<fp>" (DriverUpdates).
                 $FpMatchPattern = if ($Type -eq 'DriverUpdates') { "Cat.$OverlayFingerprint" } else { "*OVL.$OverlayFingerprint" }
-                if ($ExistingToCheck -and $ExistingToCheck.Version -like $FpMatchPattern) {
+
+                # A matching fingerprint only proves the CATALOG hasn't changed,
+                # not that the package holds every driver in it - the version is
+                # hashed from the full resolved list regardless of how many
+                # payloads actually staged. Before honouring the match, check the
+                # manifest's staged/resolved counts: a package built by a run that
+                # lost downloads is incomplete at a version that says it is
+                # complete, and would otherwise be skipped on every future sync.
+                $IncompletePackageReason = $null
+                if ($Type -eq 'DriverUpdates' -and $ExistingToCheck -and
+                    $ExistingToCheck.Version -like $FpMatchPattern -and $ExistingToCheck.SourcePath) {
+                    $ExistingManifestPath = Join-Path $ExistingToCheck.SourcePath 'manifest.json'
+                    if (Test-Path $ExistingManifestPath) {
+                        try {
+                            $ExistingManifest = Get-Content $ExistingManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                            # Packages built before these fields existed have no
+                            # counts. Treat that as "no evidence of a problem"
+                            # rather than forcing a rebuild of every existing
+                            # package on the first run after upgrading.
+                            if ($null -ne $ExistingManifest.resolvedCount -and $null -ne $ExistingManifest.stagedCount) {
+                                if ([int]$ExistingManifest.stagedCount -lt [int]$ExistingManifest.resolvedCount) {
+                                    $IncompletePackageReason = "manifest records $($ExistingManifest.stagedCount) of $($ExistingManifest.resolvedCount) driver(s) staged"
+                                }
+                            }
+                        } catch {
+                            Write-DATLog -Message "Could not read existing manifest at $ExistingManifestPath`: $($_.Exception.Message) - treating package as incomplete" -Severity 2
+                            $IncompletePackageReason = 'existing manifest.json is unreadable'
+                        }
+                    } else {
+                        $IncompletePackageReason = 'existing package has no manifest.json'
+                    }
+                }
+
+                if ($IncompletePackageReason) {
+                    Write-DATLog -Message ("Catalog fingerprint matches v$($ExistingToCheck.Version), but the existing package is incomplete " +
+                        "($IncompletePackageReason) - rebuilding to pick up the missing drivers") -Severity 2
+                } elseif ($ExistingToCheck -and $ExistingToCheck.Version -like $FpMatchPattern) {
                     Write-DATLog -Message "Package already contains latest individual drivers (v$($ExistingToCheck.Version))" -Severity 1
 
                     # Backfill the DCU repository catalog into packages built before
@@ -1662,6 +1710,13 @@ function Invoke-DATSyncSinglePackage {
             Write-DATLog -Message "Lenovo catalog staging complete. Total files in package: $($TotalFiles.Count)" -Severity 1
 
             $ManifestPath = Join-Path $PackageSourceDir 'manifest.json'
+            # resolvedCount/stagedCount record how complete this package is. The
+            # version below is a fingerprint of the FULL resolved list, so a run
+            # that lost packages to failed downloads still stamps the
+            # "everything is here" version and every later run skips it as
+            # current. These two numbers are what let the smart check tell a
+            # complete package from a partial one.
+            $LenovoResolvedCount = @($LenovoUpdates).Count
             $ManifestObj = [PSCustomObject]@{
                 schemaVersion   = 1
                 manufacturer    = $Make
@@ -1669,11 +1724,18 @@ function Invoke-DATSyncSinglePackage {
                 operatingSystem = $OperatingSystem
                 architecture    = $Architecture
                 generatedAt     = (Get-Date).ToUniversalTime().ToString('o')
+                resolvedCount   = $LenovoResolvedCount
+                stagedCount     = $ManifestEntries.Count
                 drivers         = @($ManifestEntries)
             }
             # Depth 5: manifest -> drivers[] -> driver -> SuccessCodes/HardwareIds[] -> values
             $ManifestObj | ConvertTo-Json -Depth 5 | Set-Content -Path $ManifestPath -Encoding UTF8
             Write-DATLog -Message "Wrote DriverUpdates manifest: $($ManifestEntries.Count) Lenovo package(s) -> $ManifestPath" -Severity 1
+            if ($ManifestEntries.Count -lt $LenovoResolvedCount) {
+                Write-DATLog -Message ("PARTIAL PACKAGE: staged $($ManifestEntries.Count) of $LenovoResolvedCount resolved Lenovo package(s) " +
+                    "for $ModelName. The package version is the full-catalog fingerprint, so the next sync would normally skip this model - " +
+                    "the recorded counts make it re-attempt the missing packages instead.") -Severity 2
+            }
 
             # Same versioning scheme as the Dell branch: the package version IS
             # the catalog fingerprint, computed over the FULL resolved list
@@ -2219,6 +2281,13 @@ function Invoke-DATSyncSinglePackage {
                                 throw "No DUPs were successfully staged for $ModelName - cannot build catalog-only Driver Updates package"
                             }
                             $ManifestPath = Join-Path $PackageSourceDir 'manifest.json'
+                            # See the Lenovo branch: the package version is a
+                            # fingerprint of the FULL resolved driver list, so a
+                            # run that lost DUPs to failed downloads still stamps
+                            # the complete-catalog version and is skipped as
+                            # current forever after. Record what was actually
+                            # staged so the smart check can tell the difference.
+                            $DellResolvedCount = @($IndividualDrivers).Count
                             $ManifestObj = [PSCustomObject]@{
                                 schemaVersion = 1
                                 manufacturer  = $Make
@@ -2226,11 +2295,18 @@ function Invoke-DATSyncSinglePackage {
                                 operatingSystem = $OperatingSystem
                                 architecture  = $Architecture
                                 generatedAt   = (Get-Date).ToUniversalTime().ToString('o')
+                                resolvedCount = $DellResolvedCount
+                                stagedCount   = $ManifestEntries.Count
                                 drivers       = @($ManifestEntries)
                             }
                             # Depth 5: manifest -> drivers[] -> driver -> HardwareIds[] -> values
                             $ManifestObj | ConvertTo-Json -Depth 5 | Set-Content -Path $ManifestPath -Encoding UTF8
                             Write-DATLog -Message "Wrote DriverUpdates manifest: $($ManifestEntries.Count) DUP(s) -> $ManifestPath" -Severity 1
+                            if ($ManifestEntries.Count -lt $DellResolvedCount) {
+                                Write-DATLog -Message ("PARTIAL PACKAGE: staged $($ManifestEntries.Count) of $DellResolvedCount resolved DUP(s) " +
+                                    "for $ModelName. The package version is the full-catalog fingerprint, so the next sync would normally skip " +
+                                    "this model - the recorded counts make it re-attempt the missing DUPs instead.") -Severity 2
+                            }
 
                             # DCU repository catalog: lets the apply script hand the
                             # whole install to dcu-cli (Dell-trusted execution +

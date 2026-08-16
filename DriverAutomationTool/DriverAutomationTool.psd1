@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.34.0'
+    ModuleVersion     = '2.35.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.34.0 - Adds Scripts\Get-DATSecureBootCertState.ps1, which reports whether a device holds the 2023 Secure Boot certificates in db and KEK. The OEM BIOS is not the only delivery path - Windows Update services these on a Secure Boot enabled device - so a machine stuck on old firmware can still be current on certificates. This is the check that decides whether a deferred BIOS update is safe to defer.'
+    Description       = '2.35.0 - Five safety and reliability fixes. Package Management Select All now honours the search filter instead of selecting every package on the site, the delete dialog names what it is about to remove, and bulk removal refuses packages that do not match the DAT naming/description convention (-AllowUnmanaged overrides) while confining source cleanup to the configured package root. The BIOS flash now resumes BitLocker on every path that does not reboot, so a not-applicable or failed flash no longer leaves the volume unprotected. Intune device-code sign-in works again on PowerShell 7: the Graph error parser used the Windows PowerShell 5.1 response shape, so authorization_pending was unreadable and sign-in threw on the first poll. Driver Updates packages now record staged/resolved counts in manifest.json and rebuild when a previous run staged only part of the catalog. A failed vendor catalog refresh is now contained to that manufacturer instead of ending the whole sync.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

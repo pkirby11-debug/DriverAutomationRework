@@ -1311,13 +1311,26 @@ function Remove-DATLegacyPackage {
         The package ID to remove.
     .PARAMETER CleanSource
         Also remove the source content directory.
+    .PARAMETER SourceRoot
+        When supplied with -CleanSource, the source directory is only deleted
+        if it sits under this path. Guards against a package whose
+        PkgSourcePath points somewhere unrelated (or at a share root) taking
+        content with it that this tool never created.
+    .PARAMETER AllowUnmanaged
+        Skip the Test-DATManagedPackage ownership check. Off by default so a
+        mistyped or mis-selected PackageID cannot remove a package this module
+        did not create.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$PackageID,
 
-        [switch]$CleanSource
+        [switch]$CleanSource,
+
+        [string]$SourceRoot,
+
+        [switch]$AllowUnmanaged
     )
 
     Assert-DATConfigMgrConnected
@@ -1339,6 +1352,19 @@ function Remove-DATLegacyPackage {
         $PackageType = $PkgLookup.PackageType
         $PackageName = $Package.Name
         $SourcePath = $Package.PkgSourcePath
+
+        # Ownership gate. Callers reach here from a site-wide enumeration (the
+        # Package Management grid lists every package when the filter is "All"),
+        # so the PackageID alone is not evidence that this module created the
+        # object. Refuse anything that doesn't look like ours unless the caller
+        # explicitly opts out.
+        if (-not $AllowUnmanaged) {
+            if (-not (Test-DATManagedPackage -Name $PackageName -Description $Package.Description)) {
+                throw ("Refusing to remove '$PackageName' ($PackageID): it does not match the DriverAutomationTool " +
+                    "naming or description convention, so it was not created by this tool. Re-run with -AllowUnmanaged " +
+                    "if you are certain it should be removed.")
+            }
+        }
 
         if ($PSCmdlet.ShouldProcess("$PackageName ($PackageID)", 'Remove package')) {
 
@@ -1420,7 +1446,21 @@ function Remove-DATLegacyPackage {
             } else {
                 Write-DATLog -Message "CleanSource check: SourcePath is empty - package had no source path in CM" -Severity 2
             }
-            if ($CleanSource -and $SourcePath -and [System.IO.Directory]::Exists($SourcePath)) {
+            # Containment check: only delete inside the configured package root.
+            # PkgSourcePath is whatever ConfigMgr holds for the package, and this
+            # is a recursive delete - a package pointing at a share root would
+            # take the whole share with it.
+            $SourceInRoot = $true
+            if ($CleanSource -and $SourcePath -and $SourceRoot) {
+                $SourceInRoot = Test-DATPathUnderRoot -Path $SourcePath -Root $SourceRoot
+                if (-not $SourceInRoot) {
+                    Write-DATLog -Message ("Skipping source cleanup for $PackageName ($PackageID): '$SourcePath' is outside the " +
+                        "configured package source root '$SourceRoot'. The package was removed from ConfigMgr; delete the " +
+                        "content by hand if it really belongs to this package.") -Severity 2
+                }
+            }
+
+            if ($CleanSource -and $SourceInRoot -and $SourcePath -and [System.IO.Directory]::Exists($SourcePath)) {
                 try {
                     [System.IO.Directory]::Delete($SourcePath, $true)
                     Write-DATLog -Message "Removed source content: $SourcePath" -Severity 1
@@ -3588,6 +3628,173 @@ function Test-DATManagedApplicationName {
         if ($IsMatch) { return $true }
     }
     return $false
+}
+
+function Test-DATManagedPackage {
+    <#
+    .SYNOPSIS
+        Returns $true when a Package looks like one this module created.
+    .DESCRIPTION
+        The package-side counterpart to Test-DATManagedApplicationName, and the
+        gate bulk destructive callers (Invoke-DATRemovePackages, and through it
+        the GUI's Package Management delete) run before removing anything.
+
+        Packages need a wider test than applications because one of the five
+        shapes Invoke-DATSync builds carries no DAT prefix at all. The name
+        switch there produces:
+
+          BIOS           "BIOS Update - <Make> <Model>"
+          BIOSDCU        "BIOS Update (DCU) - <Make> <Model>"
+          DriverUpdates  "Driver Updates - <Make> <Model> - <OS> <Arch>"
+          Standard/App   "Drivers - <Make> <Model> - <OS> <Arch>"
+          Driver Pkg     "<Make> <Model> - <OS> <Arch>"     <-- no prefix
+
+        A name-only test would therefore refuse to delete every ConfigMgr
+        Driver Package the tool has ever built - exactly the objects the
+        Package Management grid lists when "include driver packages" is
+        ticked. So the description is consulted too: every shape above is
+        created with a DAT-written description, either the OSD matching string
+        "(Models included:<SKU>)" or one of the generated defaults
+        ("Driver Pack - ...", "Driver Pack (Driver Pkg) - ...",
+        "BIOS Update - ...").
+
+        Matching either signal is deliberate. A false negative blocks a
+        legitimate cleanup (recoverable - the caller reports it and
+        -AllowUnmanaged overrides), while a false positive deletes a package
+        someone else owns along with its source content, which is not.
+    .PARAMETER Name
+        The package name.
+    .PARAMETER Description
+        The package description. Optional - a package whose name already
+        matches needs no description, but an unprefixed Driver Package is
+        only recognizable from here.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Name,
+
+        [AllowEmptyString()]
+        [string]$Description
+    )
+
+    $EffectiveName = $Name -replace '^Test - ', ''
+
+    # Signal 1: one of the four prefixed name shapes.
+    if ($EffectiveName -like 'Drivers - *' -or
+        $EffectiveName -like 'Driver Updates - *' -or
+        $EffectiveName -like 'BIOS Update - *' -or
+        $EffectiveName -like 'BIOS Update (DCU) - *') {
+        return $true
+    }
+
+    # Signal 2: a DAT-written description. Covers the unprefixed Driver Package
+    # shape, which is otherwise indistinguishable from an arbitrary package.
+    if ($Description) {
+        if ($Description -match '\(Models included:[^)]*\)') { return $true }
+        if ($Description -like 'Driver Pack - *') { return $true }
+        if ($Description -like 'Driver Pack (Driver Pkg) - *') { return $true }
+        if ($Description -like 'BIOS Update - *') { return $true }
+    }
+
+    return $false
+}
+
+function Test-DATPathUnderRoot {
+    <#
+    .SYNOPSIS
+        Returns $true when Path is Root itself or sits beneath it.
+    .DESCRIPTION
+        Containment test for destructive filesystem operations.
+
+        Both sides are split into path segments with '.' and '..' resolved, then
+        compared segment by segment: Path is contained when Root's segments are
+        a leading subsequence of Path's. Comparing segments rather than strings
+        is what stops '\\nas\DATSource-Archive' reading as a child of
+        '\\nas\DATSource' - a plain StartsWith would accept it.
+
+        The normalization is done by hand rather than through
+        [System.IO.Path]::GetFullPath because that resolves against the current
+        platform's rules: on a non-Windows host (CI linting, a dev box) a
+        backslash isn't a separator at all, so a Windows path would come back
+        as one opaque segment and every comparison would silently fail open or
+        closed depending on the caller. These are always Windows paths - UNC
+        shares or drive-letter paths from ConfigMgr - so they are parsed as
+        Windows paths regardless of where the code runs.
+
+        Case-insensitive, because Windows paths are. Returns $false rather than
+        throwing on malformed input - the caller's safe action is to skip the
+        delete.
+    .PARAMETER Path
+        The candidate path.
+    .PARAMETER Root
+        The directory the candidate must be contained by.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Root
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Root)) {
+        return $false
+    }
+
+    # Splits a Windows path into a root prefix ('\\' for UNC, 'C:' for a drive)
+    # and its resolved segments.
+    $Split = {
+        param([string]$Raw)
+
+        $Normalized = $Raw -replace '/', '\'
+        $Prefix = ''
+        $Rest   = $Normalized
+
+        if ($Normalized.StartsWith('\\')) {
+            $Prefix = '\\'
+            $Rest   = $Normalized.Substring(2)
+        } elseif ($Normalized -match '^([A-Za-z]:)\\?(.*)$') {
+            $Prefix = $Matches[1].ToUpperInvariant()
+            $Rest   = $Matches[2]
+        }
+
+        $Segments = [System.Collections.Generic.List[string]]::new()
+        foreach ($Segment in ($Rest -split '\\')) {
+            if ($Segment -eq '' -or $Segment -eq '.') { continue }
+            if ($Segment -eq '..') {
+                if ($Segments.Count -gt 0) { $Segments.RemoveAt($Segments.Count - 1) }
+                continue
+            }
+            $Segments.Add($Segment)
+        }
+
+        return [PSCustomObject]@{ Prefix = $Prefix; Segments = $Segments }
+    }
+
+    $P = & $Split $Path
+    $R = & $Split $Root
+
+    # An empty root would make every path "contained".
+    if ($R.Segments.Count -eq 0) { return $false }
+
+    if (-not $P.Prefix.Equals($R.Prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    if ($P.Segments.Count -lt $R.Segments.Count) { return $false }
+
+    for ($i = 0; $i -lt $R.Segments.Count; $i++) {
+        if (-not $P.Segments[$i].Equals($R.Segments[$i], [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Find-DATExistingApplications {

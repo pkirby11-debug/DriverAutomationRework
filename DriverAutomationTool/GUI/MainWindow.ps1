@@ -907,7 +907,11 @@ function Initialize-DATMainWindow {
     $Controls['PkgSelectAllButton'].Add_Click({
         $gui = Get-DATGui; $Controls = $gui.Controls
         Complete-DATGridEdit $Controls['PkgGrid']
-        Set-DATGridChecks -Table $Controls['PkgGridData'] -Checked $true
+        # -VisibleOnly so Select All honours the search filter, matching the
+        # model grid and the deploy-apps grid. Without it a filtered view still
+        # selects every row in the table, which for this grid means every
+        # package on the site.
+        Set-DATGridChecks -Table $Controls['PkgGridData'] -Checked $true -VisibleOnly
     })
 
     $Controls['PkgSelectNoneButton'].Add_Click({
@@ -938,15 +942,33 @@ function Initialize-DATMainWindow {
             return
         }
 
+        $CleanSource = [bool]$Controls['CleanSourceCheckBox'].IsChecked
+
+        # Name what is about to go, the way the overlay-cleanup dialog does. A
+        # bare count gives no chance to notice that the selection is wider than
+        # intended - and with 'All Packages' selected this grid lists every
+        # package on the site, not just DAT's.
+        $ListPreview = ($SelectedRows | Select-Object -First 25 | ForEach-Object {
+            "  - $($_['Name']) ($($_['PackageID']))"
+        }) -join "`n"
+        if ($SelectedRows.Count -gt 25) {
+            $ListPreview += "`n  ... and $($SelectedRows.Count - 25) more"
+        }
+        $SourceNote = if ($CleanSource) {
+            "`nThe 'Clean source' checkbox is ON - source folders WILL be deleted."
+        } else {
+            "`nThe 'Clean source' checkbox is OFF - SCCM packages will be removed but source folders kept."
+        }
+
         $Confirm = Show-DATWindowMessage `
-            -Message "Remove $($SelectedRows.Count) selected package(s)? This cannot be undone." `
+            -Message ("Remove {0} selected package(s)?`n`n{1}`n{2}`n`nThis cannot be undone." -f `
+                $SelectedRows.Count, $ListPreview, $SourceNote) `
             -Type Question
         if ($Confirm -ne 'Yes') { return }
 
         $PackagesToRemove = @($SelectedRows | ForEach-Object {
             @{ ID = $_['PackageID']; Name = $_['Name'] }
         })
-        $CleanSource = [bool]$Controls['CleanSourceCheckBox'].IsChecked
         $ConnParams  = @{ SiteServer = $Controls['SiteServerInput'].Text; SiteCode = $Controls['SiteCodeInput'].Text }
         if ($Controls['UseSSLCheckBox'].IsChecked) { $ConnParams['UseSSL'] = $true }
         $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
@@ -991,19 +1013,32 @@ function Initialize-DATMainWindow {
                 $RsErrors  = @($G.DeleteRunspace.Streams.Error)
                 $Succeeded = @($Results | Where-Object { $_.Status -eq 'Success' })
                 $Failed    = @($Results | Where-Object { $_.Status -eq 'Failed' })
+                $Refused   = @($Results | Where-Object { $_.Status -eq 'Refused' })
 
                 $Controls['PkgSearchBox'].Text = ''
                 Invoke-DATClick $Controls['PkgRefreshButton']
                 $Controls['StatusStripLabel'].Text = "Removed $($Succeeded.Count) package(s)"
 
-                if ($Failed.Count -eq 0 -and $RsErrors.Count -eq 0) {
+                # Refused means the ownership gate declined - a different thing
+                # from a removal that was tried and failed, and the only one with
+                # a documented override, so it gets its own note.
+                $RefusedNote = if ($Refused.Count -gt 0) {
+                    $RefusedList = ($Refused | ForEach-Object { "  - $($_.Name) ($($_.ID))" }) -join "`n"
+                    ("`n`n$($Refused.Count) package(s) were left alone because they don't match the DriverAutomationTool " +
+                     "naming or description convention:`n$RefusedList`n`nIf these really are DAT packages, remove them with " +
+                     "Invoke-DATRemovePackages -AllowUnmanaged.")
+                } else { '' }
+
+                if ($Failed.Count -eq 0 -and $RsErrors.Count -eq 0 -and $Refused.Count -eq 0) {
                     Show-DATWindowMessage -Message "Removed $($Succeeded.Count) package(s) successfully." -Type Information
+                } elseif ($Failed.Count -eq 0 -and $RsErrors.Count -eq 0) {
+                    Show-DATWindowMessage -Message "Removed $($Succeeded.Count) package(s).$RefusedNote" -Type Warning
                 } elseif ($Succeeded.Count -eq 0) {
                     $FailList = ($Failed | ForEach-Object { "$($_.ID) ($($_.Name)): $($_.Error)" }) -join "`n"
-                    Show-DATWindowMessage -Message "All $($Failed.Count) package removal(s) failed.`n`n$FailList`n`nCheck the DAT log for details." -Type Error
+                    Show-DATWindowMessage -Message "All $($Failed.Count) package removal(s) failed.`n`n$FailList`n`nCheck the DAT log for details.$RefusedNote" -Type Error
                 } else {
                     $FailList = ($Failed | ForEach-Object { "$($_.ID) ($($_.Name)): $($_.Error)" }) -join "`n"
-                    Show-DATWindowMessage -Message "$($Succeeded.Count) removed, $($Failed.Count) failed.`n`nFailed:`n$FailList`n`nCheck the DAT log for details." -Type Warning
+                    Show-DATWindowMessage -Message "$($Succeeded.Count) removed, $($Failed.Count) failed.`n`nFailed:`n$FailList`n`nCheck the DAT log for details.$RefusedNote" -Type Warning
                 }
             } catch {
                 $Controls['StatusStripLabel'].Text = 'Package removal failed'
