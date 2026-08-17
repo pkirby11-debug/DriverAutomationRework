@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.34.0'
+    ModuleVersion     = '2.38.1'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.34.0 - Adds Scripts\Get-DATSecureBootCertState.ps1, which reports whether a device holds the 2023 Secure Boot certificates in db and KEK. The OEM BIOS is not the only delivery path - Windows Update services these on a Secure Boot enabled device - so a machine stuck on old firmware can still be current on certificates. This is the check that decides whether a deferred BIOS update is safe to defer.'
+    Description       = '2.38.1 - Stops the flash comparison reporting a Security Center entry as installed software. SecurityCenter2 lists REGISTRATIONS, which a product removed without deregistering leaves behind forever - field-confirmed by a device reporting Trend Micro on a fleet where Trend was decommissioned and no trace remained. The field is renamed AVRegistrations, carries the decoded productState, and is joined by AVServicesRunning, which reports engines actually running.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
