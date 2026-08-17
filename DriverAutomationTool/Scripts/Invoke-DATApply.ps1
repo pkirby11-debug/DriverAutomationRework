@@ -4048,6 +4048,29 @@ function Invoke-DellBIOSFlash {
             if ($StatusLines.Count -gt 0) {
                 Write-Log 'Dell previous flash update status:'
                 foreach ($Line in $StatusLines) { Write-Log "    $Line" }
+
+                # Read this carefully. "Your last firmware update was successful"
+                # is what a struggling device reports too: it describes the last
+                # update the firmware actually RAN, which may be the one that put
+                # the device on the version it is stuck at, not the capsule we
+                # staged last cycle. Field-confirmed on a Precision 3630 sitting
+                # on 2.6.1 that will not take 2.40.0 - /Status still says
+                # "successful". Reported without this caveat it reads as proof
+                # the flash worked, which is the same false-success trap the
+                # ESRT status-0 handling exists to avoid.
+                #
+                # It is still a real signal, just a narrower one: a SUCCESS here
+                # after a staged-but-unapplied cycle means the firmware recorded
+                # no FAILED attempt - so the capsule was never evaluated at POST
+                # at all, rather than evaluated and rejected. That distinction is
+                # what separates "the flash is being refused" from "the flash
+                # never starts", and they need different fixes.
+                if (@($StatusLines | Where-Object { $_ -match 'success' }).Count -gt 0) {
+                    Write-Log ('The status above describes the last update the firmware actually RAN, not necessarily the capsule ' +
+                        'staged on the previous cycle - a device stuck below target reports "successful" here too. Read a success ' +
+                        'as "no FAILED attempt was recorded", which means the staged capsule was never evaluated at POST rather ' +
+                        'than evaluated and refused. Compare against the live BIOS version logged above before trusting it.') -Severity 2
+                }
             } else {
                 Write-Log 'Dell previous flash update status query produced an empty log' -Severity 2
             }

@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.37.0'
+    ModuleVersion     = '2.37.1'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.37.0 - Queries the Dell package''s own /Status ("Report previous flash update status") before flashing and quotes it into the apply log. For a DUP-staged capsule this is the authoritative account of why the last flash did not take, which the ESRT registry mirror cannot give. Bounded and killed on overrun, since these packages are GUI apps and a dialog on a headless machine would hang the deployment. Also corrects -BIOSNoVideo: the Precision 3630 packages do not carry /novideo at all, per their own help output.'
+    Description       = '2.37.1 - Qualifies the Dell /Status result in the apply log. A device stuck below target still reports "Your last firmware update was successful", because that describes the last update the firmware actually RAN - quoted bare it reads as proof the flash worked. A success there now logs what it really means: no FAILED attempt was recorded, so the staged capsule was never evaluated at POST rather than evaluated and refused.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
