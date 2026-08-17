@@ -147,10 +147,13 @@ param(
     # the Legacy-Option-ROM condition is why one headless machine can flash while
     # an identical one cannot. Dell's answer is a /novideo switch on the DUP.
     #
-    # Opt-in rather than automatic: the switch only exists on packages built
-    # after Dell added it (1.7.1 on the OptiPlex line, July 2020), and an older
-    # DUP handed an unrecognised switch may print usage and exit non-zero
-    # instead of flashing. Turn it on for a fleet you know is past that line.
+    # FIELD RESULT, and a caution: /novideo is NOT universal. The Precision 3630
+    # package's own /? help lists only /s /f /r /l= /p= /Status /BIOSMeasurement
+    # /bls - no /novideo - and passing it there changed nothing. So the switch
+    # appears to be an OptiPlex-line addition that the 3630 line never received.
+    # Verify it is in a package's /? output before deploying this against a
+    # fleet; an unrecognised switch may make an older DUP print usage and exit
+    # non-zero rather than flash. Left opt-in for the models that do carry it.
     [switch]$BIOSNoVideo,
 
     [ValidateSet('Dell', 'Lenovo', 'Microsoft')]
@@ -4009,6 +4012,53 @@ function Invoke-DellBIOSFlash {
 
     # Guarantee BitLocker protection is explicitly suspended immediately before staging the BIOS update.
     # When DCU's scan finishes or exits, DCU restores pristine settings and re-enables BitLocker.
+    # Ask the DUP what happened to the LAST flash before starting another one.
+    #
+    # /Status ("Report previous flash update status") is listed by the Dell
+    # Firmware Update Utility's own help. It is the authoritative account of a
+    # DUP-staged flash - the ESRT registry mirror is not, because Windows only
+    # records there for capsules IT submits through a firmware driver package.
+    # On a device that stages every cycle and never moves, this is the one place
+    # that can say why.
+    #
+    # Guarded hard, because these packages are GUI applications: /Status may want
+    # to draw a dialog, and a dialog on a headless machine under SYSTEM would
+    # hang the deployment forever. Bounded wait, killed if it overruns, and the
+    # answer is read from the log file rather than the console.
+    try {
+        $StatusLog = Join-Path $env:SystemRoot ('Temp\DATApply\' + (($BiosExe.BaseName) -replace '[^\w\.\-]', '_') + '.status.log')
+        $StatusDir = Split-Path $StatusLog -Parent
+        if (-not (Test-Path $StatusDir)) { New-Item -Path $StatusDir -ItemType Directory -Force | Out-Null }
+        Remove-Item -Path $StatusLog -Force -ErrorAction SilentlyContinue
+
+        $SProc = Start-Process -FilePath $BiosExe.FullName -ArgumentList @('/Status', "/l=$StatusLog") `
+            -PassThru -NoNewWindow -WorkingDirectory $Path
+        $null = $SProc.Handle
+        if ($SProc.WaitForExit(120000)) {
+            Write-Log "Previous flash status query exit code: $($SProc.ExitCode)"
+        } else {
+            Write-Log 'Previous flash status query did not return within 120s - killing it (the package likely tried to draw a dialog)' -Severity 2
+            try { $SProc.Kill() } catch {
+                Write-Verbose "Ignored exception: $($_.Exception.Message)"
+            }
+        }
+        if (Test-Path $StatusLog) {
+            $StatusLines = @(Get-Content -Path $StatusLog -ErrorAction SilentlyContinue |
+                ForEach-Object { ($_ -replace '^\[[^\]]*\]\s*', '').Trim() } | Where-Object { $_ })
+            if ($StatusLines.Count -gt 0) {
+                Write-Log 'Dell previous flash update status:'
+                foreach ($Line in $StatusLines) { Write-Log "    $Line" }
+            } else {
+                Write-Log 'Dell previous flash update status query produced an empty log' -Severity 2
+            }
+        } else {
+            Write-Log 'Dell previous flash update status query wrote no log' -Severity 2
+        }
+    } catch {
+        # Diagnostic only - never block the flash on it.
+        Write-Log "Could not query the previous flash status: $($_.Exception.Message)" -Severity 2
+    }
+
     # Direct DUP capsule staging fails if BitLocker is active on C:.
     Suspend-BitLockerForFlash
 
@@ -4051,7 +4101,8 @@ function Invoke-DellBIOSFlash {
         # Lets the flash proceed at POST on a machine with no display attached.
         # See the -BIOSNoVideo parameter help for why this is not automatic.
         $ExeArgs += '/novideo'
-        Write-Log 'Passing /novideo - the flash is allowed to start with no display attached (Dell KB 000146859). Requires a BIOS new enough to carry the switch.'
+        Write-Log ('Passing /novideo - the flash is allowed to start with no display attached (Dell KB 000146859). Confirm the ' +
+            'package actually lists it in its /? help: the Precision 3630 packages do not, and passing it there has no effect.') -Severity 2
     } elseif (@(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction SilentlyContinue).Count -eq 0) {
         # Worth saying out loud on exactly the machines this bites, because the
         # failure it produces is completely silent otherwise.

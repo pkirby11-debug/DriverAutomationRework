@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.36.0'
+    ModuleVersion     = '2.37.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.36.0 - Adds -BIOSNoVideo, which passes /novideo to the Dell BIOS DUP so the flash can start at POST on a machine with no display attached. Dell KB 000146859 documents that on this platform generation a headless machine silently does not flash unless Legacy Option ROMs are enabled - which is why one headless device can update while an identical one cannot. Without the switch the apply log now warns when no display is attached. Compare-DATFlashCapability also captures LegacyOrom and a full BIOS attribute dump.'
+    Description       = '2.37.0 - Queries the Dell package''s own /Status ("Report previous flash update status") before flashing and quotes it into the apply log. For a DUP-staged capsule this is the authoritative account of why the last flash did not take, which the ESRT registry mirror cannot give. Bounded and killed on overrun, since these packages are GUI apps and a dialog on a headless machine would hang the deployment. Also corrects -BIOSNoVideo: the Precision 3630 packages do not carry /novideo at all, per their own help output.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
