@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.37.1'
+    ModuleVersion     = '2.38.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.37.1 - Qualifies the Dell /Status result in the apply log. A device stuck below target still reports "Your last firmware update was successful", because that describes the last update the firmware actually RAN - quoted bare it reads as proof the flash worked. A success there now logs what it really means: no FAILED attempt was recorded, so the staged capsule was never evaluated at POST rather than evaluated and refused.'
+    Description       = '2.38.0 - Adds Scripts\Get-DATFirmwareDeliveryPath.ps1. Comparing a 3630 on 2.40.0 against one stuck on 2.6.1 showed the current device carries a DELL-supplied firmware driver package and an ESRT success record, while the stuck one has only the Microsoft inbox driver, no record, and is the only one DAT has actually run on - so the device treated as a working control never updated through the DUP path at all. Reports which delivery path a device has used and whether policy blocks Windows from supplying a firmware driver.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
