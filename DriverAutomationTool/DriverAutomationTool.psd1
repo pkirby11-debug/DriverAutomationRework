@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.34.0'
+    ModuleVersion     = '2.35.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.34.0 - Adds Scripts\Get-DATSecureBootCertState.ps1, which reports whether a device holds the 2023 Secure Boot certificates in db and KEK. The OEM BIOS is not the only delivery path - Windows Update services these on a Secure Boot enabled device - so a machine stuck on old firmware can still be current on certificates. This is the check that decides whether a deferred BIOS update is safe to defer.'
+    Description       = '2.35.0 - Adds Scripts\Compare-DATFlashCapability.ps1. A headless Precision 3630 that DID take the BIOS update refutes the headless theory and, with a 3630 on 2.5.x also failing, every remaining single-cause theory - so the differentiator varies machine to machine and a working control beats another hypothesis. Captures ESP free space, the Windows firmware-resource records, HECI/ME state, Fast Startup, pending-reboot, security software and boot entries from a known-good and known-bad device, then prints only what differs.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
