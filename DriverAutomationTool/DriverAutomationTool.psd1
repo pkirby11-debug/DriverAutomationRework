@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.35.0'
+    ModuleVersion     = '2.36.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.35.0 - Adds Scripts\Compare-DATFlashCapability.ps1. A headless Precision 3630 that DID take the BIOS update refutes the headless theory and, with a 3630 on 2.5.x also failing, every remaining single-cause theory - so the differentiator varies machine to machine and a working control beats another hypothesis. Captures ESP free space, the Windows firmware-resource records, HECI/ME state, Fast Startup, pending-reboot, security software and boot entries from a known-good and known-bad device, then prints only what differs.'
+    Description       = '2.36.0 - Adds -BIOSNoVideo, which passes /novideo to the Dell BIOS DUP so the flash can start at POST on a machine with no display attached. Dell KB 000146859 documents that on this platform generation a headless machine silently does not flash unless Legacy Option ROMs are enabled - which is why one headless device can update while an identical one cannot. Without the switch the apply log now warns when no display is attached. Compare-DATFlashCapability also captures LegacyOrom and a full BIOS attribute dump.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

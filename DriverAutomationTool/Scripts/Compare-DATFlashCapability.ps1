@@ -112,6 +112,32 @@ $Probe = {
     $BootOrder = (& bcdedit.exe /enum firmware 2>&1 | Select-String -Pattern 'displayorder|path|description' -SimpleMatch |
         Select-Object -First 12 | ForEach-Object { $_.ToString().Trim() }) -join ' / '
 
+    # --- BIOS attributes, if Dell Command | Configure is installed. LegacyOrom
+    # is called out by name: Dell KB 000146859 says the no-monitor flash block
+    # applies "on every attempt, where the Legacy Option Read Only Modules (ROM)
+    # are not enabled in the BIOS" - so on a headless fleet this single attribute
+    # can be the whole difference between a device that flashes and one that
+    # does not. The full dump is captured too, because the useful attribute may
+    # be one nobody has thought to name yet.
+    $Cctk = @(
+        "$env:ProgramFiles\Dell\Command Configure\X86_64\cctk.exe",
+        "${env:ProgramFiles(x86)}\Dell\Command Configure\X86_64\cctk.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    $NamedGates = 'not available (cctk not installed)'
+    $AllBiosAttrs = $null
+    if ($Cctk) {
+        $NamedGates = (@('LegacyOrom', 'CapsuleFirmwareUpdate', 'AllowBiosDowngrade', 'SecureBoot', 'UefiNwStack', 'Fastboot') |
+            ForEach-Object { ((& $Cctk "--$_" 2>&1) -join ' ').Trim() }) -join '; '
+        # Full attribute dump to a temp file, read back, then removed.
+        $Ini = Join-Path $env:TEMP "cctk_$PID.ini"
+        & $Cctk -o $Ini 2>&1 | Out-Null
+        if (Test-Path $Ini) {
+            $AllBiosAttrs = ((Get-Content $Ini | Where-Object { $_ -match '=' -and $_ -notmatch '^\s*[;\[]' }) -join '; ')
+            Remove-Item $Ini -Force
+        }
+    }
+
     # --- Evidence of what has actually run here.
     $DellLogCount = @(Get-ChildItem 'C:\ProgramData\Dell\UpdatePackage\log' -Recurse -File).Count
     $DatLogCount  = @(Get-ChildItem "$env:SystemRoot\Temp\DATApply" -Recurse -File).Count
@@ -147,6 +173,8 @@ $Probe = {
         DATApplyLogFiles    = $DatLogCount
         FirmwareBootEntries = $BootOrder
         KernelBootFirmware  = if ($WuFw) { $WuFw -join '; ' } else { 'none' }
+        BiosGates           = $NamedGates
+        AllBiosAttributes   = $AllBiosAttrs
     }
 }
 

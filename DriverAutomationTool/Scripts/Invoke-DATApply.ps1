@@ -138,6 +138,21 @@ param(
         Justification='See comment above - plaintext is unavoidable at the CCMExec boundary.')]
     [string]$BIOSPassword,
 
+    # Dell KB 000146859, for the OptiPlex 3060/5060/7060 - the same 300-series
+    # generation as the Precision 3630/3430: "If you do not have the monitor
+    # connected to the device, the FLASH does not start and the desktop reboots
+    # to its operating system... The computer is expected to do this on every
+    # attempt, where the Legacy Option Read Only Modules (ROM) are not enabled
+    # in the BIOS." That is precisely the silent stage-reboot-unchanged loop, and
+    # the Legacy-Option-ROM condition is why one headless machine can flash while
+    # an identical one cannot. Dell's answer is a /novideo switch on the DUP.
+    #
+    # Opt-in rather than automatic: the switch only exists on packages built
+    # after Dell added it (1.7.1 on the OptiPlex line, July 2020), and an older
+    # DUP handed an unrecognised switch may print usage and exit non-zero
+    # instead of flashing. Turn it on for a fleet you know is past that line.
+    [switch]$BIOSNoVideo,
+
     [ValidateSet('Dell', 'Lenovo', 'Microsoft')]
     [string]$SafetyManufacturer,
 
@@ -4032,6 +4047,18 @@ function Invoke-DellBIOSFlash {
 
     $ExeArgs = @('/s', '/f')
     if ($BiosFwLog) { $ExeArgs += "/l=$BiosFwLog" }
+    if ($BIOSNoVideo) {
+        # Lets the flash proceed at POST on a machine with no display attached.
+        # See the -BIOSNoVideo parameter help for why this is not automatic.
+        $ExeArgs += '/novideo'
+        Write-Log 'Passing /novideo - the flash is allowed to start with no display attached (Dell KB 000146859). Requires a BIOS new enough to carry the switch.'
+    } elseif (@(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction SilentlyContinue).Count -eq 0) {
+        # Worth saying out loud on exactly the machines this bites, because the
+        # failure it produces is completely silent otherwise.
+        Write-Log ('No display is attached and -BIOSNoVideo was not specified. On this platform generation Dell documents the ' +
+            'flash as not starting at POST on a monitor-less machine unless Legacy Option ROMs are enabled (KB 000146859); the ' +
+            'device reboots into Windows on the old firmware with no error. If this flash does not take, retry with -BIOSNoVideo.') -Severity 2
+    }
     if ($BIOSPassword) {
         $ExeArgs += "/p=`"$BIOSPassword`""
     } else {
