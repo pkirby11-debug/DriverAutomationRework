@@ -99,7 +99,27 @@ $Probe = {
     if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager').PendingFileRenameOperations) { $Pending += 'FileRename' }
 
     # --- Security software and firmware-adjacent OS features.
-    $AV = @(Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct | ForEach-Object { $_.displayName })
+    #
+    # SecurityCenter2 lists REGISTRATIONS, not installed software. A product that
+    # was removed without deregistering leaves its entry behind forever, so a
+    # name here is not evidence the product is present - it is evidence one was
+    # registered at some point. Field-confirmed: a device reported "Trend Micro
+    # Apex One Antivirus" on a fleet where Trend had been decommissioned and no
+    # trace of it was on the box. Decode productState so a stale, disabled
+    # registration is visibly different from a live engine.
+    $AV = @(Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct | ForEach-Object {
+        $Ps = [int]$_.productState
+        $Enabled = ((($Ps -shr 8) -band 0xFF) -band 0x10) -ne 0
+        $SigsCurrent = ($Ps -band 0xFF) -eq 0
+        "$($_.displayName) [state=0x{0:X6} enabled={1} sigsCurrent={2} path='{3}']" -f $Ps, $Enabled, $SigsCurrent, $_.pathToSignedProductExe
+    })
+
+    # What is actually on disk and running, which is the claim SecurityCenter2
+    # cannot make. Anything listed here is really present.
+    $AvRunning = @(Get-Service | Where-Object {
+            $_.Status -eq 'Running' -and
+            $_.Name -match 'ds_agent|TmListen|NTRTScan|TMBMSRV|TmCCSF|Amsp|WinDefend|Sense|CSFalcon|SentinelAgent|CylanceSvc'
+        } | ForEach-Object { "$($_.Name)=$($_.Status)" })
     $Dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard
     $Dell = @(Get-CimInstance Win32_Product -Filter "Vendor LIKE '%Dell%'" | ForEach-Object { "$($_.Name) $($_.Version)" })
     if (-not $Dell) {
@@ -167,7 +187,8 @@ $Probe = {
         SecureBoot          = "$(try { Confirm-SecureBootUEFI -ErrorAction Stop } catch { 'unavailable' })"
         VBSStatus           = $Dg.VirtualizationBasedSecurityStatus
         HVCIRunning         = ($Dg.SecurityServicesRunning -contains 2)
-        AntiVirus           = if ($AV) { $AV -join '; ' } else { 'none reported' }
+        AVRegistrations     = if ($AV) { $AV -join '; ' } else { 'none registered' }
+        AVServicesRunning   = if ($AvRunning) { $AvRunning -join '; ' } else { 'none of the known engines running' }
         DellSoftware        = if ($Dell) { ($Dell | Select-Object -First 8) -join '; ' } else { 'none' }
         DellLogFiles        = $DellLogCount
         DATApplyLogFiles    = $DatLogCount
