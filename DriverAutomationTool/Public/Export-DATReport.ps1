@@ -64,7 +64,9 @@ function Export-DATReport {
 
         [string]$PackagePath,
 
-        [int]$StaleExclusionDays = 90
+        [int]$StaleExclusionDays = 90,
+
+        [switch]$IncludeConfigMgr
     )
 
     $OutputDir = Split-Path $OutputPath -Parent
@@ -80,6 +82,7 @@ function Export-DATReport {
         }
         if ($PackagePath)      { $SnapshotParams['PackagePath'] = $PackagePath }
         if ($SummaryDirectory) { $SnapshotParams['SummaryDirectory'] = $SummaryDirectory }
+        if ($IncludeConfigMgr) { $SnapshotParams['IncludeConfigMgr'] = $true }
 
         $Snapshot = Get-DATComplianceSnapshot @SnapshotParams
 

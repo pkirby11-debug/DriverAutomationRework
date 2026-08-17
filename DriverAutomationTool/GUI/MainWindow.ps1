@@ -137,6 +137,191 @@ function Get-DATReportDays {
     return $Default
 }
 
+function Get-DATReportConnectParams {
+    <#
+    .SYNOPSIS
+        Splat for re-establishing the current ConfigMgr connection inside a
+        background runspace, or $null when the window is not connected.
+    .DESCRIPTION
+        Every runspace imports the module fresh and therefore starts
+        disconnected. The ConfigMgr-backed panels would report "Not connected"
+        against a site the operator is visibly connected to unless the child
+        reconnects first, so the parent hands down what it is connected to.
+
+        Reads the live module state via Get-DATCMState rather than the text
+        boxes: the boxes hold what was typed, which is not necessarily what a
+        successful connect resolved to (the site code in particular is
+        discovered, not entered).
+    #>
+    $State = Get-DATCMState
+    if (-not $State.Connected -or -not $State.SiteServer) { return $null }
+
+    $Params = @{ SiteServer = [string]$State.SiteServer }
+    if ($State.SiteCode) { $Params['SiteCode'] = [string]$State.SiteCode }
+
+    # UseSSL is not part of the connection state, and Connect-DATConfigMgr
+    # falls back to non-SSL on its own, so the checkbox is the only source.
+    $gui = Get-DATGui
+    if ($gui -and $gui.Controls['UseSSLCheckBox'] -and $gui.Controls['UseSSLCheckBox'].IsChecked) {
+        $Params['UseSSL'] = $true
+    }
+    return $Params
+}
+
+function Start-DATFleetPosture {
+    <#
+    .SYNOPSIS
+        Fills the Reports tab's fleet-posture rows from the two ConfigMgr-backed
+        snapshot panels.
+    .DESCRIPTION
+        Background runspace rather than inline: this is the only part of the
+        Reports tab that talks to a site server, and the BIOS inventory query
+        returns one row per client - minutes of dispatcher freeze on a large
+        site if it ran on the UI thread.
+
+        Nothing is written. The runspace calls Get-DATComplianceSnapshot
+        -IncludeConfigMgr, which is read-only by construction.
+    #>
+    $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+    if ($G.FleetHandle) { return }   # a query is already running
+
+    $Connect = Get-DATReportConnectParams
+    if (-not $Connect) {
+        Show-DATWindowMessage -Type Warning -Message (
+            "Not connected to a ConfigMgr site.`n`n" +
+            'Fleet BIOS compliance is read from the site''s hardware inventory, so connect on the Configuration tab first.')
+        return
+    }
+
+    Set-DATReportButtonsEnabled -Enabled $false
+    $Controls['RptProgress'].Visibility = [System.Windows.Visibility]::Visible
+    $Controls['RptProgress'].IsIndeterminate = $true
+    $Controls['RptStatusLabel'].Text = 'Querying the site for BIOS inventory - this can take a minute on a large site...'
+
+    $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+    $FleetScript = {
+        param($ModulePath, $Connect)
+        Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+        Connect-DATConfigMgr @Connect | Out-Null
+        # Days/StaleExclusionDays are irrelevant here - only the two ConfigMgr
+        # panels are read - but the snapshot is the one supported entry point
+        # and its other panels are cheap and local.
+        Get-DATComplianceSnapshot -IncludeConfigMgr
+    }
+
+    $G.FleetRunspace = [System.Management.Automation.PowerShell]::Create()
+    $G.FleetRunspace.AddScript($FleetScript).AddArgument($ModulePath).AddArgument($Connect) | Out-Null
+    $G.FleetHandle = $G.FleetRunspace.BeginInvoke()
+
+    if ($G.FleetTimer) { $G.FleetTimer.Stop() }
+    $G.FleetTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $G.FleetTimer.Interval = [timespan]::FromMilliseconds(400)
+
+    $G.FleetTimer.Add_Tick({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+        if ($null -eq $G.FleetHandle -or -not $G.FleetHandle.IsCompleted) { return }
+        $G.FleetTimer.Stop()
+
+        try {
+            $Result = @($G.FleetRunspace.EndInvoke($G.FleetHandle))
+            $RsErrors = @($G.FleetRunspace.Streams.Error)
+            $Snap = @($Result | Where-Object { $_ }) | Select-Object -Last 1
+
+            if (-not $Snap) {
+                if ($RsErrors.Count -gt 0) { throw $RsErrors[0].Exception.Message }
+                throw 'The fleet query returned nothing.'
+            }
+
+            Show-DATFleetPosture -Snapshot $Snap
+            $Controls['RptStatusLabel'].Text = "Fleet posture refreshed $(Get-Date -Format 'HH:mm:ss')."
+        } catch {
+            Show-DATWindowMessage -Message "Fleet query failed: $($_.Exception.Message)" -Type Error
+            $Controls['RptStatusLabel'].Text = 'Fleet query failed.'
+        } finally {
+            if ($G.FleetRunspace) {
+                try { $G.FleetRunspace.Dispose() } catch {
+                    [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+                }
+                $G.FleetRunspace = $null
+            }
+            $G.FleetHandle = $null
+            $Controls['RptProgress'].IsIndeterminate = $false
+            $Controls['RptProgress'].Visibility = [System.Windows.Visibility]::Collapsed
+            Set-DATReportButtonsEnabled -Enabled $true
+        }
+    })
+    $G.FleetTimer.Start()
+}
+
+function Show-DATFleetPosture {
+    <#
+    .SYNOPSIS
+        Renders the BIOSCompliance and Staleness panels into the Reports tab
+        labels.
+    .DESCRIPTION
+        Split out of the timer tick so the formatting - which is where the
+        honesty lives - is testable without a runspace or a site.
+
+        Each row distinguishes three things a single number would conflate:
+        the panel failed, the panel ran but had no data to work with, and the
+        panel produced a real result. "0% compliant" because hardware
+        inventory is switched off is a false alarm, not a finding.
+    .PARAMETER Snapshot
+        A Get-DATComplianceSnapshot result collected with -IncludeConfigMgr.
+    #>
+    param([Parameter(Mandatory)]$Snapshot)
+
+    $gui = Get-DATGui; $Controls = $gui.Controls
+
+    $B = $Snapshot.BIOSCompliance
+    if (-not $B) {
+        $Text = 'not collected'
+        $Controls['RptSumBiosCompliance'].Text = $Text
+        $Controls['RptSumBiosBehind'].Text     = $Text
+        $Controls['RptSumBiosUnknown'].Text    = $Text
+    } elseif (-not $B.Available) {
+        $Controls['RptSumBiosCompliance'].Text = "unavailable - $($B.Error)"
+        $Controls['RptSumBiosBehind'].Text     = '-'
+        $Controls['RptSumBiosUnknown'].Text    = '-'
+    } elseif (-not $B.InventoryAvailable) {
+        # Available, but with nothing to measure. Saying "0%" here would blame
+        # the fleet for a client-settings problem.
+        $Controls['RptSumBiosCompliance'].Text = "no result - $($B.Error)"
+        $Controls['RptSumBiosBehind'].Text     = '-'
+        $Controls['RptSumBiosUnknown'].Text    = '-'
+    } else {
+        $Covered = $B.DeviceCount - $B.NoPackageCount
+        $Controls['RptSumBiosCompliance'].Text = if ($null -ne $B.CompliancePercent) {
+            '{0}% - {1} of {2} covered device(s) at or above the packaged version ({3} device(s) inventoried)' -f `
+                $B.CompliancePercent, $B.CompliantCount, $Covered, $B.DeviceCount
+        } else {
+            'no covered devices - {0} device(s) inventoried, none matched a BIOS package' -f $B.DeviceCount
+        }
+        $Controls['RptSumBiosBehind'].Text = '{0} on older firmware than the package ships' -f $B.BehindCount
+        $Controls['RptSumBiosUnknown'].Text = '{0} version(s) could not be ordered, {1} device(s) not covered by any package' -f `
+            $B.UndeterminedCount, $B.NoPackageCount
+    }
+
+    $S = $Snapshot.Staleness
+    if (-not $S) {
+        $Controls['RptSumStaleness'].Text  = 'not collected'
+        $Controls['RptSumCatalogAge'].Text = 'not collected'
+    } elseif (-not $S.Available) {
+        $Controls['RptSumStaleness'].Text  = "unavailable - $($S.Error)"
+        $Controls['RptSumCatalogAge'].Text = '-'
+    } else {
+        $Controls['RptSumStaleness'].Text = '{0} behind the catalog, {1} current, {2} comparable but not in the catalog, {3} not comparable (of {4} package(s))' -f `
+            $S.BehindCount, $S.CurrentCount, $S.NotInCatalogCount, $S.NotComparableCount, $S.PackageCount
+        $Controls['RptSumCatalogAge'].Text = if (-not $S.CatalogAvailable) {
+            'none cached - run a sync to populate it; nothing can be compared until then'
+        } elseif ($null -ne $S.CatalogAgeHours) {
+            '{0} model(s), cached {1} hour(s) ago{2}' -f $S.CatalogModelCount, [math]::Round($S.CatalogAgeHours, 1), $(if ($S.CatalogIsStale) { ' (STALE)' } else { '' })
+        } else {
+            '{0} model(s)' -f $S.CatalogModelCount
+        }
+    }
+}
+
 function Start-DATReportExport {
     <#
     .SYNOPSIS
@@ -185,6 +370,18 @@ function Start-DATReportExport {
         }
     }
 
+    # Same reasoning for the site connection: refuse now, not after the dialog.
+    $Connect = $null
+    if ($IsSnapshot -and $Controls['RptIncludeCMCheck'].IsChecked) {
+        $Connect = Get-DATReportConnectParams
+        if (-not $Connect) {
+            Show-DATWindowMessage -Type Warning -Message (
+                "Fleet BIOS compliance and package staleness need a ConfigMgr connection.`n`n" +
+                'Connect on the Configuration tab first, or clear that checkbox.')
+            return
+        }
+    }
+
     $OutputPath = Show-DATSaveFileDialog -Title "Save $Kind report" -Filter $Spec.Filter `
         -DefaultFileName $Spec.Name -DefaultExtension $Spec.Ext
     if (-not $OutputPath) { return }
@@ -197,6 +394,7 @@ function Start-DATReportExport {
     if ($IsSnapshot) {
         $Params['StaleExclusionDays'] = Get-DATReportDays -Text $Controls['RptStaleDaysInput'].Text -Default 90
         if ($PackagePath) { $Params['PackagePath'] = $PackagePath }
+        if ($Connect)     { $Params['IncludeConfigMgr'] = $true }
     }
 
     $G.ReportOutputPath = $OutputPath
@@ -214,8 +412,12 @@ function Start-DATReportExport {
 
     $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
     $ReportScript = {
-        param($ModulePath, $Params)
+        param($ModulePath, $Params, $Connect)
         Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+        # A runspace gets its own module scope, so the connection the window
+        # holds does not carry over - the ConfigMgr panels would report
+        # "not connected" against a site the operator is plainly connected to.
+        if ($Connect) { Connect-DATConfigMgr @Connect | Out-Null }
         # Export-DATReport is exported, so a plain import is enough here.
         # It returns the output path, or nothing when a job-summary format
         # finds no summaries in the window - the caller distinguishes those.
@@ -223,7 +425,7 @@ function Start-DATReportExport {
     }
 
     $G.ReportRunspace = [System.Management.Automation.PowerShell]::Create()
-    $G.ReportRunspace.AddScript($ReportScript).AddArgument($ModulePath).AddArgument($Params) | Out-Null
+    $G.ReportRunspace.AddScript($ReportScript).AddArgument($ModulePath).AddArgument($Params).AddArgument($Connect) | Out-Null
     $G.ReportHandle = $G.ReportRunspace.BeginInvoke()
 
     if ($G.ReportTimer) { $G.ReportTimer.Stop() }
@@ -296,7 +498,8 @@ function Set-DATReportButtonsEnabled {
     if (-not $gui) { return }
     $Controls = $gui.Controls
     foreach ($Name in @('RptDashboardButton', 'RptJsonButton', 'RptActivityHtmlButton',
-                        'RptActivityCsvButton', 'RptRefreshSummaryButton')) {
+                        'RptActivityCsvButton', 'RptRefreshSummaryButton',
+                        'RptFleetPostureButton')) {
         if ($Controls[$Name]) { $Controls[$Name].IsEnabled = $Enabled }
     }
 }
@@ -352,6 +555,9 @@ function Initialize-DATMainWindow {
         ReportOutputPath         = ''
         ReportOpenAfter          = $false
         ReportKind               = ''
+        FleetRunspace            = $null
+        FleetHandle              = $null
+        FleetTimer               = $null
     }
 
     # Stash the whole GUI context in global scope. Every handler fetches it with
@@ -2115,6 +2321,8 @@ function Initialize-DATMainWindow {
         }
     })
 
+    $Controls['RptFleetPostureButton'].Add_Click({ Start-DATFleetPosture })
+
     $Controls['RptDashboardButton'].Add_Click({ Start-DATReportExport -Kind 'Dashboard' })
     $Controls['RptJsonButton'].Add_Click({ Start-DATReportExport -Kind 'Json' })
     $Controls['RptActivityHtmlButton'].Add_Click({ Start-DATReportExport -Kind 'HTML' })
@@ -2283,6 +2491,7 @@ function Initialize-DATMainWindow {
                 @{ Name='Deploy';           RS=$G.DeployRunspace;           Timer=$G.DeployTimer }
                 @{ Name='IntunePublish';    RS=$G.IntunePublishRunspace;    Timer=$G.IntunePublishTimer }
                 @{ Name='Report';           RS=$G.ReportRunspace;           Timer=$G.ReportTimer }
+                @{ Name='FleetPosture';     RS=$G.FleetRunspace;            Timer=$G.FleetTimer }
             )
 
             foreach ($Item in $TasksToStop) {

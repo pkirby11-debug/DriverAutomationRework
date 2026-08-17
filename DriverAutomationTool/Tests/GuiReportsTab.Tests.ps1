@@ -54,6 +54,33 @@ Describe 'MainWindow.xaml' {
         }
     }
 
+    It 'Declares the fleet-posture controls' {
+        foreach ($Name in @(
+            'RptFleetPostureButton', 'RptSumBiosCompliance', 'RptSumBiosBehind',
+            'RptSumBiosUnknown', 'RptSumStaleness', 'RptSumCatalogAge', 'RptIncludeCMCheck')) {
+            $script:DeclaredNames | Should -Contain $Name
+        }
+    }
+
+    It 'Gives the compliance-dashboard grid a row for every child it places' {
+        # A Grid.Row beyond the last RowDefinition does not throw - WPF clamps
+        # it into the last row, silently stacking two controls on top of each
+        # other. Adding a control without adding a row is the easy mistake.
+        $Xml = [xml]$script:XamlText
+        $Grids = @($Xml.SelectNodes('//*[local-name()="Grid"]'))
+        foreach ($Grid in $Grids) {
+            $Defs = @($Grid.SelectNodes('*[local-name()="Grid.RowDefinitions"]/*[local-name()="RowDefinition"]'))
+            if ($Defs.Count -eq 0) { continue }   # single-row grid, nothing to check
+
+            $MaxRow = -1
+            foreach ($Child in @($Grid.ChildNodes | Where-Object { $_.NodeType -eq 'Element' })) {
+                $Row = $Child.GetAttribute('Grid.Row')
+                if ($Row) { $MaxRow = [math]::Max($MaxRow, [int]$Row) }
+            }
+            $MaxRow | Should -BeLessThan $Defs.Count -Because "a Grid places a child in row $MaxRow but only defines $($Defs.Count) row(s)"
+        }
+    }
+
     It 'Gives every resolvable control a unique name' {
         # 'Bd' is deliberately repeated: it names the border INSIDE a
         # ControlTemplate, where the name is scoped per template instance
@@ -85,7 +112,8 @@ Describe 'Handler wiring' {
 
     It 'Wires a click handler to every Reports button' {
         foreach ($Button in @('RptRefreshSummaryButton', 'RptPackageBrowseButton', 'RptDashboardButton',
-                              'RptJsonButton', 'RptActivityHtmlButton', 'RptActivityCsvButton')) {
+                              'RptJsonButton', 'RptActivityHtmlButton', 'RptActivityCsvButton',
+                              'RptFleetPostureButton')) {
             $script:MainWindowText | Should -Match ([regex]::Escape("`$Controls['$Button'].Add_Click"))
         }
     }
@@ -94,6 +122,171 @@ Describe 'Handler wiring' {
         # A background export that outlives the window leaks a runspace.
         $script:MainWindowText | Should -Match 'ReportRunspace\s+= \$null'
         $script:MainWindowText | Should -Match "Name='Report';\s+RS=\`$G\.ReportRunspace"
+    }
+
+    It 'Tracks the fleet-posture runspace in the GUI state and stops it on close' {
+        $script:MainWindowText | Should -Match 'FleetRunspace\s+= \$null'
+        $script:MainWindowText | Should -Match "Name='FleetPosture';\s+RS=\`$G\.FleetRunspace"
+    }
+
+    It 'Disables the fleet-posture button while any Reports work runs' {
+        # Two concurrent site queries against the same GUI state would race on
+        # $G.FleetHandle and overwrite each other's labels.
+        $Cmd = Get-Command Set-DATReportButtonsEnabled
+        $Cmd.Definition | Should -Match 'RptFleetPostureButton'
+    }
+
+    It 'Reconnects ConfigMgr inside the export runspace' {
+        # A runspace imports the module fresh and therefore starts
+        # disconnected: without this the ConfigMgr panels report "not
+        # connected" against a site the operator is plainly connected to.
+        $Cmd = Get-Command Start-DATReportExport
+        $Cmd.Definition | Should -Match 'Connect-DATConfigMgr @Connect'
+        $Cmd.Definition | Should -Match "IncludeConfigMgr"
+    }
+}
+
+Describe 'Get-DATReportConnectParams' {
+    BeforeEach {
+        Set-DATGui @{ Controls = @{ UseSSLCheckBox = [PSCustomObject]@{ IsChecked = $false } } }
+    }
+
+    AfterAll {
+        $script:CMConnected = $false
+        $global:DATGui = $null
+    }
+
+    It 'Returns nothing when the window is not connected' {
+        $script:CMConnected = $false
+        $script:CMSiteServer = 'cm01.contoso.com'
+        Get-DATReportConnectParams | Should -BeNullOrEmpty
+    }
+
+    It 'Returns nothing when connected but no server is recorded' {
+        # Guards a splat with a mandatory -SiteServer against a blank value,
+        # which would prompt inside a background runspace and hang forever.
+        $script:CMConnected = $true
+        $script:CMSiteServer = ''
+        Get-DATReportConnectParams | Should -BeNullOrEmpty
+    }
+
+    It 'Carries the resolved site code, not what was typed' {
+        $script:CMConnected = $true
+        $script:CMSiteServer = 'cm01.contoso.com'
+        $script:CMSiteCode = 'PS1'
+        $P = Get-DATReportConnectParams
+        $P.SiteServer | Should -Be 'cm01.contoso.com'
+        $P.SiteCode | Should -Be 'PS1'
+        $P.ContainsKey('UseSSL') | Should -BeFalse
+    }
+
+    It 'Carries UseSSL only when the checkbox is set' {
+        $script:CMConnected = $true
+        $script:CMSiteServer = 'cm01.contoso.com'
+        Set-DATGui @{ Controls = @{ UseSSLCheckBox = [PSCustomObject]@{ IsChecked = $true } } }
+        (Get-DATReportConnectParams)['UseSSL'] | Should -BeTrue
+    }
+}
+
+Describe 'Show-DATFleetPosture' {
+    BeforeEach {
+        # WPF TextBlocks are not constructible off-Windows; the function only
+        # ever assigns .Text, so a plain object stands in for one.
+        $script:Fake = @{}
+        foreach ($N in @('RptSumBiosCompliance', 'RptSumBiosBehind', 'RptSumBiosUnknown',
+                         'RptSumStaleness', 'RptSumCatalogAge')) {
+            $script:Fake[$N] = [PSCustomObject]@{ Text = '' }
+        }
+        Set-DATGui @{ Controls = $script:Fake }
+    }
+
+    AfterAll { $global:DATGui = $null }
+
+    It 'Says "not collected" rather than zero when the panels were never run' {
+        Show-DATFleetPosture -Snapshot ([PSCustomObject]@{ BIOSCompliance = $null; Staleness = $null })
+        $script:Fake['RptSumBiosCompliance'].Text | Should -Be 'not collected'
+        $script:Fake['RptSumStaleness'].Text | Should -Be 'not collected'
+    }
+
+    It 'Does not report 0% when BIOS hardware inventory is switched off' {
+        # The whole point of the InventoryAvailable flag: "0% compliant" here
+        # would blame the fleet for a client-settings problem.
+        Show-DATFleetPosture -Snapshot ([PSCustomObject]@{
+            BIOSCompliance = [PSCustomObject]@{
+                Available = $true; InventoryAvailable = $false; DeviceCount = 4200
+                Error = 'BIOS hardware inventory returned no rows'
+            }
+            Staleness = $null
+        })
+        $script:Fake['RptSumBiosCompliance'].Text | Should -Match 'no result'
+        $script:Fake['RptSumBiosCompliance'].Text | Should -Not -Match '0%'
+        $script:Fake['RptSumBiosCompliance'].Text | Should -Not -Match '\b0 of\b'
+    }
+
+    It 'Surfaces a panel failure as the failure it is' {
+        Show-DATFleetPosture -Snapshot ([PSCustomObject]@{
+            BIOSCompliance = [PSCustomObject]@{ Available = $false; Error = 'Not connected to ConfigMgr' }
+            Staleness      = [PSCustomObject]@{ Available = $false; Error = 'boom' }
+        })
+        $script:Fake['RptSumBiosCompliance'].Text | Should -Match 'unavailable - Not connected'
+        $script:Fake['RptSumStaleness'].Text | Should -Match 'unavailable - boom'
+    }
+
+    It 'Reports compliance over covered devices and keeps the buckets separate' {
+        Show-DATFleetPosture -Snapshot ([PSCustomObject]@{
+            BIOSCompliance = [PSCustomObject]@{
+                Available = $true; InventoryAvailable = $true; Error = ''
+                DeviceCount = 100; NoPackageCount = 20; CompliantCount = 60
+                BehindCount = 15; UndeterminedCount = 5; CompliancePercent = 75.0
+            }
+            Staleness = $null
+        })
+        # 60/80 covered = 75%, NOT 60/100.
+        $script:Fake['RptSumBiosCompliance'].Text | Should -Match '75% - 60 of 80'
+        $script:Fake['RptSumBiosBehind'].Text | Should -Match '^15 '
+        $script:Fake['RptSumBiosUnknown'].Text | Should -Match '5 version'
+        $script:Fake['RptSumBiosUnknown'].Text | Should -Match '20 device'
+    }
+
+    It 'Says so when no device is covered instead of showing a blank percentage' {
+        Show-DATFleetPosture -Snapshot ([PSCustomObject]@{
+            BIOSCompliance = [PSCustomObject]@{
+                Available = $true; InventoryAvailable = $true; Error = ''
+                DeviceCount = 30; NoPackageCount = 30; CompliantCount = 0
+                BehindCount = 0; UndeterminedCount = 0; CompliancePercent = $null
+            }
+            Staleness = $null
+        })
+        $script:Fake['RptSumBiosCompliance'].Text | Should -Match 'no covered devices'
+    }
+
+    It 'Distinguishes an empty catalog cache from a fresh one' {
+        Show-DATFleetPosture -Snapshot ([PSCustomObject]@{
+            BIOSCompliance = $null
+            Staleness = [PSCustomObject]@{
+                Available = $true; Error = ''; CatalogAvailable = $false
+                CatalogAgeHours = $null; CatalogIsStale = $false; CatalogModelCount = 0
+                PackageCount = 12; BehindCount = 0; CurrentCount = 0
+                NotInCatalogCount = 0; NotComparableCount = 12
+            }
+        })
+        $script:Fake['RptSumCatalogAge'].Text | Should -Match 'none cached'
+        $script:Fake['RptSumStaleness'].Text | Should -Match '12 not comparable'
+    }
+
+    It 'Flags a stale catalog cache' {
+        Show-DATFleetPosture -Snapshot ([PSCustomObject]@{
+            BIOSCompliance = $null
+            Staleness = [PSCustomObject]@{
+                Available = $true; Error = ''; CatalogAvailable = $true
+                CatalogAgeHours = 400.0; CatalogIsStale = $true; CatalogModelCount = 350
+                PackageCount = 40; BehindCount = 3; CurrentCount = 20
+                NotInCatalogCount = 5; NotComparableCount = 12
+            }
+        })
+        $script:Fake['RptSumCatalogAge'].Text | Should -Match 'STALE'
+        $script:Fake['RptSumCatalogAge'].Text | Should -Match '350 model'
+        $script:Fake['RptSumStaleness'].Text | Should -Match '3 behind the catalog'
     }
 }
 

@@ -11,6 +11,7 @@ $PrivatePaths = @(
     'Private\Core\MaintenanceStore.ps1'
     'Private\Core\VulnerableDriverScreen.ps1'
     'Private\Core\ScreeningHistoryStore.ps1'
+    'Private\Core\BIOSVersion.ps1'
     'Private\Core\ComplianceSnapshot.ps1'
     'Private\Core\DashboardRenderer.ps1'
     'Private\OEM\DellAdapter.ps1'

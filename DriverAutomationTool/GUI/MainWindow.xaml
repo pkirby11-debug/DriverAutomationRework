@@ -845,6 +845,46 @@
                             </StackPanel>
                         </GroupBox>
 
+                        <!-- Fleet posture needs a live site connection and issues CIM
+                             queries against it, so unlike the box above it is opt-in
+                             and runs in a background runspace. Every number here is
+                             three-way: compliant / behind / undetermined. An
+                             undecidable version comparison is reported as its own
+                             bucket rather than folded into "behind" - a false alarm
+                             is worse than an admitted gap. -->
+                        <GroupBox Header="Fleet posture (ConfigMgr)">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                    <Button x:Name="RptFleetPostureButton" Content="Query fleet" Style="{StaticResource StandardButton}" Width="140" Margin="0,0,12,0" />
+                                    <TextBlock Text="Queries the connected site for BIOS inventory and compares packaged versions against the cached vendor catalog. Read-only."
+                                               VerticalAlignment="Center" Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" />
+                                </StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="200" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+                                    <Label Grid.Row="0" Grid.Column="0" Content="BIOS compliance:" />
+                                    <TextBlock x:Name="RptSumBiosCompliance" Grid.Row="0" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="1" Grid.Column="0" Content="Devices behind:" />
+                                    <TextBlock x:Name="RptSumBiosBehind" Grid.Row="1" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="2" Grid.Column="0" Content="Not determinable:" />
+                                    <TextBlock x:Name="RptSumBiosUnknown" Grid.Row="2" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="3" Grid.Column="0" Content="Packages vs catalog:" />
+                                    <TextBlock x:Name="RptSumStaleness" Grid.Row="3" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="4" Grid.Column="0" Content="Cached catalog:" />
+                                    <TextBlock x:Name="RptSumCatalogAge" Grid.Row="4" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                </Grid>
+                            </StackPanel>
+                        </GroupBox>
+
                         <GroupBox Header="Compliance dashboard">
                             <Grid>
                                 <Grid.ColumnDefinitions>
@@ -853,6 +893,7 @@
                                     <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
                                 <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
                                     <RowDefinition Height="Auto" />
                                     <RowDefinition Height="Auto" />
                                     <RowDefinition Height="Auto" />
@@ -867,7 +908,11 @@
                                 <TextBox x:Name="RptPackagePathInput" Grid.Row="1" Grid.Column="1" Margin="0,3" IsEnabled="False" />
                                 <Button x:Name="RptPackageBrowseButton" Grid.Row="1" Grid.Column="2" Content="..." Width="36" Margin="6,3,0,3" Style="{StaticResource StandardButton}" IsEnabled="False" />
 
-                                <StackPanel Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,3,0,0">
+                                <CheckBox x:Name="RptIncludeCMCheck" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3"
+                                          Content="Include fleet BIOS compliance and package staleness (needs a site connection)"
+                                          Margin="0,6,0,3" />
+
+                                <StackPanel Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,3,0,0">
                                     <Label Content="Window (days):" />
                                     <TextBox x:Name="RptDaysInput" Width="70" Text="30" Margin="0,0,16,0" />
                                     <Label Content="Flag exclusions unseen for (days):" />
@@ -875,7 +920,7 @@
                                     <CheckBox x:Name="RptOpenAfterCheck" Content="Open when finished" IsChecked="True" VerticalAlignment="Center" />
                                 </StackPanel>
 
-                                <StackPanel Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,10,0,0">
+                                <StackPanel Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,10,0,0">
                                     <Button x:Name="RptDashboardButton" Content="Generate dashboard" Style="{StaticResource AccentButton}" Width="170" Height="32" Margin="0,0,12,0" />
                                     <Button x:Name="RptJsonButton" Content="Export JSON (Power BI)" Style="{StaticResource StandardButton}" Width="180" Height="32" />
                                 </StackPanel>

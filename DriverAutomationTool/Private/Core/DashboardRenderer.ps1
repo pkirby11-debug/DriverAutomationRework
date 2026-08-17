@@ -931,6 +931,141 @@ function New-DATDashboardHtml {
 
     [void]$Sb.Append('</section>')
 
+    # --- BIOS fleet compliance ------------------------------------------------
+    # Heading and note are emitted BEFORE the availability checks so an
+    # unavailable panel still explains itself. $null (never collected) and
+    # failed mean different things to an operator and must read differently.
+    $Bios = $Snapshot.BIOSCompliance
+    [void]$Sb.Append('<section><h2>BIOS fleet compliance</h2>')
+    [void]$Sb.Append('<p class="section-note">How many devices are actually running the BIOS version this tool packages for them - not whether the package matches the vendor catalog, which is the separate question below. Devices whose firmware string cannot be ordered against the target (Dell letter revisions such as <code>A09</code>, single-integer versions) are counted as <strong>undetermined</strong>, never as non-compliant: an undecidable comparison is a data problem, and counting it as a failure would manufacture false alarms.</p>')
+
+    if (-not $Bios) {
+        [void]$Sb.Append('<div class="unavailable">Not collected. Pass -IncludeConfigMgr (or tick the ConfigMgr box in the GUI) to include it - it needs a live ConfigMgr connection.</div>')
+    } elseif (-not $Bios.Available) {
+        [void]$Sb.Append('<div class="unavailable">BIOS fleet compliance unavailable: ' + (ConvertTo-DATHtmlText -Value $Bios.Error) + '</div>')
+    } elseif (-not $Bios.InventoryAvailable) {
+        [void]$Sb.Append('<div class="unavailable">' + (ConvertTo-DATHtmlText -Value $Bios.Error) + '</div>')
+    } else {
+        [void]$Sb.Append('<div class="tiles">')
+        $PctText = if ($null -ne $Bios.CompliancePercent) { "$($Bios.CompliancePercent)%" } else { 'n/a' }
+        $PctStatus = if ($null -eq $Bios.CompliancePercent) { '' }
+                     elseif ($Bios.CompliancePercent -ge 90) { 'good' }
+                     elseif ($Bios.CompliancePercent -ge 60) { 'warning' }
+                     else { 'critical' }
+        [void]$Sb.Append((New-DATStatTile -Label 'Devices on the packaged BIOS' -Value $PctText `
+            -Note ("{0} of {1} covered device(s)" -f (Format-DATCount -Value $Bios.CompliantCount), (Format-DATCount -Value ($Bios.DeviceCount - $Bios.NoPackageCount))) `
+            -Status $PctStatus))
+        [void]$Sb.Append((New-DATStatTile -Label 'Devices behind' -Value (Format-DATCount -Value $Bios.BehindCount) `
+            -Note 'Firmware older than the packaged version' -Status $(if ($Bios.BehindCount -gt 0) { 'warning' } else { '' })))
+        [void]$Sb.Append((New-DATStatTile -Label 'Undetermined' -Value (Format-DATCount -Value $Bios.UndeterminedCount) `
+            -Note 'Version strings could not be ordered - not a failure'))
+        [void]$Sb.Append((New-DATStatTile -Label 'No BIOS package' -Value (Format-DATCount -Value $Bios.NoPackageCount) `
+            -Note 'Devices no package covers - a coverage gap, not a firmware one'))
+        [void]$Sb.Append('</div>')
+
+        if (@($Bios.ByModel).Count -gt 0) {
+            $ModelTable = New-DATHtmlTable -Rows $Bios.ByModel -Columns @(
+                @{ Header = 'Model'; Property = 'Name' }
+                @{ Header = 'Target'; Property = 'Target' }
+                @{ Header = 'Devices'; Property = 'Count'; Format = 'Count'; Class = 'num' }
+                @{ Header = 'Compliant'; Property = 'Compliant'; Format = 'Count'; Class = 'num' }
+                @{ Header = 'Behind'; Property = 'Behind'; Format = 'Count'; Class = 'num' }
+                @{ Header = 'Undetermined'; Property = 'Undetermined'; Format = 'Count'; Class = 'num' }
+                @{ Header = 'No package'; Property = 'NoPackage'; Format = 'Count'; Class = 'num' }
+            ) -MaxRows 200
+            $BehindChart = @($Bios.ByModel | Where-Object { $_.Behind -gt 0 } |
+                Select-Object -First 12 | ForEach-Object {
+                    [PSCustomObject]@{ Name = $_.Name; Count = $_.Behind }
+                })
+            $Body = if (@($BehindChart).Count -gt 0) {
+                New-DATSvgBarChart -Items $BehindChart -ValueProperty 'Count'
+            } else {
+                '<p class="empty">No device is behind its packaged BIOS.</p>'
+            }
+            [void]$Sb.Append('<div class="cards">')
+            [void]$Sb.Append((New-DATDashboardCard -Title 'Devices behind, by model' `
+                -Subtitle 'Models with the largest firmware gap first' `
+                -Body $Body -TableHtml $ModelTable -TableSummary 'Per-model breakdown'))
+            [void]$Sb.Append('</div>')
+        }
+
+        # Provenance: these numbers are only as good as the inventory behind
+        # them, and RBA scoping means a different operator can see a different
+        # denominator for the same query.
+        [void]$Sb.Append('<p class="note">')
+        [void]$Sb.Append(('Matched {0} device(s) by SystemSKU and {1} by model name. {2} obsolete or clientless resource(s) were excluded. ' -f `
+            (Format-DATCount -Value $Bios.MatchedBySku), (Format-DATCount -Value $Bios.MatchedByModel), (Format-DATCount -Value $Bios.ExcludedObsolete)))
+        [void]$Sb.Append('Counts come through the SMS Provider and honour role-based administration scoping, so another operator may see a different total.')
+        [void]$Sb.Append('</p>')
+    }
+    [void]$Sb.Append('</section>')
+
+    # --- Package staleness ----------------------------------------------------
+    $Stale = $Snapshot.Staleness
+    [void]$Sb.Append('<section><h2>Package staleness</h2>')
+    [void]$Sb.Append('<p class="section-note">Whether the version this tool ships still matches the cached vendor catalog. Most of the value here is the triage: a package&#39;s <code>Version</code> field means different things by type and OEM, and several kinds cannot be compared to a catalog at all. Those are listed with the reason rather than guessed at - reporting a Lenovo driver pack as &#34;up to date&#34; when its version field physically cannot move would be worse than reporting nothing.</p>')
+
+    if (-not $Stale) {
+        [void]$Sb.Append('<div class="unavailable">Not collected. Pass -IncludeConfigMgr (or tick the ConfigMgr box in the GUI) to include it.</div>')
+    } elseif (-not $Stale.Available) {
+        [void]$Sb.Append('<div class="unavailable">Package staleness unavailable: ' + (ConvertTo-DATHtmlText -Value $Stale.Error) + '</div>')
+    } else {
+        [void]$Sb.Append('<div class="tiles">')
+        [void]$Sb.Append((New-DATStatTile -Label 'Packages behind the catalog' -Value (Format-DATCount -Value $Stale.BehindCount) `
+            -Note 'Shipped version differs from the cached catalog' -Status $(if ($Stale.BehindCount -gt 0) { 'warning' } else { 'good' })))
+        [void]$Sb.Append((New-DATStatTile -Label 'Confirmed current' -Value (Format-DATCount -Value $Stale.CurrentCount) `
+            -Note 'Shipped version matches the cached catalog'))
+        [void]$Sb.Append((New-DATStatTile -Label 'Not comparable' -Value (Format-DATCount -Value $Stale.NotComparableCount) `
+            -Note 'Version field is not a catalog version - see reasons below'))
+        # The amber border says "something is off" without saying what, so the
+        # note has to name it: a week-old catalog makes every "confirmed
+        # current" above it a week-old claim, and that has to be legible.
+        # Hours past two days is arithmetic the reader should not have to do.
+        $CatAge = if ($null -eq $Stale.CatalogAgeHours) { '' }
+                  elseif ($Stale.CatalogAgeHours -ge 48) {
+                      ', cached {0} day(s) ago' -f [math]::Round($Stale.CatalogAgeHours / 24, 1)
+                  } else {
+                      ', cached {0}h ago' -f [math]::Round($Stale.CatalogAgeHours, 1)
+                  }
+        $CatNote = if (-not $Stale.CatalogAvailable) { 'No Dell catalog cached - nothing to compare against' }
+                   else {
+                       '{0} model(s){1}{2}' -f (Format-DATCount -Value $Stale.CatalogModelCount), $CatAge,
+                           $(if ($Stale.CatalogIsStale) { " - STALE, older than $($Stale.CatalogStaleAfterHours)h, so every verdict above is that old" } else { '' })
+                   }
+        $CatStatus = if (-not $Stale.CatalogAvailable) { 'critical' } elseif ($Stale.CatalogIsStale) { 'warning' } else { 'good' }
+        [void]$Sb.Append((New-DATStatTile -Label 'Cached Dell catalog' `
+            -Value $(if ($Stale.CatalogAvailable) { 'Available' } else { 'None' }) -Note $CatNote -Status $CatStatus))
+        [void]$Sb.Append('</div>')
+
+        [void]$Sb.Append('<div class="cards">')
+        if (@($Stale.Behind).Count -gt 0) {
+            $BehindTable = New-DATHtmlTable -Rows $Stale.Behind -Columns @(
+                @{ Header = 'Package'; Property = 'Name'; Class = 'wrap' }
+                @{ Header = 'Shipping'; Property = 'Packaged' }
+                @{ Header = 'Catalog'; Property = 'Catalog' }
+                @{ Header = 'Last built'; Property = 'LastModified' }
+            ) -MaxRows 200
+            [void]$Sb.Append((New-DATDashboardCard -Title 'Packages behind the catalog' `
+                -Subtitle 'Re-sync these models to pick up the newer pack' `
+                -Body '<p class="note">Every row is a model whose shipped version differs from the cached catalog.</p>' `
+                -TableHtml $BehindTable -TableSummary 'Behind the catalog'))
+        }
+        if (@($Stale.ByReason).Count -gt 0) {
+            $ReasonTable = New-DATHtmlTable -Rows $Stale.ByReason -Columns @(
+                @{ Header = 'Why it cannot be compared'; Property = 'Name'; Class = 'wrap' }
+                @{ Header = 'Packages'; Property = 'Count'; Format = 'Count'; Class = 'num' }
+            )
+            [void]$Sb.Append((New-DATDashboardCard -Title 'Not comparable, by reason' `
+                -Subtitle 'These are limitations of the version field, not findings' `
+                -Body (New-DATSvgBarChart -Items $Stale.ByReason -ValueProperty 'Count' -MaxRows 8) `
+                -TableHtml $ReasonTable))
+        }
+        [void]$Sb.Append('</div>')
+
+        [void]$Sb.Append('<p class="note">Offline by design: only the cached Dell driver-pack catalog is read. Lenovo BIOS lookups are never cached - every one is a live download - so Lenovo BIOS staleness cannot be answered without breaking the no-network guarantee, and is reported as not comparable rather than guessed.</p>')
+    }
+    [void]$Sb.Append('</section>')
+
     # --- Storage --------------------------------------------------------------
     [void]$Sb.Append('<section><h2>Storage</h2>')
     [void]$Sb.Append('<p class="section-note">Package share consumption is measured by walking the share once and bucketing every file by its position in the <code>Make\Model\Type\OS-Arch</code> layout. Local footprint is what the tool accumulates on this host between runs - <code>Invoke-DATMaintenance</code> is what reclaims it.</p>')
@@ -1028,7 +1163,17 @@ function New-DATDashboardHtml {
     # --- Recent activity ------------------------------------------------------
     if ($Act -and $Act.Available -and $Act.TotalOperations -gt 0) {
         [void]$Sb.Append('<section><h2>Recent sync activity</h2>')
-        [void]$Sb.Append(('<p class="section-note">From the job-summary CSVs for the last {0} days. "Last successful sync" is the closest the tool can currently get to content age; a catalog-versus-package comparison would be a truer measure.</p>' -f (ConvertTo-DATHtmlText -Value $Act.WindowDays)))
+        # "Last successful sync" is a fetch date, not a currency check. Point at
+        # the section that actually answers currency - but only claim it answers
+        # anything when it was collected, otherwise this is a promise the
+        # document does not keep.
+        $AgeNote = if ($Snapshot.Staleness -and $Snapshot.Staleness.Available) {
+            'the catalog-versus-package comparison above answers that for the packages where the two version strings can honestly be compared'
+        } else {
+            'the Package staleness section answers that, and needs -IncludeConfigMgr to be collected'
+        }
+        [void]$Sb.Append(('<p class="section-note">From the job-summary CSVs for the last {0} days. "Last successful sync" answers when content was last fetched, not whether it is current - {1}.</p>' -f `
+            (ConvertTo-DATHtmlText -Value $Act.WindowDays), $AgeNote))
         [void]$Sb.Append('<div class="cards">')
 
         $StatusTable = New-DATHtmlTable -Rows $Act.ByStatus -Columns @(

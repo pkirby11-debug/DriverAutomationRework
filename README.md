@@ -178,10 +178,15 @@ wrapper.
 - **Current posture** — one click fills in active driver exclusions, how many are due for
   review, the cached blocklist version and age, payloads flagged by screening, and the
   local footprint. Reads local state only: no network, nothing written to disk.
+- **Fleet posture (ConfigMgr)** — how many devices are actually running the BIOS version
+  DAT packages for them, and whether what DAT ships still matches the cached vendor
+  catalog. Needs a site connection (Connect on SCCM Settings first) and is the only part
+  of the tab that talks to a server; read-only, and it runs in the background because the
+  inventory query returns a row per client.
 - **Compliance dashboard** — generates the self-contained HTML dashboard or the Power BI
   JSON, with a save dialog and an *Open when finished* option. Package-share storage is
   opt-in via a checkbox (it walks every file on the share); the path defaults to the one
-  configured on the SCCM Settings tab.
+  configured on the SCCM Settings tab. A second checkbox adds the two fleet panels above.
 - **Sync activity report** — the original job-summary HTML/CSV export.
 
 Exports run in a background runspace, so a share scan cannot freeze the window, and the
@@ -465,6 +470,10 @@ what the estate *is*, so they work on a host that has never run a sync.
 Export-DATReport -OutputPath 'C:\Reports\Compliance.html' -Format Dashboard `
     -PackagePath '\\nas01\DriverPackages'
 
+# Everything, including the two site-backed panels
+Export-DATReport -OutputPath 'C:\Reports\Compliance.html' -Format Dashboard `
+    -PackagePath '\\nas01\DriverPackages' -IncludeConfigMgr
+
 # Snapshot only - no share walk, no network, nothing mutated
 Get-DATComplianceSnapshot | Select-Object -ExpandProperty Exclusions
 ```
@@ -476,6 +485,34 @@ screening coverage and how fresh the cached Microsoft blocklist is. Then storage
 consumption: package-share bytes by OEM, content type, production-vs-test
 channel and OS target, the largest individual package sources, and what the tool
 has accumulated on the admin host itself.
+
+**Fleet posture (`-IncludeConfigMgr`).** Two further panels turn "my package is
+correct" into "the fleet is actually running it". They are opt-in because,
+unlike everything above, they need a live site connection and issue CIM queries
+against it — the keys are present in the JSON either way (null when not
+collected) so a Power BI query built against `SchemaVersion 1` keeps working.
+
+- **BIOS compliance** — joins `SMS_G_System_PC_BIOS`, `SMS_G_System_COMPUTER_SYSTEM`
+  and `SMS_G_System_MS_SystemInformation` against the BIOS versions this tool
+  packages, matching on SystemSKU first (the key the OSD apply path uses) and
+  model name second. Devices are counted **compliant**, **behind**, or
+  **undetermined** — never two of those at once. A firmware string that cannot
+  be ordered against the target (Dell letter revisions such as `A09`,
+  single-integer versions) is undetermined, *not* non-compliant; and the
+  percentage is over devices a package actually covers, so a coverage gap is
+  never reported as a firmware problem. Zero BIOS inventory rows is reported as
+  "the class is not being inventoried", not as 0% compliant.
+- **Package staleness** — compares the version each package ships against the
+  cached Dell driver-pack catalog. Most of the value is the triage: a package's
+  `Version` field means different things by type and OEM, and several kinds
+  (content fingerprints, Windows release tags) cannot be compared to a catalog
+  at all. Those are listed with the reason rather than guessed at. Strictly
+  offline — Lenovo BIOS lookups are never cached, so Lenovo BIOS staleness is
+  reported as not comparable rather than answered by a live download.
+
+The same two panels are on the GUI Reports tab under **Fleet posture
+(ConfigMgr)**, which runs the query in the background against the site the
+window is already connected to.
 
 **Self-contained by design.** No CDN, no external stylesheet, no chart library —
 charts are hand-built inline SVG. The file renders completely on a locked-down or

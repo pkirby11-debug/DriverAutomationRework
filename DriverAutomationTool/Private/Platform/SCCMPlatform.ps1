@@ -1121,6 +1121,170 @@ function Get-DATKnownModels {
     return $Result
 }
 
+function Get-DATFleetBIOSInventory {
+    <#
+    .SYNOPSIS
+        Returns per-device BIOS firmware versions from ConfigMgr hardware
+        inventory, for fleet compliance reporting.
+    .DESCRIPTION
+        FOUR SINGLE-CLASS QUERIES, JOINED IN POWERSHELL - deliberately not a
+        WQL JOIN. A join that SELECTs across two SMS_G_System_* classes returns
+        __Generic instances whose properties are embedded class objects, which
+        silently breaks this file's Select-Object idiom and yields zero rows;
+        extended-WQL joins are also an SMS Provider feature whose behaviour over
+        the WSMan transport Get-CimInstance uses here is not something to bet a
+        compliance number on. Four plain queries cost a few extra round trips
+        and cannot fail that way.
+
+        Splitting them also buys the distinction that matters most: if
+        SMS_G_System_PC_BIOS returns NO rows at all, BIOS hardware inventory is
+        disabled or has never run - which is emphatically not the same as "no
+        devices are compliant", and a report that renders those identically is
+        a false alarm waiting to happen. InventoryAvailable carries that apart.
+
+        Obsolete and clientless resources are excluded via SMS_R_System.
+        SMS_G_System_* rows persist after decommission until the aging tasks
+        remove them, so counting them would inflate the denominator with
+        machines that no longer exist.
+    .PARAMETER Manufacturers
+        Filter to these manufacturers. Matching is done in PowerShell against
+        the inventory's own strings ('Dell Inc.', 'LENOVO', 'Microsoft
+        Corporation'), so callers pass friendly names.
+    .OUTPUTS
+        PSCustomObject: Available, Error, InventoryAvailable, DeviceCount,
+        Devices (ResourceID, Manufacturer, Model, SystemSKU, BiosVersion,
+        ReleaseDate), ExcludedObsolete, MissingBiosRow.
+    #>
+    [CmdletBinding()]
+    param(
+        [string[]]$Manufacturers = @('Dell', 'Lenovo', 'Microsoft')
+    )
+
+    $Result = [ordered]@{
+        Available          = $false
+        Error              = ''
+        InventoryAvailable = $false
+        DeviceCount        = 0
+        Devices            = @()
+        ExcludedObsolete   = 0
+        MissingBiosRow     = 0
+    }
+
+    try {
+        Assert-DATConfigMgrConnected
+    } catch {
+        $Result.Error = "ConfigMgr not connected: $($_.Exception.Message)"
+        return [PSCustomObject]$Result
+    }
+
+    $WmiNamespace = "root\SMS\site_$($script:CMSiteCode)"
+
+    # -ErrorAction Stop throughout: with SilentlyContinue a provider failure
+    # returns the same empty array as an empty site and the catch never fires,
+    # so a broken query would be reported as a fleet of zero machines.
+    $Query = {
+        param($Wql)
+        @(Get-CimInstance -ComputerName $script:CMSiteServer -Namespace $WmiNamespace -Query $Wql -ErrorAction Stop)
+    }
+
+    try {
+        # 1. Live, client-managed resources only.
+        $LiveIds = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($R in (& $Query "Select ResourceID from SMS_R_System Where Obsolete = 0 And Client = 1")) {
+            [void]$LiveIds.Add([string]$R.ResourceID)
+        }
+
+        # 2. Manufacturer/model per resource. NOT 'Select Distinct' - that
+        #    collapses N machines into unique pairs and turns a device count
+        #    into a count of distinct configurations.
+        $Systems = & $Query "Select ResourceID, Manufacturer, Model from SMS_G_System_COMPUTER_SYSTEM"
+
+        # 3. Firmware per resource. SMBIOSBIOSVersion, NOT SMSBIOSVersion (no
+        #    such property) and NOT .Version, which holds a registry string
+        #    like 'DELL   - 1072009' that matches no vendor catalog version and
+        #    would flag every device on the site as out of date.
+        $Bios = & $Query "Select ResourceID, SMBIOSBIOSVersion, ReleaseDate from SMS_G_System_PC_BIOS"
+
+        # 4. SystemSKU per resource. This is the join key back to packages:
+        #    DAT writes '(Models included:<SystemSKU>)' into every package
+        #    description and the OSD apply path matches devices on it, so it is
+        #    the tool's own established identity. Model name is NOT usable -
+        #    Lenovo's COMPUTER_SYSTEM.Model is the machine-type code
+        #    ('21F6CTO1WW'), not the friendly name the package carries, so a
+        #    name match silently drops every Lenovo device.
+        $SkuById = @{}
+        try {
+            foreach ($I in (& $Query "Select ResourceID, SystemSKU from SMS_G_System_MS_SystemInformation")) {
+                $Id = [string]$I.ResourceID
+                if (-not $SkuById.ContainsKey($Id)) { $SkuById[$Id] = [string]$I.SystemSKU }
+            }
+        } catch {
+            # SKU is an enrichment, not a prerequisite - a site that does not
+            # inventory MS_SystemInformation still gets device counts, and the
+            # panel falls back to model-name matching and says so.
+            Write-DATLog -Message "Fleet BIOS inventory: SystemSKU unavailable ($($_.Exception.Message)) - falling back to model-name matching" -Severity 2
+        }
+
+        # Zero BIOS rows means the class was never inventoried - a different
+        # fact from "no devices matched", and the caller must be able to say so.
+        $Result.InventoryAvailable = ($Bios.Count -gt 0)
+
+        $BiosById = @{}
+        foreach ($B in $Bios) {
+            $Id = [string]$B.ResourceID
+            if (-not $BiosById.ContainsKey($Id)) { $BiosById[$Id] = $B }
+        }
+
+        $Devices = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $Obsolete = 0
+        $NoBios = 0
+
+        foreach ($S in $Systems) {
+            $Id = [string]$S.ResourceID
+            if ($LiveIds.Count -gt 0 -and -not $LiveIds.Contains($Id)) { $Obsolete++; continue }
+
+            $Make = [string]$S.Manufacturer
+            if ($Manufacturers.Count -gt 0) {
+                # Inventory strings are vendor-native: 'Dell Inc.', 'LENOVO',
+                # 'Microsoft Corporation'. Match on a prefix of the friendly
+                # name rather than equality, which would drop every row.
+                $Matched = $false
+                foreach ($Wanted in $Manufacturers) {
+                    if ($Make -and $Make -like "$Wanted*") { $Matched = $true; break }
+                }
+                if (-not $Matched) { continue }
+            }
+
+            $B = $BiosById[$Id]
+            if (-not $B) { $NoBios++ }
+
+            $Devices.Add([PSCustomObject]@{
+                ResourceID   = $Id
+                Manufacturer = $Make
+                Model        = [string]$S.Model
+                SystemSKU    = [string]$SkuById[$Id]
+                BiosVersion  = if ($B) { [string]$B.SMBIOSBIOSVersion } else { '' }
+                ReleaseDate  = if ($B) { $B.ReleaseDate } else { $null }
+            })
+        }
+
+        $Result.Devices          = @($Devices)
+        $Result.DeviceCount      = $Devices.Count
+        $Result.ExcludedObsolete = $Obsolete
+        $Result.MissingBiosRow   = $NoBios
+        $Result.Available        = $true
+
+        Write-DATLog -Message ("Fleet BIOS inventory: {0} device(s), {1} excluded as obsolete/clientless, {2} with no BIOS inventory row" -f `
+            $Devices.Count, $Obsolete, $NoBios) -Severity 1
+    } catch {
+        $Result.Available = $false
+        $Result.Error     = $_.Exception.Message
+        Write-DATLog -Message "Fleet BIOS inventory query failed: $($_.Exception.Message)" -Severity 2
+    }
+
+    return [PSCustomObject]$Result
+}
+
 function Invoke-DATReleaseStaleLock {
     <#
     .SYNOPSIS
@@ -2431,33 +2595,16 @@ function Get-DATDetectionScript {
 `$Target = '$EscapedVersion'
 `$Current = `$null
 try { `$Current = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SMBIOSBIOSVersion } catch {
-        # Handled exception
-        Write-Verbose "Ignored non-fatal exception: $($_.Exception.Message)"
+        # Handled exception. NOTE the escaping: this here-string is EXPANDABLE,
+        # so an unescaped `$(`$_.Exception.Message) would interpolate HERE, in
+        # the module's scope at generation time, not on the client - baking
+        # whatever `$_ happened to hold (usually nothing) into every generated
+        # script and leaving the client with no reason logged.
+        Write-Verbose "Ignored non-fatal exception: `$(`$_.Exception.Message)"
     }
 if (-not `$Current) { return }
 
-function Compare-DATBIOSVersion {
-    param([string]`$Current, [string]`$Target)
-    if (`$Current -eq `$Target) { return 'equal' }
-    `$cv = `$null; `$tv = `$null
-    if ([System.Version]::TryParse(`$Current, [ref]`$cv) -and [System.Version]::TryParse(`$Target, [ref]`$tv)) {
-        `$cmp = `$cv.CompareTo(`$tv)
-        if (`$cmp -lt 0) { return 'lower' }
-        if (`$cmp -gt 0) { return 'higher' }
-        return 'equal'
-    }
-    `$cn = [regex]::Match(`$Current, '\d+(?:\.\d+)+').Value
-    `$tn = [regex]::Match(`$Target,  '\d+(?:\.\d+)+').Value
-    if (`$cn -and `$tn -and
-        [System.Version]::TryParse(`$cn, [ref]`$cv) -and
-        [System.Version]::TryParse(`$tn, [ref]`$tv)) {
-        `$cmp = `$cv.CompareTo(`$tv)
-        if (`$cmp -lt 0) { return 'lower' }
-        if (`$cmp -gt 0) { return 'higher' }
-        return 'equal'
-    }
-    return 'unknown'
-}
+$(Get-DATBiosComparerSource)
 
 # Primary: device firmware at or above the target = installed
 `$State = Compare-DATBIOSVersion -Current `$Current -Target `$Target

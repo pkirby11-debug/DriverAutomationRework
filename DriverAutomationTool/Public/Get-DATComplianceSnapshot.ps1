@@ -46,6 +46,14 @@ function Get-DATComplianceSnapshot {
         Default 30.
     .PARAMETER SummaryDirectory
         Directory holding JobSummary_*.csv. Defaults to the module log path.
+    .PARAMETER IncludeConfigMgr
+        Adds the two ConfigMgr-backed panels: BIOSCompliance (how many devices
+        are actually running the BIOS version DAT packages for them) and
+        Staleness (whether what DAT ships still matches the cached vendor
+        catalog). Opt-in because, unlike every other panel, they need a live
+        site connection and issue CIM queries against it. Both keys are present
+        in the returned object either way - null when not collected - so the
+        JSON schema does not change between runs.
     .EXAMPLE
         Get-DATComplianceSnapshot
 
@@ -73,7 +81,9 @@ function Get-DATComplianceSnapshot {
 
         [int]$BlocklistStaleDays = 30,
 
-        [string]$SummaryDirectory
+        [string]$SummaryDirectory,
+
+        [switch]$IncludeConfigMgr
     )
 
     Write-DATLog -Message "======== Compliance snapshot ========" -Severity 1
@@ -97,6 +107,22 @@ function Get-DATComplianceSnapshot {
 
     $Activity = Get-DATActivityPanel -Days $Days -SummaryDirectory $SummaryDirectory
     if (-not $Activity.Available -and $Activity.Error) { $Warnings.Add("Activity: $($Activity.Error)") }
+
+    # ConfigMgr-backed panels are opt-in: they need a live site connection and
+    # issue CIM queries, unlike everything above which reads local files only.
+    # The keys stay in the object either way - a key that appears on some runs
+    # and not others changes the JSON schema between refreshes and breaks a
+    # Power BI query built against SchemaVersion 1.
+    $BIOSCompliance = $null
+    $Staleness      = $null
+    if ($IncludeConfigMgr) {
+        $BIOSCompliance = Get-DATBIOSCompliancePanel
+        if (-not $BIOSCompliance.Available) { $Warnings.Add("BIOSCompliance: $($BIOSCompliance.Error)") }
+        elseif ($BIOSCompliance.Error)      { $Warnings.Add("BIOSCompliance: $($BIOSCompliance.Error)") }
+
+        $Staleness = Get-DATPackageStalenessPanel
+        if (-not $Staleness.Available) { $Warnings.Add("Staleness: $($Staleness.Error)") }
+    }
 
     # Read from the manifest rather than hard-coding: the version string is how
     # the operator confirms which build produced a given report.
@@ -129,6 +155,8 @@ function Get-DATComplianceSnapshot {
         PackageStorage = $PackageStorage
         LocalStorage   = $LocalStorage
         Activity       = $Activity
+        BIOSCompliance = $BIOSCompliance
+        Staleness      = $Staleness
     }
 
     Write-DATLog -Message ("Compliance snapshot: {0} exclusion(s) ({1} stale), {2} screening run(s), {3} flagged payload(s){4}" -f `

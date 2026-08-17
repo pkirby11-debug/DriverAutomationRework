@@ -394,3 +394,139 @@ Describe 'Full dashboard document' {
         $Doc | Should -Match 'share offline'
     }
 }
+
+Describe 'ConfigMgr-backed sections' {
+    BeforeAll {
+        # The minimum a snapshot needs for the renderer to reach the two new
+        # sections; New-TestSnapshot predates them and does not carry the keys.
+        function New-CMSnapshot {
+            param($BIOSCompliance, $Staleness)
+            $Base = New-TestSnapshot `
+                -Exclusions ([PSCustomObject]@{ Available = $true; Error = ''; TotalCount = 0; StaleCount = 0; StaleAfterDays = 90
+                    BySource = @(); ByManufacturer = @(); ByModel = @(); AgeBuckets = @(); Entries = @() }) `
+                -Screening ([PSCustomObject]@{ Available = $true; Error = ''; WindowDays = 30; RunCount = 0
+                    TotalItems = 0; TotalVulnerable = 0; TotalClean = 0; TotalUnscreenable = 0; LastRunAt = ''
+                    Blocklist = [PSCustomObject]@{ Available = $false; Version = ''; RetrievedAt = ''; AgeDays = $null
+                        IsStale = $false; StaleAfterDays = 30; FileNameRuleCount = 0; HashRuleCount = 0 }
+                    Runs = @(); FlaggedItems = @() }) `
+                -PackageStorage $null -LocalStorage $null -Activity $null
+            $Base | Add-Member -NotePropertyName BIOSCompliance -NotePropertyValue $BIOSCompliance -PassThru |
+                Add-Member -NotePropertyName Staleness -NotePropertyValue $Staleness -PassThru
+        }
+
+        function New-BiosPanel {
+            param([hashtable]$Override = @{})
+            $P = @{
+                Available = $true; Error = ''; InventoryAvailable = $true
+                DeviceCount = 100; CompliantCount = 60; BehindCount = 15
+                UndeterminedCount = 5; NoPackageCount = 20; CompliancePercent = 75.0
+                ExcludedObsolete = 3; MatchedBySku = 70; MatchedByModel = 10
+                ByModel = @(); Behind = @(); Undetermined = @()
+            }
+            foreach ($K in $Override.Keys) { $P[$K] = $Override[$K] }
+            [PSCustomObject]$P
+        }
+
+        function New-StalenessPanel {
+            param([hashtable]$Override = @{})
+            $P = @{
+                Available = $true; Error = ''; CatalogAvailable = $true
+                CatalogAgeHours = 12.0; CatalogIsStale = $false
+                CatalogStaleAfterHours = 168; CatalogModelCount = 380
+                PackageCount = 40; ComparableCount = 30; NotComparableCount = 10
+                CurrentCount = 25; BehindCount = 2; NotInCatalogCount = 3
+                ByReason = @(); Behind = @(); NotComparable = @()
+            }
+            foreach ($K in $Override.Keys) { $P[$K] = $Override[$K] }
+            [PSCustomObject]$P
+        }
+    }
+
+    It 'Says the panels were not collected rather than omitting the sections' {
+        # A missing section reads as "nothing to report"; the point is that
+        # nothing was ASKED, and the switch that would ask is named.
+        $Doc = New-DATDashboardHtml -Snapshot (New-CMSnapshot -BIOSCompliance $null -Staleness $null)
+        $Doc | Should -Match '>BIOS fleet compliance<'
+        $Doc | Should -Match '>Package staleness<'
+        $Doc | Should -Match 'IncludeConfigMgr'
+    }
+
+    It 'Names a failed panel instead of showing zeroes' {
+        $Doc = New-DATDashboardHtml -Snapshot (New-CMSnapshot `
+            -BIOSCompliance (New-BiosPanel @{ Available = $false; Error = 'Not connected to ConfigMgr' }) `
+            -Staleness (New-StalenessPanel @{ Available = $false; Error = 'provider timeout' }))
+        $Doc | Should -Match 'Not connected to ConfigMgr'
+        $Doc | Should -Match 'provider timeout'
+    }
+
+    It 'Does not report a compliance percentage when the BIOS class is not inventoried' {
+        # Available, but with nothing to measure. "0%" here would blame the
+        # fleet for a client-settings problem.
+        $Doc = New-DATDashboardHtml -Snapshot (New-CMSnapshot `
+            -BIOSCompliance (New-BiosPanel @{
+                InventoryAvailable = $false; DeviceCount = 4200; CompliantCount = 0
+                BehindCount = 0; UndeterminedCount = 0; NoPackageCount = 0; CompliancePercent = $null
+                Error = 'BIOS hardware inventory returned no rows - the SMS_G_System_PC_BIOS class is likely disabled' }) `
+            -Staleness $null)
+        $Doc | Should -Match 'SMS_G_System_PC_BIOS'
+        $Doc | Should -Not -Match '0\.0%'
+    }
+
+    It 'Bases the percentage on covered devices, not the whole fleet' {
+        $Doc = New-DATDashboardHtml -Snapshot (New-CMSnapshot -BIOSCompliance (New-BiosPanel) -Staleness $null)
+        # 60 of (100 - 20) covered, not 60 of 100.
+        # Format-DATCount trims the trailing .0, so this renders as "75%".
+        $Doc | Should -Match '>75%<'
+        $Doc | Should -Match '60 of 80 covered'
+    }
+
+    It 'Keeps undetermined out of the behind count in the rendered tiles' {
+        $Doc = New-DATDashboardHtml -Snapshot (New-CMSnapshot -BIOSCompliance (New-BiosPanel) -Staleness $null)
+        $Doc | Should -Match 'not a failure'
+        $Doc | Should -Match 'coverage\s*gap, not a firmware one'
+    }
+
+    It 'Says a stale catalog is stale, not just colours the tile' {
+        # The amber border alone does not tell the reader WHY, and a week-old
+        # catalog makes every "confirmed current" beside it a week-old claim.
+        $Doc = New-DATDashboardHtml -Snapshot (New-CMSnapshot -BIOSCompliance $null `
+            -Staleness (New-StalenessPanel @{ CatalogAgeHours = 213.4; CatalogIsStale = $true }))
+        # -Match is case-insensitive and the section is titled "Package
+        # staleness", so this has to be the whole phrase, not the word.
+        $Doc | Should -Match '- STALE, older than 168h'
+        $Doc | Should -Match '8\.9 day'          # 213.4h rendered in days, not hours
+        $Doc | Should -Not -Match '213\.4h'
+    }
+
+    It 'Keeps a fresh catalog age in hours' {
+        $Doc = New-DATDashboardHtml -Snapshot (New-CMSnapshot -BIOSCompliance $null `
+            -Staleness (New-StalenessPanel @{ CatalogAgeHours = 12.0 }))
+        $Doc | Should -Match '12h ago'
+        $Doc | Should -Not -Match '- STALE, older than'
+    }
+
+    It 'Encodes model names from inventory' {
+        # Model and SystemSKU come from device inventory, which this tool does
+        # not control, and land in tables and chart labels alike.
+        $Doc = New-DATDashboardHtml -Snapshot (New-CMSnapshot `
+            -BIOSCompliance (New-BiosPanel @{
+                ByModel = @([PSCustomObject]@{ Name = $script:Hostile; Count = 5; Compliant = 1
+                    Behind = 4; Undetermined = 0; NoPackage = 0; Target = '1.0' })
+                Behind = @([PSCustomObject]@{ Model = $script:Hostile; SystemSKU = 'X'
+                    BiosVersion = '1.0'; Target = '2.0'; State = 'lower'; MatchedBy = 'sku'; Reason = 'older' }) }) `
+            -Staleness $null)
+        $Doc.Contains($script:Hostile) | Should -BeFalse
+        $Doc | Should -Not -Match '<img'
+    }
+
+    It 'Labels every bar in the per-model chart' {
+        # A chart fed rows without a Name property renders anonymous bars -
+        # the exact bug the screening chart shipped with once.
+        $Doc = New-DATDashboardHtml -Snapshot (New-CMSnapshot `
+            -BIOSCompliance (New-BiosPanel @{
+                ByModel = @([PSCustomObject]@{ Name = 'Latitude 7440'; Count = 5; Compliant = 1
+                    Behind = 4; Undetermined = 0; NoPackage = 0; Target = '1.0' }) }) `
+            -Staleness $null)
+        $Doc | Should -Match 'Latitude 7440'
+    }
+}
