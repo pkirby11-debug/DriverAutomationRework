@@ -138,6 +138,24 @@ param(
         Justification='See comment above - plaintext is unavoidable at the CCMExec boundary.')]
     [string]$BIOSPassword,
 
+    # Dell KB 000146859, for the OptiPlex 3060/5060/7060 - the same 300-series
+    # generation as the Precision 3630/3430: "If you do not have the monitor
+    # connected to the device, the FLASH does not start and the desktop reboots
+    # to its operating system... The computer is expected to do this on every
+    # attempt, where the Legacy Option Read Only Modules (ROM) are not enabled
+    # in the BIOS." That is precisely the silent stage-reboot-unchanged loop, and
+    # the Legacy-Option-ROM condition is why one headless machine can flash while
+    # an identical one cannot. Dell's answer is a /novideo switch on the DUP.
+    #
+    # FIELD RESULT, and a caution: /novideo is NOT universal. The Precision 3630
+    # package's own /? help lists only /s /f /r /l= /p= /Status /BIOSMeasurement
+    # /bls - no /novideo - and passing it there changed nothing. So the switch
+    # appears to be an OptiPlex-line addition that the 3630 line never received.
+    # Verify it is in a package's /? output before deploying this against a
+    # fleet; an unrecognised switch may make an older DUP print usage and exit
+    # non-zero rather than flash. Left opt-in for the models that do carry it.
+    [switch]$BIOSNoVideo,
+
     [ValidateSet('Dell', 'Lenovo', 'Microsoft')]
     [string]$SafetyManufacturer,
 
@@ -573,10 +591,22 @@ function Get-DATFirmwareUpdateStatus {
         A BIOS DUP exits 2 once it has STAGED a capsule. It cannot report what
         the firmware then did with that capsule at POST, so a device that stages
         every cycle and never updates produces a clean apply log and no evidence
-        at all. The ESRT is the one place the refusal is written down: the entry
-        is updated on each UpdateCapsule() attempt, is non-volatile, and so
-        survives the reboot we are asking about. Windows' OS loader mirrors it
-        to HKLM:\SYSTEM\CurrentControlSet\Control\FirmwareResources\{<GUID>}.
+        at all. Where a status IS recorded, it lands in
+        HKLM:\SYSTEM\CurrentControlSet\Control\FirmwareResources\{<GUID>},
+        non-volatile and surviving the reboot we are asking about.
+
+        KNOW THE LIMIT OF THIS SIGNAL. Windows records that status for updates
+        delivered through ITS firmware-update platform - an INF firmware driver
+        package, where Windows itself calls UpdateCapsule() and the OS loader
+        writes the result back. A vendor DUP that stages a capsule through its
+        own mechanism bypasses that call, so on a device whose BIOS is managed
+        by Dell DUPs the key is routinely ABSENT no matter how the flash went.
+        Field-confirmed on a Precision 3630: UEFI boot, GPT, Secure Boot on,
+        PCR7 bound, the System Firmware ESRT device present - and no
+        FirmwareResources key at all, on a box that had definitely staged a
+        capsule. So an absent or empty result here is NOT evidence that nothing
+        was attempted, and must never be reported as such. It is a strong signal
+        when it is PRESENT and non-zero, and no signal at all when it is missing.
 
         Two traps in reading it:
 
@@ -667,7 +697,7 @@ function Get-DATFirmwareUpdateStatus {
                 # The case that matters: nothing was ever processed, so this row
                 # is not evidence of anything having been applied.
                 $State = 'NoAttempt'
-                $Meaning = 'no capsule attempt recorded by the firmware - status 0 is also the never-attempted default, so this is NOT evidence that a staged capsule was applied'
+                $Meaning = 'no capsule attempt recorded here - status 0 is also the never-attempted default, and a vendor DUP stages outside the Windows update path so it may never record at all. NOT evidence that a staged capsule was applied, and NOT evidence that none was attempted'
             }
         } else {
             $State = 'Failed'
@@ -722,7 +752,12 @@ function Write-DATFirmwareUpdateStatus {
     try {
         $Entries = @(Get-DATFirmwareUpdateStatus)
         if ($Entries.Count -eq 0) {
-            Write-Log 'No ESRT firmware-update status recorded on this device (the platform exposes no firmware resources)'
+            # Expected on a DUP-managed device: Windows only records here for
+            # capsules IT submitted via a firmware driver package. Say so, so
+            # nobody reads the absence as "no flash was ever attempted".
+            Write-Log ('No ESRT firmware-update status recorded on this device. This is normal where BIOS updates come from ' +
+                'vendor DUPs rather than the Windows firmware-update platform, and says NOTHING about whether a flash was ' +
+                'attempted or how it went - use the vendor framework log below for that.')
             return
         }
         foreach ($Entry in $Entries) {
@@ -3977,6 +4012,76 @@ function Invoke-DellBIOSFlash {
 
     # Guarantee BitLocker protection is explicitly suspended immediately before staging the BIOS update.
     # When DCU's scan finishes or exits, DCU restores pristine settings and re-enables BitLocker.
+    # Ask the DUP what happened to the LAST flash before starting another one.
+    #
+    # /Status ("Report previous flash update status") is listed by the Dell
+    # Firmware Update Utility's own help. It is the authoritative account of a
+    # DUP-staged flash - the ESRT registry mirror is not, because Windows only
+    # records there for capsules IT submits through a firmware driver package.
+    # On a device that stages every cycle and never moves, this is the one place
+    # that can say why.
+    #
+    # Guarded hard, because these packages are GUI applications: /Status may want
+    # to draw a dialog, and a dialog on a headless machine under SYSTEM would
+    # hang the deployment forever. Bounded wait, killed if it overruns, and the
+    # answer is read from the log file rather than the console.
+    try {
+        $StatusLog = Join-Path $env:SystemRoot ('Temp\DATApply\' + (($BiosExe.BaseName) -replace '[^\w\.\-]', '_') + '.status.log')
+        $StatusDir = Split-Path $StatusLog -Parent
+        if (-not (Test-Path $StatusDir)) { New-Item -Path $StatusDir -ItemType Directory -Force | Out-Null }
+        Remove-Item -Path $StatusLog -Force -ErrorAction SilentlyContinue
+
+        $SProc = Start-Process -FilePath $BiosExe.FullName -ArgumentList @('/Status', "/l=$StatusLog") `
+            -PassThru -NoNewWindow -WorkingDirectory $Path
+        $null = $SProc.Handle
+        if ($SProc.WaitForExit(120000)) {
+            Write-Log "Previous flash status query exit code: $($SProc.ExitCode)"
+        } else {
+            Write-Log 'Previous flash status query did not return within 120s - killing it (the package likely tried to draw a dialog)' -Severity 2
+            try { $SProc.Kill() } catch {
+                Write-Verbose "Ignored exception: $($_.Exception.Message)"
+            }
+        }
+        if (Test-Path $StatusLog) {
+            $StatusLines = @(Get-Content -Path $StatusLog -ErrorAction SilentlyContinue |
+                ForEach-Object { ($_ -replace '^\[[^\]]*\]\s*', '').Trim() } | Where-Object { $_ })
+            if ($StatusLines.Count -gt 0) {
+                Write-Log 'Dell previous flash update status:'
+                foreach ($Line in $StatusLines) { Write-Log "    $Line" }
+
+                # Read this carefully. "Your last firmware update was successful"
+                # is what a struggling device reports too: it describes the last
+                # update the firmware actually RAN, which may be the one that put
+                # the device on the version it is stuck at, not the capsule we
+                # staged last cycle. Field-confirmed on a Precision 3630 sitting
+                # on 2.6.1 that will not take 2.40.0 - /Status still says
+                # "successful". Reported without this caveat it reads as proof
+                # the flash worked, which is the same false-success trap the
+                # ESRT status-0 handling exists to avoid.
+                #
+                # It is still a real signal, just a narrower one: a SUCCESS here
+                # after a staged-but-unapplied cycle means the firmware recorded
+                # no FAILED attempt - so the capsule was never evaluated at POST
+                # at all, rather than evaluated and rejected. That distinction is
+                # what separates "the flash is being refused" from "the flash
+                # never starts", and they need different fixes.
+                if (@($StatusLines | Where-Object { $_ -match 'success' }).Count -gt 0) {
+                    Write-Log ('The status above describes the last update the firmware actually RAN, not necessarily the capsule ' +
+                        'staged on the previous cycle - a device stuck below target reports "successful" here too. Read a success ' +
+                        'as "no FAILED attempt was recorded", which means the staged capsule was never evaluated at POST rather ' +
+                        'than evaluated and refused. Compare against the live BIOS version logged above before trusting it.') -Severity 2
+                }
+            } else {
+                Write-Log 'Dell previous flash update status query produced an empty log' -Severity 2
+            }
+        } else {
+            Write-Log 'Dell previous flash update status query wrote no log' -Severity 2
+        }
+    } catch {
+        # Diagnostic only - never block the flash on it.
+        Write-Log "Could not query the previous flash status: $($_.Exception.Message)" -Severity 2
+    }
+
     # Direct DUP capsule staging fails if BitLocker is active on C:.
     Suspend-BitLockerForFlash
 
@@ -4015,6 +4120,19 @@ function Invoke-DellBIOSFlash {
 
     $ExeArgs = @('/s', '/f')
     if ($BiosFwLog) { $ExeArgs += "/l=$BiosFwLog" }
+    if ($BIOSNoVideo) {
+        # Lets the flash proceed at POST on a machine with no display attached.
+        # See the -BIOSNoVideo parameter help for why this is not automatic.
+        $ExeArgs += '/novideo'
+        Write-Log ('Passing /novideo - the flash is allowed to start with no display attached (Dell KB 000146859). Confirm the ' +
+            'package actually lists it in its /? help: the Precision 3630 packages do not, and passing it there has no effect.') -Severity 2
+    } elseif (@(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction SilentlyContinue).Count -eq 0) {
+        # Worth saying out loud on exactly the machines this bites, because the
+        # failure it produces is completely silent otherwise.
+        Write-Log ('No display is attached and -BIOSNoVideo was not specified. On this platform generation Dell documents the ' +
+            'flash as not starting at POST on a monitor-less machine unless Legacy Option ROMs are enabled (KB 000146859); the ' +
+            'device reboots into Windows on the old firmware with no error. If this flash does not take, retry with -BIOSNoVideo.') -Severity 2
+    }
     if ($BIOSPassword) {
         $ExeArgs += "/p=`"$BIOSPassword`""
     } else {
@@ -4536,15 +4654,18 @@ try {
                                 "looping until the cause is cleared. Check, in order: (1) the BIOS Setup option that blocks flashing to " +
                                 "a different revision - Dell calls it 'Allow BIOS Downgrade'. Some firmware misclassifies an UPGRADE as " +
                                 "a rollback and refuses it while that option is off; Dell fixed exactly that on the Precision 3630 in " +
-                                "BIOS 2.19.0, so a device on an older build is a candidate. An ESRT status of 0xC0000059 on the SYSTEM " +
-                                "firmware row above confirms it - a status on a device-firmware row belongs to a dock or retimer and " +
-                                "means nothing here. (2) UEFI Capsule Firmware Updates disabled in BIOS Setup, which stops the firmware " +
-                                "processing a staged capsule at all; expect the SYSTEM firmware row to report no attempt recorded. " +
+                                "BIOS 2.19.0, so a device on an older build is a candidate. If an ESRT status was logged above at all, " +
+                                "0xC0000059 on the SYSTEM firmware row confirms it - but note the ESRT is usually SILENT for a " +
+                                "DUP-staged capsule, so its absence rules nothing in or out. (2) UEFI Capsule Firmware Updates " +
+                                "disabled in BIOS Setup, which stops the firmware processing a staged capsule at all. " +
                                 "(3) A BIOS setup/admin password with no -BIOSPassword supplied - an ESRT status " +
-                                "of 0xC0000022 points here. (4) BitLocker enabled on a system not bound to PCR7, which Microsoft " +
-                                "documents as blocking UEFI capsule updates outright (msinfo32 reports PCR7 Configuration). (5) The ESRT " +
-                                "status logged above and the vendor framework log quoted below. Also compare '$CurrentBIOS' against the " +
-                                "vendor's published list for this SystemSKU: a withdrawn build sits on no supported upgrade path.") -Severity 3
+                                "of 0xC0000022 points here. (4) No display attached: on this platform generation a staged capsule is " +
+                                "reported not to be processed at POST on a headless machine, which is the shape of a device in a " +
+                                "remote rack. (5) BitLocker enabled on a system not bound to PCR7, which Microsoft " +
+                                "documents as blocking UEFI capsule updates outright (msinfo32 reports PCR7 Configuration). (6) The " +
+                                "vendor framework log quoted below, which is the authoritative record for a DUP-staged flash. Also " +
+                                "compare '$CurrentBIOS' against the vendor's published list for this SystemSKU: a withdrawn build " +
+                                "sits on no supported upgrade path.") -Severity 3
                         }
                     } catch {
                         Write-Verbose "Ignored exception: $($_.Exception.Message)"

@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.33.0'
+    ModuleVersion     = '2.37.1'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.33.0 - Adds Scripts\Get-DATCapsuleAttemptHistory.ps1, which separates "the flash was refused" from "the flash never ran" - the two possibilities every earlier check conflated. Reports the ESRT device''s hardware ID and encoded firmware revision, DAT detection markers, apply and Dell DUP logs, ConfigMgr AppEnforce BIOS entries, and Windows Update firmware history. Companion to 2.32.0''s Get-DATCapsulePathState and 2.31.0''s Get-DATBiosFlashBlocker.'
+    Description       = '2.37.1 - Qualifies the Dell /Status result in the apply log. A device stuck below target still reports "Your last firmware update was successful", because that describes the last update the firmware actually RAN - quoted bare it reads as proof the flash worked. A success there now logs what it really means: no FAILED attempt was recorded, so the staged capsule was never evaluated at POST rather than evaluated and refused.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
