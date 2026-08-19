@@ -202,6 +202,38 @@ function Show-DATFolderDialog {
     }
 }
 
+function Show-DATSaveFileDialog {
+    <#
+    .SYNOPSIS
+        Opens a save-file picker and returns the chosen path (or $null if cancelled).
+    .PARAMETER Title
+        Dialog title.
+    .PARAMETER Filter
+        Win32 filter string, e.g. 'HTML report|*.html'.
+    .PARAMETER DefaultFileName
+        Pre-filled file name.
+    .PARAMETER DefaultExtension
+        Extension appended when the user types a bare name.
+    #>
+    param(
+        [string]$Title = 'Save file',
+        [string]$Filter = 'All files|*.*',
+        [string]$DefaultFileName = '',
+        [string]$DefaultExtension = ''
+    )
+
+    $Dialog = [Microsoft.Win32.SaveFileDialog]::new()
+    $Dialog.Title = $Title
+    $Dialog.Filter = $Filter
+    if ($DefaultFileName)  { $Dialog.FileName = $DefaultFileName }
+    if ($DefaultExtension) { $Dialog.DefaultExt = $DefaultExtension }
+    $Dialog.AddExtension = $true
+    $Dialog.OverwritePrompt = $true
+
+    if ($Dialog.ShowDialog()) { return $Dialog.FileName }
+    return $null
+}
+
 function Get-DATComboText {
     <#
     .SYNOPSIS

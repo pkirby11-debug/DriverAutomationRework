@@ -3,6 +3,10 @@ BeforeAll {
 
     . "$ModuleRoot\Private\Core\LogManager.ps1"
     . "$ModuleRoot\Private\Core\ConfigManager.ps1"
+    # Core before Platform, same order as the psm1: the BIOS detection script
+    # splices its comparer body in from Get-DATBiosComparerSource, so without
+    # this the generated script has no Compare-DATBIOSVersion in it.
+    . "$ModuleRoot\Private\Core\BIOSVersion.ps1"
     . "$ModuleRoot\Private\Platform\SCCMPlatform.ps1"
 
     $script:LogPath = Join-Path $TestDrive 'Logs'

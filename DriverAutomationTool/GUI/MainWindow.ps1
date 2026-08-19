@@ -118,6 +118,411 @@ function Show-DATMainWindow {
     [void]$Controls['MainWindow'].ShowDialog()
 }
 
+function Get-DATReportDays {
+    <#
+    .SYNOPSIS
+        Parses a day-count textbox, falling back to a default on junk input.
+    .DESCRIPTION
+        The Reports tab takes two free-text day counts. A non-numeric or
+        negative value should quietly become the default rather than throwing
+        out of a click handler (which tears the window down).
+    #>
+    param(
+        [string]$Text,
+        [int]$Default = 30
+    )
+
+    $Value = 0
+    if ([int]::TryParse(([string]$Text).Trim(), [ref]$Value) -and $Value -gt 0) { return $Value }
+    return $Default
+}
+
+function Get-DATReportConnectParams {
+    <#
+    .SYNOPSIS
+        Splat for re-establishing the current ConfigMgr connection inside a
+        background runspace, or $null when the window is not connected.
+    .DESCRIPTION
+        Every runspace imports the module fresh and therefore starts
+        disconnected. The ConfigMgr-backed panels would report "Not connected"
+        against a site the operator is visibly connected to unless the child
+        reconnects first, so the parent hands down what it is connected to.
+
+        Reads the live module state via Get-DATCMState rather than the text
+        boxes: the boxes hold what was typed, which is not necessarily what a
+        successful connect resolved to (the site code in particular is
+        discovered, not entered).
+    #>
+    $State = Get-DATCMState
+    if (-not $State.Connected -or -not $State.SiteServer) { return $null }
+
+    $Params = @{ SiteServer = [string]$State.SiteServer }
+    if ($State.SiteCode) { $Params['SiteCode'] = [string]$State.SiteCode }
+
+    # UseSSL is not part of the connection state, and Connect-DATConfigMgr
+    # falls back to non-SSL on its own, so the checkbox is the only source.
+    $gui = Get-DATGui
+    if ($gui -and $gui.Controls['UseSSLCheckBox'] -and $gui.Controls['UseSSLCheckBox'].IsChecked) {
+        $Params['UseSSL'] = $true
+    }
+    return $Params
+}
+
+function Start-DATFleetPosture {
+    <#
+    .SYNOPSIS
+        Fills the Reports tab's fleet-posture rows from the two ConfigMgr-backed
+        snapshot panels.
+    .DESCRIPTION
+        Background runspace rather than inline: this is the only part of the
+        Reports tab that talks to a site server, and the BIOS inventory query
+        returns one row per client - minutes of dispatcher freeze on a large
+        site if it ran on the UI thread.
+
+        Nothing is written. The runspace calls Get-DATComplianceSnapshot
+        -IncludeConfigMgr, which is read-only by construction.
+    #>
+    $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+    if ($G.FleetHandle) { return }   # a query is already running
+
+    $Connect = Get-DATReportConnectParams
+    if (-not $Connect) {
+        Show-DATWindowMessage -Type Warning -Message (
+            "Not connected to a ConfigMgr site.`n`n" +
+            'Fleet BIOS compliance is read from the site''s hardware inventory, so connect on the Configuration tab first.')
+        return
+    }
+
+    Set-DATReportButtonsEnabled -Enabled $false
+    $Controls['RptProgress'].Visibility = [System.Windows.Visibility]::Visible
+    $Controls['RptProgress'].IsIndeterminate = $true
+    $Controls['RptStatusLabel'].Text = 'Querying the site for BIOS inventory - this can take a minute on a large site...'
+
+    $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+    $FleetScript = {
+        param($ModulePath, $Connect)
+        $Mod = Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force -PassThru
+        # Connect-DATConfigMgr is NOT exported, so calling it from here would
+        # raise CommandNotFound - which is only statement-terminating, so the
+        # script would carry on and the snapshot would report "not connected"
+        # against a site the operator is plainly connected to. & $Mod runs the
+        # call in the module's own scope, where private functions resolve.
+        # -ErrorAction Stop so a genuine connect failure aborts instead of
+        # producing a misleading not-connected snapshot.
+        & $Mod { param($C) Connect-DATConfigMgr @C -ErrorAction Stop | Out-Null } $Connect
+        # Days/StaleExclusionDays are irrelevant here - only the two ConfigMgr
+        # panels are read - but the snapshot is the one supported entry point
+        # and its other panels are cheap and local.
+        Get-DATComplianceSnapshot -IncludeConfigMgr
+    }
+
+    $G.FleetRunspace = [System.Management.Automation.PowerShell]::Create()
+    $G.FleetRunspace.AddScript($FleetScript).AddArgument($ModulePath).AddArgument($Connect) | Out-Null
+    $G.FleetHandle = $G.FleetRunspace.BeginInvoke()
+
+    if ($G.FleetTimer) { $G.FleetTimer.Stop() }
+    $G.FleetTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $G.FleetTimer.Interval = [timespan]::FromMilliseconds(400)
+
+    $G.FleetTimer.Add_Tick({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+        if ($null -eq $G.FleetHandle -or -not $G.FleetHandle.IsCompleted) { return }
+        $G.FleetTimer.Stop()
+
+        try {
+            $Result = @($G.FleetRunspace.EndInvoke($G.FleetHandle))
+            $RsErrors = @($G.FleetRunspace.Streams.Error)
+            $Snap = @($Result | Where-Object { $_ }) | Select-Object -Last 1
+
+            if (-not $Snap) {
+                if ($RsErrors.Count -gt 0) { throw $RsErrors[0].Exception.Message }
+                throw 'The fleet query returned nothing.'
+            }
+
+            # A snapshot came back AND the runspace errored: the connect step
+            # failed but the snapshot ran anyway, so every panel says "not
+            # connected" and looks like a finding rather than a fault. Raise it
+            # instead of rendering a plausible wrong answer.
+            if ($RsErrors.Count -gt 0) { throw $RsErrors[0].Exception.Message }
+
+            Show-DATFleetPosture -Snapshot $Snap
+            $Controls['RptStatusLabel'].Text = "Fleet posture refreshed $(Get-Date -Format 'HH:mm:ss')."
+        } catch {
+            Show-DATWindowMessage -Message "Fleet query failed: $($_.Exception.Message)" -Type Error
+            $Controls['RptStatusLabel'].Text = 'Fleet query failed.'
+        } finally {
+            if ($G.FleetRunspace) {
+                try { $G.FleetRunspace.Dispose() } catch {
+                    [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+                }
+                $G.FleetRunspace = $null
+            }
+            $G.FleetHandle = $null
+            $Controls['RptProgress'].IsIndeterminate = $false
+            $Controls['RptProgress'].Visibility = [System.Windows.Visibility]::Collapsed
+            Set-DATReportButtonsEnabled -Enabled $true
+        }
+    })
+    $G.FleetTimer.Start()
+}
+
+function Show-DATFleetPosture {
+    <#
+    .SYNOPSIS
+        Renders the BIOSCompliance and Staleness panels into the Reports tab
+        labels.
+    .DESCRIPTION
+        Split out of the timer tick so the formatting - which is where the
+        honesty lives - is testable without a runspace or a site.
+
+        Each row distinguishes three things a single number would conflate:
+        the panel failed, the panel ran but had no data to work with, and the
+        panel produced a real result. "0% compliant" because hardware
+        inventory is switched off is a false alarm, not a finding.
+    .PARAMETER Snapshot
+        A Get-DATComplianceSnapshot result collected with -IncludeConfigMgr.
+    #>
+    param([Parameter(Mandatory)]$Snapshot)
+
+    $gui = Get-DATGui; $Controls = $gui.Controls
+
+    $B = $Snapshot.BIOSCompliance
+    if (-not $B) {
+        $Text = 'not collected'
+        $Controls['RptSumBiosCompliance'].Text = $Text
+        $Controls['RptSumBiosBehind'].Text     = $Text
+        $Controls['RptSumBiosUnknown'].Text    = $Text
+    } elseif (-not $B.Available) {
+        $Controls['RptSumBiosCompliance'].Text = "unavailable - $($B.Error)"
+        $Controls['RptSumBiosBehind'].Text     = '-'
+        $Controls['RptSumBiosUnknown'].Text    = '-'
+    } elseif (-not $B.InventoryAvailable) {
+        # Available, but with nothing to measure. Saying "0%" here would blame
+        # the fleet for a client-settings problem.
+        $Controls['RptSumBiosCompliance'].Text = "no result - $($B.Error)"
+        $Controls['RptSumBiosBehind'].Text     = '-'
+        $Controls['RptSumBiosUnknown'].Text    = '-'
+    } else {
+        $Covered = $B.DeviceCount - $B.NoPackageCount
+        $Controls['RptSumBiosCompliance'].Text = if ($null -ne $B.CompliancePercent) {
+            '{0}% - {1} of {2} covered device(s) at or above the packaged version ({3} device(s) inventoried)' -f `
+                $B.CompliancePercent, $B.CompliantCount, $Covered, $B.DeviceCount
+        } else {
+            'no covered devices - {0} device(s) inventoried, none matched a BIOS package' -f $B.DeviceCount
+        }
+        $Controls['RptSumBiosBehind'].Text = '{0} on older firmware than the package ships' -f $B.BehindCount
+        $Controls['RptSumBiosUnknown'].Text = '{0} version(s) could not be ordered, {1} device(s) not covered by any package' -f `
+            $B.UndeterminedCount, $B.NoPackageCount
+    }
+
+    $S = $Snapshot.Staleness
+    if (-not $S) {
+        $Controls['RptSumStaleness'].Text  = 'not collected'
+        $Controls['RptSumCatalogAge'].Text = 'not collected'
+    } elseif (-not $S.Available) {
+        $Controls['RptSumStaleness'].Text  = "unavailable - $($S.Error)"
+        $Controls['RptSumCatalogAge'].Text = '-'
+    } else {
+        $Controls['RptSumStaleness'].Text = '{0} behind the catalog, {1} current, {2} comparable but not in the catalog, {3} not comparable (of {4} package(s))' -f `
+            $S.BehindCount, $S.CurrentCount, $S.NotInCatalogCount, $S.NotComparableCount, $S.PackageCount
+        $Controls['RptSumCatalogAge'].Text = if (-not $S.CatalogAvailable) {
+            'none cached - run a sync to populate it; nothing can be compared until then'
+        } elseif ($null -ne $S.CatalogAgeHours) {
+            '{0} model(s), cached {1} hour(s) ago{2}' -f $S.CatalogModelCount, [math]::Round($S.CatalogAgeHours, 1), $(if ($S.CatalogIsStale) { ' (STALE)' } else { '' })
+        } else {
+            '{0} model(s)' -f $S.CatalogModelCount
+        }
+    }
+}
+
+function Start-DATReportExport {
+    <#
+    .SYNOPSIS
+        Runs one Export-DATReport in the background and reports the outcome.
+    .DESCRIPTION
+        A module function rather than an inline scriptblock because the WPF
+        event context only resolves module functions reliably (see the header
+        note), and because all four report buttons want identical plumbing.
+
+        The work runs in a background runspace: with -PackagePath the snapshot
+        walks every file on the share, which is minutes on a real one, and a
+        synchronous call would freeze the window for the duration.
+    .PARAMETER Kind
+        Dashboard | Json | HTML | CSV - the -Format passed to Export-DATReport.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Dashboard', 'Json', 'HTML', 'CSV')]
+        [string]$Kind
+    )
+
+    $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+    if ($G.ReportHandle) { return }   # an export is already running
+
+    $IsSnapshot = $Kind -in @('Dashboard', 'Json')
+    $Stamp = Get-Date -Format 'yyyyMMdd-HHmm'
+    $Spec = switch ($Kind) {
+        'Dashboard' { @{ Ext = 'html'; Filter = 'HTML report|*.html'; Name = "DAT-Compliance-$Stamp.html" } }
+        'Json'      { @{ Ext = 'json'; Filter = 'JSON data|*.json';   Name = "DAT-Compliance-$Stamp.json" } }
+        'HTML'      { @{ Ext = 'html'; Filter = 'HTML report|*.html'; Name = "DAT-SyncReport-$Stamp.html" } }
+        'CSV'       { @{ Ext = 'csv';  Filter = 'CSV data|*.csv';     Name = "DAT-SyncReport-$Stamp.csv" } }
+    }
+
+    # Validate the share path BEFORE the save dialog - asking where to put a
+    # report and then refusing to write it is a poor order of operations.
+    $PackagePath = ''
+    if ($IsSnapshot -and $Controls['RptIncludeShareCheck'].IsChecked) {
+        $PackagePath = ([string]$Controls['RptPackagePathInput'].Text).Trim()
+        if ([string]::IsNullOrWhiteSpace($PackagePath)) {
+            Show-DATWindowMessage -Message 'Select a package share path, or clear the storage checkbox.' -Type Warning
+            return
+        }
+        if (-not (Test-Path $PackagePath)) {
+            Show-DATWindowMessage -Message "Package share not reachable:`n$PackagePath" -Type Warning
+            return
+        }
+    }
+
+    # Same reasoning for the site connection: refuse now, not after the dialog.
+    $Connect = $null
+    if ($IsSnapshot -and $Controls['RptIncludeCMCheck'].IsChecked) {
+        $Connect = Get-DATReportConnectParams
+        if (-not $Connect) {
+            Show-DATWindowMessage -Type Warning -Message (
+                "Fleet BIOS compliance and package staleness need a ConfigMgr connection.`n`n" +
+                'Connect on the Configuration tab first, or clear that checkbox.')
+            return
+        }
+    }
+
+    $OutputPath = Show-DATSaveFileDialog -Title "Save $Kind report" -Filter $Spec.Filter `
+        -DefaultFileName $Spec.Name -DefaultExtension $Spec.Ext
+    if (-not $OutputPath) { return }
+
+    $Params = @{
+        OutputPath = $OutputPath
+        Format     = $Kind
+        Days       = Get-DATReportDays -Text $Controls['RptDaysInput'].Text
+    }
+    if ($IsSnapshot) {
+        $Params['StaleExclusionDays'] = Get-DATReportDays -Text $Controls['RptStaleDaysInput'].Text -Default 90
+        if ($PackagePath) { $Params['PackagePath'] = $PackagePath }
+        if ($Connect)     { $Params['IncludeConfigMgr'] = $true }
+    }
+
+    $G.ReportOutputPath = $OutputPath
+    $G.ReportOpenAfter = [bool]$Controls['RptOpenAfterCheck'].IsChecked
+    $G.ReportKind = $Kind
+
+    Set-DATReportButtonsEnabled -Enabled $false
+    $Controls['RptProgress'].Visibility = [System.Windows.Visibility]::Visible
+    $Controls['RptProgress'].IsIndeterminate = $true
+    $Controls['RptStatusLabel'].Text = if ($PackagePath) {
+        'Generating - scanning the package share, this can take a few minutes...'
+    } else {
+        'Generating...'
+    }
+
+    $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+    $ReportScript = {
+        param($ModulePath, $Params, $Connect)
+        $Mod = Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force -PassThru
+        # A runspace gets its own module scope, so the connection the window
+        # holds does not carry over - the ConfigMgr panels would report
+        # "not connected" against a site the operator is plainly connected to.
+        # & $Mod is required, not cosmetic: Connect-DATConfigMgr is private, so
+        # a direct call raises CommandNotFound, which is only
+        # statement-terminating - the export would continue and quietly write a
+        # report whose fleet panels all say "not connected".
+        if ($Connect) {
+            & $Mod { param($C) Connect-DATConfigMgr @C -ErrorAction Stop | Out-Null } $Connect
+        }
+        # Export-DATReport is exported, so a plain import is enough here.
+        # It returns the output path, or nothing when a job-summary format
+        # finds no summaries in the window - the caller distinguishes those.
+        Export-DATReport @Params
+    }
+
+    $G.ReportRunspace = [System.Management.Automation.PowerShell]::Create()
+    $G.ReportRunspace.AddScript($ReportScript).AddArgument($ModulePath).AddArgument($Params).AddArgument($Connect) | Out-Null
+    $G.ReportHandle = $G.ReportRunspace.BeginInvoke()
+
+    if ($G.ReportTimer) { $G.ReportTimer.Stop() }
+    $G.ReportTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $G.ReportTimer.Interval = [timespan]::FromMilliseconds(400)
+
+    $G.ReportTimer.Add_Tick({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+        if ($null -eq $G.ReportHandle -or -not $G.ReportHandle.IsCompleted) { return }
+        $G.ReportTimer.Stop()
+
+        try {
+            $Result = @($G.ReportRunspace.EndInvoke($G.ReportHandle))
+            $RsErrors = @($G.ReportRunspace.Streams.Error)
+            $Written = @($Result | Where-Object { $_ }) | Select-Object -Last 1
+
+            if (-not $Written -and $RsErrors.Count -gt 0) {
+                throw $RsErrors[0].Exception.Message
+            }
+
+            if (-not $Written) {
+                # Export-DATReport's documented no-data path for HTML/CSV.
+                $Controls['RptStatusLabel'].Text = 'Nothing written - no job summaries in the selected window.'
+                Show-DATWindowMessage -Type Warning -Message (
+                    "No job-summary files were found for the last $(Get-DATReportDays -Text $Controls['RptDaysInput'].Text) days, so no report was written.`n`n" +
+                    'The compliance dashboard does not depend on sync history - use "Generate dashboard" instead.')
+            } elseif (-not (Test-Path $G.ReportOutputPath)) {
+                # Belt-and-braces: a returned path that is not on disk is a
+                # failure, not a success with a missing file.
+                throw "Export reported success but $($G.ReportOutputPath) does not exist."
+            } else {
+                $SizeKB = [math]::Round((Get-Item $G.ReportOutputPath).Length / 1KB, 1)
+                $Controls['RptStatusLabel'].Text = "$($G.ReportKind) report written to $($G.ReportOutputPath) ($SizeKB KB)."
+                if ($G.ReportOpenAfter) {
+                    try {
+                        Start-Process -FilePath $G.ReportOutputPath -ErrorAction Stop
+                    } catch {
+                        Write-DATLog -Message "Could not open $($G.ReportOutputPath): $($_.Exception.Message)" -Severity 2
+                        $Controls['RptStatusLabel'].Text += ' (could not open it automatically)'
+                    }
+                }
+            }
+        } catch {
+            Show-DATWindowMessage -Message "Report generation failed: $($_.Exception.Message)" -Type Error
+            $Controls['RptStatusLabel'].Text = 'Report generation failed.'
+        } finally {
+            if ($G.ReportRunspace) {
+                try { $G.ReportRunspace.Dispose() } catch {
+                    [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+                }
+                $G.ReportRunspace = $null
+            }
+            $G.ReportHandle = $null
+            $Controls['RptProgress'].IsIndeterminate = $false
+            $Controls['RptProgress'].Visibility = [System.Windows.Visibility]::Collapsed
+            Set-DATReportButtonsEnabled -Enabled $true
+        }
+    })
+    $G.ReportTimer.Start()
+}
+
+function Set-DATReportButtonsEnabled {
+    <#
+    .SYNOPSIS
+        Enables/disables every Reports-tab action while an export is running.
+    #>
+    param([Parameter(Mandatory)][bool]$Enabled)
+
+    $gui = Get-DATGui
+    if (-not $gui) { return }
+    $Controls = $gui.Controls
+    foreach ($Name in @('RptDashboardButton', 'RptJsonButton', 'RptActivityHtmlButton',
+                        'RptActivityCsvButton', 'RptRefreshSummaryButton',
+                        'RptFleetPostureButton')) {
+        if ($Controls[$Name]) { $Controls[$Name].IsEnabled = $Enabled }
+    }
+}
+
 function Initialize-DATMainWindow {
     <#
     .SYNOPSIS
@@ -163,6 +568,15 @@ function Initialize-DATMainWindow {
         DeployRunspace           = $null
         DeployHandle             = $null
         DeployTimer              = $null
+        ReportRunspace           = $null
+        ReportHandle             = $null
+        ReportTimer              = $null
+        ReportOutputPath         = ''
+        ReportOpenAfter          = $false
+        ReportKind               = ''
+        FleetRunspace            = $null
+        FleetHandle              = $null
+        FleetTimer               = $null
     }
 
     # Stash the whole GUI context in global scope. Every handler fetches it with
@@ -1864,6 +2278,75 @@ function Initialize-DATMainWindow {
         $G.IntunePublishTimer.Start()
     })
 
+    # ==================== Reports ====================
+    # The share walk visits every file on the package share, so the two report
+    # buttons run in a background runspace on the same pattern as the model
+    # load - a synchronous call would freeze the window for minutes on a real
+    # share. The posture summary skips the share entirely and stays inline.
+
+    $Controls['RptIncludeShareCheck'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        $On = [bool]$Controls['RptIncludeShareCheck'].IsChecked
+        $Controls['RptPackagePathInput'].IsEnabled = $On
+        $Controls['RptPackageBrowseButton'].IsEnabled = $On
+        # Default to the configured package path so the common case is one click.
+        if ($On -and [string]::IsNullOrWhiteSpace($Controls['RptPackagePathInput'].Text)) {
+            $Controls['RptPackagePathInput'].Text = $Controls['PackagePathInput'].Text
+        }
+    })
+
+    $Controls['RptPackageBrowseButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        $Path = Show-DATFolderDialog -Description 'Select the package share root' -InitialPath $Controls['RptPackagePathInput'].Text
+        if ($Path) { $Controls['RptPackagePathInput'].Text = $Path }
+    })
+
+    # --- Posture summary (inline: local files only, no share walk, no network) ---
+    $Controls['RptRefreshSummaryButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window
+        $WaitCursor = $gui.WaitCursor; $DefaultCursor = $gui.DefaultCursor
+
+        $Window.Cursor = $WaitCursor
+        try {
+            $Days = Get-DATReportDays -Text $Controls['RptDaysInput'].Text
+            $Stale = Get-DATReportDays -Text $Controls['RptStaleDaysInput'].Text -Default 90
+            $Snap = Get-DATComplianceSnapshot -Days $Days -StaleExclusionDays $Stale
+
+            $Controls['RptSumExclusions'].Text = [string]$Snap.Exclusions.TotalCount
+            $Controls['RptSumStale'].Text = '{0} (not re-seen in {1}+ days)' -f $Snap.Exclusions.StaleCount, $Snap.Exclusions.StaleAfterDays
+
+            $BL = $Snap.Screening.Blocklist
+            $Controls['RptSumBlocklist'].Text = if (-not $BL.Available) {
+                'None cached - nothing on this host has been screened yet'
+            } elseif ($null -ne $BL.AgeDays) {
+                'v{0} - cached {1} day(s) ago{2}' -f $BL.Version, $BL.AgeDays, $(if ($BL.IsStale) { ' (STALE)' } else { '' })
+            } else {
+                'v{0}' -f $BL.Version
+            }
+
+            $Controls['RptSumFlagged'].Text = '{0} across {1} item(s) in {2} screening run(s)' -f `
+                $Snap.Screening.TotalVulnerable, $Snap.Screening.TotalItems, $Snap.Screening.RunCount
+
+            $Controls['RptSumLocal'].Text = if ($Snap.LocalStorage.Available) {
+                '{0:N1} MB cache/logs/staging ({1} stale cache entr(ies))' -f ($Snap.LocalStorage.TotalBytes / 1MB), $Snap.LocalStorage.CacheStaleCount
+            } else { 'unavailable' }
+
+            $Controls['RptStatusLabel'].Text = "Summary refreshed $(Get-Date -Format 'HH:mm:ss')."
+        } catch {
+            Show-DATWindowMessage -Message "Could not read the compliance snapshot: $($_.Exception.Message)" -Type Error
+            $Controls['RptStatusLabel'].Text = 'Summary failed.'
+        } finally {
+            $Window.Cursor = $DefaultCursor
+        }
+    })
+
+    $Controls['RptFleetPostureButton'].Add_Click({ Start-DATFleetPosture })
+
+    $Controls['RptDashboardButton'].Add_Click({ Start-DATReportExport -Kind 'Dashboard' })
+    $Controls['RptJsonButton'].Add_Click({ Start-DATReportExport -Kind 'Json' })
+    $Controls['RptActivityHtmlButton'].Add_Click({ Start-DATReportExport -Kind 'HTML' })
+    $Controls['RptActivityCsvButton'].Add_Click({ Start-DATReportExport -Kind 'CSV' })
+
     # --- Load saved settings on window load ---
     $Window.Add_Loaded({
         $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window; $G = $gui.G
@@ -2026,6 +2509,8 @@ function Initialize-DATMainWindow {
                 @{ Name='OverlayRemove';    RS=$G.OverlayRemoveRunspace;    Timer=$G.OverlayRemoveTimer }
                 @{ Name='Deploy';           RS=$G.DeployRunspace;           Timer=$G.DeployTimer }
                 @{ Name='IntunePublish';    RS=$G.IntunePublishRunspace;    Timer=$G.IntunePublishTimer }
+                @{ Name='Report';           RS=$G.ReportRunspace;           Timer=$G.ReportTimer }
+                @{ Name='FleetPosture';     RS=$G.FleetRunspace;            Timer=$G.FleetTimer }
             )
 
             foreach ($Item in $TasksToStop) {

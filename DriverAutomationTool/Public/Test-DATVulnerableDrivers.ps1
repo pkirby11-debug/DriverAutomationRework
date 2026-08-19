@@ -109,5 +109,10 @@ function Test-DATVulnerableDrivers {
         Write-DATLog -Message "Screening complete: no blocklist matches across $($Results.Count) item(s)" -Severity 1
     }
 
+    # Record the run so screening coverage survives the console scrollback and
+    # can be reported on. Swallows its own failures - a reporting side effect
+    # must never fail the screen that produced the verdicts.
+    Write-DATScreeningRun -Path $Path -Results $Results.ToArray() -BlocklistVersion ([string]$Blocklist.Version)
+
     return $Results.ToArray()
 }

@@ -26,11 +26,13 @@ the sole update source).
   - [Progress](#tab-progress)
   - [Package Management](#tab-package-management)
   - [Deploy Applications](#tab-deploy-applications)
+  - [Reports](#tab-reports)
 - [Sync types & deployment platforms](#sync-types)
 - [The Driver Updates (DCU) engine](#dcu-engine)
 - [Security features](#security)
 - [The client apply script](#apply-script)
 - [Public cmdlets / automation](#cmdlets)
+- [Compliance dashboard & reporting](#reporting)
 - [Logging & diagnostics](#logging)
 - [Requirements](#requirements)
 - [Lenovo & Microsoft support](#lenovo)
@@ -169,6 +171,28 @@ Bulk-deploy DAT-built **Applications** to collections without leaving the tool:
 The same bulk deployment (including the maintenance-window option) is available headless
 via `Invoke-DATDeployApplications` and the standalone `Scripts\Deploy-DATApplications.ps1`
 wrapper.
+
+<a name="tab-reports"></a>
+### Reports
+
+- **Current posture** — one click fills in active driver exclusions, how many are due for
+  review, the cached blocklist version and age, payloads flagged by screening, and the
+  local footprint. Reads local state only: no network, nothing written to disk.
+- **Fleet posture (ConfigMgr)** — how many devices are actually running the BIOS version
+  DAT packages for them, and whether what DAT ships still matches the cached vendor
+  catalog. Needs a site connection (Connect on SCCM Settings first) and is the only part
+  of the tab that talks to a server; read-only, and it runs in the background because the
+  inventory query returns a row per client.
+- **Compliance dashboard** — generates the self-contained HTML dashboard or the Power BI
+  JSON, with a save dialog and an *Open when finished* option. Package-share storage is
+  opt-in via a checkbox (it walks every file on the share); the path defaults to the one
+  configured on the SCCM Settings tab. A second checkbox adds the two fleet panels above.
+- **Sync activity report** — the original job-summary HTML/CSV export.
+
+Exports run in a background runspace, so a share scan cannot freeze the window, and the
+tab reports plainly when a job-summary export finds nothing in the window rather than
+writing an empty file. Everything here is also available headless — see
+[Compliance dashboard & reporting](#reporting).
 
 ---
 
@@ -415,11 +439,100 @@ by the deployment type's `BasedOnExitCode` behavior.
 | `Invoke-DATRemovePackages` / `Invoke-DATCleanupOverlayPackages` | Package cleanup. |
 | `Test-DATVulnerableDrivers` | Screen a folder of DUPs / `.sys` files against the Microsoft blocklist. |
 | `Set-DATDellCommandUpdateMode` | Put DCU into DAT-managed (passive) mode, or revert/opt-out. |
-| `Export-DATReport` | Export a job/inventory report. |
+| `Export-DATReport` | Export a sync report (`HTML`/`CSV`) or a compliance dashboard (`Dashboard`/`Json`). |
+| `Get-DATComplianceSnapshot` | Collect driver-security and storage posture as one structured object. |
 | `Connect-DATIntune` / `Disconnect-DATIntune` / `Test-DATIntuneConnection` / `Get-DATIntuneWin32App` / `Find-DATIntuneEntraGroup` | Intune groundwork for upcoming Win32/driver-profile support. |
 
 Standalone scripts (module-free, deployment-ready): `Scripts\Deploy-DATApplications.ps1`,
 `Scripts\Set-DATDcuManaged.ps1`.
+
+---
+
+<a name="reporting"></a>
+## Compliance dashboard & reporting
+
+All of this is reachable from the GUI's [Reports tab](#tab-reports); the cmdlets below are
+the headless equivalent.
+
+`Export-DATReport` has four formats. Two read the job-summary CSVs and describe
+what sync *did*; two are built from `Get-DATComplianceSnapshot` and describe
+what the estate *is*, so they work on a host that has never run a sync.
+
+| Format | What it produces |
+| --- | --- |
+| `HTML` | The job-summary activity table (the original report). |
+| `CSV` | The same rows, unformatted. |
+| `Dashboard` | A self-contained interactive HTML compliance dashboard. |
+| `Json` | The same snapshot as structured JSON, for Power BI. |
+
+```powershell
+# Full dashboard, including the package-share rollup
+Export-DATReport -OutputPath 'C:\Reports\Compliance.html' -Format Dashboard `
+    -PackagePath '\\nas01\DriverPackages'
+
+# Everything, including the two site-backed panels
+Export-DATReport -OutputPath 'C:\Reports\Compliance.html' -Format Dashboard `
+    -PackagePath '\\nas01\DriverPackages' -IncludeConfigMgr
+
+# Snapshot only - no share walk, no network, nothing mutated
+Get-DATComplianceSnapshot | Select-Object -ExpandProperty Exclusions
+```
+
+**What the dashboard shows.** Driver-security posture — the exclusion ledger
+broken down by source, manufacturer, model and age, with the entries whose
+`LastSeenAt` has gone quiet flagged as a review queue — plus vulnerable-driver
+screening coverage and how fresh the cached Microsoft blocklist is. Then storage
+consumption: package-share bytes by OEM, content type, production-vs-test
+channel and OS target, the largest individual package sources, and what the tool
+has accumulated on the admin host itself.
+
+**Fleet posture (`-IncludeConfigMgr`).** Two further panels turn "my package is
+correct" into "the fleet is actually running it". They are opt-in because,
+unlike everything above, they need a live site connection and issue CIM queries
+against it — the keys are present in the JSON either way (null when not
+collected) so a Power BI query built against `SchemaVersion 1` keeps working.
+
+- **BIOS compliance** — joins `SMS_G_System_PC_BIOS`, `SMS_G_System_COMPUTER_SYSTEM`
+  and `SMS_G_System_MS_SystemInformation` against the BIOS versions this tool
+  packages, matching on SystemSKU first (the key the OSD apply path uses) and
+  model name second. Devices are counted **compliant**, **behind**, or
+  **undetermined** — never two of those at once. A firmware string that cannot
+  be ordered against the target (Dell letter revisions such as `A09`,
+  single-integer versions) is undetermined, *not* non-compliant; and the
+  percentage is over devices a package actually covers, so a coverage gap is
+  never reported as a firmware problem. Zero BIOS inventory rows is reported as
+  "the class is not being inventoried", not as 0% compliant.
+- **Package staleness** — compares the version each package ships against the
+  cached Dell driver-pack catalog. Most of the value is the triage: a package's
+  `Version` field means different things by type and OEM, and several kinds
+  (content fingerprints, Windows release tags) cannot be compared to a catalog
+  at all. Those are listed with the reason rather than guessed at. Strictly
+  offline — Lenovo BIOS lookups are never cached, so Lenovo BIOS staleness is
+  reported as not comparable rather than answered by a live download.
+
+The same two panels are on the GUI Reports tab under **Fleet posture
+(ConfigMgr)**, which runs the query in the background against the site the
+window is already connected to.
+
+**Self-contained by design.** No CDN, no external stylesheet, no chart library —
+charts are hand-built inline SVG. The file renders completely on a locked-down or
+air-gapped admin host, and survives being emailed. Every chart carries a table
+view underneath, so no value is reachable only by hovering, and the page prints.
+
+**Power BI.** Point a Power BI *folder* query at wherever you drop the JSON and
+refresh on a schedule; the schema is stable and carries a `SchemaVersion`. There
+is deliberately no OData endpoint — OData is an HTTP protocol needing a hosted
+service, not a file format, and a scheduled JSON drop on a share gets the same
+dashboards with no server to run, secure or patch.
+
+**Cost.** The snapshot never touches the network and never mutates state:
+blocklist metadata is read from the existing cache rather than refreshed. The
+only expensive part is the package-share walk, which is why it is opt-in behind
+`-PackagePath`. That walk is a single pass — every file is visited once and its
+bytes added to each bucket it belongs to.
+
+Screening runs are recorded to `Settings\ScreeningHistory.json` (capped, newest
+kept) so screening coverage survives the console scrollback.
 
 ---
 

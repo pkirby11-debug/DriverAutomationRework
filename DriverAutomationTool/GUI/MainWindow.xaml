@@ -801,6 +801,149 @@
                 </ScrollViewer>
             </TabItem>
 
+            <!-- ============ Reports ============
+                 Export-DATReport and Get-DATComplianceSnapshot were CLI-only,
+                 which is most of why the reporting was never used. The posture
+                 summary at the top reads the snapshot WITHOUT writing a file,
+                 so the common question ("how many exclusions, is the blocklist
+                 current") is answered in one click.
+            -->
+            <TabItem Header="Reports">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="16">
+                    <StackPanel>
+
+                        <GroupBox Header="Current posture">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                    <Button x:Name="RptRefreshSummaryButton" Content="Refresh summary" Style="{StaticResource StandardButton}" Width="140" Margin="0,0,12,0" />
+                                    <TextBlock Text="Reads the local ledger, screening history and cache. No network, nothing written."
+                                               VerticalAlignment="Center" Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" />
+                                </StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="200" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+                                    <Label Grid.Row="0" Grid.Column="0" Content="Active driver exclusions:" />
+                                    <TextBlock x:Name="RptSumExclusions" Grid.Row="0" Grid.Column="1" Text="-" VerticalAlignment="Center" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="1" Grid.Column="0" Content="Needing review:" />
+                                    <TextBlock x:Name="RptSumStale" Grid.Row="1" Grid.Column="1" Text="-" VerticalAlignment="Center" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="2" Grid.Column="0" Content="Vulnerable-driver blocklist:" />
+                                    <TextBlock x:Name="RptSumBlocklist" Grid.Row="2" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="3" Grid.Column="0" Content="Payloads flagged:" />
+                                    <TextBlock x:Name="RptSumFlagged" Grid.Row="3" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="4" Grid.Column="0" Content="Local footprint:" />
+                                    <TextBlock x:Name="RptSumLocal" Grid.Row="4" Grid.Column="1" Text="-" VerticalAlignment="Center" Foreground="{DynamicResource Fg}" />
+                                </Grid>
+                            </StackPanel>
+                        </GroupBox>
+
+                        <!-- Fleet posture needs a live site connection and issues CIM
+                             queries against it, so unlike the box above it is opt-in
+                             and runs in a background runspace. Every number here is
+                             three-way: compliant / behind / undetermined. An
+                             undecidable version comparison is reported as its own
+                             bucket rather than folded into "behind" - a false alarm
+                             is worse than an admitted gap. -->
+                        <GroupBox Header="Fleet posture (ConfigMgr)">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                    <Button x:Name="RptFleetPostureButton" Content="Query fleet" Style="{StaticResource StandardButton}" Width="140" Margin="0,0,12,0" />
+                                    <TextBlock Text="Queries the connected site for BIOS inventory and compares packaged versions against the cached vendor catalog. Read-only."
+                                               VerticalAlignment="Center" Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" />
+                                </StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="200" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+                                    <Label Grid.Row="0" Grid.Column="0" Content="BIOS compliance:" />
+                                    <TextBlock x:Name="RptSumBiosCompliance" Grid.Row="0" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="1" Grid.Column="0" Content="Devices behind:" />
+                                    <TextBlock x:Name="RptSumBiosBehind" Grid.Row="1" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="2" Grid.Column="0" Content="Not determinable:" />
+                                    <TextBlock x:Name="RptSumBiosUnknown" Grid.Row="2" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="3" Grid.Column="0" Content="Packages vs catalog:" />
+                                    <TextBlock x:Name="RptSumStaleness" Grid.Row="3" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                    <Label Grid.Row="4" Grid.Column="0" Content="Cached catalog:" />
+                                    <TextBlock x:Name="RptSumCatalogAge" Grid.Row="4" Grid.Column="1" Text="-" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource Fg}" />
+                                </Grid>
+                            </StackPanel>
+                        </GroupBox>
+
+                        <GroupBox Header="Compliance dashboard">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="200" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+
+                                <CheckBox x:Name="RptIncludeShareCheck" Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="3"
+                                          Content="Include package-share storage (walks every file - slow on a large share)"
+                                          Margin="0,3,0,6" />
+
+                                <Label Grid.Row="1" Grid.Column="0" Content="Package share path:" />
+                                <TextBox x:Name="RptPackagePathInput" Grid.Row="1" Grid.Column="1" Margin="0,3" IsEnabled="False" />
+                                <Button x:Name="RptPackageBrowseButton" Grid.Row="1" Grid.Column="2" Content="..." Width="36" Margin="6,3,0,3" Style="{StaticResource StandardButton}" IsEnabled="False" />
+
+                                <CheckBox x:Name="RptIncludeCMCheck" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3"
+                                          Content="Include fleet BIOS compliance and package staleness (needs a site connection)"
+                                          Margin="0,6,0,3" />
+
+                                <StackPanel Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,3,0,0">
+                                    <Label Content="Window (days):" />
+                                    <TextBox x:Name="RptDaysInput" Width="70" Text="30" Margin="0,0,16,0" />
+                                    <Label Content="Flag exclusions unseen for (days):" />
+                                    <TextBox x:Name="RptStaleDaysInput" Width="70" Text="90" Margin="0,0,16,0" />
+                                    <CheckBox x:Name="RptOpenAfterCheck" Content="Open when finished" IsChecked="True" VerticalAlignment="Center" />
+                                </StackPanel>
+
+                                <StackPanel Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,10,0,0">
+                                    <Button x:Name="RptDashboardButton" Content="Generate dashboard" Style="{StaticResource AccentButton}" Width="170" Height="32" Margin="0,0,12,0" />
+                                    <Button x:Name="RptJsonButton" Content="Export JSON (Power BI)" Style="{StaticResource StandardButton}" Width="180" Height="32" />
+                                </StackPanel>
+                            </Grid>
+                        </GroupBox>
+
+                        <GroupBox Header="Sync activity report">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="From the per-run job-summary CSVs. Uses the window set above."
+                                           VerticalAlignment="Center" Margin="0,0,16,0" Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" />
+                                <Button x:Name="RptActivityHtmlButton" Content="Export HTML" Style="{StaticResource StandardButton}" Width="120" Margin="0,0,8,0" />
+                                <Button x:Name="RptActivityCsvButton" Content="Export CSV" Style="{StaticResource StandardButton}" Width="120" />
+                            </StackPanel>
+                        </GroupBox>
+
+                        <ProgressBar x:Name="RptProgress" Height="4" Margin="0,4,0,8" Minimum="0" Maximum="100"
+                                     IsIndeterminate="False" Visibility="Collapsed"
+                                     Background="Transparent" BorderThickness="0" Foreground="{DynamicResource AccentBg}" />
+                        <TextBlock x:Name="RptStatusLabel" Text="" Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" Margin="2,0,0,0" />
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
             <!-- ============ Progress ============ -->
             <TabItem x:Name="ProgressTab" Header="Progress">
                 <DockPanel Margin="16" LastChildFill="True">
