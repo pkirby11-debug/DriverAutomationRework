@@ -201,8 +201,15 @@ function Start-DATFleetPosture {
     $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
     $FleetScript = {
         param($ModulePath, $Connect)
-        Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
-        Connect-DATConfigMgr @Connect | Out-Null
+        $Mod = Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force -PassThru
+        # Connect-DATConfigMgr is NOT exported, so calling it from here would
+        # raise CommandNotFound - which is only statement-terminating, so the
+        # script would carry on and the snapshot would report "not connected"
+        # against a site the operator is plainly connected to. & $Mod runs the
+        # call in the module's own scope, where private functions resolve.
+        # -ErrorAction Stop so a genuine connect failure aborts instead of
+        # producing a misleading not-connected snapshot.
+        & $Mod { param($C) Connect-DATConfigMgr @C -ErrorAction Stop | Out-Null } $Connect
         # Days/StaleExclusionDays are irrelevant here - only the two ConfigMgr
         # panels are read - but the snapshot is the one supported entry point
         # and its other panels are cheap and local.
@@ -231,6 +238,12 @@ function Start-DATFleetPosture {
                 if ($RsErrors.Count -gt 0) { throw $RsErrors[0].Exception.Message }
                 throw 'The fleet query returned nothing.'
             }
+
+            # A snapshot came back AND the runspace errored: the connect step
+            # failed but the snapshot ran anyway, so every panel says "not
+            # connected" and looks like a finding rather than a fault. Raise it
+            # instead of rendering a plausible wrong answer.
+            if ($RsErrors.Count -gt 0) { throw $RsErrors[0].Exception.Message }
 
             Show-DATFleetPosture -Snapshot $Snap
             $Controls['RptStatusLabel'].Text = "Fleet posture refreshed $(Get-Date -Format 'HH:mm:ss')."
@@ -413,11 +426,17 @@ function Start-DATReportExport {
     $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
     $ReportScript = {
         param($ModulePath, $Params, $Connect)
-        Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+        $Mod = Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force -PassThru
         # A runspace gets its own module scope, so the connection the window
         # holds does not carry over - the ConfigMgr panels would report
         # "not connected" against a site the operator is plainly connected to.
-        if ($Connect) { Connect-DATConfigMgr @Connect | Out-Null }
+        # & $Mod is required, not cosmetic: Connect-DATConfigMgr is private, so
+        # a direct call raises CommandNotFound, which is only
+        # statement-terminating - the export would continue and quietly write a
+        # report whose fleet panels all say "not connected".
+        if ($Connect) {
+            & $Mod { param($C) Connect-DATConfigMgr @C -ErrorAction Stop | Out-Null } $Connect
+        }
         # Export-DATReport is exported, so a plain import is enough here.
         # It returns the output path, or nothing when a job-summary format
         # finds no summaries in the window - the caller distinguishes those.

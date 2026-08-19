@@ -141,8 +141,37 @@ Describe 'Handler wiring' {
         # disconnected: without this the ConfigMgr panels report "not
         # connected" against a site the operator is plainly connected to.
         $Cmd = Get-Command Start-DATReportExport
-        $Cmd.Definition | Should -Match 'Connect-DATConfigMgr @Connect'
+        $Cmd.Definition | Should -Match 'Connect-DATConfigMgr'
         $Cmd.Definition | Should -Match "IncludeConfigMgr"
+    }
+
+    It 'Calls Connect-DATConfigMgr through the module scope in both runspaces' {
+        # THE BUG THIS GUARDS: Connect-DATConfigMgr is private, so a bare call
+        # from a runspace raises CommandNotFound. That is only
+        # statement-terminating, so the script carries on and the snapshot
+        # reports every fleet panel as "not connected" - a plausible-looking
+        # answer that is actually a fault. & $Mod runs it in module scope.
+        foreach ($Fn in @('Start-DATFleetPosture', 'Start-DATReportExport')) {
+            $Def = (Get-Command $Fn).Definition
+            $Def | Should -Match '-PassThru' -Because "$Fn must capture the module object to scope the connect call"
+            $Def | Should -Match '&\s*\$Mod\s*\{[^}]*Connect-DATConfigMgr' -Because "$Fn must invoke Connect-DATConfigMgr inside the module scope"
+            $Def | Should -Not -Match '(?m)^\s*(if \(\$Connect\) \{ )?Connect-DATConfigMgr @Connect' -Because "$Fn must not call the private function from runspace scope"
+        }
+    }
+
+    It 'Surfaces a runspace error even when a snapshot was still produced' {
+        # Without this the failed connect is swallowed, because the snapshot
+        # object is non-null and only its contents carry the bad news.
+        #
+        # Counted, not pattern-matched around Show-DATFleetPosture: the buggy
+        # version already had ONE such throw nested inside the "-not $Snap"
+        # branch, so a proximity regex matched it and guarded nothing. The
+        # second, unconditional occurrence is the actual fix.
+        $Throws = [regex]::Matches(
+            (Get-Command Start-DATFleetPosture).Definition,
+            '\$RsErrors\.Count -gt 0'
+        ).Count
+        $Throws | Should -Be 2 -Because 'one throw covers the empty-result case, the second covers a result that arrived alongside an error'
     }
 }
 
