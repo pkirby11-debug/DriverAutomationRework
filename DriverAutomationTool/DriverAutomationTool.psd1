@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.34.0'
+    ModuleVersion     = '2.35.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.34.0 - Adds Scripts\Get-DATSecureBootCertState.ps1, which reports whether a device holds the 2023 Secure Boot certificates in db and KEK. The OEM BIOS is not the only delivery path - Windows Update services these on a Secure Boot enabled device - so a machine stuck on old firmware can still be current on certificates. This is the check that decides whether a deferred BIOS update is safe to defer.'
+    Description       = '2.35.0 - Fixes the Suppress System Restart deployment option, which never took effect. It was written to a SuppressAutoRestart property that does not exist on SMS_ApplicationAssignment, so the site rejected it and every deployment since 2.26.1 stayed free to reboot. Restart suppression now sets the workstation bit of SuppressReboot on the deployment assignment and reads the value back to confirm the site accepted it. Re-running a deployment reconciles the setting on deployments that already exist, and Scripts\Deploy-DATApplications.ps1 gains -SuppressAutoRestart.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

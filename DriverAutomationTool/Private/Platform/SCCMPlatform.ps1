@@ -938,6 +938,104 @@ function Set-DATCollectionMaintenanceWindow {
     }
 }
 
+function Set-DATDeploymentRestartSuppression {
+    <#
+    .SYNOPSIS
+        Sets or clears the workstation reboot-suppression bit on an existing application
+        deployment's SMS_ApplicationAssignment instance.
+    .DESCRIPTION
+        New-CMApplicationDeployment exposes no restart-suppression parameter, so the
+        assignment has to be updated in WMI after the deployment is created.
+
+        SMS_ApplicationAssignment inherits SuppressReboot from SMS_CIAssignmentBaseClass.
+        It is a [bits] property, and the SDK reference tables it by BIT POSITION rather
+        than by value ("0 SUPPRESS_REBOOT_WORKSTATIONS / 1 SUPPRESS_REBOOT_SERVERS"), so
+        the values that actually go on the wire are 1 for workstations and 2 for servers.
+
+        There is no SuppressAutoRestart anywhere in this path: 2.26.0 passed it to
+        New-CMApplicationDeployment (no such parameter) and 2.26.1 wrote it to the
+        assignment (no such property, which is the "class schema does not contain the
+        property" warning). Both left reboots enabled while logging success.
+
+        Only the workstation bit is touched, so a server bit set by hand in the console
+        survives a DAT re-run.
+
+        Returns a hashtable { Changed, Applied, Reason } rather than throwing, so a
+        suppression failure can be reported without failing an otherwise good deployment.
+    .PARAMETER CollectionID
+        CollectionID the deployment targets. Scopes the assignment query.
+    .PARAMETER ApplicationName
+        Display name of the deployed application.
+    .PARAMETER Suppress
+        $true to set the workstation suppression bit, $false to clear it.
+    .OUTPUTS
+        Hashtable: { Changed (bool), Applied (bool), Reason (string) }.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$CollectionID,
+
+        [Parameter(Mandatory)]
+        [string]$ApplicationName,
+
+        [Parameter(Mandatory)]
+        [bool]$Suppress
+    )
+
+    $SuppressRebootWorkstations = 1
+
+    $CimParams = @{
+        ComputerName = $script:CMSiteServer
+        Namespace    = "root\sms\site_$($script:CMSiteCode)"
+        ClassName    = 'SMS_ApplicationAssignment'
+    }
+
+    # Filter on TargetCollectionID alone - it is provider-generated ([A-Z]{3}[0-9A-F]{5})
+    # so it needs no WQL escaping, unlike an application name that may carry a quote. The
+    # app is matched client-side instead. 2.26.1 filtered on ApplicationName = ModelName,
+    # which never matched (ApplicationName is the display name), so every lookup fell
+    # through to a -like match that honored any wildcard character in the name.
+    $Assignments = @(Get-CimInstance @CimParams -Filter "TargetCollectionID = '$CollectionID'" -ErrorAction Stop)
+
+    $Assignment = $Assignments | Where-Object { $_.ApplicationName -eq $ApplicationName } | Select-Object -First 1
+    if (-not $Assignment) {
+        # AssignmentName is "<app name>_<CollectionID>_<action>".
+        $Assignment = $Assignments |
+            Where-Object { $_.AssignmentName -and $_.AssignmentName.StartsWith("$ApplicationName" + '_', [System.StringComparison]::OrdinalIgnoreCase) } |
+            Select-Object -First 1
+    }
+    if (-not $Assignment) {
+        return @{ Changed = $false; Applied = $false; Reason = "no SMS_ApplicationAssignment on collection $CollectionID matches '$ApplicationName'" }
+    }
+
+    $Current = [uint32]$Assignment.SuppressReboot
+    $Desired = if ($Suppress) {
+        $Current -bor $SuppressRebootWorkstations
+    } else {
+        $Current -band (-bnot $SuppressRebootWorkstations)
+    }
+
+    if ($Current -eq $Desired) {
+        return @{ Changed = $false; Applied = $true; Reason = "already SuppressReboot=$Current" }
+    }
+
+    Set-CimInstance -InputObject $Assignment -Property @{ SuppressReboot = [uint32]$Desired } -ErrorAction Stop
+
+    # Read the value back. Set-CimInstance returning without error is not proof the SMS
+    # provider persisted the change, and a write that is accepted but ignored is exactly
+    # the failure mode this code path carried from 2.26.1 to 2.34.0.
+    $Verify = Get-CimInstance @CimParams -Filter "AssignmentID = $($Assignment.AssignmentID)" -ErrorAction Stop | Select-Object -First 1
+    if (-not $Verify) {
+        return @{ Changed = $true; Applied = $false; Reason = "assignment $($Assignment.AssignmentID) could not be re-read to confirm the change" }
+    }
+    if ([uint32]$Verify.SuppressReboot -ne $Desired) {
+        return @{ Changed = $true; Applied = $false; Reason = "site reports SuppressReboot=$([uint32]$Verify.SuppressReboot), expected $Desired" }
+    }
+
+    return @{ Changed = $true; Applied = $true; Reason = "SuppressReboot=$Desired" }
+}
+
 function Get-DATKnownModels {
     <#
     .SYNOPSIS
