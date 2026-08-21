@@ -39,6 +39,22 @@ function Invoke-DATDeployApplications {
         Accepts -RebootOutsideOfServiceWindow as an alias for callers from 1.10.0-1.11.3
         that used the misspelled name (which silently broke deployment because the
         underlying New-CMApplicationDeployment cmdlet doesn't have the "Of" form).
+    .PARAMETER SuppressAutoRestart
+        When $true (the default), workstation restarts are suppressed on the deployment:
+        the client will not restart the device even when the install signals a pending
+        reboot. When $false, a previously suppressed deployment is un-suppressed.
+
+        New-CMApplicationDeployment has no parameter for this, so it is applied after the
+        deployment exists by setting the workstation bit of SuppressReboot on the
+        deployment's SMS_ApplicationAssignment instance. It is reconciled on re-runs too,
+        including deployments this function skips as already present.
+
+        Only the workstation bit is written; a server bit set by hand in the console is
+        preserved. Because the console's application deployment property pages don't
+        expose reboot suppression, editing the deployment there won't show or reset it.
+
+        A failure to apply suppression is logged at Severity 2 and does not fail the
+        deployment - so treat a warning here as "the deployment exists but may restart".
     .PARAMETER EnsureMaintenanceWindow
         When set, create/ensure a maintenance window on the target collection before
         deploying (idempotent by -MWName). Lets a reboot the install script signals be
@@ -101,7 +117,9 @@ function Invoke-DATDeployApplications {
         [Alias('RebootOutsideOfServiceWindow')]
         [bool]$RebootOutsideServiceWindow = $false,
 
-        # Suppress system restarts on workstations (prevents forced reboots after driver/BIOS updates).
+        # Suppress system restarts on workstations (prevents forced reboots after
+        # driver/BIOS updates). Applied post-deployment via the assignment's
+        # SuppressReboot bit - see Set-DATDeploymentRestartSuppression.
         [bool]$SuppressAutoRestart = $true,
 
         # Optional: create/ensure a maintenance window on the target collection before
@@ -180,6 +198,11 @@ function Invoke-DATDeployApplications {
                 $Existing = Get-CMApplicationDeployment -Name $AppName -CollectionName $CollectionName -ErrorAction SilentlyContinue
                 if ($Existing) {
                     Write-DATLog -Message "Skipping '$AppName' - already deployed to '$CollectionName'" -Severity 1
+                    # Still reconcile restart suppression. Deployments created by 2.26.1
+                    # through 2.34.0 were all written with the bad property name and so
+                    # carry SuppressReboot=0; without this a re-run would skip them and
+                    # they would never pick the setting up.
+                    Set-DATDeploymentRestartSuppressionForApp -CollectionID $Collection.CollectionID -AppName $AppName -Suppress $SuppressAutoRestart
                     $Results.Add(@{ Name = $AppName; Status = 'Skipped' })
                     continue
                 }
@@ -210,22 +233,9 @@ function Invoke-DATDeployApplications {
 
                 New-CMApplicationDeployment @DeployParams | Out-Null
 
-                # Post-deployment: set SuppressAutoRestart on the SMS_ApplicationAssignment WMI instance
-                if ($SuppressAutoRestart) {
-                    try {
-                        $SmsNamespace = "root\sms\site_$($script:CMSiteCode)"
-                        $Assignment = Get-CimInstance -ComputerName $script:CMSiteServer -Namespace $SmsNamespace -ClassName "SMS_ApplicationAssignment" -Filter "TargetCollectionID = '$($Collection.CollectionID)' AND ApplicationName = '$($App.ModelName)'" -ErrorAction SilentlyContinue | Select-Object -First 1
-                        if (-not $Assignment) {
-                            $Assignment = Get-CimInstance -ComputerName $script:CMSiteServer -Namespace $SmsNamespace -ClassName "SMS_ApplicationAssignment" -Filter "TargetCollectionID = '$($Collection.CollectionID)'" -ErrorAction SilentlyContinue | Where-Object { $_.AssignmentName -like "*$AppName*" } | Select-Object -First 1
-                        }
-                        if ($Assignment) {
-                            Set-CimInstance -InputObject $Assignment -Property @{ SuppressAutoRestart = 1 } -ErrorAction SilentlyContinue
-                            Write-DATLog -Message "Suppressed workstation system restarts for deployment '$AppName'" -Severity 1
-                        }
-                    } catch {
-                        Write-DATLog -Message "Notice applying restart suppression to '$AppName': $($_.Exception.Message)" -Severity 2
-                    }
-                }
+                # New-CMApplicationDeployment has no restart-suppression parameter, so the
+                # assignment's SuppressReboot bit is set in WMI once the deployment exists.
+                Set-DATDeploymentRestartSuppressionForApp -CollectionID $Collection.CollectionID -AppName $AppName -Suppress $SuppressAutoRestart
 
                 Write-DATLog -Message "Deployed '$AppName' to '$CollectionName' ($DeployPurpose / $DeployAction)" -Severity 1
                 $Results.Add(@{ Name = $AppName; Status = 'Created' })
@@ -243,4 +253,51 @@ function Invoke-DATDeployApplications {
     }
 
     return $Results.ToArray()
+}
+
+function Set-DATDeploymentRestartSuppressionForApp {
+    <#
+    .SYNOPSIS
+        Applies restart suppression to one deployment and logs the outcome, without
+        letting a suppression failure fail the deployment itself.
+    .DESCRIPTION
+        Thin logging shim over Set-DATDeploymentRestartSuppression. The deployment is
+        already created by the time this runs, so anything that goes wrong here is
+        reported at Severity 2 and the app still counts as deployed - but it is reported,
+        rather than swallowed by an -ErrorAction SilentlyContinue and followed by a
+        "Suppressed workstation system restarts" line that was not true.
+    .PARAMETER CollectionID
+        CollectionID the deployment targets.
+    .PARAMETER AppName
+        Display name of the deployed application.
+    .PARAMETER Suppress
+        $true to suppress workstation restarts, $false to allow them.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$CollectionID,
+
+        [Parameter(Mandatory)]
+        [string]$AppName,
+
+        [Parameter(Mandatory)]
+        [bool]$Suppress
+    )
+
+    $Action = if ($Suppress) { 'Suppressed workstation restarts for' } else { 'Allowed workstation restarts for' }
+
+    try {
+        $Result = Set-DATDeploymentRestartSuppression -CollectionID $CollectionID -ApplicationName $AppName -Suppress $Suppress
+
+        if (-not $Result.Applied) {
+            Write-DATLog -Message "Could not apply restart suppression to '$AppName': $($Result.Reason). The deployment was created; set 'Suppress reboot' on its assignment by hand if devices must not restart." -Severity 2
+        } elseif ($Result.Changed) {
+            Write-DATLog -Message "$Action deployment '$AppName' ($($Result.Reason))" -Severity 1
+        } else {
+            Write-DATLog -Message "Restart suppression on '$AppName' needed no change ($($Result.Reason))" -Severity 1
+        }
+    } catch {
+        Write-DATLog -Message "Could not apply restart suppression to '$AppName': $($_.Exception.Message). The deployment was created; set 'Suppress reboot' on its assignment by hand if devices must not restart." -Severity 2
+    }
 }
