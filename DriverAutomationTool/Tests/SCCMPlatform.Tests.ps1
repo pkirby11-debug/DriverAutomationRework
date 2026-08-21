@@ -638,18 +638,30 @@ Describe 'Set-DATDeploymentRestartSuppression' {
         # real cmdlets and Mock replaces them as usual; the stubs exist so the same
         # tests are runnable on a non-Windows box, where Mock would otherwise fail
         # with "Could not find Command Get-CimInstance".
-        # The stubs must declare the parameters the code under test passes, because
-        # Pester binds the mock body against the stub's own parameter block.
+        # The stubs must mirror the real cmdlets' parameter names AND types: Pester binds
+        # the mock body against the mocked command's own parameter block, so a stub that
+        # is laxer than the real cmdlet would let these tests pass here and fail on the
+        # Windows runner. Microsoft.Management.Infrastructure.CimInstance resolves even
+        # where CimCmdlets does not, so -InputObject can carry its real type.
         if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
             Set-Item -Path 'function:global:Get-CimInstance' -Value {
                 [CmdletBinding()]
-                param([string]$ComputerName, [string]$Namespace, [string]$ClassName, [string]$Filter, [string]$Query)
+                param(
+                    [Parameter(Position = 0)][string]$ClassName,
+                    [string[]]$ComputerName,
+                    [string]$Namespace,
+                    [string]$Filter,
+                    [string]$Query
+                )
             }
         }
         if (-not (Get-Command Set-CimInstance -ErrorAction SilentlyContinue)) {
             Set-Item -Path 'function:global:Set-CimInstance' -Value {
                 [CmdletBinding()]
-                param([Parameter(ValueFromPipeline)]$InputObject, [hashtable]$Property)
+                param(
+                    [Parameter(Mandatory, ValueFromPipeline)][Microsoft.Management.Infrastructure.CimInstance[]]$InputObject,
+                    [System.Collections.IDictionary]$Property
+                )
             }
         }
 
@@ -686,7 +698,11 @@ Describe 'Set-DATDeploymentRestartSuppression' {
                 $script:GetFilters.Add($Filter)
                 $script:Store
             }
-            Mock Set-CimInstance {
+            # -RemoveParameterType drops the [CimInstance[]] constraint on -InputObject so
+            # a plain test double can stand in for a real WMI instance. Without it these
+            # tests fail on the Windows runner (where CimCmdlets is real) and pass
+            # everywhere else - the exact split the typed stubs above exist to prevent.
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' {
                 $script:SetCalls.Add(@{ Property = $Property })
                 # Reflect the write so the function's read-back sees the new value.
                 $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot']
@@ -737,7 +753,7 @@ Describe 'Set-DATDeploymentRestartSuppression' {
         It 'Preserves a server bit an admin set by hand' {
             $script:Store = New-FakeAssignment -ApplicationName 'App' -SuppressReboot 2
             Mock Get-CimInstance { $script:Store }
-            Mock Set-CimInstance {
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' {
                 $script:SetCalls.Add(@{ Property = $Property })
                 $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot']
             }
@@ -751,7 +767,7 @@ Describe 'Set-DATDeploymentRestartSuppression' {
         It 'Clears only the workstation bit when suppression is turned off' {
             $script:Store = New-FakeAssignment -ApplicationName 'App' -SuppressReboot 3
             Mock Get-CimInstance { $script:Store }
-            Mock Set-CimInstance {
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' {
                 $script:SetCalls.Add(@{ Property = $Property })
                 $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot']
             }
@@ -764,7 +780,7 @@ Describe 'Set-DATDeploymentRestartSuppression' {
         It 'Writes nothing when the value is already correct' {
             $script:Store = New-FakeAssignment -ApplicationName 'App' -SuppressReboot 1
             Mock Get-CimInstance { $script:Store }
-            Mock Set-CimInstance { $script:SetCalls.Add(@{ Property = $Property }) }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' { $script:SetCalls.Add(@{ Property = $Property }) }
 
             $Result = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $true
 
@@ -779,7 +795,7 @@ Describe 'Set-DATDeploymentRestartSuppression' {
             # AssignmentName is "<app name>_<CollectionID>_<action>".
             $script:Store = New-FakeAssignment -ApplicationName '' -AssignmentName 'App_P0100016_Install'
             Mock Get-CimInstance { $script:Store }
-            Mock Set-CimInstance {
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' {
                 $script:SetCalls.Add(@{ Property = $Property })
                 $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot']
             }
@@ -793,7 +809,7 @@ Describe 'Set-DATDeploymentRestartSuppression' {
             # A "*$AppName*" -like match would have hit this one.
             $script:Store = New-FakeAssignment -ApplicationName 'Drivers - Dell OptiPlex 7080 v2' -AssignmentName 'Drivers - Dell OptiPlex 7080 v2_P0100016_Install'
             Mock Get-CimInstance { $script:Store }
-            Mock Set-CimInstance { $script:SetCalls.Add(@{ Property = $Property }) }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' { $script:SetCalls.Add(@{ Property = $Property }) }
 
             $Result = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' `
                 -ApplicationName 'Drivers - Dell OptiPlex 7080' -Suppress $true
@@ -805,7 +821,7 @@ Describe 'Set-DATDeploymentRestartSuppression' {
 
         It 'Reports no match rather than throwing when the collection has no assignment' {
             Mock Get-CimInstance { @() }
-            Mock Set-CimInstance { $script:SetCalls.Add(@{ Property = $Property }) }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' { $script:SetCalls.Add(@{ Property = $Property }) }
 
             $Result = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $true
 
@@ -821,7 +837,7 @@ Describe 'Set-DATDeploymentRestartSuppression' {
             # persisted anything, which is how the old code could log success forever.
             $script:Store = New-FakeAssignment -ApplicationName 'App' -SuppressReboot 0
             Mock Get-CimInstance { $script:Store }
-            Mock Set-CimInstance { }   # accepts the write, changes nothing
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' { }   # accepts the write, changes nothing
 
             $Result = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $true
 
@@ -836,7 +852,7 @@ Describe 'Set-DATDeploymentRestartSuppression' {
                 $script:GetFilters.Add($Filter)
                 $script:Store
             }
-            Mock Set-CimInstance { $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot'] }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' { $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot'] }
 
             $null = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $true
 
