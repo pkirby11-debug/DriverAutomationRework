@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.38.2'
+    ModuleVersion     = '2.39.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.38.2 - Merges the BIOS flash investigation line (2.35.0-2.38.1) with main''s 2.35.2 ProgramData relocation and MSI repair. The investigation added four read-only field diagnostics, the Dell /Status query, and the finding that the one Precision 3630 running current firmware reached it through Windows'' firmware-driver path rather than the DUP path being debugged. Both version lines bumped independently while the branch was open; this keeps the higher number and carries both sets of changes.'
+    Description       = '2.39.0 - Fixes the Suppress System Restart deployment option, which never took effect. It was written to a SuppressAutoRestart property that does not exist on SMS_ApplicationAssignment, so the site rejected it and every deployment since 2.26.1 stayed free to reboot. Restart suppression now sets the workstation bit of SuppressReboot on the deployment assignment and reads the value back to confirm the site accepted it. Re-running a deployment reconciles the setting on deployments that already exist, and Scripts\Deploy-DATApplications.ps1 gains -SuppressAutoRestart.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
