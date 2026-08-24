@@ -73,8 +73,28 @@ Describe 'Test-DATPathWritable' {
 }
 
 Describe 'Get-DATDataRoot' {
+    # Resolution reads three environment variables and creates directories, so each
+    # test points them at TestDrive and puts them back afterwards. Never assert on
+    # the SHAPE of a resolved path: on a Windows runner TestDrive itself lives under
+    # C:\Users\<user>\AppData\Local\Temp, so "the root is not under AppData" is
+    # unprovable from the string. Assert which candidate won instead.
+    BeforeEach {
+        $script:SavedEnv = @{
+            DAT_DATA_ROOT = $env:DAT_DATA_ROOT
+            ProgramData   = $env:ProgramData
+            LOCALAPPDATA  = $env:LOCALAPPDATA
+        }
+    }
+
     AfterEach {
-        Remove-Item Env:\DAT_DATA_ROOT -ErrorAction SilentlyContinue
+        foreach ($Name in @($script:SavedEnv.Keys)) {
+            $Value = $script:SavedEnv[$Name]
+            if ([string]::IsNullOrEmpty($Value)) {
+                Remove-Item "Env:\$Name" -ErrorAction SilentlyContinue
+            } else {
+                Set-Item "Env:\$Name" -Value $Value
+            }
+        }
     }
 
     It 'Honors the DAT_DATA_ROOT override ahead of the machine-wide default' {
@@ -96,11 +116,31 @@ Describe 'Get-DATDataRoot' {
         Get-DATDataRoot -Refresh | Should -Be $env:DAT_DATA_ROOT
     }
 
-    It 'Does not put the tree in the user profile' {
-        $env:DAT_DATA_ROOT = Join-Path $TestDrive 'NotInProfile'
-        $Root = Get-DATDataRoot -Refresh
-        $Root | Should -Not -Match '(?i)\\AppData\\'
-        $Root | Should -Not -Match '(?i)\\Documents\\'
+    It 'Puts the tree in ProgramData, not the per-user location, by default' {
+        $ProgramData = Join-Path $TestDrive 'PD'
+        $LocalAppData = Join-Path $TestDrive 'LA'
+        New-Item -ItemType Directory -Path $ProgramData, $LocalAppData -Force | Out-Null
+
+        Remove-Item Env:\DAT_DATA_ROOT -ErrorAction SilentlyContinue
+        $env:ProgramData = $ProgramData
+        $env:LOCALAPPDATA = $LocalAppData
+
+        Get-DATDataRoot -Refresh | Should -Be (Join-Path $ProgramData 'DriverAutomationTool')
+        # The per-user candidate is a last resort and must not even be created.
+        Test-Path (Join-Path $LocalAppData 'DriverAutomationTool') | Should -BeFalse
+    }
+
+    It 'Falls back to the per-user location when ProgramData cannot be used' {
+        $Blocker = Join-Path $TestDrive 'pd-blocker.txt'
+        Set-Content -LiteralPath $Blocker -Value 'not a directory' -Encoding UTF8
+        $LocalAppData = Join-Path $TestDrive 'LA2'
+        New-Item -ItemType Directory -Path $LocalAppData -Force | Out-Null
+
+        Remove-Item Env:\DAT_DATA_ROOT -ErrorAction SilentlyContinue
+        $env:ProgramData = $Blocker
+        $env:LOCALAPPDATA = $LocalAppData
+
+        Get-DATDataRoot -Refresh | Should -Be (Join-Path $LocalAppData 'DriverAutomationTool')
     }
 }
 
