@@ -432,6 +432,9 @@ Standalone scripts (module-free, deployment-ready): `Scripts\Deploy-DATApplicati
   logs and DCU output logs under `C:\Temp\DriverAutomationTool\`.
 - **Detection / state:** `HKLM\SOFTWARE\MSEndpointMgr\DriverAutomation` (install markers,
   per-DUP version markers, `DcuManagedMode`).
+- **Where the admin side keeps its data:** cache, logs, settings and pack staging all live
+  under `C:\ProgramData\DriverAutomationTool\`, shared by every operator on the host. Set
+  `DAT_DATA_ROOT` to relocate the whole tree if your fleet restricts ProgramData.
 
 When the DCU scan finds nothing applicable, the apply log dumps the manifest summary, the
 scan report, and DCU's own reasoning so a "nothing to do" verdict is verifiable rather than

@@ -103,6 +103,7 @@
 
         <!-- ==================== Private/Core ==================== -->
         <ComponentGroup Id="CoreFiles" Directory="CoreDir">
+            <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\AppPaths.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\CacheManager.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\CatalogParser.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\ConfigManager.ps1" KeyPath="yes" /></Component>

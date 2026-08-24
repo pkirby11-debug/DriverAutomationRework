@@ -5,6 +5,7 @@ BeforeAll {
     . "$ModuleRoot\Private\Core\LogManager.ps1"
     . "$ModuleRoot\Private\Core\ConfigManager.ps1"
     . "$ModuleRoot\Private\Core\CacheManager.ps1"
+    . "$ModuleRoot\Private\Core\AppPaths.ps1"
     . "$ModuleRoot\Private\Core\CatalogParser.ps1"
     . "$ModuleRoot\Private\Core\DownloadManager.ps1"
     . "$ModuleRoot\Private\OEM\DellAdapter.ps1"

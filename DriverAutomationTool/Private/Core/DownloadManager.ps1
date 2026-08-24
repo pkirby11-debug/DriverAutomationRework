@@ -454,9 +454,9 @@ function Compress-DATINFCache {
         return $null
     }
 
-    # Stage INF files into a per-user staging directory preserving relative folder
-    # structure. See Get-DATStagingRoot for why this lives under Documents rather
-    # than $env:ProgramData or %TEMP%.
+    # Stage INF files into a staging directory preserving relative folder
+    # structure. See Get-DATStagingRoot for why this lives under the machine-wide
+    # data root rather than the user profile or %TEMP%.
     $INFCacheStaging = Join-Path (Get-DATStagingRoot) "INFCache_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
     New-Item -Path $INFCacheStaging -ItemType Directory -Force | Out-Null
 
@@ -606,10 +606,10 @@ function Compress-DATPackage {
             }
 
             # DISM does NOT support UNC paths - must use a local directory. Stage
-            # the capture under the per-user staging root rather than %TEMP%
-            # (Defender treats %TEMP% as a malware-staging hotspot) and rather
-            # than $env:ProgramData (enterprise AV / EDR rules flag bulk writes
-            # there). See Get-DATStagingRoot.
+            # the capture under the staging root rather than %TEMP% (Defender
+            # treats %TEMP% as a malware-staging hotspot) and rather than the user
+            # profile (Controlled Folder Access blocks writes to Documents by
+            # default). See Get-DATStagingRoot.
             # IMPORTANT: The WIM output file must be in a SEPARATE directory from
             # the capture source, otherwise DISM gets exit code 5 (Access Denied)
             # because it locks the output file while also reading the same
