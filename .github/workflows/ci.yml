@@ -85,3 +85,24 @@ jobs:
           name: pester-results
           path: testResults.xml
           if-no-files-found: ignore
+
+      # Product.wxs lists every shipped file by hand, and the Pester manifest tests
+      # check that list is complete and self-consistent - but only WiX can prove the
+      # installer actually compiles. Building it here means the MSI can no longer go
+      # stale between releases, which is how 15 module files ended up unshipped.
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          # Pin the WiX major version: v6+ stops with error WIX7015 unless the paid
+          # Open Source Maintenance Fee EULA is accepted, so a bare install fails.
+          dotnet tool install --global wix --version 5.0.2
+          $env:PATH = "$env:PATH;$env:USERPROFILE\.dotnet\tools"
+          ./Installer/Build-MSI.ps1 -OutputDir "$env:RUNNER_TEMP/msi"
+
+      - name: Upload MSI
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DriverAutomationTool-msi
+          path: ${{ runner.temp }}/msi/*.msi
+          if-no-files-found: ignore

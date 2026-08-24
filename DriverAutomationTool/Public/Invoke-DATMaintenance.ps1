@@ -8,7 +8,9 @@ function Invoke-DATMaintenance {
           * Orphaned staging directories. Get-DATTempPath creates one per
             operation and Remove-DATTempPath drops it in a finally block; a crash
             or a killed GUI skips that finally and an extracted driver pack -
-            often gigabytes - is stranded permanently.
+            often gigabytes - is stranded permanently. Both the current staging
+            root and the per-user root used before 2.35.0 are swept, so packs
+            left in the old location are still reclaimable.
           * Oversized logs. Write-DATLog appends without bound.
           * Stale cache entries. Get-DATCachedItem age-checks on read and ignores
             what is too old, but never deletes it.
@@ -72,19 +74,34 @@ function Invoke-DATMaintenance {
     Write-DATLog -Message "======== DAT Maintenance ($(if ($Force) { 'RECLAIM' } else { 'REPORT ONLY' })) ========" -Severity 1
 
     # --- Staging orphans -----------------------------------------------------
-    $Orphans = @(Get-DATStagingOrphan -MaxAgeHours $MaxAgeHours)
+    # Sweeps the live staging root and the per-user root builds before 2.35.0
+    # staged into. Nothing writes to the legacy tree any more, so anything still
+    # in it is stranded for good - and it sits in the user profile that Defender's
+    # Controlled Folder Access blocks, which is why a normal run can no longer
+    # clean up after itself there.
+    $StagingRoots = [System.Collections.Generic.List[string]]::new()
+    $StagingRoots.Add((Get-DATStagingRoot))
+    $LegacyStaging = (Get-DATLegacyPath).StagingRoot
+    if ($LegacyStaging -and (Test-Path $LegacyStaging) -and
+        $LegacyStaging.TrimEnd('\', '/') -ne $StagingRoots[0].TrimEnd('\', '/')) {
+        $StagingRoots.Add($LegacyStaging)
+    }
+
+    $Orphans = @(foreach ($Root in $StagingRoots) { Get-DATStagingOrphan -MaxAgeHours $MaxAgeHours -StagingRoot $Root })
     $Report.StagingOrphans = $Orphans
     if ($Orphans.Count -gt 0) {
         $OrphanMB = [math]::Round((($Orphans | Measure-Object SizeBytes -Sum).Sum) / 1MB, 2)
         Write-DATLog -Message "Staging: $($Orphans.Count) orphaned directory(ies), $OrphanMB MB (idle > ${MaxAgeHours}h)" -Severity 1
         foreach ($O in $Orphans) {
             $MountNote = if ($O.Mounted) { ' [WIM MOUNTED - will be skipped]' } else { '' }
-            Write-DATLog -Message ("  {0}  {1,8:N1} MB  idle {2}h{3}" -f $O.Name, ($O.SizeBytes / 1MB), $O.AgeHours, $MountNote) -Severity 1
+            Write-DATLog -Message ("  {0}  {1,8:N1} MB  idle {2}h{3}" -f $O.Path, ($O.SizeBytes / 1MB), $O.AgeHours, $MountNote) -Severity 1
         }
         if ($Force) {
-            $Cleared = Clear-DATStagingOrphan -MaxAgeHours $MaxAgeHours -Confirm:$false
-            $Report.StagingFreedMB = $Cleared.FreedMB
-            Write-DATLog -Message "Staging: removed $($Cleared.Removed), skipped $($Cleared.Skipped), freed $($Cleared.FreedMB) MB" -Severity 1
+            foreach ($Root in $StagingRoots) {
+                $Cleared = Clear-DATStagingOrphan -MaxAgeHours $MaxAgeHours -StagingRoot $Root -Confirm:$false
+                $Report.StagingFreedMB += $Cleared.FreedMB
+                Write-DATLog -Message "Staging ${Root}: removed $($Cleared.Removed), skipped $($Cleared.Skipped), freed $($Cleared.FreedMB) MB" -Severity 1
+            }
         }
     } else {
         Write-DATLog -Message "Staging: no orphaned directories" -Severity 1

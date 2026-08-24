@@ -168,49 +168,18 @@ function Read-DATXmlStreaming {
     }
 }
 
-function Get-DATStagingRoot {
-    <#
-    .SYNOPSIS
-        Returns the per-user staging root used for all pack extract / compress work.
-    .DESCRIPTION
-        Resolves to "<Documents>\DriverAutomationTool\Staging" and creates the
-        directory if it does not exist. Uses [Environment]::GetFolderPath so that
-        Group Policy folder redirection and OneDrive's Known Folder Move are
-        honored — the path tracks wherever the user's Documents actually live.
-
-        Staging lives under the user profile (not $env:ProgramData) so that
-        enterprise AV / EDR products that watch ProgramData for bulk file churn
-        stop flagging DAT's normal extract activity, and so the tool no longer
-        needs write access to a machine-wide directory.
-    #>
-    [CmdletBinding()]
-    param()
-
-    $Documents = [Environment]::GetFolderPath('MyDocuments')
-    if ([string]::IsNullOrWhiteSpace($Documents)) {
-        # GetFolderPath returns empty for some service / SYSTEM contexts that have
-        # no loaded user profile. Fall back to the literal profile Documents path.
-        $ProfilePath = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($env:HOME) { $env:HOME } else { [System.IO.Path]::GetTempPath() }
-        $Documents = Join-Path $ProfilePath 'Documents'
-    }
-
-    $Root = Join-Path $Documents 'DriverAutomationTool\Staging'
-    if (-not (Test-Path $Root)) {
-        New-Item -Path $Root -ItemType Directory -Force | Out-Null
-    }
-    return $Root
-}
-
 function Get-DATTempPath {
     <#
     .SYNOPSIS
         Returns a unique staging directory for the current operation.
     .DESCRIPTION
-        Returns a path under "<Documents>\DriverAutomationTool\Staging". Self-
-        extracting driver .exe files written under %TEMP% consistently trigger
-        Defender's on-access scanner (it treats that path as a malware-staging
-        hotspot), and staging under $env:ProgramData has been observed to trip
-        enterprise AV / EDR rules that watch ProgramData for bulk file writes.
+        Returns a path under the staging root - "<DataRoot>\Staging", by default
+        C:\ProgramData\DriverAutomationTool\Staging. Self-extracting driver .exe
+        files written under %TEMP% consistently trigger Defender's on-access
+        scanner (it treats that path as a malware-staging hotspot), and the user
+        profile is worse still: Controlled Folder Access protects Documents by
+        default and refuses the write outright. See Get-DATStagingRoot in
+        Private\Core\AppPaths.ps1.
 
         The function name is retained for backward compatibility with the many
         callers in DellAdapter / LenovoAdapter / SurfaceAdapter / Invoke-DATSync;
@@ -241,9 +210,9 @@ function Remove-DATTempPath {
         [string]$Path
     )
 
-    # The path marker accepts either the current Documents\DriverAutomationTool
-    # location or any leftover $env:ProgramData\DriverAutomationTool folders from
-    # builds prior to the staging-root move, so cleanup works across upgrades.
+    # The marker matches the current ProgramData\DriverAutomationTool root as well
+    # as the per-user Documents and %LOCALAPPDATA% trees earlier builds staged in,
+    # so cleanup keeps working across an upgrade.
     if ((Test-Path $Path) -and $Path -like "*DriverAutomationTool*") {
         Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
     }

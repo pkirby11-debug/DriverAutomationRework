@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.34.0'
+    ModuleVersion     = '2.35.2'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.34.0 - Adds Scripts\Get-DATSecureBootCertState.ps1, which reports whether a device holds the 2023 Secure Boot certificates in db and KEK. The OEM BIOS is not the only delivery path - Windows Update services these on a Secure Boot enabled device - so a machine stuck on old firmware can still be current on certificates. This is the check that decides whether a deferred BIOS update is safe to defer.'
+    Description       = '2.35.2 - Moves everything the tool writes between runs out of the user profile and into one machine-wide root, C:\ProgramData\DriverAutomationTool (Cache, Logs, Settings, Staging). Defender Controlled Folder Access protects Documents and the other known folders by default and blocked the old staging location outright, stopping a sync mid-extract. Settings are carried forward automatically on first run, Invoke-DATMaintenance now also reclaims packs stranded in the old per-user location, and DAT_DATA_ROOT relocates the whole tree for a fleet that restricts ProgramData. Also repairs the MSI, which had drifted 15 files behind the module - an installed copy was missing Invoke-DATMaintenance, the driver-exclusion commands and six Scripts entry points. CI now builds the installer on every change so it cannot go stale again.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

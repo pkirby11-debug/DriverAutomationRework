@@ -1957,9 +1957,9 @@ function Invoke-DATPatchPackage {
             # WIM package: mount, copy, dismount
             Write-DATLog -Message "Detected WIM package format: $($WimFile.Name)" -Severity 1
 
-            # Under the per-user staging root (not %TEMP%) to avoid AV on-access
-            # scans while DISM has the WIM mounted, and not $env:ProgramData so
-            # corporate AV / EDR doesn't flag bulk writes there. Consistent with
+            # Under the staging root (not %TEMP%) to avoid AV on-access scans
+            # while DISM has the WIM mounted, and not the user profile, where
+            # Controlled Folder Access blocks the write outright. Consistent with
             # the rest of DAT's staging strategy - see Get-DATStagingRoot.
             $MountDir = Join-Path (Get-DATStagingRoot) "WimMount\$PackageID"
             if (Test-Path $MountDir) { Remove-Item -Path $MountDir -Recurse -Force }
