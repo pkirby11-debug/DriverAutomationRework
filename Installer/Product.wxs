@@ -75,22 +75,29 @@
 
         <!-- ==================== Public functions ==================== -->
         <ComponentGroup Id="PublicFiles" Directory="PublicDir">
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Add-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Clear-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Connect-DATIntune.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Disconnect-DATIntune.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Export-DATReport.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Find-DATIntuneEntraGroup.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATBIOSUpdate.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverPack.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATIntuneDriverInventory.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATIntuneDriverUpdateProfile.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATIntuneWin32App.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Invoke-DATCleanupOverlayPackages.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Invoke-DATDeployApplications.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Invoke-DATMaintenance.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Invoke-DATRemoveDeployments.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Invoke-DATRemovePackages.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Invoke-DATSync.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\New-DATDcuModeApplication.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\New-DATIntuneDriverUpdateProfile.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\New-DATIntuneWin32App.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Register-DATQueueLogSubscriber.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Remove-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Set-DATDellCommandUpdateMode.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Set-DATIntuneDriverApproval.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Start-DATGui.ps1" KeyPath="yes" /></Component>
@@ -108,7 +115,9 @@
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\CatalogParser.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\ConfigManager.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\DownloadManager.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\DriverExclusionStore.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\LogManager.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\MaintenanceStore.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\VulnerableDriverScreen.ps1" KeyPath="yes" /></Component>
         </ComponentGroup>
 
@@ -138,7 +147,13 @@
         <!-- ==================== Scripts (client apply + automation wrappers) ==================== -->
         <ComponentGroup Id="ScriptsFiles" Directory="ScriptsDir">
             <Component Guid="*"><File Source="$(var.SourceDir)\Scripts\Deploy-DATApplications.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Scripts\Get-DATBiosFlashBlocker.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Scripts\Get-DATCapsuleAttemptHistory.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Scripts\Get-DATCapsulePathState.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Scripts\Get-DATSecureBootCertState.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Scripts\Invoke-DATApply.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Scripts\New-DATDcuModeApp.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Scripts\Remove-DATDeployments.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Scripts\Set-DATDcuManaged.ps1" KeyPath="yes" /></Component>
         </ComponentGroup>
 
