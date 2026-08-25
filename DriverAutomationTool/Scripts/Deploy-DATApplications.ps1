@@ -62,6 +62,11 @@
     $true lets a restart required to complete an install fire outside the maintenance
     window. Default $false defers it to the next window.
 
+.PARAMETER SuppressAutoRestart
+    $true (the default) suppresses workstation restarts on the deployment, so a device
+    will not reboot even when the install signals a pending restart. $false leaves
+    restarts enabled, and un-suppresses a deployment that was previously suppressed.
+
 .PARAMETER EnsureMaintenanceWindow
     Create/ensure a maintenance window on the target collection before deploying.
 
@@ -136,6 +141,8 @@ param(
     [Alias('RebootOutsideOfServiceWindow')]
     [bool]$RebootOutsideServiceWindow = $false,
 
+    [bool]$SuppressAutoRestart = $true,
+
     [switch]$EnsureMaintenanceWindow,
 
     [Nullable[datetime]]$MWStart,
@@ -180,6 +187,7 @@ $DeployParams = @{
     UserNotification           = $UserNotification
     OverrideServiceWindow      = $OverrideServiceWindow
     RebootOutsideServiceWindow = $RebootOutsideServiceWindow
+    SuppressAutoRestart        = $SuppressAutoRestart
 }
 if ($SiteCode)          { $DeployParams['SiteCode'] = $SiteCode }
 if ($UseSSL)            { $DeployParams['UseSSL']   = $true }

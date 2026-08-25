@@ -631,3 +631,238 @@ Describe 'DAT custom return codes' {
         }
     }
 }
+
+Describe 'Set-DATDeploymentRestartSuppression' {
+    BeforeAll {
+        # CimCmdlets is Windows-only. CI runs on windows-latest, where these are the
+        # real cmdlets and Mock replaces them as usual; the stubs exist so the same
+        # tests are runnable on a non-Windows box, where Mock would otherwise fail
+        # with "Could not find Command Get-CimInstance".
+        # The stubs must mirror the real cmdlets' parameter names AND types: Pester binds
+        # the mock body against the mocked command's own parameter block, so a stub that
+        # is laxer than the real cmdlet would let these tests pass here and fail on the
+        # Windows runner. Microsoft.Management.Infrastructure.CimInstance resolves even
+        # where CimCmdlets does not, so -InputObject can carry its real type.
+        if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+            Set-Item -Path 'function:global:Get-CimInstance' -Value {
+                [CmdletBinding()]
+                param(
+                    [Parameter(Position = 0)][string]$ClassName,
+                    [string[]]$ComputerName,
+                    [string]$Namespace,
+                    [string]$Filter,
+                    [string]$Query
+                )
+            }
+        }
+        if (-not (Get-Command Set-CimInstance -ErrorAction SilentlyContinue)) {
+            Set-Item -Path 'function:global:Set-CimInstance' -Value {
+                [CmdletBinding()]
+                param(
+                    [Parameter(Mandatory, ValueFromPipeline)][Microsoft.Management.Infrastructure.CimInstance[]]$InputObject,
+                    [System.Collections.IDictionary]$Property
+                )
+            }
+        }
+
+        $script:CMSiteServer = 'cm01.contoso.com'
+        $script:CMSiteCode   = 'P01'
+
+        function New-FakeAssignment {
+            param(
+                [string]$ApplicationName,
+                [string]$AssignmentName,
+                [uint32]$SuppressReboot = 0,
+                [int]$AssignmentID = 16785252
+            )
+            if (-not $AssignmentName) { $AssignmentName = "${ApplicationName}_P0100016_Install" }
+            [PSCustomObject]@{
+                ApplicationName = $ApplicationName
+                AssignmentName  = $AssignmentName
+                AssignmentID    = $AssignmentID
+                SuppressReboot  = $SuppressReboot
+            }
+        }
+    }
+
+    BeforeEach {
+        $script:SetCalls = [System.Collections.Generic.List[hashtable]]::new()
+        $script:GetFilters = [System.Collections.Generic.List[string]]::new()
+    }
+
+    Context 'When the deployment exists and is not yet suppressed' {
+        BeforeEach {
+            $script:Store = New-FakeAssignment -ApplicationName 'Driver Updates - Dell OptiPlex 7080 - Windows 11 x64' -SuppressReboot 0
+
+            Mock Get-CimInstance {
+                $script:GetFilters.Add($Filter)
+                $script:Store
+            }
+            # -RemoveParameterType drops the [CimInstance[]] constraint on -InputObject so
+            # a plain test double can stand in for a real WMI instance. Without it these
+            # tests fail on the Windows runner (where CimCmdlets is real) and pass
+            # everywhere else - the exact split the typed stubs above exist to prevent.
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' {
+                $script:SetCalls.Add(@{ Property = $Property })
+                # Reflect the write so the function's read-back sees the new value.
+                $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot']
+            }
+        }
+
+        It 'Writes SuppressReboot, not SuppressAutoRestart' {
+            # SMS_ApplicationAssignment has no SuppressAutoRestart property. Writing it
+            # produced "The class schema does not contain the property" and left every
+            # deployment from 2.26.1 to 2.34.0 free to reboot.
+            $null = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' `
+                -ApplicationName 'Driver Updates - Dell OptiPlex 7080 - Windows 11 x64' -Suppress $true
+
+            $script:SetCalls.Count | Should -Be 1
+            $script:SetCalls[0].Property.Keys | Should -Contain 'SuppressReboot'
+            $script:SetCalls[0].Property.Keys | Should -Not -Contain 'SuppressAutoRestart'
+        }
+
+        It 'Sets the workstation bit to 1' {
+            # SuppressReboot is a [bits] property and the SDK tables it by bit position,
+            # so workstations is bit 0 - value 1 - not value 0.
+            $null = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' `
+                -ApplicationName 'Driver Updates - Dell OptiPlex 7080 - Windows 11 x64' -Suppress $true
+
+            [uint32]$script:SetCalls[0].Property['SuppressReboot'] | Should -Be 1
+        }
+
+        It 'Reports the change as applied' {
+            $Result = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' `
+                -ApplicationName 'Driver Updates - Dell OptiPlex 7080 - Windows 11 x64' -Suppress $true
+
+            $Result.Changed | Should -BeTrue
+            $Result.Applied | Should -BeTrue
+        }
+
+        It 'Scopes the WQL filter to the collection and never interpolates the app name' {
+            # A name carrying a quote would otherwise break the query, and one carrying a
+            # wildcard would otherwise match the wrong assignment.
+            $null = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' `
+                -ApplicationName 'Driver Updates - Dell OptiPlex 7080 - Windows 11 x64' -Suppress $true
+
+            $script:GetFilters[0] | Should -Be "TargetCollectionID = 'P0100016'"
+            $script:GetFilters[0] | Should -Not -Match 'OptiPlex'
+        }
+    }
+
+    Context 'Bit handling' {
+        It 'Preserves a server bit an admin set by hand' {
+            $script:Store = New-FakeAssignment -ApplicationName 'App' -SuppressReboot 2
+            Mock Get-CimInstance { $script:Store }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' {
+                $script:SetCalls.Add(@{ Property = $Property })
+                $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot']
+            }
+
+            $null = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $true
+
+            # 2 (servers) | 1 (workstations) = 3, not a clobbering 1.
+            [uint32]$script:SetCalls[0].Property['SuppressReboot'] | Should -Be 3
+        }
+
+        It 'Clears only the workstation bit when suppression is turned off' {
+            $script:Store = New-FakeAssignment -ApplicationName 'App' -SuppressReboot 3
+            Mock Get-CimInstance { $script:Store }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' {
+                $script:SetCalls.Add(@{ Property = $Property })
+                $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot']
+            }
+
+            $null = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $false
+
+            [uint32]$script:SetCalls[0].Property['SuppressReboot'] | Should -Be 2
+        }
+
+        It 'Writes nothing when the value is already correct' {
+            $script:Store = New-FakeAssignment -ApplicationName 'App' -SuppressReboot 1
+            Mock Get-CimInstance { $script:Store }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' { $script:SetCalls.Add(@{ Property = $Property }) }
+
+            $Result = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $true
+
+            $script:SetCalls.Count | Should -Be 0
+            $Result.Changed | Should -BeFalse
+            $Result.Applied | Should -BeTrue
+        }
+    }
+
+    Context 'Assignment lookup' {
+        It 'Falls back to the AssignmentName prefix when ApplicationName does not match' {
+            # AssignmentName is "<app name>_<CollectionID>_<action>".
+            $script:Store = New-FakeAssignment -ApplicationName '' -AssignmentName 'App_P0100016_Install'
+            Mock Get-CimInstance { $script:Store }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' {
+                $script:SetCalls.Add(@{ Property = $Property })
+                $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot']
+            }
+
+            $Result = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $true
+
+            $Result.Applied | Should -BeTrue
+        }
+
+        It 'Does not match a different app that merely shares a name prefix' {
+            # A "*$AppName*" -like match would have hit this one.
+            $script:Store = New-FakeAssignment -ApplicationName 'Drivers - Dell OptiPlex 7080 v2' -AssignmentName 'Drivers - Dell OptiPlex 7080 v2_P0100016_Install'
+            Mock Get-CimInstance { $script:Store }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' { $script:SetCalls.Add(@{ Property = $Property }) }
+
+            $Result = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' `
+                -ApplicationName 'Drivers - Dell OptiPlex 7080' -Suppress $true
+
+            $script:SetCalls.Count | Should -Be 0
+            $Result.Applied | Should -BeFalse
+            $Result.Reason  | Should -Match 'no SMS_ApplicationAssignment'
+        }
+
+        It 'Reports no match rather than throwing when the collection has no assignment' {
+            Mock Get-CimInstance { @() }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' { $script:SetCalls.Add(@{ Property = $Property }) }
+
+            $Result = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $true
+
+            $script:SetCalls.Count | Should -Be 0
+            $Result.Changed | Should -BeFalse
+            $Result.Applied | Should -BeFalse
+        }
+    }
+
+    Context 'Verification' {
+        It 'Reports not-applied when the site silently ignores the write' {
+            # Set-CimInstance returning without error is not proof the SMS provider
+            # persisted anything, which is how the old code could log success forever.
+            $script:Store = New-FakeAssignment -ApplicationName 'App' -SuppressReboot 0
+            Mock Get-CimInstance { $script:Store }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' { }   # accepts the write, changes nothing
+
+            $Result = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $true
+
+            $Result.Changed | Should -BeTrue
+            $Result.Applied | Should -BeFalse
+            $Result.Reason  | Should -Match 'SuppressReboot=0'
+        }
+
+        It 'Re-reads by AssignmentID to confirm' {
+            $script:Store = New-FakeAssignment -ApplicationName 'App' -SuppressReboot 0 -AssignmentID 16785252
+            Mock Get-CimInstance {
+                $script:GetFilters.Add($Filter)
+                $script:Store
+            }
+            Mock Set-CimInstance -RemoveParameterType 'InputObject' { $script:Store.SuppressReboot = [uint32]$Property['SuppressReboot'] }
+
+            $null = Set-DATDeploymentRestartSuppression -CollectionID 'P0100016' -ApplicationName 'App' -Suppress $true
+
+            $script:GetFilters.Count | Should -Be 2
+            $script:GetFilters[1] | Should -Be 'AssignmentID = 16785252'
+        }
+    }
+
+    AfterAll {
+        $script:CMSiteServer = $null
+        $script:CMSiteCode   = $null
+    }
+}
