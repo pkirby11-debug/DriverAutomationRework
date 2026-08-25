@@ -6,14 +6,18 @@
     This script compiles the WiX source into an MSI installer package.
 
     Prerequisites:
-        Install the WiX Toolset v4 .NET tool:
-        dotnet tool install --global wix
+        Install the WiX Toolset. Pin the major version - WiX v6 and later require
+        accepting the paid Open Source Maintenance Fee EULA before they will build,
+        so a bare "dotnet tool install --global wix" now fails with error WIX7015:
+            dotnet tool install --global wix --version 5.0.2
 
     The resulting MSI installs the PowerShell module to:
-        C:\ProgramData\WindowsPowerShell\Modules\DriverAutomationTool
+        C:\Program Files\PowerShell\Modules\DriverAutomationTool
 
-    This path is in the system-wide PSModulePath, making the module
-    available to all users without manual Import-Module paths.
+    That is the per-machine pwsh 7 module path and is on pwsh 7's default
+    PSModulePath, so the module is available to all users without a manual
+    Import-Module path. (It is NOT the Windows PowerShell 5.1 location - this
+    module requires 7.4+.)
 
 .PARAMETER OutputDir
     Directory where the MSI will be created. Defaults to .\Output
@@ -53,13 +57,31 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "`nChecking for WiX Toolset..." -ForegroundColor Yellow
 $wixCmd = Get-Command 'wix' -ErrorAction SilentlyContinue
 if (-not $wixCmd) {
-    Write-Host "WiX Toolset v4 not found. Install it with:" -ForegroundColor Red
-    Write-Host "  dotnet tool install --global wix" -ForegroundColor White
-    Write-Host "`nThen add the WiX UI extension:" -ForegroundColor Red
-    Write-Host "  wix extension add WixToolset.UI.wixext" -ForegroundColor White
+    Write-Host "WiX Toolset not found. Install it with:" -ForegroundColor Red
+    Write-Host "  dotnet tool install --global wix --version 5.0.2" -ForegroundColor White
+    Write-Host "Pin the version - v6+ refuses to build without a paid EULA (see below)." -ForegroundColor Red
     exit 1
 }
 Write-Host "  Found: $($wixCmd.Source)" -ForegroundColor Green
+
+# WiX v6 introduced the Open Source Maintenance Fee: it stops with error WIX7015
+# unless the EULA is accepted. Say so here rather than letting the build fail with
+# a message that reads like a fault in this installer.
+$wixVersion = @(& wix --version 2>&1)[-1]
+if ($wixVersion -match '^(\d+)\.') {
+    $wixMajor = [int]$Matches[1]
+    Write-Host "  Version: $wixVersion" -ForegroundColor Green
+    if ($wixMajor -lt 4) {
+        Write-Error "Product.wxs targets the WiX v4 schema; WiX $wixMajor cannot build it. Install 4.x or 5.x."
+        exit 1
+    }
+    if ($wixMajor -ge 6) {
+        Write-Host "  WiX $wixMajor requires the Open Source Maintenance Fee EULA (error WIX7015)." -ForegroundColor Yellow
+        Write-Host "  If the build fails on that, pin the free line instead:" -ForegroundColor Yellow
+        Write-Host "    dotnet tool uninstall --global wix" -ForegroundColor White
+        Write-Host "    dotnet tool install --global wix --version 5.0.2" -ForegroundColor White
+    }
+}
 
 # Create output directory
 if (-not (Test-Path $OutputDir)) {
