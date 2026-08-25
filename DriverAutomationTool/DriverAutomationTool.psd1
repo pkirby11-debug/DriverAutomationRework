@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.35.2'
+    ModuleVersion     = '2.38.2'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.35.2 - Moves everything the tool writes between runs out of the user profile and into one machine-wide root, C:\ProgramData\DriverAutomationTool (Cache, Logs, Settings, Staging). Defender Controlled Folder Access protects Documents and the other known folders by default and blocked the old staging location outright, stopping a sync mid-extract. Settings are carried forward automatically on first run, Invoke-DATMaintenance now also reclaims packs stranded in the old per-user location, and DAT_DATA_ROOT relocates the whole tree for a fleet that restricts ProgramData. Also repairs the MSI, which had drifted 15 files behind the module - an installed copy was missing Invoke-DATMaintenance, the driver-exclusion commands and six Scripts entry points. CI now builds the installer on every change so it cannot go stale again.'
+    Description       = '2.38.2 - Merges the BIOS flash investigation line (2.35.0-2.38.1) with main''s 2.35.2 ProgramData relocation and MSI repair. The investigation added four read-only field diagnostics, the Dell /Status query, and the finding that the one Precision 3630 running current firmware reached it through Windows'' firmware-driver path rather than the DUP path being debugged. Both version lines bumped independently while the branch was open; this keeps the higher number and carries both sets of changes.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
