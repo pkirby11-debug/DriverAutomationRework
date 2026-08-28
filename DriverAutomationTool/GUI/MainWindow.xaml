@@ -516,6 +516,96 @@
                 </DockPanel>
             </TabItem>
 
+            <!-- ============ Driver Pins ============ -->
+            <TabItem Header="Driver Pins">
+                <Grid Margin="16">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="1.1*" />
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Grid.Row="0">
+                        <TextBlock Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" Margin="0,0,0,8"
+                                   Text="A pin holds one driver at a chosen revision: the sync stops resolving it to the catalog's newest, and devices already carrying something newer are forced back down to it. Load a model's revisions, pick the one you want, and pin it. Dell 'Driver Updates' packages only." />
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                            <Label Content="Model:" Width="55" />
+                            <TextBox x:Name="PinModelBox" Width="260" Margin="0,0,8,0" />
+                            <Label Content="OS:" Width="34" />
+                            <ComboBox x:Name="PinOsCombo" Width="170" Margin="0,0,8,0" />
+                            <CheckBox x:Name="PinForceRefreshCheckBox" Content="Refresh catalog" VerticalAlignment="Center" Margin="0,0,12,0" />
+                            <Button x:Name="PinLoadButton" Content="Load Revisions" Style="{StaticResource StandardButton}" Width="132" />
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                            <CheckBox x:Name="PinRollbackOnlyCheckBox" Content="Rollback targets only (hide the revision that ships today)" VerticalAlignment="Center" Margin="0,0,16,0" />
+                            <Label Content="Search:" Width="55" />
+                            <TextBox x:Name="PinSearchBox" Width="260" />
+                        </StackPanel>
+                    </StackPanel>
+
+                    <DataGrid x:Name="PinCandidateGrid" Grid.Row="1" Margin="0,0,0,8">
+                        <DataGrid.Columns>
+                            <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox Style="{StaticResource GridCheckCell}"
+                                                  IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                            <DataGridTextColumn Header="Ships today" Width="86" IsReadOnly="True" Binding="{Binding Current}" />
+                            <DataGridTextColumn Header="Category" Width="90" IsReadOnly="True" Binding="{Binding Category}" />
+                            <DataGridTextColumn Header="Driver" Width="2*" IsReadOnly="True" Binding="{Binding Name}" />
+                            <DataGridTextColumn Header="Version" Width="150" IsReadOnly="True" Binding="{Binding Version}" />
+                            <DataGridTextColumn Header="Released" Width="110" IsReadOnly="True" Binding="{Binding Released}" />
+                            <DataGridTextColumn Header="File" Width="*" IsReadOnly="True" Binding="{Binding FileName}" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
+                        <Label Content="Reason:" Width="55" />
+                        <TextBox x:Name="PinReasonBox" Width="470" Margin="0,0,8,0"
+                                 ToolTip="Why this driver is being held back. Carried into the package manifest and the client apply log." />
+                        <Button x:Name="PinCreateButton" Content="Pin Selected Revision" Style="{StaticResource AccentButton}" Width="168" Margin="0,0,8,0" />
+                        <TextBlock x:Name="PinStatusLabel" Text="" VerticalAlignment="Center"
+                                   Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,6">
+                        <TextBlock Text="Active pins" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,16,0"
+                                   Foreground="{DynamicResource Fg}" />
+                        <Button x:Name="PinRefreshButton" Content="Refresh" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,8,0" />
+                        <Button x:Name="PinDisableButton" Content="Disable" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,8,0" />
+                        <Button x:Name="PinEnableButton" Content="Enable" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,8,0" />
+                        <Button x:Name="PinRemoveButton" Content="Remove" Style="{StaticResource StandardButton}" Width="90" Margin="0,0,16,0" Foreground="#FFE74C3C" />
+                        <CheckBox x:Name="PinShowDisabledCheckBox" Content="Show disabled" VerticalAlignment="Center" />
+                    </StackPanel>
+
+                    <DataGrid x:Name="PinGrid" Grid.Row="4">
+                        <DataGrid.Columns>
+                            <DataGridTemplateColumn Header="" Width="40" CanUserSort="False">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox Style="{StaticResource GridCheckCell}"
+                                                  IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                            <DataGridTextColumn Header="On" Width="44" IsReadOnly="True" Binding="{Binding Enabled}" />
+                            <DataGridTextColumn Header="Driver" Width="2*" IsReadOnly="True" Binding="{Binding NamePattern}" />
+                            <DataGridTextColumn Header="Pinned to" Width="150" IsReadOnly="True" Binding="{Binding PinnedVersion}" />
+                            <DataGridTextColumn Header="SystemID" Width="90" IsReadOnly="True" Binding="{Binding SystemId}" />
+                            <DataGridTextColumn Header="Model" Width="140" IsReadOnly="True" Binding="{Binding Model}" />
+                            <DataGridTextColumn Header="OS" Width="120" IsReadOnly="True" Binding="{Binding OperatingSystem}" />
+                            <DataGridTextColumn Header="Recoverable" Width="94" IsReadOnly="True" Binding="{Binding Recoverable}" />
+                            <DataGridTextColumn Header="Reason" Width="*" IsReadOnly="True" Binding="{Binding Reason}" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </Grid>
+            </TabItem>
+
             <!-- ============ Deploy Applications ============ -->
             <TabItem Header="Deploy Applications">
                 <DockPanel Margin="16" LastChildFill="True">

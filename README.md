@@ -25,6 +25,7 @@ the sole update source).
   - [SCCM Settings](#tab-sccm-settings)
   - [Progress](#tab-progress)
   - [Package Management](#tab-package-management)
+  - [Driver Pins](#tab-driver-pins)
   - [Deploy Applications](#tab-deploy-applications)
 - [Sync types & deployment platforms](#sync-types)
 - [The Driver Updates (DCU) engine](#dcu-engine)
@@ -149,6 +150,30 @@ Inventory and clean up existing DAT-built ConfigMgr objects:
 - **Grid** of existing packages (ID, name, version, manufacturer, type, source path).
 - **Delete** selected packages, or **Clean up overlay packages** (removes superseded
   overlay revisions).
+
+<a name="tab-driver-pins"></a>
+### Driver Pins
+
+Roll a driver back, and hold it there. See
+[Driver version pinning](#pinning) for what a pin actually does.
+
+- **Model / OS → Load Revisions** — resolves that model's Dell catalog the way a
+  Driver Updates sync would, but lists *every* revision it finds rather than only
+  the newest per component. The predecessor revisions are the rollback targets,
+  and the resolver's dedup normally discards them without showing you.
+  *Rollback targets only* hides the revision that ships today; *Refresh catalog*
+  re-pulls the per-model XML instead of using the cached copy.
+- **Pin Selected Revision** — writes the pin, capturing that revision's download
+  URL, MD5, size, filename and raw catalog XML along with it. That capture is the
+  point of using the tab over the cmdlet: without it a pin stops resolving the day
+  Dell drops the revision, which is exactly when you still need it.
+- **Active pins grid** — every pin, with **Recoverable** showing which ones carry
+  that metadata (`Version only` means the pin dies when Dell purges the revision).
+  **Disable** stops a pin applying but keeps the captured metadata; **Remove**
+  throws it away and lets the driver resolve to the catalog's newest again.
+
+Nothing reaches the fleet until you run a sync for that model — the pin changes
+what the *next* sync resolves.
 
 <a name="tab-deploy-applications"></a>
 ### Deploy Applications
@@ -372,11 +397,22 @@ current revision and usually a predecessor or two; it is not an archive. `-Sourc
 `-ComponentXml`, `-HashMD5` and `-PinnedName` are what keep a pin working after Dell
 drops the revision — which is exactly when you still need it.
 
+**Finding the revision to pin to.** `Get-DATDriverPinCandidate` lists every revision
+the catalog holds for a model, flagged with which one ships today, and pipes straight
+into `Add-DATDriverPin` so the capture happens for you:
+
+```powershell
+Get-DATDriverPinCandidate -Model 'Latitude 5430' -OperatingSystem 'Windows 11 24H2' |
+  Where-Object { $_.Name -like '*AMD*' -and -not $_.IsCurrent } |
+  Add-DATDriverPin -Reason 'v32 breaks P2419H over DisplayPort'
+```
+
+The GUI's [Driver Pins](#tab-driver-pins) tab is the same thing with a picker.
+
 Managed with `Get-DATDriverPin` / `Add-DATDriverPin` / `Remove-DATDriverPin` /
 `Disable-DATDriverPin` / `Enable-DATDriverPin`. Pins apply to Dell **Driver Updates**
 packages; the base-pack `Drivers` overlay installs extracted INFs and has no
-force-install path, so a pin there is refused rather than half-honored. GUI syncs pick
-pins up automatically — there is no GUI surface for them yet.
+force-install path, so a pin there is refused rather than half-honored.
 
 ---
 
@@ -473,6 +509,7 @@ by the deployment type's `BasedOnExitCode` behavior.
 | `Invoke-DATRemovePackages` / `Invoke-DATCleanupOverlayPackages` | Package cleanup. |
 | `Test-DATVulnerableDrivers` | Screen a folder of DUPs / `.sys` files against the Microsoft blocklist. |
 | `Get-DATDriverPin` / `Add-DATDriverPin` / `Remove-DATDriverPin` / `Enable-DATDriverPin` / `Disable-DATDriverPin` | Hold a driver component at a specific version — the rollback mechanism. See [Driver version pinning](#pinning). |
+| `Get-DATDriverPinCandidate` | List the catalog revisions a pin could target for a model, newest and superseded alike. Pipes into `Add-DATDriverPin`. |
 | `Set-DATDellCommandUpdateMode` | Put DCU into DAT-managed (passive) mode, or revert/opt-out. |
 | `Export-DATReport` | Export a job/inventory report. |
 | `Connect-DATIntune` / `Disconnect-DATIntune` / `Test-DATIntuneConnection` / `Get-DATIntuneWin32App` / `Find-DATIntuneEntraGroup` | Intune groundwork for upcoming Win32/driver-profile support. |

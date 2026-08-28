@@ -78,6 +78,29 @@ function New-DATMainWindow {
     $Controls['SyncReportGridData'] = New-DATGridTable -Columns @('Status', 'Manufacturer', 'Model', 'Type', 'Version', 'PackageID', 'Message')
     $Controls['SyncReportGrid'].ItemsSource = $Controls['SyncReportGridData'].DefaultView
 
+    # Driver Pins tab. The candidate grid carries far more columns than it shows:
+    # SourceUrl, HashMD5, Size, ComponentXml and the rest are the catalog metadata
+    # a pin must capture to survive Dell purging that revision later. Collecting it
+    # by hand is exactly what an operator forgets, so the picker carries it.
+    $Controls['PinCandidateGridData'] = New-DATGridTable -Columns @(
+        'Current', 'Category', 'Name', 'Version', 'Released', 'FileName',
+        'SourceUrl', 'HashMD5', 'Size', 'ReleaseDate', 'HardwareIds', 'ComponentXml',
+        'SystemId', 'Model', 'OperatingSystem')
+    $Controls['PinCandidateGrid'].ItemsSource = $Controls['PinCandidateGridData'].DefaultView
+
+    $Controls['PinGridData'] = New-DATGridTable -Columns @(
+        'Enabled', 'NamePattern', 'PinnedVersion', 'SystemId', 'Model',
+        'OperatingSystem', 'Recoverable', 'Reason')
+    $Controls['PinGrid'].ItemsSource = $Controls['PinGridData'].DefaultView
+
+    try {
+        $PinBuilds = Get-DATWindowsBuilds
+        Add-DATComboItems -Combo $Controls['PinOsCombo'] -Items @($PinBuilds.Keys | Sort-Object -Descending)
+    } catch {
+        Add-DATComboItems -Combo $Controls['PinOsCombo'] -Items @('Windows 11 24H2')
+    }
+    if ($Controls['PinOsCombo'].Items.Count -gt 0) { $Controls['PinOsCombo'].SelectedIndex = 0 }
+
     # --- Date/time picker defaults (DatePicker + HH:mm TextBox pairs) ---
     Set-DATDateTimeValue -DatePicker $Controls['DeployAvailablePicker'] -TimeBox $Controls['DeployAvailableTime'] -Value (Get-Date)
     Set-DATDateTimeValue -DatePicker $Controls['DeployDeadlinePicker'] -TimeBox $Controls['DeployDeadlineTime'] -Value (Get-Date).AddHours(24)
@@ -163,6 +186,9 @@ function Initialize-DATMainWindow {
         DeployRunspace           = $null
         DeployHandle             = $null
         DeployTimer              = $null
+        PinRunspace              = $null
+        PinHandle                = $null
+        PinTimer                 = $null
     }
 
     # Stash the whole GUI context in global scope. Every handler fetches it with
@@ -1865,6 +1891,247 @@ function Initialize-DATMainWindow {
     })
 
     # --- Load saved settings on window load ---
+    # ======================= Driver Pins tab =============================
+    # A pin holds a component at a chosen revision: the sync stops resolving it to
+    # the catalog's newest (so the upgrade stops), and the apply script forces
+    # devices already carrying something newer back down to it. The mechanism
+    # lives in Private\Core\DriverPinStore.ps1.
+    #
+    # The picker exists because the revision an operator needs to roll back to is
+    # invisible otherwise - the resolver's dedup discards predecessor revisions
+    # and only names them in a log line. Loading them here also captures the
+    # download URL, hash and catalog XML into the pin, which is what keeps it
+    # working after Dell purges that revision from the per-model catalog.
+
+    # --- Load the model's catalog revisions (background: the catalog fetch is slow) ---
+    $Controls['PinLoadButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+
+        $PinModel = $Controls['PinModelBox'].Text.Trim()
+        $PinOs    = Get-DATComboText -Combo $Controls['PinOsCombo']
+        if (-not $PinModel) {
+            Show-DATWindowMessage -Message 'Enter the Dell catalog model name (as it appears in the Models grid).' -Type Warning
+            return
+        }
+        if (-not $PinOs) {
+            Show-DATWindowMessage -Message 'Select a target operating system.' -Type Warning
+            return
+        }
+
+        $ForceRefresh = [bool]$Controls['PinForceRefreshCheckBox'].IsChecked
+        $ModulePath   = (Get-Module DriverAutomationTool).ModuleBase
+
+        $Controls['PinLoadButton'].IsEnabled   = $false
+        $Controls['PinCreateButton'].IsEnabled = $false
+        $Controls['PinStatusLabel'].Text       = "Resolving catalog revisions for $PinModel..."
+        $Controls['StatusStripLabel'].Text     = 'Loading driver revisions...'
+        $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+        $PinScript = {
+            param($ModulePath, $PinModel, $PinOs, $ForceRefresh, $LogQueue)
+            Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+            Register-DATQueueLogSubscriber -LogQueue $LogQueue
+            return @(Get-DATDriverPinCandidate -Model $PinModel -OperatingSystem $PinOs -ForceRefresh:$ForceRefresh)
+        }
+
+        $G.PinRunspace = [System.Management.Automation.PowerShell]::Create()
+        $G.PinRunspace.AddScript($PinScript).AddArgument($ModulePath).AddArgument($PinModel).AddArgument($PinOs).AddArgument($ForceRefresh).AddArgument($G.LogQueue) | Out-Null
+        $G.PinHandle = $G.PinRunspace.BeginInvoke()
+
+        if ($G.PinTimer) { $G.PinTimer.Stop() }
+        $G.PinTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $G.PinTimer.Interval = [timespan]::FromMilliseconds(500)
+
+        $G.PinTimer.Add_Tick({
+            $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
+
+            if ($null -eq $G.PinHandle -or -not $G.PinHandle.IsCompleted) { return }
+
+            $G.PinTimer.Stop()
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
+
+            try {
+                $Candidates = @($G.PinRunspace.EndInvoke($G.PinHandle))
+                $Table = $Controls['PinCandidateGridData']
+                $Table.Rows.Clear()
+                foreach ($C in $Candidates) {
+                    $Row = $Table.NewRow()
+                    $Row['Selected']        = $false
+                    $Row['Current']         = if ($C.IsCurrent) { 'Yes' } else { '' }
+                    $Row['Category']        = [string]$C.Category
+                    $Row['Name']            = [string]$C.Name
+                    $Row['Version']         = [string]$C.Version
+                    # Date only: the catalog's round-trip timestamps are unreadable
+                    # in a grid and the time of day never decides anything here.
+                    $Row['Released']        = if ($C.ReleaseDate) { ([string]$C.ReleaseDate -split '[T ]')[0] } else { '' }
+                    $Row['FileName']        = [string]$C.FileName
+                    $Row['SourceUrl']       = [string]$C.SourceUrl
+                    $Row['HashMD5']         = [string]$C.HashMD5
+                    $Row['Size']            = [string]$C.Size
+                    $Row['ReleaseDate']     = [string]$C.ReleaseDate
+                    $Row['HardwareIds']     = (@($C.HardwareIds) -join ';')
+                    $Row['ComponentXml']    = [string]$C.ComponentXml
+                    $Row['SystemId']        = [string]$C.SystemId
+                    $Row['Model']           = [string]$C.Model
+                    $Row['OperatingSystem'] = [string]$C.OperatingSystem
+                    $Table.Rows.Add($Row)
+                }
+
+                $Superseded = @($Candidates | Where-Object { -not $_.IsCurrent }).Count
+                if ($Candidates.Count -eq 0) {
+                    $Controls['PinStatusLabel'].Text = 'No revisions resolved - check the model name and OS against the Models tab.'
+                } elseif ($Superseded -eq 0) {
+                    $Controls['PinStatusLabel'].Text = "$($Candidates.Count) revision(s); Dell's catalog currently lists no predecessor to roll back to."
+                } else {
+                    $Controls['PinStatusLabel'].Text = "$($Candidates.Count) revision(s), $Superseded of them older revisions you can pin to."
+                }
+                $Controls['StatusStripLabel'].Text = "Loaded $($Candidates.Count) driver revision(s)"
+                Update-DATPinCandidateFilter
+            } catch {
+                $Controls['PinStatusLabel'].Text   = 'Failed to load revisions.'
+                $Controls['StatusStripLabel'].Text = 'Loading driver revisions failed'
+                Show-DATWindowMessage -Message "Could not load driver revisions: $($_.Exception.Message)" -Type Error
+            } finally {
+                if ($G.PinRunspace) {
+                    try { $G.PinRunspace.Dispose() } catch {
+                        [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+                    }
+                    $G.PinRunspace = $null
+                }
+                $G.PinHandle = $null
+                $G.LogQueue  = $null
+                $Controls['PinLoadButton'].IsEnabled   = $true
+                $Controls['PinCreateButton'].IsEnabled = $true
+            }
+        })
+
+        $G.PinTimer.Start()
+    })
+
+    $Controls['PinSearchBox'].Add_TextChanged({ Update-DATPinCandidateFilter })
+    $Controls['PinRollbackOnlyCheckBox'].Add_Checked({ Update-DATPinCandidateFilter })
+    $Controls['PinRollbackOnlyCheckBox'].Add_Unchecked({ Update-DATPinCandidateFilter })
+
+    # --- Create the pin from the selected revision ---------------------------
+    $Controls['PinCreateButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        Complete-DATGridEdit $Controls['PinCandidateGrid']
+        $Rows = Get-DATGridSelectedRows -Table $Controls['PinCandidateGridData']
+        if ($Rows.Count -eq 0) {
+            Show-DATWindowMessage -Message 'Tick the revision you want to pin to.' -Type Warning
+            return
+        }
+
+        $Reason = $Controls['PinReasonBox'].Text.Trim()
+        if (-not $Reason) {
+            $Ask = Show-DATWindowMessage -Type Question -Message ("No reason entered. The reason is carried into the package manifest and the client's apply log, and it is what tells the next person why this driver is being held back.`n`nPin anyway?")
+            if ($Ask -ne 'Yes') { return }
+        }
+
+        # Name the consequence, not the action: this holds the fleet AND pushes
+        # already-updated devices back down on the next deployment cycle.
+        $Summary = (@($Rows | ForEach-Object { "  $($_['Name'])  ->  v$($_['Version'])" }) -join "`n")
+        $Confirm = Show-DATWindowMessage -Type Question -Message (
+            "Pin $($Rows.Count) driver(s)?`n`n$Summary`n`n" +
+            "The next sync rebuilds this model's Driver Updates package with these revisions, and devices already running a newer driver are forced back down to them.")
+        if ($Confirm -ne 'Yes') { return }
+
+        $Created = 0
+        $Failed  = [System.Collections.Generic.List[string]]::new()
+        foreach ($Row in $Rows) {
+            try {
+                $PinParams = @{
+                    NamePattern     = [string]$Row['Name']
+                    PinnedVersion   = [string]$Row['Version']
+                    SystemId        = [string]$Row['SystemId']
+                    Manufacturer    = 'Dell'
+                    Model           = [string]$Row['Model']
+                    OperatingSystem = [string]$Row['OperatingSystem']
+                    Reason          = $Reason
+                    SourceUrl       = [string]$Row['SourceUrl']
+                    PinnedFileName  = [string]$Row['FileName']
+                    PinnedName      = [string]$Row['Name']
+                    ComponentXml    = [string]$Row['ComponentXml']
+                    HashMD5         = [string]$Row['HashMD5']
+                    Size            = [string]$Row['Size']
+                    ReleaseDate     = [string]$Row['ReleaseDate']
+                    Category        = [string]$Row['Category']
+                    Confirm         = $false
+                }
+                $Ids = @(([string]$Row['HardwareIds'] -split ';') | Where-Object { $_ })
+                if ($Ids.Count -gt 0) { $PinParams['HardwareIds'] = $Ids }
+                Add-DATDriverPin @PinParams
+                $Created++
+            } catch {
+                $Failed.Add("$($Row['Name']): $($_.Exception.Message)")
+            }
+        }
+
+        Set-DATGridChecks -Table $Controls['PinCandidateGridData'] -Checked $false
+        Update-DATPinGrid
+
+        if ($Failed.Count -eq 0) {
+            $Controls['PinStatusLabel'].Text = "Pinned $Created driver(s). Run a sync for this model to rebuild the package."
+            Show-DATWindowMessage -Type Information -Message (
+                "Pinned $Created driver(s).`n`nNothing has changed on the fleet yet - run a sync for this model " +
+                "(Models tab, Type 'Driver Updates (Catalog Only)') to rebuild the package. The existing application updates in place.")
+        } else {
+            $Controls['PinStatusLabel'].Text = "$Created pinned, $($Failed.Count) failed."
+            Show-DATWindowMessage -Type Warning -Message "$Created pinned, $($Failed.Count) failed:`n`n$(($Failed) -join "`n")"
+        }
+    })
+
+    # --- Active pins grid ----------------------------------------------------
+    $Controls['PinRefreshButton'].Add_Click({ Update-DATPinGrid })
+    $Controls['PinShowDisabledCheckBox'].Add_Checked({ Update-DATPinGrid })
+    $Controls['PinShowDisabledCheckBox'].Add_Unchecked({ Update-DATPinGrid })
+
+    $Controls['PinDisableButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        Complete-DATGridEdit $Controls['PinGrid']
+        $Rows = Get-DATGridSelectedRows -Table $Controls['PinGridData']
+        if ($Rows.Count -eq 0) { Show-DATWindowMessage -Message 'Select pins to disable.' -Type Warning; return }
+        foreach ($Row in $Rows) {
+            Disable-DATDriverPin -NamePattern ([string]$Row['NamePattern']) -SystemId ([string]$Row['SystemId']) -Confirm:$false
+        }
+        Update-DATPinGrid
+        $Controls['PinStatusLabel'].Text = "Disabled $($Rows.Count) pin(s). The next sync resolves those drivers to the catalog's newest again."
+    })
+
+    $Controls['PinEnableButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        Complete-DATGridEdit $Controls['PinGrid']
+        $Rows = Get-DATGridSelectedRows -Table $Controls['PinGridData']
+        if ($Rows.Count -eq 0) { Show-DATWindowMessage -Message 'Select pins to enable.' -Type Warning; return }
+        foreach ($Row in $Rows) {
+            Enable-DATDriverPin -NamePattern ([string]$Row['NamePattern']) -SystemId ([string]$Row['SystemId']) -Confirm:$false
+        }
+        Update-DATPinGrid
+        $Controls['PinStatusLabel'].Text = "Enabled $($Rows.Count) pin(s)."
+    })
+
+    $Controls['PinRemoveButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls
+        Complete-DATGridEdit $Controls['PinGrid']
+        $Rows = Get-DATGridSelectedRows -Table $Controls['PinGridData']
+        if ($Rows.Count -eq 0) { Show-DATWindowMessage -Message 'Select pins to remove.' -Type Warning; return }
+
+        # Removing throws away the captured URL and catalog XML, which cannot be
+        # recovered once Dell drops the revision. Disabling keeps them.
+        $Confirm = Show-DATWindowMessage -Type Question -Message (
+            "Remove $($Rows.Count) pin(s)?`n`nThose drivers resolve to the catalog's newest revision again on the next sync, " +
+            "and devices take it - so only remove a pin once the vendor has actually fixed the fault.`n`n" +
+            "To stop a pin applying while keeping the download URL and catalog XML it captured, use Disable instead.")
+        if ($Confirm -ne 'Yes') { return }
+
+        foreach ($Row in $Rows) {
+            Remove-DATDriverPin -NamePattern ([string]$Row['NamePattern']) -SystemId ([string]$Row['SystemId']) -Confirm:$false
+        }
+        Update-DATPinGrid
+        $Controls['PinStatusLabel'].Text = "Removed $($Rows.Count) pin(s)."
+    })
+
     $Window.Add_Loaded({
         $gui = Get-DATGui; $Controls = $gui.Controls; $Window = $gui.Window; $G = $gui.G
 
@@ -2006,6 +2273,9 @@ function Initialize-DATMainWindow {
 
         $Controls['UpdateIndividualCheckBox'].IsEnabled = [bool]$Controls['DellCheckBox'].IsChecked
 
+        # Fill the active-pins grid so the tab is never blank on first open.
+        Update-DATPinGrid
+
         # Safe Window Closing Cleanup: Stop & dispose any background runspaces and timers
         $Window.Add_Closing({
             param($EvtSender, $EvtArgs)
@@ -2026,6 +2296,7 @@ function Initialize-DATMainWindow {
                 @{ Name='OverlayRemove';    RS=$G.OverlayRemoveRunspace;    Timer=$G.OverlayRemoveTimer }
                 @{ Name='Deploy';           RS=$G.DeployRunspace;           Timer=$G.DeployTimer }
                 @{ Name='IntunePublish';    RS=$G.IntunePublishRunspace;    Timer=$G.IntunePublishTimer }
+                @{ Name='Pin';              RS=$G.PinRunspace;              Timer=$G.PinTimer }
             )
 
             foreach ($Item in $TasksToStop) {

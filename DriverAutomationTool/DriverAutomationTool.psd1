@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.40.0'
+    ModuleVersion     = '2.41.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.40.0 - Adds driver version pinning, the rollback mechanism for a bad vendor driver. Add-DATDriverPin holds a named component at a specific revision, so the sync resolves that revision instead of the catalog''s newest and the existing Driver Updates application rebuilds in place at a new fingerprint - no second package to fight the deployed one, and the pin survives every future scheduled sync. On the client a pinned package bypasses the DCU engine (dcu-cli only installs what it judges newer, so it cannot apply a rollback) and the built-in DUP engine appends Dell''s /f only on devices whose live installed driver is newer than the pinned target, so the rollback targets itself. A pin that cannot be satisfied fails the model rather than silently re-shipping the driver it was holding back. Dell Driver Updates packages only.'
+    Description       = '2.41.0 - Driver version pinning gains a GUI. The new Driver Pins tab loads a model''s catalog revisions, including the older ones the resolver''s dedup normally discards, and pins the one you pick - capturing that revision''s download URL, MD5, size and catalog XML with it, which is what keeps the pin working after Dell purges it from the per-model catalog. Existing pins are listed there too, with enable/disable/remove and a Recoverable column showing which ones carry that metadata. The same discovery is available headless as Get-DATDriverPinCandidate, which pipes straight into Add-DATDriverPin. A pin does two things: it stops the sync resolving that component to the catalog''s newest, and it forces devices already carrying something newer back down to the pinned revision.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
@@ -33,6 +33,7 @@
         'Remove-DATDriverExclusion'
         'Clear-DATDriverExclusion'
         'Get-DATDriverPin'
+        'Get-DATDriverPinCandidate'
         'Add-DATDriverPin'
         'Remove-DATDriverPin'
         'Enable-DATDriverPin'

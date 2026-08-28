@@ -257,6 +257,35 @@ Describe 'Get-DellIndividualDrivers version pinning' {
         $Unsatisfied.Count | Should -Be 1
     }
 
+    It 'Discovery mode returns every revision, flagged with the one that ships today' {
+        # This is what makes a pin choosable: the dedup discards the predecessor
+        # revisions, so without -IncludeSuperseded an operator cannot see what to
+        # roll back to.
+        $All = @(Get-DellIndividualDrivers @script:ResolveParams -IncludeSuperseded)
+        @($All | Where-Object { $_.Category -eq 'Video' }).Count | Should -Be 2
+
+        $Current = @($All | Where-Object { $_.Category -eq 'Video' -and $_.IsCurrent })
+        $Current.Count   | Should -Be 1
+        $Current[0].Version | Should -Be '32.0.11021.4004'
+
+        $Rollback = @($All | Where-Object { $_.Category -eq 'Video' -and -not $_.IsCurrent })
+        $Rollback.Count | Should -Be 1
+        $Rollback[0].Version | Should -Be '31.0.15021.1001'
+        # The metadata that keeps a pin alive after Dell purges the revision.
+        $Rollback[0].Url          | Should -Not -BeNullOrEmpty
+        $Rollback[0].ComponentXml | Should -Not -BeNullOrEmpty
+        $Rollback[0].HashMD5      | Should -Be 'old'
+    }
+
+    It 'Discovery mode ignores pins - it is the menu, not the order' {
+        $Pin = [PSCustomObject]@{
+            NamePattern = 'AMD Radeon'; PinnedVersion = '31.0.15021.1001'
+            SystemId = '0B12'; Manufacturer = 'Dell'; Enabled = $true
+        }
+        $All = @(Get-DellIndividualDrivers @script:ResolveParams -IncludeSuperseded -PinVersions @($Pin))
+        @($All | Where-Object { $_.Category -eq 'Video' }).Count | Should -Be 2
+    }
+
     It 'Rebuilds the pinned revision from captured metadata once the catalog drops it' {
         $Pin = [PSCustomObject]@{
             NamePattern    = 'AMD Radeon'; PinnedVersion = '30.0.00000.0001'

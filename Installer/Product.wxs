@@ -88,6 +88,7 @@
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverPack.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverPin.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverPinCandidate.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATIntuneDriverInventory.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATIntuneDriverUpdateProfile.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATIntuneWin32App.ps1" KeyPath="yes" /></Component>

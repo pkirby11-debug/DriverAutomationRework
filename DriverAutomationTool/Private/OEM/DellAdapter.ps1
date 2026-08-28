@@ -710,6 +710,14 @@ function Get-DellIndividualDrivers {
         # and the dedup step will pick the older revision.
         [switch]$ForceRefresh,
 
+        # Discovery mode: return every revision the catalog filters accepted,
+        # BEFORE the "newest per family wins" dedup, each tagged IsCurrent. The
+        # dedup is what normally discards the predecessor revisions - which are
+        # exactly the ones a rollback needs to choose from - so without this an
+        # operator has no way to see what a pin could target. Returns the menu;
+        # pins are not applied (see the early return below).
+        [switch]$IncludeSuperseded,
+
         # Version pins (Get-DATDriverPinForScope output) that override the
         # "newest revision wins" dedup for the components they name - the
         # rollback mechanism. Applied after dedup by Select-DATPinnedDriver, so
@@ -1222,6 +1230,25 @@ function Get-DellIndividualDrivers {
             }
         }
         $Winner
+    }
+
+    # Discovery mode returns here, before pins are applied: this is the menu of
+    # revisions a pin could name, not the resolved order. Every candidate that
+    # passed the catalog filters is returned, tagged with whether the dedup would
+    # have picked it, newest first within each component.
+    if ($IncludeSuperseded) {
+        $WinnerKeys = @{}
+        foreach ($W in $LatestPerDriver) {
+            $WinnerKeys['{0}|{1}|{2}' -f $W.Category, $W.Name, $W.Version] = $true
+        }
+        foreach ($C in $MatchedDrivers) {
+            $IsCurrent = [bool]$WinnerKeys['{0}|{1}|{2}' -f $C.Category, $C.Name, $C.Version]
+            $C | Add-Member -NotePropertyName 'IsCurrent' -NotePropertyValue $IsCurrent -Force
+        }
+        $CurrentCount = @($MatchedDrivers | Where-Object { $_.IsCurrent }).Count
+        Write-DATLog -Message ("Catalog discovery for SystemID {0}: {1} revision(s) available - {2} current, {3} superseded (pinnable)" -f `
+            $SystemID, $MatchedDrivers.Count, $CurrentCount, ($MatchedDrivers.Count - $CurrentCount)) -Severity 1
+        return @($MatchedDrivers | Sort-Object Category, Name, @{ Expression = 'ParsedDate'; Descending = $true })
     }
 
     # Version pins: hold a named component at a specific revision instead of the
