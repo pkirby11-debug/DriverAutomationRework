@@ -232,3 +232,100 @@ Describe 'Firmware update status (ESRT) reader' {
         $Catch | Should -Match 'Write-Log'
     }
 }
+
+Describe 'Version-pinned rollback (Dell DUP loop)' {
+    BeforeAll {
+        $script:InstallFn = Get-DATFunctionAst -Name 'Install-DriverUpdates'
+        $script:DrvLoop   = Get-DATPerDriverLoopAst
+
+        function Get-DATAssignmentAst {
+            param($Scope, [string]$Left, [string]$Operator)
+            @($Scope.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $n.Left.Extent.Text -eq $Left
+            }, $true) | Where-Object { -not $Operator -or $_.Operator -eq $Operator })
+        }
+    }
+
+    It 'Builds the default DUP argument list without /f' {
+        # /f overrides the DUP's own version and qualification checks. Applied
+        # unconditionally it would let every DUP roll back whatever is installed,
+        # including a driver a device got from Windows Update that we cannot see.
+        # It belongs on the pinned-rollback path only.
+        $Init = Get-DATAssignmentAst -Scope $script:DrvLoop -Left '$DupArgs' -Operator 'Equals'
+        @($Init).Count | Should -BeGreaterThan 0
+        foreach ($A in $Init) { $A.Extent.Text | Should -Not -Match "'/f'" }
+    }
+
+    It 'Appends /f only under $ForceDowngrade' {
+        $Appends = @(Get-DATAssignmentAst -Scope $script:DrvLoop -Left '$DupArgs' |
+            Where-Object { $_.Extent.Text -match "'/f'" })
+        @($Appends).Count | Should -Be 1
+
+        $Node = $Appends[0]
+        $Guard = $null
+        while ($Node -and -not $Guard) {
+            $Node = $Node.Parent
+            if ($Node -is [System.Management.Automation.Language.IfStatementAst]) { $Guard = $Node }
+        }
+        $Guard | Should -Not -BeNullOrEmpty
+        $Guard.Clauses[0].Item1.Extent.Text | Should -Match 'ForceDowngrade'
+    }
+
+    It 'Decides the downgrade from the live installed driver, never from the marker' {
+        # The Components marker cannot carry this decision: DCU-managed devices
+        # have no markers at all (Invoke-DCUDriverUpdates returns before the tree
+        # is created), and the key is derived from the DUP filename, which carries
+        # the version - so the pinned DUP looks at a different key than the bad one
+        # wrote. A marker-based rule would force the downgrade fleet-wide.
+        $Sets = @(Get-DATAssignmentAst -Scope $script:DrvLoop -Left '$ForceDowngrade' |
+            Where-Object { $_.Right.Extent.Text -eq '$true' })
+        @($Sets).Count | Should -Be 1
+
+        $Node = $Sets[0]
+        $Guard = $null
+        while ($Node -and -not $Guard) {
+            $Node = $Node.Parent
+            if ($Node -is [System.Management.Automation.Language.IfStatementAst]) { $Guard = $Node }
+        }
+        $Guard | Should -Not -BeNullOrEmpty
+        ($Guard.Clauses | ForEach-Object { $_.Item1.Extent.Text }) -join ' ' | Should -Match 'LiveCmp'
+    }
+
+    It 'Narrows the marker skip to equality for a pinned row' {
+        # The ordinary ">= manifest version, skip" rule is backwards for a
+        # rollback: the marker holds the version being rolled back FROM, so it
+        # compares greater and would swallow the fix.
+        $script:DrvLoop.Extent.Text | Should -Match '\$SkipOnMarker'
+        $script:DrvLoop.Extent.Text | Should -Match 'AllowDowngrade'
+    }
+
+    It 'Routes a pinned package past the DCU engine' {
+        # dcu-cli only installs what it judges newer than the live device, so
+        # against a pinned catalog it reports "no applicable updates" and the run
+        # records success having installed nothing.
+        # Scoped to Install-DriverUpdates: Install-BIOSDCU calls the same engine
+        # and must keep calling it unchanged - BIOS packages are never pinned.
+        $Call = $script:InstallFn.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.GetCommandName() -eq 'Invoke-DCUDriverUpdates'
+        }, $true) | Select-Object -First 1
+        $Call | Should -Not -BeNullOrEmpty
+        $Call.Extent.Text | Should -Match 'SkipApply'
+    }
+
+    It 'Enumerates the live driver once, outside the per-driver loop' {
+        # Win32_PnPSignedDriver is a join across every PnP device and routinely
+        # takes tens of seconds. Per driver it would add minutes to every run.
+        $CimCalls = @($script:DrvLoop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.GetCommandName() -eq 'Get-CimInstance'
+        }, $true))
+        @($CimCalls | Where-Object { $_.Extent.Text -match 'Win32_PnPSignedDriver|Win32_VideoController' }).Count |
+            Should -Be 0
+        $script:InstallFn.Extent.Text | Should -Match 'Win32_PnPSignedDriver'
+    }
+}

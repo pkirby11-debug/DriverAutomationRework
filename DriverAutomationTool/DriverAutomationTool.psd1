@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.39.0'
+    ModuleVersion     = '2.40.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.39.0 - Fixes the Suppress System Restart deployment option, which never took effect. It was written to a SuppressAutoRestart property that does not exist on SMS_ApplicationAssignment, so the site rejected it and every deployment since 2.26.1 stayed free to reboot. Restart suppression now sets the workstation bit of SuppressReboot on the deployment assignment and reads the value back to confirm the site accepted it. Re-running a deployment reconciles the setting on deployments that already exist, and Scripts\Deploy-DATApplications.ps1 gains -SuppressAutoRestart.'
+    Description       = '2.40.0 - Adds driver version pinning, the rollback mechanism for a bad vendor driver. Add-DATDriverPin holds a named component at a specific revision, so the sync resolves that revision instead of the catalog''s newest and the existing Driver Updates application rebuilds in place at a new fingerprint - no second package to fight the deployed one, and the pin survives every future scheduled sync. On the client a pinned package bypasses the DCU engine (dcu-cli only installs what it judges newer, so it cannot apply a rollback) and the built-in DUP engine appends Dell''s /f only on devices whose live installed driver is newer than the pinned target, so the rollback targets itself. A pin that cannot be satisfied fails the model rather than silently re-shipping the driver it was holding back. Dell Driver Updates packages only.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
@@ -32,6 +32,11 @@
         'Add-DATDriverExclusion'
         'Remove-DATDriverExclusion'
         'Clear-DATDriverExclusion'
+        'Get-DATDriverPin'
+        'Add-DATDriverPin'
+        'Remove-DATDriverPin'
+        'Enable-DATDriverPin'
+        'Disable-DATDriverPin'
         'Set-DATDellCommandUpdateMode'
         'New-DATIntuneWin32App'
         'Get-DATIntuneRequiredPermission'

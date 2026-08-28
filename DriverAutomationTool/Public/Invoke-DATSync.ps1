@@ -317,6 +317,14 @@ function Invoke-DATSync {
     if ($ExcludeDrivers.Count -gt 0) {
         Write-DATLog -Message "Driver exclusions active: $($ExcludeDrivers -join '; ')" -Severity 1
     }
+    # Driver version pins (Settings\DriverPins.json). Read once per run and
+    # narrowed per package by SystemID inside Invoke-DATSyncSinglePackage, which
+    # reads $DriverPins from this scope the same way it reads $ExcludeDrivers.
+    # Disabled pins are dropped here so nothing downstream has to re-check.
+    $DriverPins = @(Get-DATDriverPin | Where-Object { $_ -and $_.Enabled })
+    if ($DriverPins.Count -gt 0) {
+        Write-DATLog -Message "Driver version pins active: $($DriverPins.Count) pin(s) - $(@($DriverPins | ForEach-Object { "'$($_.NamePattern)'=v$($_.PinnedVersion) [$($_.SystemId)]" }) -join '; '). A pinned component resolves to the pinned revision instead of the catalog's newest; see Get-DATDriverPin." -Severity 1
+    }
 
     # Validate paths
     foreach ($Path in @($DownloadPath, $PackagePath)) {
@@ -694,6 +702,29 @@ function Invoke-DATSyncSinglePackage {
     $Version = $PackageInfo.Version
     $DownloadUrl = $PackageInfo.Url
 
+    # Version pins narrowed to THIS package. Resolved once, here, and reused by
+    # both the smart-check resolve and the staging resolve: those two passes must
+    # see an identical filter set or the fingerprints they compute diverge and
+    # every package churns (see the warning above the staging call).
+    #
+    # Dell 'DriverUpdates' only. The base-pack 'Drivers' overlay lays down
+    # extracted INFs and has no force-install path, so a pin there would change
+    # which INFs ship without being able to push a device back down to them -
+    # a half-capability that reads as a working rollback. Refused out loud.
+    $ActivePins = @()
+    if ($Make -eq 'Dell' -and $PackageInfo.SystemID) {
+        $ScopedPins = @(Get-DATDriverPinForScope -Pins $DriverPins -Manufacturer $Make `
+            -SystemID $PackageInfo.SystemID -OperatingSystem $PackageInfo.OS)
+        if ($ScopedPins.Count -gt 0) {
+            if ($Type -eq 'DriverUpdates') {
+                $ActivePins = $ScopedPins
+                Write-DATLog -Message "Version pins for $ModelName (SystemID $($PackageInfo.SystemID)): $(@($ActivePins | ForEach-Object { "'$($_.NamePattern)' -> v$($_.PinnedVersion)" }) -join '; ')" -Severity 1
+            } else {
+                Write-DATLog -Message "$($ScopedPins.Count) version pin(s) match $ModelName but this is a '$Type' package - pins apply to Dell 'Driver Updates' packages only (the base-pack overlay installs extracted INFs and cannot force a downgrade). Ignoring them for this package." -Severity 2
+            }
+        }
+    }
+
     # Build package name matching original DAT naming conventions
     # Standard Pkg + Drivers: "Drivers - Make Model - OS Architecture"
     # Standard Pkg + BIOS:    "BIOS Update - Make Model"
@@ -993,6 +1024,13 @@ function Invoke-DATSyncSinglePackage {
             if ($ForceRefresh) {
                 $GetDriverParams['ForceRefresh'] = $true
             }
+            # Pins are part of the filter set for the same reason exclusions are:
+            # they change which revision resolves, so they must be present in the
+            # pass that computes the fingerprint or the smart check would match a
+            # pre-pin package and skip the rebuild that applies the rollback.
+            if ($ActivePins.Count -gt 0) {
+                $GetDriverParams['PinVersions'] = $ActivePins
+            }
             $CachedIndividualDrivers = if ($Make -eq 'Lenovo') {
                 # Lenovo resolver takes the machine types straight from the
                 # package info; the Dell-shaped $GetDriverParams don't apply.
@@ -1003,6 +1041,28 @@ function Invoke-DATSyncSinglePackage {
                     -OperatingSystem $PackageInfo.OS -ExcludeDrivers $ExcludeDrivers
             } else {
                 Get-DellIndividualDrivers @GetDriverParams
+            }
+
+            # Fail-closed pin gate, deliberately placed HERE rather than deeper in
+            # the resolver. This is the last resolve before the unconditional
+            # recursive wipe of $PackageSourceDir below, so failing now leaves the
+            # existing package - and the deployment behind it - untouched. The
+            # alternative, quietly building with the newest revision, would ship
+            # the bad driver back to exactly the devices the pin exists to protect.
+            if ($ActivePins.Count -gt 0) {
+                $UnsatisfiedPins = @(Test-DATDriverPinsSatisfied -Drivers $CachedIndividualDrivers -Pins $ActivePins)
+                if ($UnsatisfiedPins.Count -gt 0) {
+                    $PinDetail = (@($UnsatisfiedPins | ForEach-Object {
+                        "'$($_.NamePattern)' pinned to v$($_.PinnedVersion) ($($_.Reason)$(if ($_.ResolvedVersion) { "; catalog offers v$($_.ResolvedVersion)" }))"
+                    }) -join '; ')
+                    # Prefixed so the catch below can tell this apart from the
+                    # transient catalog failures it is there to absorb, and
+                    # re-throw it to the caller instead of falling through to the
+                    # rebuild. See the catch for the other half of this contract.
+                    throw ("PIN FAILURE: $PinDetail. The existing package was left alone. " +
+                        "Re-add the pin with -SourceUrl (and -ComponentXml) for the revision you want, " +
+                        "or remove it with Remove-DATDriverPin.")
+                }
             }
 
             if ($CachedIndividualDrivers -and $CachedIndividualDrivers.Count -gt 0) {
@@ -1129,6 +1189,13 @@ function Invoke-DATSyncSinglePackage {
                 }
             }
         } catch {
+            # This catch exists to absorb transient catalog trouble (share down,
+            # cab fetch failed) and fall through to a full rebuild. An
+            # unsatisfiable version pin is the opposite case: falling through
+            # would rebuild the package WITHOUT the pin and re-ship the driver the
+            # operator rolled back. Re-throw so the caller records the model as an
+            # error and the existing package stays deployed.
+            if ($_.Exception.Message -like 'PIN FAILURE:*') { throw }
             Write-DATLog -Message "Individual driver check failed: $($_.Exception.Message) - proceeding with full sync" -Severity 2
         }
     }
@@ -1761,7 +1828,26 @@ function Invoke-DATSyncSinglePackage {
                     if ($ForceRefresh) {
                         $GetDriverParams['ForceRefresh'] = $true
                     }
+                    if ($ActivePins.Count -gt 0) {
+                        $GetDriverParams['PinVersions'] = $ActivePins
+                    }
                     $IndividualDrivers = Get-DellIndividualDrivers @GetDriverParams
+                }
+
+                # Second half of the fail-closed pin gate. The smart-check pass
+                # already ran this before the source wipe when a package existed;
+                # this covers the first build of a pinned model and the path where
+                # the smart check resolved from a different category set. For
+                # DriverUpdates the throw is re-thrown by the catch below, so the
+                # package is not built rather than built without the pin.
+                if ($ActivePins.Count -gt 0) {
+                    $UnsatisfiedPins = @(Test-DATDriverPinsSatisfied -Drivers $IndividualDrivers -Pins $ActivePins)
+                    if ($UnsatisfiedPins.Count -gt 0) {
+                        throw ("PIN FAILURE: " + (@($UnsatisfiedPins | ForEach-Object {
+                            "'$($_.NamePattern)' pinned to v$($_.PinnedVersion) ($($_.Reason)$(if ($_.ResolvedVersion) { "; catalog offers v$($_.ResolvedVersion)" }))"
+                        }) -join '; ') + ". Refusing to build $ModelName without the pin - that would re-ship the driver you rolled back. " +
+                            "Re-add the pin with -SourceUrl (and -ComponentXml) for the revision you want, or remove it with Remove-DATDriverPin.")
+                    }
                 }
 
                 if ($IndividualDrivers -and $IndividualDrivers.Count -gt 0) {
@@ -2078,6 +2164,14 @@ function Invoke-DATSyncSinglePackage {
                                         # always runs it. Non-empty -> apply script only runs it
                                         # when a matching device is present (conservative filter).
                                         HardwareIds = @($IndvDriver.HardwareIds)
+                                        # Version-pin fields (manifest schemaVersion 2). AllowDowngrade
+                                        # tells the apply script this row is DELIBERATELY older than
+                                        # the catalog's newest, so it must judge "already installed"
+                                        # against the live driver rather than its own marker, and may
+                                        # append Dell's /f to install over a newer version. False on
+                                        # every ordinary row, which is the pre-2.40 behavior exactly.
+                                        AllowDowngrade = [bool]$IndvDriver.IsPinned
+                                        PinReason      = if ($IndvDriver.IsPinned) { [string]$IndvDriver.PinReason } else { '' }
                                     })
                                     Write-DATLog -Message "  Staged DUP: $($IndvDriver.FileName) ($([math]::Round($StagedSize / 1MB, 2)) MB)" -Severity 1
                                     continue
@@ -2219,14 +2313,30 @@ function Invoke-DATSyncSinglePackage {
                                 throw "No DUPs were successfully staged for $ModelName - cannot build catalog-only Driver Updates package"
                             }
                             $ManifestPath = Join-Path $PackageSourceDir 'manifest.json'
+                            $PinnedEntries = @($ManifestEntries | Where-Object { $_.AllowDowngrade })
+                            # engine='dup' forces the client past the DCU engine for this
+                            # package. dcu-cli only proposes updates it judges NEWER than the
+                            # live device, so against a pinned (deliberately downlevel)
+                            # catalog it reports "no applicable updates" and the run records
+                            # success having installed nothing. It also cannot select
+                            # individual updates, so there is no split where DCU handles the
+                            # unpinned rows - it is all or nothing. The built-in DUP loop is
+                            # the only engine that can force a downgrade.
                             $ManifestObj = [PSCustomObject]@{
-                                schemaVersion = 1
+                                schemaVersion = 2
                                 manufacturer  = $Make
                                 model         = $ModelName
                                 operatingSystem = $OperatingSystem
                                 architecture  = $Architecture
                                 generatedAt   = (Get-Date).ToUniversalTime().ToString('o')
+                                engine        = if ($PinnedEntries.Count -gt 0) { 'dup' } else { 'auto' }
                                 drivers       = @($ManifestEntries)
+                            }
+                            if ($PinnedEntries.Count -gt 0) {
+                                Write-DATLog -Message ("Package carries $($PinnedEntries.Count) version-pinned driver(s): " +
+                                    (@($PinnedEntries | ForEach-Object { "$($_.Name) v$($_.Version)" }) -join '; ') +
+                                    ". The client will use the built-in DUP engine (not DCU) and force the downgrade on devices carrying a newer driver. " +
+                                    "The first pass on a DCU-managed device re-runs every DUP in the manifest, because DCU never wrote per-component markers - schedule it into a maintenance window.") -Severity 2
                             }
                             # Depth 5: manifest -> drivers[] -> driver -> HardwareIds[] -> values
                             $ManifestObj | ConvertTo-Json -Depth 5 | Set-Content -Path $ManifestPath -Encoding UTF8

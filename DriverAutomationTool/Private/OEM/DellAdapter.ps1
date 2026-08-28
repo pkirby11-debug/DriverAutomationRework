@@ -708,7 +708,17 @@ function Get-DellIndividualDrivers {
         # SoftwareComponent Dell published since then (e.g. an A05 graphics
         # driver that replaced the A03 currently in cache) won't be visible
         # and the dedup step will pick the older revision.
-        [switch]$ForceRefresh
+        [switch]$ForceRefresh,
+
+        # Version pins (Get-DATDriverPinForScope output) that override the
+        # "newest revision wins" dedup for the components they name - the
+        # rollback mechanism. Applied after dedup by Select-DATPinnedDriver, so
+        # a pinned revision the dedup dropped is recovered without re-reading
+        # the catalog. Callers MUST pass the same pins to every resolve in a
+        # sync: the package fingerprint is computed from what comes back here,
+        # so two passes with different pins would churn the package.
+        [AllowNull()]
+        [object[]]$PinVersions
     )
 
     # Try per-model catalogs first (CatalogIndexPC chain - more current than legacy CatalogPC).
@@ -1214,6 +1224,17 @@ function Get-DellIndividualDrivers {
         $Winner
     }
 
+    # Version pins: hold a named component at a specific revision instead of the
+    # newest one the dedup just picked. Applied here, after dedup, so a pin can
+    # reach back into $MatchedDrivers for a predecessor revision the dedup
+    # dropped - the common case, since Dell's per-model catalog usually still
+    # lists the revision you are rolling back to. This single point is also what
+    # makes a pin flow into the fingerprint, the staged DUPs, manifest.json and
+    # DCUCatalog.xml together, exactly as an exclusion does.
+    if ($PinVersions -and @($PinVersions).Count -gt 0) {
+        $LatestPerDriver = Select-DATPinnedDriver -Selected @($LatestPerDriver) -Candidates @($MatchedDrivers) -Pins @($PinVersions)
+    }
+
     # Log summary split by updated vs missing
     $UpdatedCount = @($LatestPerDriver | Where-Object { -not $_.IsMissing }).Count
     $MissingCount = @($LatestPerDriver | Where-Object { $_.IsMissing }).Count
@@ -1238,6 +1259,9 @@ function Get-DellIndividualDrivers {
     # revision's SystemIDs and OS codes so the operator can immediately see why
     # the filter dropped it, instead of having to diff the catalog by hand.
     foreach ($Drv in $LatestPerDriver) {
+        # A pinned driver is older than the catalog's newest ON PURPOSE - saying
+        # so here would read as a fault and bury the real ones.
+        if ($Drv.PSObject.Properties['IsPinned'] -and $Drv.IsPinned) { continue }
         $FK = & $GetFamilyKey $Drv.Name
         if (-not $RawNewestPerFamily.ContainsKey($FK)) { continue }
         $RN = $RawNewestPerFamily[$FK]

@@ -28,6 +28,7 @@ the sole update source).
   - [Deploy Applications](#tab-deploy-applications)
 - [Sync types & deployment platforms](#sync-types)
 - [The Driver Updates (DCU) engine](#dcu-engine)
+- [Driver version pinning (rollback)](#pinning)
 - [Security features](#security)
 - [The client apply script](#apply-script)
 - [Public cmdlets / automation](#cmdlets)
@@ -322,6 +323,63 @@ catalog (the same feed Lenovo System Update / Thin Installer consume):
 
 ---
 
+<a name="pinning"></a>
+## Driver version pinning (rollback)
+
+When a vendor driver update breaks something, exclusions are the wrong tool: they are
+subtractive and version-blind, so they stop the bad driver shipping but leave every
+already-broken device broken and the package with no driver in that category at all.
+
+A **pin** holds one component at a named revision instead:
+
+```powershell
+Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion '31.0.15021.1001' `
+  -SystemId '0B12' -Model 'QCM1255' -Reason 'v32 breaks P2419H over DisplayPort' `
+  -SourceUrl 'https://dl.dell.com/FOLDER11223344M/1/Video-Driver_..._A03.EXE'
+Invoke-DATSync -Manufacturer Dell -Models '<model>' -IncludeDriverUpdates
+```
+
+The pin is honored at catalog-resolve time, so it flows into the package fingerprint,
+the staged DUPs, `manifest.json` and `DCUCatalog.xml` together. Because the fingerprint
+moves, the **existing** Driver Updates application rebuilds in place at a new
+`Cat.<fp>` — there is no second package to fight the deployed one, no supersedence to
+wire, and the pin is re-read on every future scheduled sync, so it holds until you
+remove it.
+
+On the client, a pinned package:
+
+- **bypasses the DCU engine.** `dcu-cli` only installs what it judges *newer* than the
+  live device, so against a downlevel catalog it reports "no applicable updates" and
+  the run records success having installed nothing. DCU is still invoked for its
+  lockdown and persistent end state; only scan/apply are skipped.
+- **forces the downgrade with Dell's `/f`, but only where it is needed.** The engine
+  reads the *live* installed driver once per run (`Win32_VideoController`, falling back
+  to the GPU brand inferred from the DUP name for the many Dell graphics DUPs that carry
+  no PCI metadata) and appends `/f` only when that version is strictly newer than the
+  pinned target. A device already at or below the pinned version is left alone, so the
+  rollback targets itself.
+- **is not skipped by its own marker.** The per-DUP version marker holds the version
+  being rolled back *from*, so the usual ">= manifest, skip" rule is narrowed to
+  equality for a pinned row. `LiveVersionBefore` and `ForcedDowngrade` are recorded
+  alongside it as the audit trail.
+
+**Fail-closed.** If the pinned revision is neither in Dell's catalog nor recoverable
+from the metadata the pin captured, the sync **fails that model** and leaves the
+existing package deployed, rather than quietly rebuilding with the newer driver.
+
+**Capture the metadata when you add the pin.** Dell's per-model catalog carries the
+current revision and usually a predecessor or two; it is not an archive. `-SourceUrl`,
+`-ComponentXml`, `-HashMD5` and `-PinnedName` are what keep a pin working after Dell
+drops the revision — which is exactly when you still need it.
+
+Managed with `Get-DATDriverPin` / `Add-DATDriverPin` / `Remove-DATDriverPin` /
+`Disable-DATDriverPin` / `Enable-DATDriverPin`. Pins apply to Dell **Driver Updates**
+packages; the base-pack `Drivers` overlay installs extracted INFs and has no
+force-install path, so a pin there is refused rather than half-honored. GUI syncs pick
+pins up automatically — there is no GUI surface for them yet.
+
+---
+
 <a name="security"></a>
 ## Security features
 
@@ -414,6 +472,7 @@ by the deployment type's `BasedOnExitCode` behavior.
 | `Update-DATApplicationCommands` | Repair install commands / return codes on existing Applications. |
 | `Invoke-DATRemovePackages` / `Invoke-DATCleanupOverlayPackages` | Package cleanup. |
 | `Test-DATVulnerableDrivers` | Screen a folder of DUPs / `.sys` files against the Microsoft blocklist. |
+| `Get-DATDriverPin` / `Add-DATDriverPin` / `Remove-DATDriverPin` / `Enable-DATDriverPin` / `Disable-DATDriverPin` | Hold a driver component at a specific version — the rollback mechanism. See [Driver version pinning](#pinning). |
 | `Set-DATDellCommandUpdateMode` | Put DCU into DAT-managed (passive) mode, or revert/opt-out. |
 | `Export-DATReport` | Export a job/inventory report. |
 | `Connect-DATIntune` / `Disconnect-DATIntune` / `Test-DATIntuneConnection` / `Get-DATIntuneWin32App` / `Find-DATIntuneEntraGroup` | Intune groundwork for upcoming Win32/driver-profile support. |
