@@ -3134,6 +3134,9 @@ function Install-DriverUpdates {
         $AllowDowngrade = [bool]$Drv.AllowDowngrade
         $ForceDowngrade = $false
         $LiveVersion = $null
+        # Did the probe give us a usable answer? Only then may the live driver
+        # decide; otherwise we are blind and the marker rules below apply.
+        $LiveVersionKnown = $false
         if ($AllowDowngrade) {
             $LiveVersion = & $GetLiveDriverVersion $Drv
             if ($LiveVersion) {
@@ -3141,6 +3144,7 @@ function Install-DriverUpdates {
                 if ($null -eq $LiveCmp) {
                     Write-Log "$DriverLabel - PINNED: installed v$LiveVersion is not comparable with the pinned v$($Drv.Version) - installing without /f and letting the DUP decide" -Severity 2
                 } elseif ($LiveCmp -gt 0) {
+                    $LiveVersionKnown = $true
                     $ForceDowngrade = $true
                     Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, newer than the pinned v$($Drv.Version) - forcing the rollback with /f$(if ($Drv.PinReason) { " ($($Drv.PinReason))" })" -Severity 2
                 } elseif ($LiveCmp -eq 0) {
@@ -3148,6 +3152,7 @@ function Install-DriverUpdates {
                     $AlreadyInst++
                     continue
                 } else {
+                    $LiveVersionKnown = $true
                     Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, older than the pinned v$($Drv.Version) - installing normally (no downgrade needed)"
                 }
             } else {
@@ -3160,20 +3165,47 @@ function Install-DriverUpdates {
         # repeat passes and stops Dell DUPs from churning their own re-install
         # logic for drivers that haven't changed.
         #
-        # A pinned row narrows this to EQUAL only. The ordinary ">= manifest ->
-        # skip" rule is exactly backwards for a rollback: the marker holds the
-        # version we are rolling back FROM, so it compares greater and the skip
-        # would swallow the fix. Equality still skips, which keeps the pinned
-        # package idempotent across deployment cycles.
+        # For a PINNED row the marker is not evidence of what is on the device.
+        # It records what WE last installed under this DUP's filename, and Dell
+        # puts the version in that filename - so the pinned v31 DUP reads the v31
+        # marker, not the v32 one the device is actually running. A machine that
+        # took v31 from us once, then moved to v32, still has a v31 marker equal
+        # to the pinned manifest version. The naive "equal -> skip" rule then
+        # swallows the rollback: the run reports success and the driver never
+        # moves. The marker GC that would have cleared it only runs at the end of
+        # this loop, so DCU-managed devices (which return before it) keep theirs
+        # indefinitely - i.e. exactly the fleet a rollback is aimed at.
+        #
+        # So: when the live probe gave us an answer, that answer already decided
+        # above and the marker gets no vote. Only when we are blind may it skip,
+        # and then only for a marker written by a previous PINNED run - one left
+        # over from an ordinary install predates the pin and proves nothing.
+        $SkipOnMarker = $false
         if (Test-Path $CompKeyPath) {
             try {
                 $ExistingVer = (Get-ItemProperty -Path $CompKeyPath -Name 'Version' -ErrorAction Stop).Version
                 $Cmp = & $CompareVersion $ExistingVer $Drv.Version
-                $SkipOnMarker = ($null -ne $Cmp) -and ($Cmp -eq 0 -or (-not $AllowDowngrade -and $Cmp -gt 0))
+                if ($null -ne $Cmp) {
+                    if (-not $AllowDowngrade) {
+                        $SkipOnMarker = ($Cmp -ge 0)
+                    } elseif (-not $LiveVersionKnown) {
+                        $MarkerFromPinnedRun = $false
+                        try {
+                            $MarkerFromPinnedRun = [bool][int](Get-ItemProperty -Path $CompKeyPath -Name 'Pinned' -ErrorAction Stop).Pinned
+                        } catch {
+                            # No 'Pinned' value - the marker predates this pin.
+                            Write-Verbose "Component marker carries no Pinned flag"
+                        }
+                        $SkipOnMarker = ($Cmp -eq 0 -and $MarkerFromPinnedRun)
+                    }
+                }
                 if ($SkipOnMarker) {
                     Write-Log "$DriverLabel - already installed (marker v$ExistingVer) - skipping"
                     $AlreadyInst++
                     continue
+                }
+                if ($AllowDowngrade -and $null -ne $Cmp -and $Cmp -ge 0) {
+                    Write-Log "$DriverLabel - PINNED: a v$ExistingVer marker exists for this DUP, but the marker records what we installed, not what the device is running - ignoring it and proceeding$(if ($LiveVersionKnown) { " (the live driver decided above)" } else { ' (live version unreadable, so letting the DUP decide)' })"
                 }
             } catch {
         # Non-fatal hardware or registry probe error

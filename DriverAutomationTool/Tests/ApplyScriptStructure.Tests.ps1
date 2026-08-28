@@ -301,6 +301,42 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
         $script:DrvLoop.Extent.Text | Should -Match 'AllowDowngrade'
     }
 
+    It 'Never lets the component marker veto a pinned rollback' {
+        # The regression this guards shipped once: the pin block set
+        # $ForceDowngrade, and the marker check a few lines later skipped the DUP
+        # anyway. The marker key carries the DUP filename, which carries the
+        # version, so a pinned v31 DUP reads a v31 marker left over from an older
+        # install - equal to the manifest - and the rollback was swallowed. The
+        # run reported success and the driver never moved.
+        $Sets = @($script:DrvLoop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -eq '$SkipOnMarker'
+        }, $true))
+        @($Sets).Count | Should -BeGreaterThan 0
+
+        # Every assignment that can produce a skip must be reachable only when the
+        # row is unpinned, or when the live probe failed AND the marker itself was
+        # written by a previous pinned run.
+        foreach ($Set in $Sets) {
+            $Text = $Set.Right.Extent.Text
+            if ($Text -eq '$false') { continue }
+            $Node = $Set
+            $Guard = $null
+            while ($Node -and -not $Guard) {
+                $Node = $Node.Parent
+                if ($Node -is [System.Management.Automation.Language.IfStatementAst]) { $Guard = $Node }
+            }
+            $Guard | Should -Not -BeNullOrEmpty
+            $Conditions = ($Guard.Clauses | ForEach-Object { $_.Item1.Extent.Text }) -join ' '
+            $Conditions | Should -Match 'AllowDowngrade|LiveVersionKnown'
+        }
+
+        # And the blind path must consult the marker's own Pinned flag.
+        $script:DrvLoop.Extent.Text | Should -Match 'MarkerFromPinnedRun'
+        $script:DrvLoop.Extent.Text | Should -Match 'LiveVersionKnown'
+    }
+
     It 'Routes a pinned package past the DCU engine' {
         # dcu-cli only installs what it judges newer than the live device, so
         # against a pinned catalog it reports "no applicable updates" and the run
