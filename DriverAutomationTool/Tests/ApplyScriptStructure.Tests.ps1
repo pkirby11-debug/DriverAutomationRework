@@ -1,4 +1,4 @@
-<#
+﻿<#
     Structural (AST) guards for Invoke-DATApply.ps1.
 
     Invoke-DATApply.ps1 is the client-side script; it is never dot-sourced by
@@ -281,16 +281,42 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
         # wrote. A marker-based rule would force the downgrade fleet-wide.
         $Sets = @(Get-DATAssignmentAst -Scope $script:DrvLoop -Left '$ForceDowngrade' |
             Where-Object { $_.Right.Extent.Text -eq '$true' })
-        @($Sets).Count | Should -Be 1
+        # Two: the device is measurably newer than the target, and the device
+        # reports a version nothing on the row can be ordered against. Both are
+        # branches of the same $LiveCmp decision; neither may come from a marker.
+        @($Sets).Count | Should -Be 2
 
-        $Node = $Sets[0]
-        $Guard = $null
-        while ($Node -and -not $Guard) {
-            $Node = $Node.Parent
-            if ($Node -is [System.Management.Automation.Language.IfStatementAst]) { $Guard = $Node }
+        foreach ($Set in $Sets) {
+            $Node = $Set
+            $Guard = $null
+            while ($Node -and -not $Guard) {
+                $Node = $Node.Parent
+                if ($Node -is [System.Management.Automation.Language.IfStatementAst]) { $Guard = $Node }
+            }
+            $Guard | Should -Not -BeNullOrEmpty
+            ($Guard.Clauses | ForEach-Object { $_.Item1.Extent.Text }) -join ' ' | Should -Match 'LiveCmp'
         }
-        $Guard | Should -Not -BeNullOrEmpty
-        ($Guard.Clauses | ForEach-Object { $_.Item1.Extent.Text }) -join ' ' | Should -Match 'LiveCmp'
+    }
+
+    It 'Compares the live driver against a resolved target, not the row version' {
+        # The field bug this guards: Dell's dellVersion is a revision letter
+        # ('A05') for most components, so comparing it with the dotted version
+        # Windows reports yields no ordering at all - and the rollback was never
+        # forced. $GetPinTargetVersion resolves a comparable number first; a
+        # $LiveCmp taken straight from $Drv.Version puts the bug back.
+        $LiveCmp = @(Get-DATAssignmentAst -Scope $script:DrvLoop -Left '$LiveCmp')
+        @($LiveCmp).Count | Should -Be 1
+        $LiveCmp[0].Right.Extent.Text | Should -Match 'PinTarget'
+        $LiveCmp[0].Right.Extent.Text | Should -Not -Match '\$Drv\.Version'
+    }
+
+    It 'Never lets an uncomparable pin quietly install without /f' {
+        # Installing a pinned DUP without /f is not the neutral choice: the DUP's
+        # own version check then declines the downgrade and exits 0, so the
+        # deployment reports success and the driver never moves. That was the
+        # observed failure. The uncomparable branch must force.
+        $Fn = $script:InstallFn.Extent.Text
+        $Fn | Should -Not -Match "installing without /f and letting the DUP decide"
     }
 
     It 'Narrows the marker skip to equality for a pinned row' {

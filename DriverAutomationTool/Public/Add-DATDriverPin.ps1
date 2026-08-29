@@ -1,4 +1,4 @@
-function Add-DATDriverPin {
+﻿function Add-DATDriverPin {
     <#
     .SYNOPSIS
         Pins a driver component to a specific version so the sync stops
@@ -67,6 +67,14 @@ function Add-DATDriverPin {
         working after Dell purges the revision from the catalog.
     .PARAMETER PinnedFileName
         DUP filename. Defaults to the leaf of -SourceUrl.
+    .PARAMETER VendorVersion
+        The vendor's own dotted version for the pinned revision (Dell's
+        vendorVersion, e.g. '32.0.23040.1006'). This is the number the client
+        compares the installed driver against when deciding whether to force the
+        rollback: -PinnedVersion is Dell's dellVersion, which is a revision
+        letter for most components and orders against nothing. Captured
+        automatically when piping a candidate; when it is missing the client
+        recovers it from the DUP filename instead.
     .PARAMETER PinnedName
         The catalog display name of the pinned revision, frozen so the package
         fingerprint does not churn if Dell later renames the component. Defaults
@@ -128,6 +136,9 @@ function Add-DATDriverPin {
         [Parameter(ValueFromPipelineByPropertyName)]
         [Alias('FileName')]
         [string]$PinnedFileName = '',
+
+        [Parameter(ValueFromPipelineByPropertyName)]
+        [string]$VendorVersion = '',
 
         [Parameter(ValueFromPipelineByPropertyName)]
         [string]$PinnedName = '',
@@ -195,6 +206,7 @@ function Add-DATDriverPin {
             if ($SourceUrl)      { $Existing.SourceUrl = $SourceUrl }
             if ($PinnedFileName) { $Existing.PinnedFileName = $PinnedFileName }
             if ($PinnedName)     { $Existing.PinnedName = $PinnedName }
+            if ($VendorVersion)  { $Existing.VendorVersion = $VendorVersion }
             if ($ComponentXml)   { $Existing.ComponentXml = $ComponentXml }
             if ($HashMD5)        { $Existing.HashMD5 = $HashMD5 }
             if ($Size)           { $Existing.Size = $Size }
@@ -214,6 +226,7 @@ function Add-DATDriverPin {
                 SourceUrl       = $SourceUrl
                 PinnedFileName  = $PinnedFileName
                 PinnedName      = $PinnedName
+                VendorVersion   = $VendorVersion
                 ComponentXml    = $ComponentXml
                 HashMD5         = $HashMD5
                 Size            = $Size

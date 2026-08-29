@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Applies a staged driver pack or BIOS update on a running Windows device.
 
@@ -2838,6 +2838,47 @@ function Install-DriverUpdates {
         if ($ni -eq $nt) { return 0 }
         return $null  # unknown ordering - caller should treat as "needs install"
     }
+    # The version a PINNED row must be compared against - which is not the
+    # version the row is named by. Dell's dellVersion is a revision letter for
+    # most components ('A05'), and Windows reports the vendor's own dotted
+    # version ('32.0.23040.2002'), so comparing the two returns "no ordering"
+    # and the rollback decision falls through to "install without /f" - which a
+    # Dell DUP answers by quietly declining the downgrade and exiting 0. The
+    # deployment then reports success and the driver never moves.
+    #
+    # Two sources carry the comparable number, in order of authority:
+    #   1. VendorVersion, taken from the catalog's vendorVersion attribute and
+    #      written into the manifest.
+    #   2. The DUP filename. Dell builds it as
+    #      Name_id_WIN64_<vendorVersion>_<dellVersion>.EXE, so the dotted token
+    #      is there even in packages staged before VendorVersion existed - which
+    #      is what makes this fix work on an already-deployed package.
+    # The row's own Version is tried last and is correct whenever dellVersion is
+    # itself dotted.
+    #
+    # Selection is by comparability against what THIS device reports, not by a
+    # guess at which field is canonical: the first candidate that yields an
+    # ordering is the right one to decide on.
+    $GetPinTargetVersion = {
+        param($Row, [string]$Installed)
+
+        $Candidates = [System.Collections.Generic.List[string]]::new()
+        if ($Row.VendorVersion) { $Candidates.Add([string]$Row.VendorVersion) }
+        # Three or more dot-separated numeric parts: enough to exclude the stray
+        # "5.1" that turns up inside a product name, and every Dell DUP version
+        # has at least that many.
+        foreach ($M in [regex]::Matches("$($Row.FileName)", '(?<![0-9.])[0-9]+(?:\.[0-9]+){2,}(?![0-9])')) {
+            $Candidates.Add($M.Value)
+        }
+        $Candidates.Add([string]$Row.Version)
+
+        foreach ($C in $Candidates) {
+            if ([string]::IsNullOrWhiteSpace($C)) { continue }
+            if ($null -ne (& $CompareVersion $Installed $C)) { return $C }
+        }
+        return $null
+    }
+
     # Infer the GPU brand a Video DUP targets from its name. Returns
     # 'NVIDIA'/'AMD'/'Intel', or $null when it can't tell (then we don't filter on it).
     # Only meaningful for Category=Video DUPs.
@@ -3140,20 +3181,38 @@ function Install-DriverUpdates {
         if ($AllowDowngrade) {
             $LiveVersion = & $GetLiveDriverVersion $Drv
             if ($LiveVersion) {
-                $LiveCmp = & $CompareVersion $LiveVersion $Drv.Version
+                # Compare against the vendor's dotted version, not the row's
+                # dellVersion revision letter - see $GetPinTargetVersion.
+                $PinTarget = & $GetPinTargetVersion $Drv $LiveVersion
+                $LiveCmp = if ($PinTarget) { & $CompareVersion $LiveVersion $PinTarget } else { $null }
+                # Name the pin by what the operator pinned, and show the number
+                # actually compared when it differs, so the log explains itself.
+                $TargetLabel = if ($PinTarget -and $PinTarget -ne [string]$Drv.Version) {
+                    "$($Drv.Version) (v$PinTarget)"
+                } else {
+                    [string]$Drv.Version
+                }
                 if ($null -eq $LiveCmp) {
-                    Write-Log "$DriverLabel - PINNED: installed v$LiveVersion is not comparable with the pinned v$($Drv.Version) - installing without /f and letting the DUP decide" -Severity 2
+                    # Nothing on the row orders against what the device reports.
+                    # Installing without /f here is not neutral - it is the DUP's
+                    # own version check deciding, and it declines the downgrade
+                    # and exits 0, so the pin is silently never enforced. A pinned
+                    # row exists to be forced, so force it. $LiveVersionKnown
+                    # stays false deliberately: the marker rules below then stop
+                    # this repeating on every deployment once it has run once.
+                    $ForceDowngrade = $true
+                    Write-Log "$DriverLabel - PINNED: installed v$LiveVersion does not compare with the pinned v$($Drv.Version), and neither the manifest nor the DUP filename offers a version that does - forcing with /f anyway, because otherwise the DUP's own check would decline the rollback and report success" -Severity 2
                 } elseif ($LiveCmp -gt 0) {
                     $LiveVersionKnown = $true
                     $ForceDowngrade = $true
-                    Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, newer than the pinned v$($Drv.Version) - forcing the rollback with /f$(if ($Drv.PinReason) { " ($($Drv.PinReason))" })" -Severity 2
+                    Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, newer than the pinned v$TargetLabel - forcing the rollback with /f$(if ($Drv.PinReason) { " ($($Drv.PinReason))" })" -Severity 2
                 } elseif ($LiveCmp -eq 0) {
-                    Write-Log "$DriverLabel - PINNED: device is already on the pinned v$($Drv.Version) - skipping"
+                    Write-Log "$DriverLabel - PINNED: device is already on the pinned v$TargetLabel - skipping"
                     $AlreadyInst++
                     continue
                 } else {
                     $LiveVersionKnown = $true
-                    Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, older than the pinned v$($Drv.Version) - installing normally (no downgrade needed)"
+                    Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, older than the pinned v$TargetLabel - installing normally (no downgrade needed)"
                 }
             } else {
                 Write-Log "$DriverLabel - PINNED: could not read the installed driver version for this device (no matching hardware enumerated) - installing without /f; the DUP will refuse if it is already newer" -Severity 2

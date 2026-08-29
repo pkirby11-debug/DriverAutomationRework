@@ -1,9 +1,9 @@
-@{
+﻿@{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.41.1'
+    ModuleVersion     = '2.42.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.41.1 - Fixes a version pin that built the right package but never rolled the driver back. The per-DUP marker key is derived from the DUP filename, and Dell puts the version in that filename, so the pinned DUP read its OWN older marker rather than the one for the driver actually installed. A device that had taken the pinned revision from DAT at some point still carried a marker equal to the pinned manifest version, so the run logged "already installed" and skipped the rollback while reporting success - and the marker GC that would have cleared it only runs at the end of the built-in DUP loop, which DCU-managed devices return before reaching. For a pinned driver the live installed version now decides outright and the marker gets no vote; it can only skip when the live version was unreadable AND the marker was written by a previous pinned run.'
+    Description       = '2.42.0 - Makes a version pin actually roll the driver back on Dell components versioned by a revision letter. Dell''s dellVersion is "A05" for most drivers, while Windows reports the vendor''s dotted version ("32.0.23040.2002"), so the client''s pin check found no ordering between them, logged "not comparable", installed without /f - and the DUP''s own version check then declined the downgrade and exited 0, reporting success while the driver never moved. Pins now carry the vendor version (Dell''s vendorVersion) through the catalog, the pin ledger, the GUI picker and the package manifest, and the client picks whichever known version actually orders against what the device reports, recovering it from the DUP filename for packages and pins created before this release. A pinned row that still cannot be compared is now forced with /f rather than left to the DUP to decline.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

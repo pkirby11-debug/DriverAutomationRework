@@ -1,4 +1,4 @@
-# Dell OEM Adapter
+﻿# Dell OEM Adapter
 # Handles Dell DriverPackCatalog.cab for driver packs, CatalogIndexPC.cab chain for
 # per-model individual driver lookup, and CatalogPC.cab as legacy fallback/BIOS updates.
 
@@ -1150,6 +1150,14 @@ function Get-DellIndividualDrivers {
                 Category    = $ResolvedCategory
                 Name        = $DisplayName
                 Version     = $Component.dellVersion
+                # The vendor's own version ('32.0.23040.1006'), alongside Dell's
+                # revision letter. dellVersion is what the package is named and
+                # fingerprinted by, but it is 'A05' for most components and never
+                # compares with what Windows reports for the installed driver -
+                # so a version pin could not tell whether a device needed the
+                # rollback. This is the number that does compare. Absent from
+                # some catalog entries, hence a plain passthrough with no default.
+                VendorVersion = $Component.vendorVersion
                 ReleaseDate = $Component.dateTime
                 ParsedDate  = $ComponentDate
                 Url         = $DownloadUrl

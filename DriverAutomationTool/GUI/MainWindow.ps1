@@ -1,4 +1,4 @@
-# GUI MainWindow (WPF) - layout loader + event handlers.
+﻿# GUI MainWindow (WPF) - layout loader + event handlers.
 # New-DATMainWindow loads the XAML and returns the $Controls hashtable;
 # Initialize-DATMainWindow wires every event. Show-DATMainWindow is the entry
 # point used by Start-DATGui.
@@ -85,7 +85,7 @@ function New-DATMainWindow {
     $Controls['PinCandidateGridData'] = New-DATGridTable -Columns @(
         'Current', 'Category', 'Name', 'Version', 'Released', 'FileName',
         'SourceUrl', 'HashMD5', 'Size', 'ReleaseDate', 'HardwareIds', 'ComponentXml',
-        'SystemId', 'Model', 'OperatingSystem')
+        'SystemId', 'Model', 'OperatingSystem', 'VendorVersion')
     $Controls['PinCandidateGrid'].ItemsSource = $Controls['PinCandidateGridData'].DefaultView
 
     $Controls['PinGridData'] = New-DATGridTable -Columns @(
@@ -1962,6 +1962,9 @@ function Initialize-DATMainWindow {
                     $Row['Category']        = [string]$C.Category
                     $Row['Name']            = [string]$C.Name
                     $Row['Version']         = [string]$C.Version
+                    # Not shown, but the number the client actually compares the
+                    # installed driver against - Version is Dell's revision letter.
+                    $Row['VendorVersion']   = [string]$C.VendorVersion
                     # Date only: the catalog's round-trip timestamps are unreadable
                     # in a grid and the time of day never decides anything here.
                     $Row['Released']        = if ($C.ReleaseDate) { ([string]$C.ReleaseDate -split '[T ]')[0] } else { '' }
@@ -2052,6 +2055,7 @@ function Initialize-DATMainWindow {
                     SourceUrl       = [string]$Row['SourceUrl']
                     PinnedFileName  = [string]$Row['FileName']
                     PinnedName      = [string]$Row['Name']
+                    VendorVersion   = [string]$Row['VendorVersion']
                     ComponentXml    = [string]$Row['ComponentXml']
                     HashMD5         = [string]$Row['HashMD5']
                     Size            = [string]$Row['Size']

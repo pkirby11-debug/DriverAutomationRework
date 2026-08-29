@@ -1,4 +1,4 @@
-function Invoke-DATSync {
+﻿function Invoke-DATSync {
     <#
     .SYNOPSIS
         Main workflow: discovers, downloads, packages, and distributes driver packs and BIOS updates.
@@ -2156,6 +2156,15 @@ function Invoke-DATSyncSinglePackage {
                                         FileName    = $IndvDriver.FileName
                                         Name        = $IndvDriver.Name
                                         Version     = $IndvDriver.Version
+                                        # The vendor's dotted version, when the catalog carries one.
+                                        # Version above is Dell's dellVersion, which is a revision
+                                        # letter ('A05') for most components and does not compare
+                                        # with the version Windows reports for the installed driver.
+                                        # A pinned row is decided by that comparison, so without
+                                        # this the rollback could not be forced. Empty on rows
+                                        # whose catalog entry omits it - the client then reads the
+                                        # version out of the DUP filename instead.
+                                        VendorVersion = [string]$IndvDriver.VendorVersion
                                         Category    = $IndvDriver.Category
                                         ReleaseDate = $IndvDriver.ReleaseDate
                                         Size        = $StagedSize

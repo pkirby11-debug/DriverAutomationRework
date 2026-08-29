@@ -1,4 +1,4 @@
-<#
+﻿<#
     Behavioural tests for the version-pin decision inside Invoke-DATApply.ps1.
 
     That script is the client-side one: it is never dot-sourced by the module and
@@ -43,6 +43,7 @@ BeforeAll {
     $script:CompareVersion     = Get-ApplyScriptBlock -Fn $InstallFn -Name '$CompareVersion'
     $script:GetDupGpuVendor    = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetDupGpuVendor'
     $script:GetLiveDriverVersion = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetLiveDriverVersion'
+    $script:GetPinTargetVersion  = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetPinTargetVersion'
 
     function New-FakeVideoController {
         param([string]$PnpId, [string]$DriverVersion)
@@ -63,10 +64,84 @@ BeforeAll {
 }
 
 Describe 'Invoke-DATApply pin scriptblocks are extractable' {
-    It 'Finds all three scriptblocks the pin decision depends on' {
+    It 'Finds every scriptblock the pin decision depends on' {
         $script:CompareVersion       | Should -Not -BeNullOrEmpty
         $script:GetDupGpuVendor      | Should -Not -BeNullOrEmpty
         $script:GetLiveDriverVersion | Should -Not -BeNullOrEmpty
+        $script:GetPinTargetVersion  | Should -Not -BeNullOrEmpty
+    }
+}
+
+Describe 'Comparable pin target resolution' {
+    BeforeEach {
+        $CompareVersion = $script:CompareVersion
+    }
+
+    # The field failure this exists to prevent, taken from the log verbatim:
+    # the device reported 32.0.23040.2002, the pin was Dell's 'A05', the two do
+    # not order, and the rollback silently never ran.
+    It 'Recovers the vendor version from the DUP filename when the pin is a Dell revision letter' {
+        $Row = [PSCustomObject]@{
+            Version = 'A05'; VendorVersion = ''
+            FileName = 'AMD-Radeon-Graphics-Driver_17DHW_WIN64_32.0.23040.1006_A05.EXE'
+        }
+        $Target = & $script:GetPinTargetVersion $Row '32.0.23040.2002'
+        $Target | Should -Be '32.0.23040.1006'
+        # And that the resolved target actually decides the rollback the right way.
+        (& $CompareVersion '32.0.23040.2002' $Target) | Should -BeGreaterThan 0
+    }
+
+    It 'Prefers the manifest VendorVersion over the filename' {
+        $Row = [PSCustomObject]@{
+            Version = 'A05'; VendorVersion = '32.0.23040.1006'
+            FileName = 'AMD-Radeon-Graphics-Driver_17DHW_WIN64_31.0.99999.9999_A05.EXE'
+        }
+        & $script:GetPinTargetVersion $Row '32.0.23040.2002' | Should -Be '32.0.23040.1006'
+    }
+
+    It 'Keeps using the row version when dellVersion is itself dotted' {
+        $Row = [PSCustomObject]@{
+            Version = '31.0.15021.1001'; VendorVersion = ''
+            FileName = 'Video-Driver_ABCDE_WIN64_31.0.15021.1001_A03.EXE'
+        }
+        & $script:GetPinTargetVersion $Row '32.0.101.7077' | Should -Be '31.0.15021.1001'
+    }
+
+    It 'Skips a candidate that does not order against what the device reports' {
+        # VendorVersion present but unusable (vendor scheme differs from the OS's);
+        # the filename token is the one that orders, so it must win.
+        $Row = [PSCustomObject]@{
+            Version = 'A05'; VendorVersion = 'REV-A05'
+            FileName = 'Some-Driver_ABCDE_WIN64_3.1.2025.815_A01.EXE'
+        }
+        & $script:GetPinTargetVersion $Row '3.1.2025.900' | Should -Be '3.1.2025.815'
+    }
+
+    It 'Returns null when nothing on the row orders against the installed version' {
+        $Row = [PSCustomObject]@{
+            Version = 'A05'; VendorVersion = ''
+            FileName = 'Firmware-Utility_ABCDE_WIN64_A05.EXE'
+        }
+        & $script:GetPinTargetVersion $Row '32.0.23040.2002' | Should -BeNullOrEmpty
+    }
+
+    It 'Ignores short numeric runs in a product name' {
+        # 'MT7920' has no dots and '5.1' is too short to be a Dell DUP version;
+        # only the 4-part token may be taken as one.
+        $Row = [PSCustomObject]@{
+            Version = 'A02'; VendorVersion = ''
+            FileName = 'AMD-Integrated-Management-5.1-Service_CHGG0_WIN64_5.1.1469.0_A02.EXE'
+        }
+        & $script:GetPinTargetVersion $Row '5.1.1500.0' | Should -Be '5.1.1469.0'
+    }
+
+    It 'Matches an equal version so an already-rolled-back device is skipped, not forced' {
+        $Row = [PSCustomObject]@{
+            Version = 'A05'; VendorVersion = ''
+            FileName = 'AMD-Radeon-Graphics-Driver_17DHW_WIN64_32.0.23040.1006_A05.EXE'
+        }
+        $Target = & $script:GetPinTargetVersion $Row '32.0.23040.1006'
+        (& $CompareVersion '32.0.23040.1006' $Target) | Should -Be 0
     }
 }
 

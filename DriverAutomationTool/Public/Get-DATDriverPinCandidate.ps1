@@ -1,4 +1,4 @@
-function Get-DATDriverPinCandidate {
+﻿function Get-DATDriverPinCandidate {
     <#
     .SYNOPSIS
         Lists the driver revisions a version pin could target for a model - the
@@ -43,8 +43,9 @@ function Get-DATDriverPinCandidate {
             Format-Table Category, Name, Version, ReleaseDate, IsCurrent
     .OUTPUTS
         PSCustomObject per revision: Manufacturer, Model, SystemId,
-        OperatingSystem, Category, Name, Version, ReleaseDate, FileName,
-        SourceUrl, HashMD5, Size, HardwareIds, ComponentXml, IsCurrent.
+        OperatingSystem, Category, Name, Version, VendorVersion, ReleaseDate,
+        FileName, SourceUrl, HashMD5, Size, HardwareIds, ComponentXml,
+        IsCurrent.
     #>
     [CmdletBinding()]
     param(
@@ -112,6 +113,11 @@ function Get-DATDriverPinCandidate {
             Category        = [string]$C.Category
             Name            = [string]$C.Name
             Version         = [string]$C.Version
+            # Dell's own dotted version for the revision. Version above is
+            # dellVersion ('A05' for most components); this is the one that
+            # compares with what a device reports, so it is what the client
+            # decides the rollback on.
+            VendorVersion   = [string]$C.VendorVersion
             ReleaseDate     = [string]$C.ReleaseDate
             FileName        = [string]$C.FileName
             SourceUrl       = [string]$C.Url

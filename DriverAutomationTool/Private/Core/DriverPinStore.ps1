@@ -1,4 +1,4 @@
-# Driver Pin Store
+﻿# Driver Pin Store
 # Persistent ledger of driver VERSION PINS - "resolve component X to version N
 # for this model, not to whatever the catalog says is newest".
 #
@@ -224,10 +224,23 @@ function New-DATPinnedDriverObject {
     $HardwareIds = @($Pin.HardwareIds)
     if ($HardwareIds.Count -eq 0 -and $Template) { $HardwareIds = @($Template.HardwareIds) }
 
+    # The vendor's dotted version, which is what the client compares the live
+    # driver against - Dell's dellVersion is a revision letter for most
+    # components and compares with nothing. A pin captured before this field
+    # existed has none; the client then recovers it from the DUP filename.
+    $VendorVersion = [string]$Pin.VendorVersion
+    if ([string]::IsNullOrWhiteSpace($VendorVersion) -and $Template -and
+        ([string]$Template.Version).Trim().Equals(([string]$Pin.PinnedVersion).Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+        # Only inherit from the template when it IS the pinned revision -
+        # otherwise we would label this revision with its successor's version.
+        $VendorVersion = [string]$Template.VendorVersion
+    }
+
     [PSCustomObject]@{
-        Category     = $Category
-        Name         = $Name
-        Version      = [string]$Pin.PinnedVersion
+        Category      = $Category
+        Name          = $Name
+        Version       = [string]$Pin.PinnedVersion
+        VendorVersion = $VendorVersion
         ReleaseDate  = $ReleaseDate
         ParsedDate   = $ParsedDate
         Url          = $Url

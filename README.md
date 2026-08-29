@@ -383,6 +383,16 @@ On the client, a pinned package:
   no PCI metadata) and appends `/f` only when that version is strictly newer than the
   pinned target. A device already at or below the pinned version is left alone, so the
   rollback targets itself.
+- **compares against the vendor version, not Dell's revision letter.** `-PinnedVersion`
+  is Dell's `dellVersion`, which is `A05` for most components while Windows reports
+  `32.0.23040.2002` — the two order against nothing, and a pin decided on them would
+  never force anything. The vendor's dotted version (`vendorVersion`) is carried through
+  the catalog, the pin, the GUI picker and `manifest.json`, and the client picks
+  whichever known version actually orders against what the device reports, reading it
+  out of the DUP filename when the manifest predates that field. A pinned row that still
+  cannot be compared is forced anyway: installing without `/f` hands the decision to the
+  DUP, which declines the downgrade and exits 0, and the deployment reports success
+  while the driver never moves.
 - **is not skipped by its own marker.** The per-DUP version marker holds the version
   being rolled back *from*, so the usual ">= manifest, skip" rule is narrowed to
   equality for a pinned row. `LiveVersionBefore` and `ForcedDowngrade` are recorded
@@ -394,8 +404,8 @@ existing package deployed, rather than quietly rebuilding with the newer driver.
 
 **Capture the metadata when you add the pin.** Dell's per-model catalog carries the
 current revision and usually a predecessor or two; it is not an archive. `-SourceUrl`,
-`-ComponentXml`, `-HashMD5` and `-PinnedName` are what keep a pin working after Dell
-drops the revision — which is exactly when you still need it.
+`-ComponentXml`, `-HashMD5`, `-VendorVersion` and `-PinnedName` are what keep a pin
+working after Dell drops the revision — which is exactly when you still need it.
 
 **Finding the revision to pin to.** `Get-DATDriverPinCandidate` lists every revision
 the catalog holds for a model, flagged with which one ships today, and pipes straight
