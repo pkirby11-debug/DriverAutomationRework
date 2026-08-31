@@ -45,6 +45,18 @@ BeforeAll {
     $script:GetLiveDriverVersion = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetLiveDriverVersion'
     $script:GetPinTargetVersion  = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetPinTargetVersion'
     $script:ReadDupLog           = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ReadDupLog'
+    $script:GetBoundPackages     = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetBoundPackages'
+
+    function New-FakeSignedPackage {
+        param(
+            [string]$DeviceId, [string]$HardwareId, [string]$DriverVersion,
+            [string]$DeviceName, [string]$InfName, [string]$DeviceClass
+        )
+        [PSCustomObject]@{
+            DeviceID = $DeviceId; HardWareID = $HardwareId; DriverVersion = $DriverVersion
+            DeviceName = $DeviceName; InfName = $InfName; DeviceClass = $DeviceClass
+        }
+    }
 
     function New-FakeVideoController {
         param([string]$PnpId, [string]$DriverVersion)
@@ -279,5 +291,92 @@ Describe 'Dell framework log reader' {
         $Text | Should -Match 'dropping\s+/f\s+from\s+commandline'
         @([regex]::Matches($Text, 'is\s+not\s+a\s+better\s+match\s+than\s+the\s+current\s+driver')).Count |
             Should -Be 2
+    }
+}
+
+Describe 'Which packages are eligible to be retired' {
+    # This selection decides what gets DELETED off a machine, so it is tested
+    # for real rather than structurally. The failure mode that matters is not
+    # "misses one" - it is "matches something it should not".
+    BeforeAll {
+        # Get-CimInstance does not exist on non-Windows PowerShell, so Pester
+        # cannot mock it - stand in a function the lifted scriptblock resolves
+        # from this scope. CmdletBinding gives it -ErrorAction for free.
+        function Get-CimInstance {
+            [CmdletBinding()]
+            param([string]$ClassName)
+            if ($script:CimThrows) { throw 'WMI is broken' }
+            # Emitted one at a time, the way the real cmdlet does: the caller
+            # pipes into Select-Object, and a wrapped array would arrive there
+            # as a single object with every property null.
+            foreach ($Item in $script:FakeSigned) { $Item }
+        }
+    }
+
+    BeforeEach {
+        $script:CimThrows = $false
+        $GetDupGpuVendor = $script:GetDupGpuVendor
+        # The real device set from the field box: an AMD GPU plus the AMD audio
+        # and chipset functions, which share VEN_1002 with it.
+        $script:FakeSigned = @(
+            New-FakeSignedPackage -DeviceId 'PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7\4&18e01285&0&0041' `
+                -HardwareId 'PCI\VEN_1002&DEV_15C8' -DriverVersion '32.0.23040.2002' `
+                -DeviceName 'AMD Radeon 740M Graphics' -InfName 'oem80.inf' -DeviceClass 'DISPLAY'
+            New-FakeSignedPackage -DeviceId 'PCI\VEN_1002&DEV_15E3' -HardwareId 'PCI\VEN_1002&DEV_15E3' `
+                -DriverVersion '10.0.1.5' -DeviceName 'AMD High Definition Audio' `
+                -InfName 'oem12.inf' -DeviceClass 'MEDIA'
+            New-FakeSignedPackage -DeviceId 'PCI\VEN_1002&DEV_14E8' -HardwareId 'PCI\VEN_1002&DEV_14E8' `
+                -DriverVersion '5.1.1469.0' -DeviceName 'AMD PSP' -InfName 'oem33.inf' -DeviceClass 'SYSTEM'
+            New-FakeSignedPackage -DeviceId 'PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7\OTHER' `
+                -HardwareId 'PCI\VEN_1002&DEV_15C8' -DriverVersion '10.0.26100.1' `
+                -DeviceName 'Microsoft Basic Display Adapter' -InfName 'display.inf' -DeviceClass 'DISPLAY'
+        )
+    }
+
+    It 'Is extractable from the shipped script' {
+        $script:GetBoundPackages | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Never offers an inbox INF - that is the fallback the device lands on' {
+        $Row = [PSCustomObject]@{ Name = 'AMD Radeon Graphics Driver'; Category = 'Video'; HardwareIds = @() }
+        $Hits = @(& $script:GetBoundPackages $Row)
+        @($Hits | Where-Object { $_.InfName -eq 'display.inf' }).Count | Should -Be 0
+    }
+
+    It 'Confines the GPU-brand fallback to Display, not every VEN_1002 function' {
+        # Without the class narrowing this matches the AMD audio and PSP devices
+        # too - they are all VEN_1002 - and retiring their packages would break
+        # hardware the pin has nothing to do with.
+        $Row = [PSCustomObject]@{ Name = 'AMD Radeon Graphics Driver'; Category = 'Video'; HardwareIds = @() }
+        $Hits = @(& $script:GetBoundPackages $Row)
+        @($Hits | ForEach-Object { $_.InfName }) | Should -Be @('oem80.inf')
+    }
+
+    It 'Matches on an explicit hardware token when the pin carries one' {
+        $Row = [PSCustomObject]@{
+            Name = 'AMD Radeon Graphics Driver'; Category = 'Video'
+            HardwareIds = @('VEN_1002&DEV_15C8')
+        }
+        $Hits = @(& $script:GetBoundPackages $Row)
+        # The token matches the inbox row too; the oemNN filter is what drops it.
+        @($Hits | ForEach-Object { $_.InfName }) | Should -Be @('oem80.inf')
+    }
+
+    It 'Finds nothing for a brand that is not present' {
+        $Row = [PSCustomObject]@{ Name = 'NVIDIA GeForce Driver'; Category = 'Video'; HardwareIds = @() }
+        @(& $script:GetBoundPackages $Row).Count | Should -Be 0
+    }
+
+    It 'Does not use the brand fallback for non-video rows' {
+        # A non-Video pin with no hardware IDs has nothing to match on, and must
+        # not fall back to "anything from this vendor".
+        $Row = [PSCustomObject]@{ Name = 'AMD Chipset Driver'; Category = 'Chipset'; HardwareIds = @() }
+        @(& $script:GetBoundPackages $Row).Count | Should -Be 0
+    }
+
+    It 'Returns empty rather than throwing when the device query fails' {
+        $script:CimThrows = $true
+        $Row = [PSCustomObject]@{ Name = 'AMD Radeon Graphics Driver'; Category = 'Video'; HardwareIds = @() }
+        @(& $script:GetBoundPackages $Row).Count | Should -Be 0
     }
 }

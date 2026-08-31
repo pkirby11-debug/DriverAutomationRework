@@ -90,7 +90,7 @@ function New-DATMainWindow {
 
     $Controls['PinGridData'] = New-DATGridTable -Columns @(
         'Enabled', 'NamePattern', 'PinnedVersion', 'SystemId', 'Model',
-        'OperatingSystem', 'Recoverable', 'Reason')
+        'OperatingSystem', 'Recoverable', 'RetireOutranking', 'Reason')
     $Controls['PinGrid'].ItemsSource = $Controls['PinGridData'].DefaultView
 
     try {
@@ -2035,9 +2035,14 @@ function Initialize-DATMainWindow {
         # Name the consequence, not the action: this holds the fleet AND pushes
         # already-updated devices back down on the next deployment cycle.
         $Summary = (@($Rows | ForEach-Object { "  $($_['Name'])  ->  v$($_['Version'])" }) -join "`n")
+        $Retire = [bool]$Controls['PinRemoveOutrankingCheckBox'].IsChecked
         $Confirm = Show-DATWindowMessage -Type Question -Message (
             "Pin $($Rows.Count) driver(s)?`n`n$Summary`n`n" +
-            "The next sync rebuilds this model's Driver Updates package with these revisions, and devices already running a newer driver are forced back down to them.")
+            "The next sync rebuilds this model's Driver Updates package with these revisions, and devices already running a newer driver are forced back down to them." +
+            $(if ($Retire) {
+                "`n`nRETIRE THE OUTRANKING DRIVER is ticked. Where the pin does not take hold on its own, the client will DELETE the newer driver package from the device's DriverStore so the pinned one becomes the best match. " +
+                "It only does this after the pin has already failed, only for a package newer than the pin on matching hardware, and only when the pinned revision is already staged. This removes a driver package from the machine."
+            } else { '' }))
         if ($Confirm -ne 'Yes') { return }
 
         $Created = 0
@@ -2056,6 +2061,7 @@ function Initialize-DATMainWindow {
                     PinnedFileName  = [string]$Row['FileName']
                     PinnedName      = [string]$Row['Name']
                     VendorVersion   = [string]$Row['VendorVersion']
+                    RemoveOutrankingDriver = [bool]$Controls['PinRemoveOutrankingCheckBox'].IsChecked
                     ComponentXml    = [string]$Row['ComponentXml']
                     HashMD5         = [string]$Row['HashMD5']
                     Size            = [string]$Row['Size']

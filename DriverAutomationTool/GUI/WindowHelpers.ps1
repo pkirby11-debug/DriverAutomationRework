@@ -689,6 +689,9 @@ function Update-DATPinGrid {
         $Row['Model']           = [string]$Pin.Model
         $Row['OperatingSystem'] = [string]$Pin.OperatingSystem
         $Row['Recoverable']     = if ($Pin.SourceUrl) { 'Yes' } else { 'Version only' }
+        # Which pins are allowed to retire the package outranking them. Worth a
+        # column of its own: it is the one pin setting that deletes something.
+        $Row['RetireOutranking'] = if ($Pin.RemoveOutrankingDriver) { 'Yes' } else { 'No' }
         $Row['Reason']          = [string]$Pin.Reason
         $Table.Rows.Add($Row)
     }

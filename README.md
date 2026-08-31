@@ -405,7 +405,20 @@ On the client, a pinned package:
   DUP's own framework log — Dell's DCH/mup packages declare no `force`
   parameter and the framework **drops `/f`** before the payload installer sees
   it, and Windows declines each display INF as *"not a better match than the
-  current driver"*. When that happens the newer package
+  current driver"*.
+- **can retire the package that outranks the pin** (`-RemoveOutrankingDriver`,
+  or the *Retire the outranking driver* tick box on the GUI tab). Installing
+  the pinned revision is frequently not enough: Windows separates two
+  equally-matching packages by driver **date**, so the newer one keeps the
+  device for as long as it stays in the DriverStore, and a forced bind would be
+  undone at the next re-evaluation. Removing it is what makes the rollback
+  durable. **Off by default — it deletes a driver package.** It runs only after
+  the pin has already failed, only against a package newer than the pin that
+  matches the pinned component's own hardware, never against an inbox INF, and
+  it refuses unless the pinned revision is already staged so PnP has somewhere
+  to land. The device is re-read afterwards to decide the outcome, because the
+  re-bind and the removal are separate steps that succeed and fail
+  independently. When that happens the newer package
   has to leave the DriverStore first (`pnputil /enum-drivers`, then
   `pnputil /delete-driver oemNN.inf /uninstall`) — irreversible, so test it on
   one device before doing it at scale.

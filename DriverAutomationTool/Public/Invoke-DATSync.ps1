@@ -2181,6 +2181,13 @@ function Invoke-DATSyncSinglePackage {
                                         # every ordinary row, which is the pre-2.40 behavior exactly.
                                         AllowDowngrade = [bool]$IndvDriver.IsPinned
                                         PinReason      = if ($IndvDriver.IsPinned) { [string]$IndvDriver.PinReason } else { '' }
+                                        # May the client retire a newer driver package that is
+                                        # outranking this pin? Installing the pinned revision is
+                                        # not always enough: Windows separates equally-matching
+                                        # packages by driver date, so the newer one keeps the
+                                        # device until it leaves the DriverStore. Off unless the
+                                        # pin was added with -RemoveOutrankingDriver.
+                                        AllowDriverStoreRemoval = [bool]$IndvDriver.PinRemoveOutranking
                                     })
                                     Write-DATLog -Message "  Staged DUP: $($IndvDriver.FileName) ($([math]::Round($StagedSize / 1MB, 2)) MB)" -Severity 1
                                     continue

@@ -2879,6 +2879,85 @@ function Install-DriverUpdates {
         return $null
     }
 
+    # Which DriverStore package is bound to the device(s) a pinned row targets.
+    # Win32_PnPSignedDriver.InfName is the published oemNN.inf name, which is
+    # exactly what pnputil /delete-driver takes.
+    #
+    # Matching is deliberately NARROWER than the live-version probe. That probe
+    # only has to read a number, so a loose match costs nothing; this decides
+    # what gets REMOVED, so a loose match is a broken device. A Video row falls
+    # back to the GPU brand, which on its own would also match AMD audio and
+    # chipset functions - every one of them is VEN_1002 - so the brand path is
+    # additionally confined to the Display class.
+    $GetBoundPackages = {
+        param($Row)
+
+        $Tokens = @($Row.HardwareIds | Where-Object { $_ })
+        $Brand  = if ($Row.Category -eq 'Video') { & $GetDupGpuVendor $Row.Name } else { $null }
+
+        $Signed = @()
+        try {
+            $Signed = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+                Select-Object DeviceID, HardWareID, DriverVersion, DeviceName, InfName, DeviceClass)
+        } catch {
+            Write-Verbose "Bound-package enumeration failed: $($_.Exception.Message)"
+            return @()
+        }
+
+        $Hits = [System.Collections.Generic.List[object]]::new()
+        foreach ($Sd in $Signed) {
+            # Only third-party packages are removable, and only they are named
+            # oemNN.inf. An inbox INF (display.inf and friends) must never be
+            # touched - it is the fallback the device lands on.
+            if ("$($Sd.InfName)" -notmatch '^oem\d+\.inf$') { continue }
+
+            $Hay = "$($Sd.DeviceID) $($Sd.HardWareID)"
+            $IsMatch = $false
+            foreach ($T in $Tokens) { if ($Hay -like "*$T*") { $IsMatch = $true; break } }
+
+            if (-not $IsMatch -and $Brand -and "$($Sd.DeviceClass)" -match '^(?i)display$' -and
+                $Hay -match 'VEN_([0-9A-Fa-f]{4})') {
+                switch ($Matches[1].ToUpperInvariant()) {
+                    '10DE' { if ($Brand -eq 'NVIDIA') { $IsMatch = $true } }
+                    '1002' { if ($Brand -eq 'AMD')    { $IsMatch = $true } }
+                    '8086' { if ($Brand -eq 'Intel')  { $IsMatch = $true } }
+                }
+            }
+            if ($IsMatch) { $Hits.Add($Sd) }
+        }
+        # Emit nothing at all when there is no hit. The unary comma that keeps a
+        # single hit from unrolling would otherwise wrap an EMPTY list into a
+        # one-element array, and the caller would count a match that is not
+        # there - on the path that decides what gets removed.
+        if ($Hits.Count -eq 0) { return @() }
+        return ,@($Hits)
+    }
+
+    # Is the pinned revision already staged in the DriverStore? This is THE
+    # safety gate on removal: PnP re-binds the device to the next best matching
+    # package, so removing the bound one without the pinned one present leaves
+    # the device on an inbox driver or none at all. Fails CLOSED - if the store
+    # cannot be enumerated, nothing is removed.
+    $PinnedPackageStaged = {
+        param([string]$TargetVersion, [string]$ClassName)
+        if ([string]::IsNullOrWhiteSpace($TargetVersion)) { return $false }
+        $Pkgs = @()
+        try {
+            # Third-party packages only (no -All): the pinned revision is always
+            # one, and enumerating every inbox driver costs minutes.
+            $Pkgs = @(Get-WindowsDriver -Online -ErrorAction Stop)
+        } catch {
+            Write-Log "  Could not enumerate the DriverStore ($($_.Exception.Message)) - refusing to remove any driver package" -Severity 2
+            return $false
+        }
+        foreach ($P in $Pkgs) {
+            if ("$($P.Version)" -ne $TargetVersion) { continue }
+            if ($ClassName -and "$($P.ClassName)" -notmatch ('^(?i)' + [regex]::Escape($ClassName) + '$')) { continue }
+            return $true
+        }
+        return $false
+    }
+
     # Infer the GPU brand a Video DUP targets from its name. Returns
     # 'NVIDIA'/'AMD'/'Intel', or $null when it can't tell (then we don't filter on it).
     # Only meaningful for Category=Video DUPs.
@@ -3553,8 +3632,86 @@ function Install-DriverUpdates {
                     }
                     Write-Log ("$DriverLabel - PIN NOT APPLIED: the DUP exited $DupCode (success), but the device is STILL on v$AfterVersion instead of the pinned v$PinTarget. " +
                         $(if ($Reasons.Count -gt 0) { "Framework log says: $($Reasons -join '; '). " } else { "The framework log names no known cause - read it at $(if ($DupFwLog) { $DupFwLog } else { 'not captured' }). " }) +
-                        "Neither Dell's /f nor a re-run can beat PnP ranking: the newer package has to leave the DriverStore first, so the pinned one becomes the best match. " +
-                        "Find it with 'pnputil /enum-drivers' and remove it with 'pnputil /delete-driver oemNN.inf /uninstall' - irreversible, so prove it on one device before doing it at scale.") -Severity 3
+                        "Neither Dell's /f nor a re-run can beat PnP ranking: two packages that match a device equally are separated by driver DATE, so the newer one keeps winning while it is in the DriverStore.") -Severity 3
+
+                    # Retiring the outranking package is the only durable fix -
+                    # a forced bind would be undone by the next re-evaluation
+                    # while that package is still present. It is opt-in per pin
+                    # because it is a real deletion.
+                    #
+                    # pnputil's /uninstall does it in the safe order: devices are
+                    # moved off the package FIRST, then it leaves the store. That
+                    # ordering is what keeps the device from being stranded -
+                    # provided the pinned package is already staged for PnP to
+                    # land on, which is checked before anything is touched.
+                    if (-not $Drv.AllowDriverStoreRemoval) {
+                        Write-Log ("$DriverLabel - the pinned revision is staged but outranked. To let the client retire the newer package automatically, re-add the pin with -RemoveOutrankingDriver " +
+                            "(or tick 'Retire the outranking driver' on the GUI's Driver Pins tab).") -Severity 2
+                    } else {
+                        $Bound = @(& $GetBoundPackages $Drv)
+                        # Only ever act on a package NEWER than the pin. An older
+                        # or equal one is not what is outranking us, and removing
+                        # it would be pure damage.
+                        $Outranking = @($Bound | Where-Object {
+                            $C = & $CompareVersion "$($_.DriverVersion)" $PinTarget
+                            ($null -ne $C) -and ($C -gt 0)
+                        })
+
+                        if ($Outranking.Count -eq 0) {
+                            Write-Log "$DriverLabel - no removable package matched this component with a version newer than v$PinTarget, so there is nothing to retire; the DriverStore is left untouched" -Severity 2
+                        } elseif (-not (& $PinnedPackageStaged $PinTarget "$($Outranking[0].DeviceClass)")) {
+                            Write-Log ("$DriverLabel - REFUSING to touch $(@($Outranking | ForEach-Object { $_.InfName }) -join ', '): the pinned v$PinTarget is NOT in the DriverStore, so PnP would have nothing to fall back to and the device could be left without a driver. " +
+                                "Check that the pinned DUP actually staged its INFs.") -Severity 3
+                        } else {
+                            $PnpUtil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
+                            foreach ($Pkg in $Outranking) {
+                                $Inf = "$($Pkg.InfName)"
+                                Write-Log "$DriverLabel - retiring outranking package $Inf (v$($Pkg.DriverVersion), $($Pkg.DeviceName)) so the pinned v$PinTarget becomes the best match"
+                                $PnpOut = ''
+                                $PnpCode = -1
+                                try {
+                                    $PnpOut = (& $PnpUtil '/delete-driver' $Inf '/uninstall' 2>&1 | Out-String).Trim()
+                                    $PnpCode = $LASTEXITCODE
+                                } catch {
+                                    Write-Log "$DriverLabel - pnputil failed to launch: $($_.Exception.Message)" -Severity 3
+                                    continue
+                                }
+                                if ($PnpCode -eq 3010) { $Rebooted = $true }
+                                # The exit code is NOT the outcome. pnputil does
+                                # the device re-bind first and the store removal
+                                # second, so it can re-bind successfully and
+                                # still report failure on the second step - which
+                                # is exactly what the field hit (259 after the
+                                # device had already moved). Only the device is
+                                # worth believing, and it is re-read below.
+                                Write-Log "$DriverLabel - pnputil exit $PnpCode$(if ($PnpOut) { ": $($PnpOut -replace '\s+', ' ')" })" -Severity $(if ($PnpCode -eq 0 -or $PnpCode -eq 3010) { 1 } else { 2 })
+                            }
+
+                            try {
+                                $LiveVideoAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+                            } catch {
+                                Write-Verbose "Post-retire display re-read failed: $($_.Exception.Message)"
+                            }
+                            if ($Drv.Category -ne 'Video') {
+                                try {
+                                    $LiveSignedDrivers = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+                                        Select-Object DeviceID, HardWareID, DriverVersion, DeviceName)
+                                } catch {
+                                    Write-Verbose "Post-retire signed-driver re-read failed: $($_.Exception.Message)"
+                                }
+                            }
+                            $FinalVersion = & $GetLiveDriverVersion $Drv
+                            $FinalCmp = if ($FinalVersion -and $PinTarget) { & $CompareVersion $FinalVersion $PinTarget } else { $null }
+                            if ($null -ne $FinalCmp -and $FinalCmp -le 0) {
+                                $PinNotApplied--
+                                $AfterVersion = $FinalVersion
+                                Write-Log "$DriverLabel - PIN VERIFIED after retiring the outranking package: device is now on v$FinalVersion (was v$LiveVersion)"
+                            } else {
+                                Write-Log ("$DriverLabel - PIN STILL NOT APPLIED after retiring the outranking package: device reports $(if ($FinalVersion) { "v$FinalVersion" } else { 'no readable version' }). " +
+                                    "A reboot may be pending; if it has not moved after one, enumerate the device's matching drivers to see what is outranking the pin now.") -Severity 3
+                            }
+                        }
+                    }
                 }
             }
 

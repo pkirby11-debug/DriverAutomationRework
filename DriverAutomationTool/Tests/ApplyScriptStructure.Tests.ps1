@@ -336,6 +336,57 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
         $M.Groups[1].Value | Should -Not -Match '\$Failed\+\+'
     }
 
+    It 'Retires a driver package only behind both gates' {
+        # This is the one path that DELETES something off a machine. Two
+        # conditions have to hold above it, and neither is optional:
+        #   * the pin opted in (AllowDriverStoreRemoval), because the operator
+        #     is authorising a deletion;
+        #   * the pinned revision is already staged, because PnP re-binds the
+        #     device to the next best match and there has to BE one.
+        $Loop = $script:DrvLoop
+        $Calls = @($Loop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.Extent.Text -match 'delete-driver'
+        }, $true))
+        @($Calls).Count | Should -Be 1
+
+        $Node = $Calls[0]
+        $Guards = [System.Collections.Generic.List[string]]::new()
+        while ($Node -and $Node -ne $Loop) {
+            if ($Node -is [System.Management.Automation.Language.IfStatementAst]) {
+                foreach ($Clause in $Node.Clauses) { $Guards.Add($Clause.Item1.Extent.Text) }
+            }
+            $Node = $Node.Parent
+        }
+        $All = $Guards -join ' '
+        $All | Should -Match 'AllowDriverStoreRemoval'
+        $All | Should -Match 'PinnedPackageStaged'
+    }
+
+    It 'Only ever considers packages newer than the pinned version' {
+        # Removing an older or equal package is never the fix and is pure
+        # damage: it is not what is outranking the pin.
+        $Sel = [regex]::Match($script:DrvLoop.Extent.Text,
+            '\$Outranking\s*=\s*@\(\$Bound\s*\|\s*Where-Object\s*\{(.*?)\}\)', 'Singleline')
+        $Sel.Success | Should -BeTrue
+        $Sel.Groups[1].Value | Should -Match '\$PinTarget'
+        $Sel.Groups[1].Value | Should -Match '\-gt\s+0'
+    }
+
+    It 'Decides the retire outcome from the device, not from pnputil exit code' {
+        # pnputil re-binds the device first and removes the package second, so
+        # it can succeed at the part that matters and still report failure. The
+        # field hit exactly that (259 after the device had already moved).
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match '\$FinalVersion\s*=\s*&\s*\$GetLiveDriverVersion'
+        $Verdict = [regex]::Match($Loop, 'PIN VERIFIED after retiring(.{0,200})', 'Singleline')
+        $Verdict.Success | Should -BeTrue
+        # The success branch must be selected by the comparison, not by $PnpCode.
+        $Cond = [regex]::Match($Loop, 'if\s*\(\$null -ne \$FinalCmp -and \$FinalCmp -le 0\)')
+        $Cond.Success | Should -BeTrue
+    }
+
     It 'Never lets an uncomparable pin quietly install without /f' {
         # Installing a pinned DUP without /f is not the neutral choice: the DUP's
         # own version check then declines the downgrade and exits 0, so the

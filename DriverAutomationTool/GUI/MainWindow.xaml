@@ -566,8 +566,11 @@
 
                     <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
                         <Label Content="Reason:" Width="55" />
-                        <TextBox x:Name="PinReasonBox" Width="470" Margin="0,0,8,0"
+                        <TextBox x:Name="PinReasonBox" Width="380" Margin="0,0,8,0"
                                  ToolTip="Why this driver is being held back. Carried into the package manifest and the client apply log." />
+                        <CheckBox x:Name="PinRemoveOutrankingCheckBox" Content="Retire the outranking driver"
+                                  VerticalAlignment="Center" Margin="0,0,10,0"
+                                  ToolTip="Installing the pinned revision is often not enough: Windows separates equally-matching driver packages by DATE, so the newer one keeps the device while it is still in the DriverStore. Tick this to let the client retire that newer package - but only after the pin has already failed to apply, only for a package newer than the pin that matches this component's hardware, and only when the pinned revision is already staged so PnP has somewhere to fall back to. This deletes a driver package from the machine." />
                         <Button x:Name="PinCreateButton" Content="Pin Selected Revision" Style="{StaticResource AccentButton}" Width="168" Margin="0,0,8,0" />
                         <TextBlock x:Name="PinStatusLabel" Text="" VerticalAlignment="Center"
                                    Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" />
@@ -600,6 +603,7 @@
                             <DataGridTextColumn Header="Model" Width="140" IsReadOnly="True" Binding="{Binding Model}" />
                             <DataGridTextColumn Header="OS" Width="120" IsReadOnly="True" Binding="{Binding OperatingSystem}" />
                             <DataGridTextColumn Header="Recoverable" Width="94" IsReadOnly="True" Binding="{Binding Recoverable}" />
+                            <DataGridTextColumn Header="Retires outranking" Width="122" IsReadOnly="True" Binding="{Binding RetireOutranking}" />
                             <DataGridTextColumn Header="Reason" Width="*" IsReadOnly="True" Binding="{Binding Reason}" />
                         </DataGrid.Columns>
                     </DataGrid>

@@ -301,6 +301,10 @@ function Select-DATPinnedDriver {
         param($Driver, $Pin)
         $Driver | Add-Member -NotePropertyName 'IsPinned'  -NotePropertyValue $true -Force
         $Driver | Add-Member -NotePropertyName 'PinReason' -NotePropertyValue ([string]$Pin.Reason) -Force
+        # Carried into the manifest so the client knows whether it may retire the
+        # package that is outranking this pin. Absent on pins created before the
+        # switch existed, which reads as $false - the safe default.
+        $Driver | Add-Member -NotePropertyName 'PinRemoveOutranking' -NotePropertyValue ([bool]$Pin.RemoveOutrankingDriver) -Force
         $Driver
     }
 

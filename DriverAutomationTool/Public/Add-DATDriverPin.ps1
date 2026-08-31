@@ -67,6 +67,23 @@
         working after Dell purges the revision from the catalog.
     .PARAMETER PinnedFileName
         DUP filename. Defaults to the leaf of -SourceUrl.
+    .PARAMETER RemoveOutrankingDriver
+        Let the client retire the newer driver package from the DriverStore when
+        the pinned one is installed but Windows keeps the newer one bound.
+
+        This is needed more often than it sounds. Two packages that match a
+        device equally are separated by driver DATE, so the newer one keeps
+        winning as long as it is present - installing the pinned revision is not
+        enough on its own, and no force switch survives the next re-evaluation.
+        Retiring the outranking package is what makes the rollback stick.
+
+        It only ever runs when the pin has already failed to apply, and only
+        against a package NEWER than the pinned version that matches this
+        component's own hardware. The client refuses outright unless the pinned
+        revision is already staged in the DriverStore, so PnP always has
+        something to fall back to.
+
+        Off by default: this deletes a driver package from the machine.
     .PARAMETER VendorVersion
         The vendor's own dotted version for the pinned revision (Dell's
         vendorVersion, e.g. '32.0.23040.1006'). This is the number the client
@@ -138,6 +155,9 @@
         [string]$PinnedFileName = '',
 
         [Parameter(ValueFromPipelineByPropertyName)]
+        [switch]$RemoveOutrankingDriver,
+
+        [Parameter(ValueFromPipelineByPropertyName)]
         [string]$VendorVersion = '',
 
         [Parameter(ValueFromPipelineByPropertyName)]
@@ -207,6 +227,9 @@
             if ($PinnedFileName) { $Existing.PinnedFileName = $PinnedFileName }
             if ($PinnedName)     { $Existing.PinnedName = $PinnedName }
             if ($VendorVersion)  { $Existing.VendorVersion = $VendorVersion }
+            # Explicit on every update rather than only when set: an operator
+            # re-running the pin without the switch means they want it off.
+            $Existing.RemoveOutrankingDriver = [bool]$RemoveOutrankingDriver
             if ($ComponentXml)   { $Existing.ComponentXml = $ComponentXml }
             if ($HashMD5)        { $Existing.HashMD5 = $HashMD5 }
             if ($Size)           { $Existing.Size = $Size }
@@ -227,6 +250,7 @@
                 PinnedFileName  = $PinnedFileName
                 PinnedName      = $PinnedName
                 VendorVersion   = $VendorVersion
+                RemoveOutrankingDriver = [bool]$RemoveOutrankingDriver
                 ComponentXml    = $ComponentXml
                 HashMD5         = $HashMD5
                 Size            = $Size
