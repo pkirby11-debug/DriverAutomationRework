@@ -322,3 +322,90 @@ Describe 'Test-DATDriverPinsSatisfied' {
         @(Test-DATDriverPinsSatisfied -Drivers @($script:Amd32) -Pins @()).Count | Should -Be 0
     }
 }
+
+Describe 'Get-DATDriverPin projection coverage' {
+    # Invoke-DATSync reads pins through Get-DATDriverPin, never from the JSON, so
+    # that projection is the only view the sync gets of a pin. A field written by
+    # Add-DATDriverPin and left out of it does not surface as missing - it reads
+    # as empty or $false, indistinguishable from the operator not having asked
+    # for it. That is exactly how -RemoveOutrankingDriver shipped inert: the
+    # ledger held $true, the sync saw $null, the manifest said "not allowed", and
+    # the GUI honestly reported "No". Comparing the two field sets at runtime is
+    # what stops the next added field going the same way.
+    BeforeEach {
+        $script:SettingsPath = Join-Path $TestDrive ("Settings_{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+        New-Item -Path $script:SettingsPath -ItemType Directory -Force | Out-Null
+    }
+
+    It 'Projects every field the ledger stores' {
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A05' -SystemId '0D58' `
+            -Manufacturer 'Dell' -Model 'Dell Pro Micro QCM12' -OperatingSystem 'Windows 11' `
+            -Reason 'blank screens on P2419H' -SourceUrl 'https://dl.dell.com/FOLDER11223344M/1/Video_A05.EXE' `
+            -PinnedFileName 'Video_A05.EXE' -PinnedName 'AMD Radeon Graphics Driver' `
+            -VendorVersion '32.0.23040.1006' -RemoveOutrankingDriver `
+            -ComponentXml '<SoftwareComponent />' -HashMD5 'abc' -Size 1024 `
+            -ReleaseDate '2026-05-26' -Category 'Video' -HardwareIds @('VEN_1002&DEV_73FF')
+
+        $Raw = (Get-Content -Path (Join-Path $script:SettingsPath 'DriverPins.json') -Raw | ConvertFrom-Json).entries[0]
+        $Projected = @(Get-DATDriverPin)[0]
+
+        $Stored = @($Raw.PSObject.Properties.Name)
+        $Stored.Count | Should -BeGreaterThan 10 -Because 'the fixture has to actually populate the ledger for this comparison to mean anything'
+
+        $Missing = @($Stored | Where-Object { -not $Projected.PSObject.Properties[$_] })
+        $Missing -join ', ' | Should -BeNullOrEmpty -Because 'a stored field left out of the projection reads as empty or $false to the sync, not as absent'
+    }
+}
+
+Describe 'RemoveOutrankingDriver round trip' {
+    BeforeEach {
+        $script:SettingsPath = Join-Path $TestDrive ("Settings_{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+        New-Item -Path $script:SettingsPath -ItemType Directory -Force | Out-Null
+    }
+
+    It 'Survives the store and reaches the resolved driver as PinRemoveOutranking' {
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A05' -SystemId '0D58' `
+            -Model 'Dell Pro Micro QCM12' -VendorVersion '32.0.23040.1006' `
+            -SourceUrl 'https://dl.dell.com/FOLDER11223344M/1/Video_A05.EXE' -RemoveOutrankingDriver
+
+        # The read side - what the GUI grid and the sync both see.
+        $Pin = @(Get-DATDriverPin)[0]
+        $Pin.RemoveOutrankingDriver | Should -BeTrue
+        $Pin.VendorVersion          | Should -Be '32.0.23040.1006'
+
+        # And the end of the chain: the flag Invoke-DATSync builds the manifest's
+        # AllowDriverStoreRemoval from.
+        $Drv = New-TestDriver -Name 'AMD Radeon Graphics Driver' -Version 'A05'
+        $Out = @(Select-DATPinnedDriver -Selected @($Drv) -Candidates @($Drv) -Pins @($Pin))
+        $Out[0].PinRemoveOutranking | Should -BeTrue
+    }
+
+    It 'Carries the pin VendorVersion onto a revision rebuilt from captured metadata' {
+        # The rollback case: the catalog has moved on, so the pinned revision is
+        # synthesized from the pin itself - which is the only place the client can
+        # get a version that orders against what the device reports.
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A05' -SystemId '0D58' `
+            -Model 'Dell Pro Micro QCM12' -VendorVersion '32.0.23040.1006' `
+            -PinnedName 'AMD Radeon Graphics Driver' -PinnedFileName 'Video_A05.EXE' -Category 'Video' `
+            -SourceUrl 'https://dl.dell.com/FOLDER11223344M/1/Video_A05.EXE' -RemoveOutrankingDriver
+
+        $Pin   = @(Get-DATDriverPin)[0]
+        $Newer = New-TestDriver -Name 'AMD Radeon Graphics Driver' -Version 'A06'
+        $Out   = @(Select-DATPinnedDriver -Selected @($Newer) -Candidates @($Newer) -Pins @($Pin))
+
+        $Out[0].Version             | Should -Be 'A05'
+        $Out[0].VendorVersion       | Should -Be '32.0.23040.1006'
+        $Out[0].PinRemoveOutranking | Should -BeTrue
+    }
+
+    It 'Defaults to off and turns off again when the pin is re-added without it' {
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A05' -SystemId '0D58' -Model 'QCM12'
+        @(Get-DATDriverPin)[0].RemoveOutrankingDriver | Should -BeFalse
+
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A05' -SystemId '0D58' -Model 'QCM12' -RemoveOutrankingDriver
+        @(Get-DATDriverPin)[0].RemoveOutrankingDriver | Should -BeTrue
+
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A05' -SystemId '0D58' -Model 'QCM12'
+        @(Get-DATDriverPin)[0].RemoveOutrankingDriver | Should -BeFalse
+    }
+}

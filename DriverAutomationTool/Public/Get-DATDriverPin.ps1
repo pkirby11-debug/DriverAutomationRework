@@ -10,8 +10,16 @@ function Get-DATDriverPin {
         at catalog-resolve time, and refuses to build a model whose pin cannot
         be satisfied.
 
-        ComponentXml is deliberately not projected here; it is a whole XML
-        element and would swamp the table. Read the JSON directly if you need it.
+        This projection is the ONLY view the sync gets of a pin - Invoke-DATSync
+        reads pins through here, not from the JSON - so every field the ledger
+        stores has to be listed below. A field added to the store and forgotten
+        here does not read as missing, it reads as empty or false, which is how
+        RemoveOutrankingDriver silently disabled itself. The 'Get-DATDriverPin
+        projection coverage' test compares the two field sets at runtime and
+        fails the build if they drift apart.
+
+        ComponentXml is projected in full rather than trimmed for display: it is
+        what rebuilds a pinned revision once Dell purges it from the catalog.
     .PARAMETER IncludeDisabled
         Also list pins turned off with Disable-DATDriverPin. By default only
         pins that actually affect a sync are returned.
@@ -44,6 +52,8 @@ function Get-DATDriverPin {
             SourceUrl       = [string]$Entry.SourceUrl
             PinnedFileName  = [string]$Entry.PinnedFileName
             PinnedName      = [string]$Entry.PinnedName
+            VendorVersion   = [string]$Entry.VendorVersion
+            RemoveOutrankingDriver = [bool]$Entry.RemoveOutrankingDriver
             HashMD5         = [string]$Entry.HashMD5
             Size            = $Entry.Size
             ReleaseDate     = [string]$Entry.ReleaseDate
