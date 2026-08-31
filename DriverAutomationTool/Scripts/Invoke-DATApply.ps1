@@ -3061,6 +3061,21 @@ function Install-DriverUpdates {
     $DefenderFlagged = 0
     $VulnExclusionAdvice = [System.Collections.Generic.List[string]]::new()
 
+    # Dell writes the framework log as UTF-16LE with a BOM. Read it through a
+    # reader that honours the BOM rather than relying on Get-Content's default
+    # encoding, so a phrase match never silently fails on the encoding - every
+    # decision below is made by matching text in this file.
+    $ReadDupLog = {
+        param([string]$LogPath)
+        if (-not $LogPath -or -not (Test-Path $LogPath)) { return '' }
+        try {
+            return [System.IO.File]::ReadAllText($LogPath)
+        } catch {
+            Write-Verbose "Framework log read failed ($LogPath): $($_.Exception.Message)"
+            return ''
+        }
+    }
+
     # Per-DUP framework-log capture. The Dell framework log (.dup.log) is the
     # only place a DUP records why it failed - requested per-DUP via Dell's
     # documented /l= switch. (DUPs are GUI apps and never write to stdout/stderr,
@@ -3209,7 +3224,7 @@ function Install-DriverUpdates {
                 } elseif ($LiveCmp -gt 0) {
                     $LiveVersionKnown = $true
                     $ForceDowngrade = $true
-                    Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, newer than the pinned v$TargetLabel - forcing the rollback with /f$(if ($Drv.PinReason) { " ($($Drv.PinReason))" })" -Severity 2
+                    Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, newer than the pinned v$TargetLabel - passing Dell's /f to force the rollback$(if ($Drv.PinReason) { " ($($Drv.PinReason))" })" -Severity 2
                 } elseif ($LiveCmp -eq 0) {
                     Write-Log "$DriverLabel - PINNED: device is already on the pinned v$TargetLabel - skipping"
                     $AlreadyInst++
@@ -3438,10 +3453,7 @@ function Install-DriverUpdates {
         # Install-InfTree.
         if ($DupCode -eq 1 -and $DupTempDir -and $DupFwLog -and (Test-Path $DupFwLog)) {
             $FwRaw = ''
-            try { $FwRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction Stop } catch {
-        # Non-fatal hardware or registry probe error
-        Write-Verbose "Ignored exception: $($_.Exception.Message)"
-    }
+            $FwRaw = & $ReadDupLog $DupFwLog
             if ($FwRaw -and $FwRaw -match 'Error locating default extractpath') {
                 Write-Log "$DriverLabel - framework could not resolve its default extract path; retrying as extract (/e=) + pnputil" -Severity 2
                 $FbExtract = Join-Path $DupTempDir 'fallback-extract'
@@ -3521,10 +3533,28 @@ function Install-DriverUpdates {
                     Write-Log "$DriverLabel - PIN: device still reports v$AfterVersion, but this DUP asked for a reboot - the rollback cannot be confirmed until the device restarts" -Severity 2
                 } else {
                     $PinNotApplied++
-                    Write-Log ("$DriverLabel - PIN NOT APPLIED: the DUP ran with /f and exited $DupCode (success), but the device is STILL on v$AfterVersion instead of the pinned v$PinTarget. " +
-                        "Dell's /f overrides the DUP framework's own version check, not Windows' driver ranking - the older package can land in the DriverStore while PnP keeps the newer driver bound to the device. " +
-                        "Read this DUP's framework log ($(if ($DupFwLog) { $DupFwLog } else { 'not captured' })) to see what the payload installer decided. " +
-                        "If it reports success too, the newer package has to leave the DriverStore before the older one can win: find it with 'pnputil /enum-drivers' and remove it with 'pnputil /delete-driver oemNN.inf /uninstall' - which is irreversible, so test it on one device before doing it at scale.") -Severity 3
+                    # Name the actual reason from the framework log instead of
+                    # making the operator go read it. Two are known and neither
+                    # is visible in the exit code:
+                    #   * a DCH/mup DUP whose mup.xml declares no force
+                    #     parameter - the framework drops /f before the payload
+                    #     installer ever sees it, and says so on its first line;
+                    #   * PnP declining the INF on driver ranking, one line per
+                    #     INF, which is what "success with nothing installed"
+                    #     actually looks like from inside.
+                    $FwPin = & $ReadDupLog $DupFwLog
+                    $Reasons = [System.Collections.Generic.List[string]]::new()
+                    if ($FwPin -match 'dropping\s+/f\s+from\s+commandline') {
+                        $Reasons.Add("the DUP framework DROPPED /f before running the payload ('the parameter force is not found in mup file') - this is a DCH/mup package and the switch never took effect")
+                    }
+                    $RankDeclines = @([regex]::Matches($FwPin, 'is\s+not\s+a\s+better\s+match\s+than\s+the\s+current\s+driver')).Count
+                    if ($RankDeclines -gt 0) {
+                        $Reasons.Add("Windows declined $RankDeclines INF(s) as 'not a better match than the current driver' - PnP ranking kept the newer driver bound")
+                    }
+                    Write-Log ("$DriverLabel - PIN NOT APPLIED: the DUP exited $DupCode (success), but the device is STILL on v$AfterVersion instead of the pinned v$PinTarget. " +
+                        $(if ($Reasons.Count -gt 0) { "Framework log says: $($Reasons -join '; '). " } else { "The framework log names no known cause - read it at $(if ($DupFwLog) { $DupFwLog } else { 'not captured' }). " }) +
+                        "Neither Dell's /f nor a re-run can beat PnP ranking: the newer package has to leave the DriverStore first, so the pinned one becomes the best match. " +
+                        "Find it with 'pnputil /enum-drivers' and remove it with 'pnputil /delete-driver oemNN.inf /uninstall' - irreversible, so prove it on one device before doing it at scale.") -Severity 3
                 }
             }
 
@@ -3596,7 +3626,7 @@ function Install-DriverUpdates {
             $FwLogRaw = ''
             if ($DupCode -eq 1 -and $DupFwLog -and (Test-Path $DupFwLog)) {
                 try {
-                    $FwLogRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction SilentlyContinue
+                    $FwLogRaw = & $ReadDupLog $DupFwLog
                 } catch {
                     $FwLogRaw = ''
                 }

@@ -1,9 +1,9 @@
 ﻿@{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.43.0'
+    ModuleVersion     = '2.43.1'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.43.0 - Verifies that a forced driver rollback actually took, instead of trusting the installer''s exit code. A Dell DUP can run with /f, report success and leave the device on the newer driver: /f overrides the DUP framework''s own version check, not Windows'' driver ranking, so the pinned package can land in the DriverStore while PnP keeps the newer driver bound. Nothing in the exit code shows that. For a pinned row the client now re-reads the device after the install and logs PIN VERIFIED or PIN NOT APPLIED, records the before/after versions on the component marker, and counts unapplied rollbacks separately in the run summary. Deliberately not a deployment failure - the install did what it was told and retrying cannot change PnP''s choice - so ConfigMgr is not put into a retry loop; the log names the DUP''s framework log and the pnputil /delete-driver step that removes the newer package when that is what is blocking it.'
+    Description       = '2.43.1 - Names why a pinned rollback did not take, from the DUP''s own framework log. A field log settled the two causes: Dell''s DCH/mup packages declare no force parameter, so the framework DROPS /f before the payload installer ever sees it ("the parameter force is not found in mup file"), and Windows then declines each display INF as "not a better match than the current driver" - PnP ranking keeps the newer driver bound while the DUP reports overall success. PIN NOT APPLIED now quotes whichever of those the log shows, with the count of declined INFs, so the cause is in DATApply.log instead of only in a file someone has to go find. The framework log is also read through a BOM-aware reader, because Dell writes it as UTF-16LE and every phrase match in the apply script depends on decoding it correctly. The pin decision line now says it is passing /f rather than asserting the force took effect.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

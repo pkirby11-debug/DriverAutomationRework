@@ -44,6 +44,7 @@ BeforeAll {
     $script:GetDupGpuVendor    = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetDupGpuVendor'
     $script:GetLiveDriverVersion = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetLiveDriverVersion'
     $script:GetPinTargetVersion  = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetPinTargetVersion'
+    $script:ReadDupLog           = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ReadDupLog'
 
     function New-FakeVideoController {
         param([string]$PnpId, [string]$DriverVersion)
@@ -225,5 +226,58 @@ Describe 'Downgrade decision (live version vs pinned target)' {
 
     It 'Treats identical non-dotted revisions as equal' {
         (& $script:CompareVersion 'A05' 'A05') | Should -Be 0
+    }
+}
+
+Describe 'Dell framework log reader' {
+    BeforeAll {
+        # Dell writes .dup.log as UTF-16LE with a BOM. Get-Content's default
+        # encoding is not guaranteed to decode that, and every phrase match the
+        # apply script makes on this file would silently find nothing - which
+        # looks identical to "the log said nothing interesting".
+        $script:Utf16Log = Join-Path $TestDrive 'fw-utf16.dup.log'
+        $Lines = @(
+            '[Mon Aug 31 13:06:51 2026]	Update Package Execution Started'
+            '[Mon Aug 31 13:06:51 2026]	The parameter force is not found in mup file .. dropping /f from commandline'
+            '[Mon Aug 31 13:06:51 2026]	DUP Vendor Software Version: 32.0.23040.1006'
+            '[8/31/2026 1:07:07 PM] Driver provided in inf file C:\x\u02011155.inf  is not a better match than the current driver'
+            '[8/31/2026 1:07:22 PM] Driver provided in inf file C:\x\amduw23e.inf  is not a better match than the current driver'
+            '[8/31/2026 1:07:25 PM] Overall INF installations Passed'
+            '[Mon Aug 31 13:07:27 2026]	Exit Code set to: 0 (0x0)'
+        )
+        [System.IO.File]::WriteAllLines($script:Utf16Log, $Lines, [System.Text.UnicodeEncoding]::new($false, $true))
+
+        $script:AsciiLog = Join-Path $TestDrive 'fw-ascii.dup.log'
+        [System.IO.File]::WriteAllLines($script:AsciiLog, $Lines, [System.Text.ASCIIEncoding]::new())
+    }
+
+    It 'Is extractable from the shipped script' {
+        $script:ReadDupLog | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Decodes a UTF-16LE framework log' {
+        $Text = & $script:ReadDupLog $script:Utf16Log
+        $Text | Should -Match 'Update Package Execution Started'
+        # A mis-decode yields NUL-separated characters, not readable text.
+        $Text | Should -Not -Match "`0"
+    }
+
+    It 'Still reads a plain-ASCII framework log' {
+        (& $script:ReadDupLog $script:AsciiLog) | Should -Match 'Update Package Execution Started'
+    }
+
+    It 'Returns empty rather than throwing for a missing or empty path' {
+        (& $script:ReadDupLog (Join-Path $TestDrive 'nope.log')) | Should -Be ''
+        (& $script:ReadDupLog '') | Should -Be ''
+    }
+
+    It 'Surfaces the two causes the field log proved, from the decoded text' {
+        # These are the exact phrases the AMD DCH DUP emitted while exiting 0
+        # and changing nothing. If either regex stops matching, PIN NOT APPLIED
+        # goes back to being undiagnosable from the log alone.
+        $Text = & $script:ReadDupLog $script:Utf16Log
+        $Text | Should -Match 'dropping\s+/f\s+from\s+commandline'
+        @([regex]::Matches($Text, 'is\s+not\s+a\s+better\s+match\s+than\s+the\s+current\s+driver')).Count |
+            Should -Be 2
     }
 }

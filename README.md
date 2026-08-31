@@ -401,7 +401,11 @@ On the client, a pinned package:
   keeps the newer driver bound to the device, and the exit code shows nothing.
   An unapplied rollback is counted separately in the run summary rather than
   failing the deployment: the install did what it was told, and ConfigMgr
-  retrying it cannot change PnP's choice. When that happens the newer package
+  retrying it cannot change PnP's choice. The log names the cause from the
+  DUP's own framework log — Dell's DCH/mup packages declare no `force`
+  parameter and the framework **drops `/f`** before the payload installer sees
+  it, and Windows declines each display INF as *"not a better match than the
+  current driver"*. When that happens the newer package
   has to leave the DriverStore first (`pnputil /enum-drivers`, then
   `pnputil /delete-driver oemNN.inf /uninstall`) — irreversible, so test it on
   one device before doing it at scale.
