@@ -2917,6 +2917,10 @@ function Install-DriverUpdates {
         Write-Log "No GPU vendors detected (or enumeration failed) - graphics DUPs will not be vendor-filtered this run" -Severity 2
     }
     $SkippedGpu = 0
+    # Pinned rows whose DUP reported success but left the device on the old
+    # driver anyway. Counted separately because it is neither a success nor an
+    # installer failure: the install worked, the rollback did not take.
+    $PinNotApplied = 0
 
     # --- Live installed-driver version, for version-pinned rows only ---
     #
@@ -3476,6 +3480,54 @@ function Install-DriverUpdates {
             $RebootTag = if ($DupCode -in $RebootCodes) { ' (reboot required)' } else { '' }
             Write-Log "$DriverLabel - exit $DupCode (success$RebootTag) in ${Elapsed}s"
 
+            # Verify a forced rollback actually took, instead of trusting the
+            # exit code. A Dell DUP can exit 0 having added the older package to
+            # the DriverStore without PnP re-binding the device to it: Windows
+            # ranks driver packages and keeps the higher-ranked (newer) one, and
+            # /f overrides the DUP framework's version gate, not PnP's choice.
+            # That failure is invisible in the exit code - every field failure
+            # of this feature has looked exactly like it, success reported and
+            # the driver unmoved - so the device itself has to be re-read.
+            #
+            # Deliberately NOT turned into a deployment failure: the install did
+            # what it was told, and ConfigMgr retrying it changes nothing. It is
+            # logged at Severity 3 and counted on its own so the run is honest
+            # about what happened.
+            $AfterVersion = $null
+            if ($ForceDowngrade) {
+                # The pre-loop enumeration is now stale for this device; re-read
+                # it. Assigning the same names refreshes them for later rows too,
+                # which is correct - they describe live state.
+                try {
+                    $LiveVideoAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+                } catch {
+                    Write-Verbose "Post-install display re-read failed: $($_.Exception.Message)"
+                }
+                if ($Drv.Category -ne 'Video') {
+                    try {
+                        $LiveSignedDrivers = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+                            Select-Object DeviceID, HardWareID, DriverVersion, DeviceName)
+                    } catch {
+                        Write-Verbose "Post-install signed-driver re-read failed: $($_.Exception.Message)"
+                    }
+                }
+                $AfterVersion = & $GetLiveDriverVersion $Drv
+                $AfterCmp = if ($AfterVersion -and $PinTarget) { & $CompareVersion $AfterVersion $PinTarget } else { $null }
+                if ($null -eq $AfterCmp) {
+                    Write-Log "$DriverLabel - PIN: could not re-read the installed driver after the run, so the rollback is unconfirmed$(if ($AfterVersion) { " (device reports v$AfterVersion)" })" -Severity 2
+                } elseif ($AfterCmp -le 0) {
+                    Write-Log "$DriverLabel - PIN VERIFIED: device is now on v$AfterVersion (was v$LiveVersion)"
+                } elseif ($DupCode -in $RebootCodes) {
+                    Write-Log "$DriverLabel - PIN: device still reports v$AfterVersion, but this DUP asked for a reboot - the rollback cannot be confirmed until the device restarts" -Severity 2
+                } else {
+                    $PinNotApplied++
+                    Write-Log ("$DriverLabel - PIN NOT APPLIED: the DUP ran with /f and exited $DupCode (success), but the device is STILL on v$AfterVersion instead of the pinned v$PinTarget. " +
+                        "Dell's /f overrides the DUP framework's own version check, not Windows' driver ranking - the older package can land in the DriverStore while PnP keeps the newer driver bound to the device. " +
+                        "Read this DUP's framework log ($(if ($DupFwLog) { $DupFwLog } else { 'not captured' })) to see what the payload installer decided. " +
+                        "If it reports success too, the newer package has to leave the DriverStore before the older one can win: find it with 'pnputil /enum-drivers' and remove it with 'pnputil /delete-driver oemNN.inf /uninstall' - which is irreversible, so test it on one device before doing it at scale.") -Severity 3
+                }
+            }
+
             # Record per-DUP version so subsequent deployments can skip this DUP
             # if its version hasn't moved. We deliberately only mark on success
             # codes (0/2/6) - not on N-A (3/4/5) - so that if hardware later
@@ -3497,8 +3549,13 @@ function Install-DriverUpdates {
                 if ($AllowDowngrade) {
                     New-ItemProperty -Path $CompKeyPath -Name 'LiveVersionBefore' -Value ([string]$LiveVersion) -PropertyType String -Force | Out-Null
                     New-ItemProperty -Path $CompKeyPath -Name 'ForcedDowngrade'   -Value ([int][bool]$ForceDowngrade) -PropertyType DWord -Force | Out-Null
+                    # What the device actually reported afterwards - the only
+                    # inventory-visible proof of whether the rollback took.
+                    if ($AfterVersion) {
+                        New-ItemProperty -Path $CompKeyPath -Name 'LiveVersionAfter' -Value ([string]$AfterVersion) -PropertyType String -Force | Out-Null
+                    }
                 } else {
-                    foreach ($PProp in 'LiveVersionBefore', 'ForcedDowngrade') {
+                    foreach ($PProp in 'LiveVersionBefore', 'ForcedDowngrade', 'LiveVersionAfter') {
                         Remove-ItemProperty -Path $CompKeyPath -Name $PProp -ErrorAction SilentlyContinue
                     }
                 }
@@ -3694,7 +3751,7 @@ function Install-DriverUpdates {
                 "Manual differential (elevated cmd): run any failed DUP as '<name>.EXE /s /l=C:\Windows\Temp\duptest.log' - if it installs by hand, the block is specific to the CCMExec-spawned context.") -Severity 3
         }
     }
-    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Quarantined quarantined (persistent vendor failures, skipped), $Failed failed$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
+    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Quarantined quarantined (persistent vendor failures, skipped), $Failed failed$(if ($PinNotApplied -gt 0) { ", $PinNotApplied pinned rollback(s) NOT applied (DUP reported success, device unchanged)" })$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
     }

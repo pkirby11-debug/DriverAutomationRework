@@ -310,6 +310,32 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
         $LiveCmp[0].Right.Extent.Text | Should -Not -Match '\$Drv\.Version'
     }
 
+    It 'Re-reads the device after a forced rollback instead of trusting the exit code' {
+        # The DUP can exit 0 having added the older package to the DriverStore
+        # while PnP keeps the newer driver bound. Nothing in the exit code shows
+        # that, so a success branch that never re-reads the device reports a
+        # rollback that did not happen - which is exactly what the field saw.
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match '\$AfterVersion'
+        $Loop | Should -Match 'PIN NOT APPLIED'
+
+        # The re-read must be a fresh CIM query, not the pre-loop enumeration.
+        $Verify = [regex]::Match($Loop, '\$AfterVersion\s*=\s*&\s*\$GetLiveDriverVersion')
+        $Verify.Success | Should -BeTrue
+        $Before = $Loop.Substring(0, $Verify.Index)
+        $Before | Should -Match 'Get-CimInstance -ClassName Win32_VideoController'
+    }
+
+    It 'Does not turn an unapplied pin into a deployment failure' {
+        # Retrying the install cannot fix PnP ranking, so failing the row would
+        # only loop ConfigMgr on a condition that never clears. It is counted
+        # and logged loudly instead.
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match '\$PinNotApplied\+\+'
+        $M = [regex]::Match($Loop, '\$PinNotApplied\+\+(.{0,400})', 'Singleline')
+        $M.Groups[1].Value | Should -Not -Match '\$Failed\+\+'
+    }
+
     It 'Never lets an uncomparable pin quietly install without /f' {
         # Installing a pinned DUP without /f is not the neutral choice: the DUP's
         # own version check then declines the downgrade and exits 0, so the
@@ -378,16 +404,36 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
         $Call.Extent.Text | Should -Match 'SkipApply'
     }
 
-    It 'Enumerates the live driver once, outside the per-driver loop' {
+    It 'Enumerates the live driver once up front, and re-reads only to verify a forced rollback' {
         # Win32_PnPSignedDriver is a join across every PnP device and routinely
-        # takes tens of seconds. Per driver it would add minutes to every run.
+        # takes tens of seconds. Per driver it would add minutes to every run,
+        # so the bulk enumeration stays ahead of the loop.
+        #
+        # The one permitted in-loop re-read is the post-install verification,
+        # which must be gated on $ForceDowngrade: at most one pinned rollback
+        # per component, against a device whose state just changed. An
+        # ungated call is the regression this guards - it would put the slow
+        # query back on every driver.
+        $script:InstallFn.Extent.Text | Should -Match 'Win32_PnPSignedDriver'
+
         $CimCalls = @($script:DrvLoop.FindAll({
             param($n)
             $n -is [System.Management.Automation.Language.CommandAst] -and
             $n.GetCommandName() -eq 'Get-CimInstance'
-        }, $true))
-        @($CimCalls | Where-Object { $_.Extent.Text -match 'Win32_PnPSignedDriver|Win32_VideoController' }).Count |
-            Should -Be 0
-        $script:InstallFn.Extent.Text | Should -Match 'Win32_PnPSignedDriver'
+        }, $true) | Where-Object { $_.Extent.Text -match 'Win32_PnPSignedDriver|Win32_VideoController' })
+
+        foreach ($Cim in $CimCalls) {
+            # Walk every enclosing if, not just the nearest: the signed-driver
+            # re-read sits inside a category test nested in the pin guard.
+            $Node = $Cim
+            $Guards = [System.Collections.Generic.List[string]]::new()
+            while ($Node -and $Node -ne $script:DrvLoop) {
+                if ($Node -is [System.Management.Automation.Language.IfStatementAst]) {
+                    foreach ($Clause in $Node.Clauses) { $Guards.Add($Clause.Item1.Extent.Text) }
+                }
+                $Node = $Node.Parent
+            }
+            ($Guards -join ' ') | Should -Match 'ForceDowngrade' -Because "the in-loop CIM call '$($Cim.Extent.Text)' must run only for a forced rollback"
+        }
     }
 }

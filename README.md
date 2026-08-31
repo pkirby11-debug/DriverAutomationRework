@@ -393,6 +393,18 @@ On the client, a pinned package:
   cannot be compared is forced anyway: installing without `/f` hands the decision to the
   DUP, which declines the downgrade and exits 0, and the deployment reports success
   while the driver never moves.
+- **verifies the rollback actually took.** The engine re-reads the device after a
+  forced install and logs `PIN VERIFIED` or `PIN NOT APPLIED`, recording
+  `LiveVersionBefore`/`LiveVersionAfter` on the component marker. Dell's `/f`
+  overrides the DUP framework's own version check, not Windows' driver ranking —
+  a DUP can exit 0 having added the pinned package to the DriverStore while PnP
+  keeps the newer driver bound to the device, and the exit code shows nothing.
+  An unapplied rollback is counted separately in the run summary rather than
+  failing the deployment: the install did what it was told, and ConfigMgr
+  retrying it cannot change PnP's choice. When that happens the newer package
+  has to leave the DriverStore first (`pnputil /enum-drivers`, then
+  `pnputil /delete-driver oemNN.inf /uninstall`) — irreversible, so test it on
+  one device before doing it at scale.
 - **is not skipped by its own marker.** The per-DUP version marker holds the version
   being rolled back *from*, so the usual ">= manifest, skip" rule is narrowed to
   equality for a pinned row. `LiveVersionBefore` and `ForcedDowngrade` are recorded
