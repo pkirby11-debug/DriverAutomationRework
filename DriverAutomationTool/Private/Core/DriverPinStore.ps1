@@ -468,3 +468,96 @@ function Set-DATDriverPinEnabled {
     Write-DATDriverPinStore -Store $Store
     Write-DATLog -Message "Driver pin $State`: '$NamePattern'$(if ($SystemId) { " on SystemID $SystemId" }) ($Changed entr$(if ($Changed -eq 1) { 'y' } else { 'ies' })). Takes effect on the next sync; the package rebuilds once." -Severity 1
 }
+
+function Get-DATDriverSetFingerprint {
+    <#
+    .SYNOPSIS
+        Computes the 8-character package fingerprint for a resolved driver set.
+    .DESCRIPTION
+        The package version IS this fingerprint ("Cat.<fp>", or "<base>.OVL.<fp>"
+        for the Drivers overlay), and the sync's smart check skips a rebuild when
+        the deployed package already carries it. So the fingerprint is the answer
+        to one question: would a client behave differently if we rebuilt?
+
+        Driver names and versions alone do not answer that. A pin changes two
+        other things - the per-row manifest flags that tell the client it may
+        force a downgrade and retire an outranking package, and the apply script
+        that acts on them - and neither shows up in a name/version list. Ticking
+        "retire the outranking driver" on an already-pinned revision therefore
+        produced a byte-identical fingerprint, the smart check reported
+        "already contains latest individual drivers", and manifest.json was never
+        rewritten: the client kept reading AllowDriverStoreRemoval false, and the
+        unchanged package version meant its detection marker said "installed" so
+        it had no reason to run again. The pin was correct in the ledger, correct
+        in the GUI, and invisible to the device.
+
+        An UNPINNED row contributes exactly "Name=Version" as it always has, and
+        an unpinned set omits the engine component entirely, so fingerprints for
+        ordinary packages are unchanged and nothing churns on upgrade. Only a set
+        containing a pin picks up the extra inputs - which is right, because a pin
+        is an active correction whose behavior depends on the client engine
+        enforcing it.
+
+        Lives here rather than beside the sync because what it encodes beyond
+        name and version is entirely pin semantics.
+    .PARAMETER Drivers
+        The resolved driver rows, as tagged by Select-DATPinnedDriver.
+    .OUTPUTS
+        String. 8 lowercase hex characters, or '' when there are no drivers.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object[]]$Drivers
+    )
+
+    $Rows = @($Drivers | Where-Object { $_ })
+    if ($Rows.Count -eq 0) { return '' }
+
+    $Pinned = $false
+    $Parts = foreach ($D in ($Rows | Sort-Object Name)) {
+        $Part = "$($D.Name)=$($D.Version)"
+        if ($D.IsPinned) {
+            $Pinned = $true
+            # Named rather than positional so a future flag appends without
+            # reinterpreting what is already there.
+            $Part += ';pin=1'
+            if ($D.PinRemoveOutranking) { $Part += ';retire=1' }
+        }
+        $Part
+    }
+    $FpString = $Parts -join '|'
+
+    if ($Pinned) {
+        # The rev the apply script reports about itself at run time, so a client
+        # engine change rebuilds the package that depends on it. Unreadable is a
+        # fixed sentinel, never a throw: a fingerprint must not be able to break
+        # a sync, and it must not flip value between two runs that saw the same
+        # drivers.
+        $ScriptRev = 'unknown'
+        try {
+            $ApplyScript = Join-Path $script:ModuleRoot 'Scripts\Invoke-DATApply.ps1'
+            if (Test-Path $ApplyScript) {
+                $ScriptRev = (Get-FileHash -Path $ApplyScript -Algorithm SHA256).Hash.Substring(0, 8).ToLower()
+            } else {
+                # Not fatal, but say it: the sentinel is a CONSTANT, so silently
+                # taking this branch turns the engine component off and pinned
+                # packages stop rebuilding when the apply script changes - the
+                # exact failure this input was added to prevent.
+                Write-DATLog -Message "Apply script not found at '$ApplyScript' while fingerprinting a pinned driver set - the package will not re-version on an engine change. The module installation is incomplete." -Severity 2
+            }
+        } catch {
+            Write-DATLog -Message "Could not hash the apply script for the package fingerprint ($($_.Exception.Message)) - pinned packages will not rebuild on an engine change until this is readable" -Severity 2
+        }
+        $FpString += "|engine=$ScriptRev"
+    }
+
+    $Md5 = [System.Security.Cryptography.MD5]::Create()
+    try {
+        $FpBytes = $Md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($FpString))
+    } finally {
+        $Md5.Dispose()
+    }
+    return (($FpBytes | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
+}

@@ -409,3 +409,118 @@ Describe 'RemoveOutrankingDriver round trip' {
         @(Get-DATDriverPin)[0].RemoveOutrankingDriver | Should -BeFalse
     }
 }
+
+Describe 'Get-DATDriverSetFingerprint' {
+    # The package version IS this value, and the sync skips a rebuild when the
+    # deployed package already carries it. So it has to move whenever a client
+    # would behave differently - and NOT move otherwise, or every package in the
+    # fleet churns on an upgrade.
+    BeforeAll {
+        # Get-DATDriverSetFingerprint hashes the shipped apply script through
+        # $script:ModuleRoot, which the module normally sets on import.
+        $script:ModuleRoot = Split-Path $PSScriptRoot -Parent
+
+        function New-Row {
+            param([string]$Name, [string]$Version, [bool]$Pinned, [bool]$Retire)
+            $R = [PSCustomObject]@{ Name = $Name; Version = $Version }
+            if ($Pinned) {
+                $R | Add-Member -NotePropertyName 'IsPinned' -NotePropertyValue $true -Force
+                $R | Add-Member -NotePropertyName 'PinRemoveOutranking' -NotePropertyValue $Retire -Force
+            }
+            $R
+        }
+
+        # The exact string the three call sites hashed before this function
+        # existed. Unpinned packages must keep producing this, or every deployed
+        # package re-versions on upgrade for no reason.
+        function Get-LegacyFingerprint {
+            param([object[]]$Drivers)
+            $FpString = ($Drivers | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Version)" }) -join '|'
+            $Md5 = [System.Security.Cryptography.MD5]::Create()
+            $FpBytes = $Md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($FpString))
+            (($FpBytes | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
+        }
+
+        $script:Plain = @(
+            (New-Row -Name 'AMD Radeon Graphics Driver' -Version 'A05' -Pinned $false -Retire $false)
+            (New-Row -Name 'Intel Wi-Fi Driver' -Version '23.160.0.4' -Pinned $false -Retire $false)
+        )
+    }
+
+    It 'Is 8 lowercase hex characters' {
+        Get-DATDriverSetFingerprint -Drivers $script:Plain | Should -Match '^[0-9a-f]{8}$'
+    }
+
+    It 'Is stable across repeated calls and independent of input order' {
+        $A = Get-DATDriverSetFingerprint -Drivers $script:Plain
+        $B = Get-DATDriverSetFingerprint -Drivers @($script:Plain[1], $script:Plain[0])
+        $A | Should -Be $B
+    }
+
+    It 'Matches the pre-existing hash for an unpinned set, so nothing churns on upgrade' {
+        Get-DATDriverSetFingerprint -Drivers $script:Plain | Should -Be (Get-LegacyFingerprint -Drivers $script:Plain)
+    }
+
+    It 'Moves when a row becomes pinned' {
+        $Pinned = @(
+            (New-Row -Name 'AMD Radeon Graphics Driver' -Version 'A05' -Pinned $true -Retire $false)
+            $script:Plain[1]
+        )
+        Get-DATDriverSetFingerprint -Drivers $Pinned | Should -Not -Be (Get-DATDriverSetFingerprint -Drivers $script:Plain)
+    }
+
+    It 'Moves when the retire flag is turned on at the SAME pinned version' {
+        # The field failure this function exists for: the pinned revision did not
+        # change, so the old name/version hash was identical, the smart check
+        # reported the package current, manifest.json was never rewritten, and
+        # the device never saw AllowDriverStoreRemoval.
+        $Off = @((New-Row -Name 'AMD Radeon Graphics Driver' -Version 'A05' -Pinned $true -Retire $false), $script:Plain[1])
+        $On  = @((New-Row -Name 'AMD Radeon Graphics Driver' -Version 'A05' -Pinned $true -Retire $true),  $script:Plain[1])
+
+        (Get-LegacyFingerprint -Drivers $Off) | Should -Be (Get-LegacyFingerprint -Drivers $On) -Because 'this is precisely why the old fingerprint could not see the change'
+        (Get-DATDriverSetFingerprint -Drivers $Off) | Should -Not -Be (Get-DATDriverSetFingerprint -Drivers $On)
+    }
+
+    It 'Moves when the apply script changes, but only for a set containing a pin' {
+        $ApplyScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'Scripts\Invoke-DATApply.ps1'
+        $Original = [System.IO.File]::ReadAllBytes($ApplyScript)
+
+        $PinnedSet = @((New-Row -Name 'AMD Radeon Graphics Driver' -Version 'A05' -Pinned $true -Retire $true), $script:Plain[1])
+        $PinnedBefore = Get-DATDriverSetFingerprint -Drivers $PinnedSet
+        $PlainBefore  = Get-DATDriverSetFingerprint -Drivers $script:Plain
+        try {
+            Add-Content -Path $ApplyScript -Value "# fingerprint test $(New-Guid)"
+            (Get-DATDriverSetFingerprint -Drivers $PinnedSet) | Should -Not -Be $PinnedBefore -Because 'a pin depends on the client engine that enforces it'
+            (Get-DATDriverSetFingerprint -Drivers $script:Plain) | Should -Be $PlainBefore -Because 'an unpinned package must not re-version just because the module was upgraded'
+        } finally {
+            [System.IO.File]::WriteAllBytes($ApplyScript, $Original)
+        }
+        (Get-DATDriverSetFingerprint -Drivers $PinnedSet) | Should -Be $PinnedBefore
+    }
+
+    It 'Returns empty for an empty or null set rather than hashing nothing' {
+        Get-DATDriverSetFingerprint -Drivers @()   | Should -BeNullOrEmpty
+        Get-DATDriverSetFingerprint -Drivers $null | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'The sync computes the fingerprint in exactly one place' {
+    # Before this, three copies of the same MD5 block sat in Invoke-DATSync.ps1,
+    # kept in step only by a comment saying they must match. Two of them decide
+    # the version a package is BUILT with and the third decides whether to build
+    # at all, so a change to one and not the others either rebuilds every sync or
+    # never rebuilds again. Adding the pin inputs to one copy would have done
+    # precisely that.
+    BeforeAll {
+        $script:SyncSource = Get-Content -Path (Join-Path (Split-Path $PSScriptRoot -Parent) 'Public\Invoke-DATSync.ps1') -Raw
+    }
+
+    It 'Routes every fingerprint through the shared helper' {
+        @([regex]::Matches($script:SyncSource, 'Get-DATDriverSetFingerprint')).Count |
+            Should -BeGreaterOrEqual 3 -Because 'the smart check and both build paths all need it'
+    }
+
+    It 'Hashes nothing inline' {
+        $script:SyncSource | Should -Not -Match 'MD5\]::Create' -Because 'an inline copy can drift from the one the smart check compares against'
+    }
+}

@@ -1066,14 +1066,11 @@ function Invoke-DATSyncSinglePackage {
             }
 
             if ($CachedIndividualDrivers -and $CachedIndividualDrivers.Count -gt 0) {
-                # Build fingerprint: sorted "Name=Version" strings hashed together
-                $FpString = ($CachedIndividualDrivers |
-                    Sort-Object Name |
-                    ForEach-Object { "$($_.Name)=$($_.Version)" }) -join '|'
-                $Md5 = [System.Security.Cryptography.MD5]::Create()
-                $FpBytes = $Md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($FpString))
-                $OverlayFingerprint = ($FpBytes | ForEach-Object { $_.ToString('x2') }) -join ''
-                $OverlayFingerprint = $OverlayFingerprint.Substring(0, 8)  # Short 8-char hash
+                # One function computes this in all three places it is needed -
+                # they MUST agree or the smart check compares against a
+                # fingerprint the build would never produce and every sync
+                # rebuilds (or, worse, never does).
+                $OverlayFingerprint = Get-DATDriverSetFingerprint -Drivers $CachedIndividualDrivers
                 Write-DATLog -Message "Individual driver fingerprint: $OverlayFingerprint ($($CachedIndividualDrivers.Count) driver(s))" -Severity 1
 
                 # Check if existing package already has this fingerprint
@@ -1087,6 +1084,18 @@ function Invoke-DATSyncSinglePackage {
                 $FpMatchPattern = if ($Type -eq 'DriverUpdates') { "Cat.$OverlayFingerprint" } else { "*OVL.$OverlayFingerprint" }
                 if ($ExistingToCheck -and $ExistingToCheck.Version -like $FpMatchPattern) {
                     Write-DATLog -Message "Package already contains latest individual drivers (v$($ExistingToCheck.Version))" -Severity 1
+
+                    # Say so out loud when a pin is in play. This branch leaves
+                    # manifest.json exactly as it was and keeps the package
+                    # version, so the client has nothing new to read and no
+                    # reason to re-run - which is correct only because the
+                    # fingerprint now covers the pin's flags and the apply
+                    # script. If a pinned rollback is not reaching devices, this
+                    # line and the fingerprint above are where to look first.
+                    $PinnedRows = @($CachedIndividualDrivers | Where-Object { $_.IsPinned })
+                    if ($PinnedRows.Count -gt 0) {
+                        Write-DATLog -Message ("  Pin(s) unchanged since the deployed build: {0}. The package keeps v{1}, so devices that already ran it will not run it again - which is what you want unless you just changed a pin. If you did, the fingerprint would have moved and this would be a rebuild." -f (@($PinnedRows | ForEach-Object { "'$($_.Name)'=v$($_.Version)$(if ($_.PinRemoveOutranking) { ' (retires outranking)' })" }) -join '; '), $ExistingToCheck.Version) -Severity 1
+                    }
 
                     # Backfill the DCU repository catalog into packages built before
                     # 2.2.0 (fingerprint-current, so the staging path that normally
@@ -1747,12 +1756,7 @@ function Invoke-DATSyncSinglePackage {
             # (staged or not) so it always matches what the smart check
             # computes - a failed download this run doesn't fake a new version.
             if (-not $OverlayFingerprint) {
-                $FpString = ($LenovoUpdates |
-                    Sort-Object Name |
-                    ForEach-Object { "$($_.Name)=$($_.Version)" }) -join '|'
-                $Md5 = [System.Security.Cryptography.MD5]::Create()
-                $FpBytes = $Md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($FpString))
-                $OverlayFingerprint = (($FpBytes | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
+                $OverlayFingerprint = Get-DATDriverSetFingerprint -Drivers $LenovoUpdates
             }
             $Version = 'Cat.{0}' -f $OverlayFingerprint
             Write-DATLog -Message "Driver Updates package version: $Version" -Severity 1
@@ -2386,14 +2390,8 @@ function Invoke-DATSyncSinglePackage {
                         # The fingerprint is a hash of all overlay driver names+versions so
                         # re-running with the same drivers produces the same version (no churn).
                         if (-not $OverlayFingerprint) {
-                            # Compute fingerprint if not already done during smart check
-                            $FpString = ($IndividualDrivers |
-                                Sort-Object Name |
-                                ForEach-Object { "$($_.Name)=$($_.Version)" }) -join '|'
-                            $Md5 = [System.Security.Cryptography.MD5]::Create()
-                            $FpBytes = $Md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($FpString))
-                            $OverlayFingerprint = ($FpBytes | ForEach-Object { $_.ToString('x2') }) -join ''
-                            $OverlayFingerprint = $OverlayFingerprint.Substring(0, 8)
+                            # Same function as the smart check - see the note there.
+                            $OverlayFingerprint = Get-DATDriverSetFingerprint -Drivers $IndividualDrivers
                         }
                         if ($Type -eq 'DriverUpdates') {
                             $Version = 'Cat.{0}' -f $OverlayFingerprint
