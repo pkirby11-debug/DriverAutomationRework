@@ -25,9 +25,11 @@ the sole update source).
   - [SCCM Settings](#tab-sccm-settings)
   - [Progress](#tab-progress)
   - [Package Management](#tab-package-management)
+  - [Driver Pins](#tab-driver-pins)
   - [Deploy Applications](#tab-deploy-applications)
 - [Sync types & deployment platforms](#sync-types)
 - [The Driver Updates (DCU) engine](#dcu-engine)
+- [Driver version pinning (rollback)](#pinning)
 - [Security features](#security)
 - [The client apply script](#apply-script)
 - [Public cmdlets / automation](#cmdlets)
@@ -148,6 +150,30 @@ Inventory and clean up existing DAT-built ConfigMgr objects:
 - **Grid** of existing packages (ID, name, version, manufacturer, type, source path).
 - **Delete** selected packages, or **Clean up overlay packages** (removes superseded
   overlay revisions).
+
+<a name="tab-driver-pins"></a>
+### Driver Pins
+
+Roll a driver back, and hold it there. See
+[Driver version pinning](#pinning) for what a pin actually does.
+
+- **Model / OS → Load Revisions** — resolves that model's Dell catalog the way a
+  Driver Updates sync would, but lists *every* revision it finds rather than only
+  the newest per component. The predecessor revisions are the rollback targets,
+  and the resolver's dedup normally discards them without showing you.
+  *Rollback targets only* hides the revision that ships today; *Refresh catalog*
+  re-pulls the per-model XML instead of using the cached copy.
+- **Pin Selected Revision** — writes the pin, capturing that revision's download
+  URL, MD5, size, filename and raw catalog XML along with it. That capture is the
+  point of using the tab over the cmdlet: without it a pin stops resolving the day
+  Dell drops the revision, which is exactly when you still need it.
+- **Active pins grid** — every pin, with **Recoverable** showing which ones carry
+  that metadata (`Version only` means the pin dies when Dell purges the revision).
+  **Disable** stops a pin applying but keeps the captured metadata; **Remove**
+  throws it away and lets the driver resolve to the catalog's newest again.
+
+Nothing reaches the fleet until you run a sync for that model — the pin changes
+what the *next* sync resolves.
 
 <a name="tab-deploy-applications"></a>
 ### Deploy Applications
@@ -322,6 +348,113 @@ catalog (the same feed Lenovo System Update / Thin Installer consume):
 
 ---
 
+<a name="pinning"></a>
+## Driver version pinning (rollback)
+
+When a vendor driver update breaks something, exclusions are the wrong tool: they are
+subtractive and version-blind, so they stop the bad driver shipping but leave every
+already-broken device broken and the package with no driver in that category at all.
+
+A **pin** holds one component at a named revision instead:
+
+```powershell
+Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion '31.0.15021.1001' `
+  -SystemId '0B12' -Model 'QCM1255' -Reason 'v32 breaks P2419H over DisplayPort' `
+  -SourceUrl 'https://dl.dell.com/FOLDER11223344M/1/Video-Driver_..._A03.EXE'
+Invoke-DATSync -Manufacturer Dell -Models '<model>' -IncludeDriverUpdates
+```
+
+The pin is honored at catalog-resolve time, so it flows into the package fingerprint,
+the staged DUPs, `manifest.json` and `DCUCatalog.xml` together. Because the fingerprint
+moves, the **existing** Driver Updates application rebuilds in place at a new
+`Cat.<fp>` — there is no second package to fight the deployed one, no supersedence to
+wire, and the pin is re-read on every future scheduled sync, so it holds until you
+remove it.
+
+On the client, a pinned package:
+
+- **bypasses the DCU engine.** `dcu-cli` only installs what it judges *newer* than the
+  live device, so against a downlevel catalog it reports "no applicable updates" and
+  the run records success having installed nothing. DCU is still invoked for its
+  lockdown and persistent end state; only scan/apply are skipped.
+- **forces the downgrade with Dell's `/f`, but only where it is needed.** The engine
+  reads the *live* installed driver once per run (`Win32_VideoController`, falling back
+  to the GPU brand inferred from the DUP name for the many Dell graphics DUPs that carry
+  no PCI metadata) and appends `/f` only when that version is strictly newer than the
+  pinned target. A device already at or below the pinned version is left alone, so the
+  rollback targets itself.
+- **compares against the vendor version, not Dell's revision letter.** `-PinnedVersion`
+  is Dell's `dellVersion`, which is `A05` for most components while Windows reports
+  `32.0.23040.2002` — the two order against nothing, and a pin decided on them would
+  never force anything. The vendor's dotted version (`vendorVersion`) is carried through
+  the catalog, the pin, the GUI picker and `manifest.json`, and the client picks
+  whichever known version actually orders against what the device reports, reading it
+  out of the DUP filename when the manifest predates that field. A pinned row that still
+  cannot be compared is forced anyway: installing without `/f` hands the decision to the
+  DUP, which declines the downgrade and exits 0, and the deployment reports success
+  while the driver never moves.
+- **verifies the rollback actually took.** The engine re-reads the device after a
+  forced install and logs `PIN VERIFIED` or `PIN NOT APPLIED`, recording
+  `LiveVersionBefore`/`LiveVersionAfter` on the component marker. Dell's `/f`
+  overrides the DUP framework's own version check, not Windows' driver ranking —
+  a DUP can exit 0 having added the pinned package to the DriverStore while PnP
+  keeps the newer driver bound to the device, and the exit code shows nothing.
+  An unapplied rollback is counted separately in the run summary rather than
+  failing the deployment: the install did what it was told, and ConfigMgr
+  retrying it cannot change PnP's choice. The log names the cause from the
+  DUP's own framework log — Dell's DCH/mup packages declare no `force`
+  parameter and the framework **drops `/f`** before the payload installer sees
+  it, and Windows declines each display INF as *"not a better match than the
+  current driver"*.
+- **can retire the package that outranks the pin** (`-RemoveOutrankingDriver`,
+  or the *Retire the outranking driver* tick box on the GUI tab). Installing
+  the pinned revision is frequently not enough: Windows separates two
+  equally-matching packages by driver **date**, so the newer one keeps the
+  device for as long as it stays in the DriverStore, and a forced bind would be
+  undone at the next re-evaluation. Removing it is what makes the rollback
+  durable. **Off by default — it deletes a driver package.** It runs only after
+  the pin has already failed, only against a package newer than the pin that
+  matches the pinned component's own hardware, never against an inbox INF, and
+  it refuses unless the pinned revision is already staged so PnP has somewhere
+  to land. The device is re-read afterwards to decide the outcome, because the
+  re-bind and the removal are separate steps that succeed and fail
+  independently. When that happens the newer package
+  has to leave the DriverStore first (`pnputil /enum-drivers`, then
+  `pnputil /delete-driver oemNN.inf /uninstall`) — irreversible, so test it on
+  one device before doing it at scale.
+- **is not skipped by its own marker.** The per-DUP version marker holds the version
+  being rolled back *from*, so the usual ">= manifest, skip" rule is narrowed to
+  equality for a pinned row. `LiveVersionBefore` and `ForcedDowngrade` are recorded
+  alongside it as the audit trail.
+
+**Fail-closed.** If the pinned revision is neither in Dell's catalog nor recoverable
+from the metadata the pin captured, the sync **fails that model** and leaves the
+existing package deployed, rather than quietly rebuilding with the newer driver.
+
+**Capture the metadata when you add the pin.** Dell's per-model catalog carries the
+current revision and usually a predecessor or two; it is not an archive. `-SourceUrl`,
+`-ComponentXml`, `-HashMD5`, `-VendorVersion` and `-PinnedName` are what keep a pin
+working after Dell drops the revision — which is exactly when you still need it.
+
+**Finding the revision to pin to.** `Get-DATDriverPinCandidate` lists every revision
+the catalog holds for a model, flagged with which one ships today, and pipes straight
+into `Add-DATDriverPin` so the capture happens for you:
+
+```powershell
+Get-DATDriverPinCandidate -Model 'Latitude 5430' -OperatingSystem 'Windows 11 24H2' |
+  Where-Object { $_.Name -like '*AMD*' -and -not $_.IsCurrent } |
+  Add-DATDriverPin -Reason 'v32 breaks P2419H over DisplayPort'
+```
+
+The GUI's [Driver Pins](#tab-driver-pins) tab is the same thing with a picker.
+
+Managed with `Get-DATDriverPin` / `Add-DATDriverPin` / `Remove-DATDriverPin` /
+`Disable-DATDriverPin` / `Enable-DATDriverPin`. Pins apply to Dell **Driver Updates**
+packages; the base-pack `Drivers` overlay installs extracted INFs and has no
+force-install path, so a pin there is refused rather than half-honored.
+
+---
+
 <a name="security"></a>
 ## Security features
 
@@ -414,6 +547,8 @@ by the deployment type's `BasedOnExitCode` behavior.
 | `Update-DATApplicationCommands` | Repair install commands / return codes on existing Applications. |
 | `Invoke-DATRemovePackages` / `Invoke-DATCleanupOverlayPackages` | Package cleanup. |
 | `Test-DATVulnerableDrivers` | Screen a folder of DUPs / `.sys` files against the Microsoft blocklist. |
+| `Get-DATDriverPin` / `Add-DATDriverPin` / `Remove-DATDriverPin` / `Enable-DATDriverPin` / `Disable-DATDriverPin` | Hold a driver component at a specific version — the rollback mechanism. See [Driver version pinning](#pinning). |
+| `Get-DATDriverPinCandidate` | List the catalog revisions a pin could target for a model, newest and superseded alike. Pipes into `Add-DATDriverPin`. |
 | `Set-DATDellCommandUpdateMode` | Put DCU into DAT-managed (passive) mode, or revert/opt-out. |
 | `Export-DATReport` | Export a job/inventory report. |
 | `Connect-DATIntune` / `Disconnect-DATIntune` / `Test-DATIntuneConnection` / `Get-DATIntuneWin32App` / `Find-DATIntuneEntraGroup` | Intune groundwork for upcoming Win32/driver-profile support. |

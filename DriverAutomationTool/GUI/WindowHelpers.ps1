@@ -609,3 +609,90 @@ function Select-DATKnownModelsInGrid {
 
     return $MatchCount
 }
+
+function Update-DATPinCandidateFilter {
+    <#
+    .SYNOPSIS
+        Applies the Driver Pins tab's search box and "rollback targets only"
+        toggle to the candidate grid.
+    .DESCRIPTION
+        A module function rather than inline handler code because WPF dispatches
+        events re-entrantly and only module functions resolve reliably in that
+        context (see the header of MainWindow.ps1).
+
+        "Rollback targets only" hides the revision that ships today, which is
+        almost always what the operator wants: a model's catalog is mostly
+        current revisions, and the two or three predecessors buried among them
+        are the entire point of the picker.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $gui = Get-DATGui
+    if (-not $gui) { return }
+    $Controls = $gui.Controls
+    $Table = $Controls['PinCandidateGridData']
+    if (-not $Table) { return }
+
+    $Clauses = [System.Collections.Generic.List[string]]::new()
+
+    if ($Controls['PinRollbackOnlyCheckBox'] -and $Controls['PinRollbackOnlyCheckBox'].IsChecked) {
+        $Clauses.Add("[Current] <> 'Yes'")
+    }
+
+    $SearchText = if ($Controls['PinSearchBox']) { $Controls['PinSearchBox'].Text } else { '' }
+    if (-not [string]::IsNullOrEmpty($SearchText)) {
+        $Escaped = ConvertTo-DATLikeLiteral $SearchText
+        $Clauses.Add("([Name] LIKE '%$Escaped%' OR [Category] LIKE '%$Escaped%' OR [Version] LIKE '%$Escaped%' OR [FileName] LIKE '%$Escaped%')")
+    }
+
+    $Table.DefaultView.RowFilter = ($Clauses -join ' AND ')
+}
+
+function Update-DATPinGrid {
+    <#
+    .SYNOPSIS
+        Reloads the Driver Pins tab's active-pins grid from the pin ledger.
+    .DESCRIPTION
+        Recoverable answers the question that decides whether a pin still works
+        in six months: a pin carrying the revision's download URL can be rebuilt
+        after Dell purges it from the per-model catalog, and one that is only a
+        version number cannot - the sync will fail that model instead. Pins
+        created through this tab always carry it; ones typed by hand may not.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $gui = Get-DATGui
+    if (-not $gui) { return }
+    $Controls = $gui.Controls
+    $Table = $Controls['PinGridData']
+    if (-not $Table) { return }
+
+    $ShowDisabled = [bool]($Controls['PinShowDisabledCheckBox'] -and $Controls['PinShowDisabledCheckBox'].IsChecked)
+
+    $Table.Rows.Clear()
+    try {
+        $Pins = @(Get-DATDriverPin -IncludeDisabled:$ShowDisabled)
+    } catch {
+        Write-DATLog -Message "Could not read the driver-pin ledger for the GUI: $($_.Exception.Message)" -Severity 2
+        return
+    }
+
+    foreach ($Pin in $Pins) {
+        $Row = $Table.NewRow()
+        $Row['Selected']        = $false
+        $Row['Enabled']         = if ($Pin.Enabled) { 'Yes' } else { 'No' }
+        $Row['NamePattern']     = [string]$Pin.NamePattern
+        $Row['PinnedVersion']   = [string]$Pin.PinnedVersion
+        $Row['SystemId']        = [string]$Pin.SystemId
+        $Row['Model']           = [string]$Pin.Model
+        $Row['OperatingSystem'] = [string]$Pin.OperatingSystem
+        $Row['Recoverable']     = if ($Pin.SourceUrl) { 'Yes' } else { 'Version only' }
+        # Which pins are allowed to retire the package outranking them. Worth a
+        # column of its own: it is the one pin setting that deletes something.
+        $Row['RetireOutranking'] = if ($Pin.RemoveOutrankingDriver) { 'Yes' } else { 'No' }
+        $Row['Reason']          = [string]$Pin.Reason
+        $Table.Rows.Add($Row)
+    }
+}

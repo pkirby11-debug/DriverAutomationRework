@@ -76,14 +76,19 @@
         <!-- ==================== Public functions ==================== -->
         <ComponentGroup Id="PublicFiles" Directory="PublicDir">
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Add-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Add-DATDriverPin.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Clear-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Connect-DATIntune.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Disable-DATDriverPin.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Disconnect-DATIntune.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Enable-DATDriverPin.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Export-DATReport.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Find-DATIntuneEntraGroup.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATBIOSUpdate.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverPack.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverPin.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverPinCandidate.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATIntuneDriverInventory.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATIntuneDriverUpdateProfile.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATIntuneWin32App.ps1" KeyPath="yes" /></Component>
@@ -98,6 +103,7 @@
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\New-DATIntuneWin32App.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Register-DATQueueLogSubscriber.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Remove-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Remove-DATDriverPin.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Set-DATDellCommandUpdateMode.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Set-DATIntuneDriverApproval.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Start-DATGui.ps1" KeyPath="yes" /></Component>
@@ -116,6 +122,7 @@
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\ConfigManager.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\DownloadManager.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\DriverExclusionStore.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\DriverPinStore.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\LogManager.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\MaintenanceStore.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\VulnerableDriverScreen.ps1" KeyPath="yes" /></Component>

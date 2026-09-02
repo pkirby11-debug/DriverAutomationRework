@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Applies a staged driver pack or BIOS update on a running Windows device.
 
@@ -1541,7 +1541,16 @@ function Invoke-DCUDriverUpdates {
         Success here returns 0 (reboot signaled via $script:RebootRequired,
         same as the DUP loop); failures return 1 with the real code in the log.
     #>
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+
+        # Set for a version-pinned package. DCU still runs everything that
+        # protects the device - the managed-mode lockdown, the settings backup,
+        # the catalog configure and the persistent end state in finally - but
+        # stops short of scan/apply and hands the manifest to the built-in DUP
+        # loop. See the block above the scan for why DCU cannot do a rollback.
+        [switch]$SkipApply
+    )
 
     # Dell-only engine - the built-in DUP loop covers everything else.
     try {
@@ -2196,6 +2205,28 @@ function Invoke-DCUDriverUpdates {
         # Non-fatal hardware or registry probe error
         Write-Verbose "Ignored exception: $($_.Exception.Message)"
     }
+        # Version-pinned package: stop here, before scan/apply.
+        #
+        # dcu-cli inventories the live device and only proposes an update it
+        # judges NEWER than what is installed. Against a pinned catalog - one
+        # deliberately carrying an older revision - it therefore finds nothing,
+        # exits 500, and this function's 500 handler returns 0: the deployment
+        # records success having installed nothing, and the rollback silently
+        # never happens. dcu-cli also has no way to select individual updates
+        # (only an -updateType fence), so there is no arrangement where DCU
+        # handles the unpinned rows and the DUP loop handles the pinned one.
+        #
+        # Returning $null hands the WHOLE manifest to the built-in DUP loop,
+        # which can force a downgrade with Dell's /f. The finally block below
+        # still runs, so the managed-mode lockdown and the persistent end-state
+        # catalog are applied exactly as on a normal run.
+        if ($SkipApply) {
+            Write-Log ("DCU configured and locked down, but NOT scanning or applying: this package is version-pinned (it deliberately carries a driver older than Dell's newest). " +
+                "dcu-cli only installs what it judges newer than the live device, so it cannot apply a rollback and its 'no applicable updates' verdict would report success having installed nothing. " +
+                "Handing the manifest to the built-in DUP engine, which can force the downgrade.") -Severity 2
+            return $null
+        }
+
         $ScanLog = Join-Path $SessionDir 'dcu-scan.log'
         $ScanCode = & $RunDcu @('/scan', "-report=$ReportDir", "-outputLog=$ScanLog") 1800000 'scan'
 
@@ -2721,11 +2752,29 @@ function Install-DriverUpdates {
     Write-Log "DriverUpdates manifest: $($Drivers.Count) DUP(s) for $($Manifest.manufacturer) $($Manifest.model) ($($Manifest.operatingSystem))"
     if ($Manifest.generatedAt) { Write-Log "  Manifest generated: $($Manifest.generatedAt)" }
 
+    # Version-pinned rows (manifest schemaVersion 2). A pinned row is one the
+    # sync deliberately resolved to an OLDER revision than the catalog's newest -
+    # a rollback. Their presence changes two things: the engine (DCU cannot
+    # install downlevel, see Invoke-DCUDriverUpdates -SkipApply) and, per row,
+    # how "already installed" is judged. Absent on pre-2.40 manifests, where the
+    # property reads as $null and every row behaves exactly as before.
+    $PinnedRows = @($Drivers | Where-Object { $_.AllowDowngrade })
+    # The manifest's own engine flag is authoritative, but a pinned row implies
+    # it regardless - a hand-edited or partially-rebuilt manifest must not be
+    # able to route a rollback through an engine that cannot perform one.
+    $ForceDupEngine = ($PinnedRows.Count -gt 0) -or ("$($Manifest.engine)" -eq 'dup')
+    if ($PinnedRows.Count -gt 0) {
+        Write-Log ("  Version-pinned: $($PinnedRows.Count) of $($Drivers.Count) driver(s) are held at a specific revision - " +
+            (@($PinnedRows | ForEach-Object { "$($_.Name) v$($_.Version)$(if ($_.PinReason) { " ($($_.PinReason))" })" }) -join '; '))
+    }
+
     # Preferred engine: Dell Command Update against the package as a local
     # repository (see Invoke-DCUDriverUpdates). $null = DCU wasn't attempted
-    # (non-Dell, no catalog, no dcu-cli, or configure failed) -> fall through
-    # to the built-in DUP loop below. A non-null result is authoritative.
-    $DcuExit = Invoke-DCUDriverUpdates -Path $Path
+    # (non-Dell, no catalog, no dcu-cli, configure failed, or a pinned package)
+    # -> fall through to the built-in DUP loop below. A non-null result is
+    # authoritative. DCU is still CALLED for a pinned package so its lockdown and
+    # persistent end state are applied; -SkipApply stops it before scan/apply.
+    $DcuExit = Invoke-DCUDriverUpdates -Path $Path -SkipApply:$ForceDupEngine
     if ($null -ne $DcuExit) { return $DcuExit }
     Write-Log "Continuing with built-in DUP engine"
 
@@ -2789,6 +2838,126 @@ function Install-DriverUpdates {
         if ($ni -eq $nt) { return 0 }
         return $null  # unknown ordering - caller should treat as "needs install"
     }
+    # The version a PINNED row must be compared against - which is not the
+    # version the row is named by. Dell's dellVersion is a revision letter for
+    # most components ('A05'), and Windows reports the vendor's own dotted
+    # version ('32.0.23040.2002'), so comparing the two returns "no ordering"
+    # and the rollback decision falls through to "install without /f" - which a
+    # Dell DUP answers by quietly declining the downgrade and exiting 0. The
+    # deployment then reports success and the driver never moves.
+    #
+    # Two sources carry the comparable number, in order of authority:
+    #   1. VendorVersion, taken from the catalog's vendorVersion attribute and
+    #      written into the manifest.
+    #   2. The DUP filename. Dell builds it as
+    #      Name_id_WIN64_<vendorVersion>_<dellVersion>.EXE, so the dotted token
+    #      is there even in packages staged before VendorVersion existed - which
+    #      is what makes this fix work on an already-deployed package.
+    # The row's own Version is tried last and is correct whenever dellVersion is
+    # itself dotted.
+    #
+    # Selection is by comparability against what THIS device reports, not by a
+    # guess at which field is canonical: the first candidate that yields an
+    # ordering is the right one to decide on.
+    $GetPinTargetVersion = {
+        param($Row, [string]$Installed)
+
+        $Candidates = [System.Collections.Generic.List[string]]::new()
+        if ($Row.VendorVersion) { $Candidates.Add([string]$Row.VendorVersion) }
+        # Three or more dot-separated numeric parts: enough to exclude the stray
+        # "5.1" that turns up inside a product name, and every Dell DUP version
+        # has at least that many.
+        foreach ($M in [regex]::Matches("$($Row.FileName)", '(?<![0-9.])[0-9]+(?:\.[0-9]+){2,}(?![0-9])')) {
+            $Candidates.Add($M.Value)
+        }
+        $Candidates.Add([string]$Row.Version)
+
+        foreach ($C in $Candidates) {
+            if ([string]::IsNullOrWhiteSpace($C)) { continue }
+            if ($null -ne (& $CompareVersion $Installed $C)) { return $C }
+        }
+        return $null
+    }
+
+    # Which DriverStore package is bound to the device(s) a pinned row targets.
+    # Win32_PnPSignedDriver.InfName is the published oemNN.inf name, which is
+    # exactly what pnputil /delete-driver takes.
+    #
+    # Matching is deliberately NARROWER than the live-version probe. That probe
+    # only has to read a number, so a loose match costs nothing; this decides
+    # what gets REMOVED, so a loose match is a broken device. A Video row falls
+    # back to the GPU brand, which on its own would also match AMD audio and
+    # chipset functions - every one of them is VEN_1002 - so the brand path is
+    # additionally confined to the Display class.
+    $GetBoundPackages = {
+        param($Row)
+
+        $Tokens = @($Row.HardwareIds | Where-Object { $_ })
+        $Brand  = if ($Row.Category -eq 'Video') { & $GetDupGpuVendor $Row.Name } else { $null }
+
+        $Signed = @()
+        try {
+            $Signed = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+                Select-Object DeviceID, HardWareID, DriverVersion, DeviceName, InfName, DeviceClass)
+        } catch {
+            Write-Verbose "Bound-package enumeration failed: $($_.Exception.Message)"
+            return @()
+        }
+
+        $Hits = [System.Collections.Generic.List[object]]::new()
+        foreach ($Sd in $Signed) {
+            # Only third-party packages are removable, and only they are named
+            # oemNN.inf. An inbox INF (display.inf and friends) must never be
+            # touched - it is the fallback the device lands on.
+            if ("$($Sd.InfName)" -notmatch '^oem\d+\.inf$') { continue }
+
+            $Hay = "$($Sd.DeviceID) $($Sd.HardWareID)"
+            $IsMatch = $false
+            foreach ($T in $Tokens) { if ($Hay -like "*$T*") { $IsMatch = $true; break } }
+
+            if (-not $IsMatch -and $Brand -and "$($Sd.DeviceClass)" -match '^(?i)display$' -and
+                $Hay -match 'VEN_([0-9A-Fa-f]{4})') {
+                switch ($Matches[1].ToUpperInvariant()) {
+                    '10DE' { if ($Brand -eq 'NVIDIA') { $IsMatch = $true } }
+                    '1002' { if ($Brand -eq 'AMD')    { $IsMatch = $true } }
+                    '8086' { if ($Brand -eq 'Intel')  { $IsMatch = $true } }
+                }
+            }
+            if ($IsMatch) { $Hits.Add($Sd) }
+        }
+        # Emit nothing at all when there is no hit. The unary comma that keeps a
+        # single hit from unrolling would otherwise wrap an EMPTY list into a
+        # one-element array, and the caller would count a match that is not
+        # there - on the path that decides what gets removed.
+        if ($Hits.Count -eq 0) { return @() }
+        return ,@($Hits)
+    }
+
+    # Is the pinned revision already staged in the DriverStore? This is THE
+    # safety gate on removal: PnP re-binds the device to the next best matching
+    # package, so removing the bound one without the pinned one present leaves
+    # the device on an inbox driver or none at all. Fails CLOSED - if the store
+    # cannot be enumerated, nothing is removed.
+    $PinnedPackageStaged = {
+        param([string]$TargetVersion, [string]$ClassName)
+        if ([string]::IsNullOrWhiteSpace($TargetVersion)) { return $false }
+        $Pkgs = @()
+        try {
+            # Third-party packages only (no -All): the pinned revision is always
+            # one, and enumerating every inbox driver costs minutes.
+            $Pkgs = @(Get-WindowsDriver -Online -ErrorAction Stop)
+        } catch {
+            Write-Log "  Could not enumerate the DriverStore ($($_.Exception.Message)) - refusing to remove any driver package" -Severity 2
+            return $false
+        }
+        foreach ($P in $Pkgs) {
+            if ("$($P.Version)" -ne $TargetVersion) { continue }
+            if ($ClassName -and "$($P.ClassName)" -notmatch ('^(?i)' + [regex]::Escape($ClassName) + '$')) { continue }
+            return $true
+        }
+        return $false
+    }
+
     # Infer the GPU brand a Video DUP targets from its name. Returns
     # 'NVIDIA'/'AMD'/'Intel', or $null when it can't tell (then we don't filter on it).
     # Only meaningful for Category=Video DUPs.
@@ -2827,6 +2996,111 @@ function Install-DriverUpdates {
         Write-Log "No GPU vendors detected (or enumeration failed) - graphics DUPs will not be vendor-filtered this run" -Severity 2
     }
     $SkippedGpu = 0
+    # Pinned rows whose DUP reported success but left the device on the old
+    # driver anyway. Counted separately because it is neither a success nor an
+    # installer failure: the install worked, the rollback did not take.
+    $PinNotApplied = 0
+
+    # --- Live installed-driver version, for version-pinned rows only ---
+    #
+    # A pinned row is a rollback: its manifest version is BELOW what a broken
+    # device is carrying. Deciding whether to force it must therefore be based on
+    # what is actually installed, not on our own Components marker, for two
+    # reasons the field will hit immediately:
+    #   - On a DCU-managed device the marker tree is EMPTY. Invoke-DCUDriverUpdates
+    #     returns before $ComponentsRoot is even created, so DCU runs never write
+    #     per-component markers. A marker-based decision would read "nothing
+    #     installed" and force the downgrade on every device in the model line,
+    #     including ones that never took the bad driver.
+    #   - The marker key is derived from the DUP FILENAME, and Dell embeds the
+    #     version in it, so the pinned DUP looks at a different key than the one
+    #     the bad DUP wrote (this is why the marker GC below exists at all).
+    # Reading the live driver makes the rollback self-targeting: only a device
+    # carrying something newer than the pinned version gets forced.
+    #
+    # Enumerated once, here, not per driver and never in a detection rule -
+    # Win32_PnPSignedDriver is a join across every PnP device and routinely takes
+    # tens of seconds; a detection rule that slow reads as "not installed" and
+    # loops the deployment.
+    $LiveVideoAdapters = @()
+    $LiveSignedDrivers = @()
+    if ($PinnedRows.Count -gt 0) {
+        try {
+            $LiveVideoAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+        } catch {
+            Write-Log "Could not enumerate display adapters for the version-pin check ($($_.Exception.Message)) - pinned graphics rows install without /f" -Severity 2
+        }
+        # Only pay for the expensive class when a pinned row is not a graphics
+        # driver; Win32_VideoController already carries DriverVersion for those.
+        if (@($PinnedRows | Where-Object { $_.Category -ne 'Video' }).Count -gt 0) {
+            try {
+                $LiveSignedDrivers = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+                    Select-Object DeviceID, HardWareID, DriverVersion, DeviceName)
+            } catch {
+                Write-Log "Could not enumerate signed drivers for the version-pin check ($($_.Exception.Message)) - pinned non-graphics rows install without /f" -Severity 2
+            }
+        }
+        Write-Log "Version-pin probe: $($LiveVideoAdapters.Count) display adapter(s), $($LiveSignedDrivers.Count) signed driver(s) enumerated"
+    }
+
+    # Returns the installed driver version for a pinned manifest row, or $null
+    # when the device cannot be identified (caller then installs without /f).
+    $GetLiveDriverVersion = {
+        param($Row)
+
+        $Tokens = @($Row.HardwareIds | Where-Object { $_ })
+        $Candidates = @()
+
+        if ($Row.Category -eq 'Video') {
+            if ($Tokens.Count -gt 0) {
+                foreach ($Vc in $LiveVideoAdapters) {
+                    foreach ($T in $Tokens) {
+                        if ("$($Vc.PNPDeviceID)" -like "*$T*") { $Candidates += $Vc.DriverVersion; break }
+                    }
+                }
+            }
+            # Dell ships every GPU option's DUP for a model and many graphics DUPs
+            # carry no PCIInfo at all, so the token match finds nothing on exactly
+            # the rows most likely to be rolled back. Fall back to the GPU brand
+            # inferred from the DUP name - the same inference the vendor pre-skip
+            # above already trusts to decide whether to run the DUP.
+            if ($Candidates.Count -eq 0) {
+                $Brand = & $GetDupGpuVendor $Row.Name
+                if ($Brand) {
+                    foreach ($Vc in $LiveVideoAdapters) {
+                        $VcBrand = $null
+                        if ("$($Vc.PNPDeviceID)" -match 'VEN_([0-9A-Fa-f]{4})') {
+                            switch ($Matches[1].ToUpperInvariant()) {
+                                '10DE' { $VcBrand = 'NVIDIA' }
+                                '1002' { $VcBrand = 'AMD' }
+                                '8086' { $VcBrand = 'Intel' }
+                            }
+                        }
+                        if ($VcBrand -eq $Brand) { $Candidates += $Vc.DriverVersion }
+                    }
+                }
+            }
+        } elseif ($Tokens.Count -gt 0) {
+            foreach ($Sd in $LiveSignedDrivers) {
+                $Hay = "$($Sd.DeviceID) $($Sd.HardWareID)"
+                foreach ($T in $Tokens) {
+                    if ($Hay -like "*$T*") { $Candidates += $Sd.DriverVersion; break }
+                }
+            }
+        }
+
+        $Candidates = @($Candidates | Where-Object { $_ })
+        if ($Candidates.Count -eq 0) { return $null }
+        # Several devices of the same family can be present (dual GPUs, two NICs).
+        # The highest installed version is the one that decides: if ANY of them is
+        # newer than the pinned target, the downgrade still has work to do.
+        $Highest = $Candidates[0]
+        foreach ($C in $Candidates) {
+            $Cmp = & $CompareVersion $C $Highest
+            if ($null -ne $Cmp -and $Cmp -gt 0) { $Highest = $C }
+        }
+        return $Highest
+    }
 
     # Defender correlation. DUPs run serially, so any Defender ASR/quarantine
     # event raised between a DUP's start and its exit belongs to that DUP's
@@ -2865,6 +3139,21 @@ function Install-DriverUpdates {
     }
     $DefenderFlagged = 0
     $VulnExclusionAdvice = [System.Collections.Generic.List[string]]::new()
+
+    # Dell writes the framework log as UTF-16LE with a BOM. Read it through a
+    # reader that honours the BOM rather than relying on Get-Content's default
+    # encoding, so a phrase match never silently fails on the encoding - every
+    # decision below is made by matching text in this file.
+    $ReadDupLog = {
+        param([string]$LogPath)
+        if (-not $LogPath -or -not (Test-Path $LogPath)) { return '' }
+        try {
+            return [System.IO.File]::ReadAllText($LogPath)
+        } catch {
+            Write-Verbose "Framework log read failed ($LogPath): $($_.Exception.Message)"
+            return ''
+        }
+    }
 
     # Per-DUP framework-log capture. The Dell framework log (.dup.log) is the
     # only place a DUP records why it failed - requested per-DUP via Dell's
@@ -2977,18 +3266,103 @@ function Install-DriverUpdates {
             continue
         }
 
+        # Version pin (manifest AllowDowngrade). This row is deliberately older
+        # than Dell's newest, so decide against the LIVE driver: newer than the
+        # target -> force it down with /f; already at the target -> nothing to do;
+        # older or unreadable -> ordinary install, no /f.
+        $AllowDowngrade = [bool]$Drv.AllowDowngrade
+        $ForceDowngrade = $false
+        $LiveVersion = $null
+        # Did the probe give us a usable answer? Only then may the live driver
+        # decide; otherwise we are blind and the marker rules below apply.
+        $LiveVersionKnown = $false
+        if ($AllowDowngrade) {
+            $LiveVersion = & $GetLiveDriverVersion $Drv
+            if ($LiveVersion) {
+                # Compare against the vendor's dotted version, not the row's
+                # dellVersion revision letter - see $GetPinTargetVersion.
+                $PinTarget = & $GetPinTargetVersion $Drv $LiveVersion
+                $LiveCmp = if ($PinTarget) { & $CompareVersion $LiveVersion $PinTarget } else { $null }
+                # Name the pin by what the operator pinned, and show the number
+                # actually compared when it differs, so the log explains itself.
+                $TargetLabel = if ($PinTarget -and $PinTarget -ne [string]$Drv.Version) {
+                    "$($Drv.Version) (v$PinTarget)"
+                } else {
+                    [string]$Drv.Version
+                }
+                if ($null -eq $LiveCmp) {
+                    # Nothing on the row orders against what the device reports.
+                    # Installing without /f here is not neutral - it is the DUP's
+                    # own version check deciding, and it declines the downgrade
+                    # and exits 0, so the pin is silently never enforced. A pinned
+                    # row exists to be forced, so force it. $LiveVersionKnown
+                    # stays false deliberately: the marker rules below then stop
+                    # this repeating on every deployment once it has run once.
+                    $ForceDowngrade = $true
+                    Write-Log "$DriverLabel - PINNED: installed v$LiveVersion does not compare with the pinned v$($Drv.Version), and neither the manifest nor the DUP filename offers a version that does - forcing with /f anyway, because otherwise the DUP's own check would decline the rollback and report success" -Severity 2
+                } elseif ($LiveCmp -gt 0) {
+                    $LiveVersionKnown = $true
+                    $ForceDowngrade = $true
+                    Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, newer than the pinned v$TargetLabel - passing Dell's /f to force the rollback$(if ($Drv.PinReason) { " ($($Drv.PinReason))" })" -Severity 2
+                } elseif ($LiveCmp -eq 0) {
+                    Write-Log "$DriverLabel - PINNED: device is already on the pinned v$TargetLabel - skipping"
+                    $AlreadyInst++
+                    continue
+                } else {
+                    $LiveVersionKnown = $true
+                    Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, older than the pinned v$TargetLabel - installing normally (no downgrade needed)"
+                }
+            } else {
+                Write-Log "$DriverLabel - PINNED: could not read the installed driver version for this device (no matching hardware enumerated) - installing without /f; the DUP will refuse if it is already newer" -Severity 2
+            }
+        }
+
         # Per-DUP version skip: if we already installed this exact DUP at >= the
         # manifest version, don't re-run it. Saves the bulk of the deploy time on
         # repeat passes and stops Dell DUPs from churning their own re-install
         # logic for drivers that haven't changed.
+        #
+        # For a PINNED row the marker is not evidence of what is on the device.
+        # It records what WE last installed under this DUP's filename, and Dell
+        # puts the version in that filename - so the pinned v31 DUP reads the v31
+        # marker, not the v32 one the device is actually running. A machine that
+        # took v31 from us once, then moved to v32, still has a v31 marker equal
+        # to the pinned manifest version. The naive "equal -> skip" rule then
+        # swallows the rollback: the run reports success and the driver never
+        # moves. The marker GC that would have cleared it only runs at the end of
+        # this loop, so DCU-managed devices (which return before it) keep theirs
+        # indefinitely - i.e. exactly the fleet a rollback is aimed at.
+        #
+        # So: when the live probe gave us an answer, that answer already decided
+        # above and the marker gets no vote. Only when we are blind may it skip,
+        # and then only for a marker written by a previous PINNED run - one left
+        # over from an ordinary install predates the pin and proves nothing.
+        $SkipOnMarker = $false
         if (Test-Path $CompKeyPath) {
             try {
                 $ExistingVer = (Get-ItemProperty -Path $CompKeyPath -Name 'Version' -ErrorAction Stop).Version
                 $Cmp = & $CompareVersion $ExistingVer $Drv.Version
-                if ($null -ne $Cmp -and $Cmp -ge 0) {
+                if ($null -ne $Cmp) {
+                    if (-not $AllowDowngrade) {
+                        $SkipOnMarker = ($Cmp -ge 0)
+                    } elseif (-not $LiveVersionKnown) {
+                        $MarkerFromPinnedRun = $false
+                        try {
+                            $MarkerFromPinnedRun = [bool][int](Get-ItemProperty -Path $CompKeyPath -Name 'Pinned' -ErrorAction Stop).Pinned
+                        } catch {
+                            # No 'Pinned' value - the marker predates this pin.
+                            Write-Verbose "Component marker carries no Pinned flag"
+                        }
+                        $SkipOnMarker = ($Cmp -eq 0 -and $MarkerFromPinnedRun)
+                    }
+                }
+                if ($SkipOnMarker) {
                     Write-Log "$DriverLabel - already installed (marker v$ExistingVer) - skipping"
                     $AlreadyInst++
                     continue
+                }
+                if ($AllowDowngrade -and $null -ne $Cmp -and $Cmp -ge 0) {
+                    Write-Log "$DriverLabel - PINNED: a v$ExistingVer marker exists for this DUP, but the marker records what we installed, not what the device is running - ignoring it and proceeding$(if ($LiveVersionKnown) { " (the live driver decided above)" } else { ' (live version unreadable, so letting the DUP decide)' })"
                 }
             } catch {
         # Non-fatal hardware or registry probe error
@@ -3007,7 +3381,10 @@ function Install-DriverUpdates {
                 if ($CProps.PSObject.Properties['FailedVersion'] -and
                     $CProps.FailedVersion -eq $Drv.Version -and
                     [int]$CProps.FailCount -ge $QuarantineThreshold) {
-                    Write-Log "$DriverLabel - QUARANTINED: v$($Drv.Version) failed $($CProps.FailCount) consecutive time(s) on this device (last exit $($CProps.LastFailExit) at $($CProps.LastFailAt)) - the vendor installer is deterministically broken here. Skipping; a newer version in the manifest re-arms it automatically. To force a retry now, delete HKLM:\...\DriverUpdates\Components\$CompKey." -Severity 2
+                    $QuarantineNote = if ($AllowDowngrade) {
+                        ' This row is VERSION-PINNED, so the quarantine is holding off a rollback: read the framework log under C:\Windows\Temp\DATDupLogs to see whether the DUP is refusing the downgrade outright, and check with Get-DATDriverPin that you pinned a revision this device will accept.'
+                    } else { '' }
+                    Write-Log "$DriverLabel - QUARANTINED: v$($Drv.Version) failed $($CProps.FailCount) consecutive time(s) on this device (last exit $($CProps.LastFailExit) at $($CProps.LastFailAt)) - the vendor installer is deterministically broken here. Skipping; a newer version in the manifest re-arms it automatically. To force a retry now, delete HKLM:\...\DriverUpdates\Components\$CompKey.$QuarantineNote" -Severity 2
                     $Quarantined++
                     continue
                 }
@@ -3051,14 +3428,22 @@ function Install-DriverUpdates {
         # /l=<file> is Dell's documented universal DUP switch for the framework
         # log - the only place a DUP records WHY it failed.
         $DupFwLog = if ($DupLogDir) { Join-Path $DupLogDir ($SafeName + '.dup.log') } else { $null }
-        # Deliberately no /f here. /f overrides the DUP's own soft dependency and
-        # qualification checks, which includes its version check - and the skip
+        # Deliberately no /f by default. /f overrides the DUP's own soft dependency
+        # and qualification checks, which includes its version check - and the skip
         # above compares against OUR marker, not the live installed driver, so a
         # driver newer than the catalog (a Windows Update delivery, say) is
         # invisible to us. With /f the DUP would stop refusing and roll it back.
         # The framework log below is what makes failures diagnosable; that is /l=,
         # not /f.
+        #
+        # The one exception is a version-pinned row on a device we have just READ
+        # as carrying something newer - which is that rollback, asked for
+        # deliberately, and where the DUP's version check is the only thing
+        # standing in the way. $ForceDowngrade is set above and only from the live
+        # driver version, never from the marker, so /f can never be appended to a
+        # device whose installed version we could not establish.
         $DupArgs = if ($DupFwLog) { @('/s', "/l=$DupFwLog") } else { @('/s') }
+        if ($ForceDowngrade) { $DupArgs += '/f' }
 
         # Per-DUP extract dir. The DUP's framework calls GetTempPath() at startup
         # and uses that to unpack its payload before installing - if it can't, the
@@ -3147,10 +3532,7 @@ function Install-DriverUpdates {
         # Install-InfTree.
         if ($DupCode -eq 1 -and $DupTempDir -and $DupFwLog -and (Test-Path $DupFwLog)) {
             $FwRaw = ''
-            try { $FwRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction Stop } catch {
-        # Non-fatal hardware or registry probe error
-        Write-Verbose "Ignored exception: $($_.Exception.Message)"
-    }
+            $FwRaw = & $ReadDupLog $DupFwLog
             if ($FwRaw -and $FwRaw -match 'Error locating default extractpath') {
                 Write-Log "$DriverLabel - framework could not resolve its default extract path; retrying as extract (/e=) + pnputil" -Severity 2
                 $FbExtract = Join-Path $DupTempDir 'fallback-extract'
@@ -3189,6 +3571,150 @@ function Install-DriverUpdates {
             $RebootTag = if ($DupCode -in $RebootCodes) { ' (reboot required)' } else { '' }
             Write-Log "$DriverLabel - exit $DupCode (success$RebootTag) in ${Elapsed}s"
 
+            # Verify a forced rollback actually took, instead of trusting the
+            # exit code. A Dell DUP can exit 0 having added the older package to
+            # the DriverStore without PnP re-binding the device to it: Windows
+            # ranks driver packages and keeps the higher-ranked (newer) one, and
+            # /f overrides the DUP framework's version gate, not PnP's choice.
+            # That failure is invisible in the exit code - every field failure
+            # of this feature has looked exactly like it, success reported and
+            # the driver unmoved - so the device itself has to be re-read.
+            #
+            # Deliberately NOT turned into a deployment failure: the install did
+            # what it was told, and ConfigMgr retrying it changes nothing. It is
+            # logged at Severity 3 and counted on its own so the run is honest
+            # about what happened.
+            $AfterVersion = $null
+            if ($ForceDowngrade) {
+                # The pre-loop enumeration is now stale for this device; re-read
+                # it. Assigning the same names refreshes them for later rows too,
+                # which is correct - they describe live state.
+                try {
+                    $LiveVideoAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+                } catch {
+                    Write-Verbose "Post-install display re-read failed: $($_.Exception.Message)"
+                }
+                if ($Drv.Category -ne 'Video') {
+                    try {
+                        $LiveSignedDrivers = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+                            Select-Object DeviceID, HardWareID, DriverVersion, DeviceName)
+                    } catch {
+                        Write-Verbose "Post-install signed-driver re-read failed: $($_.Exception.Message)"
+                    }
+                }
+                $AfterVersion = & $GetLiveDriverVersion $Drv
+                $AfterCmp = if ($AfterVersion -and $PinTarget) { & $CompareVersion $AfterVersion $PinTarget } else { $null }
+                if ($null -eq $AfterCmp) {
+                    Write-Log "$DriverLabel - PIN: could not re-read the installed driver after the run, so the rollback is unconfirmed$(if ($AfterVersion) { " (device reports v$AfterVersion)" })" -Severity 2
+                } elseif ($AfterCmp -le 0) {
+                    Write-Log "$DriverLabel - PIN VERIFIED: device is now on v$AfterVersion (was v$LiveVersion)"
+                } elseif ($DupCode -in $RebootCodes) {
+                    Write-Log "$DriverLabel - PIN: device still reports v$AfterVersion, but this DUP asked for a reboot - the rollback cannot be confirmed until the device restarts" -Severity 2
+                } else {
+                    $PinNotApplied++
+                    # Name the actual reason from the framework log instead of
+                    # making the operator go read it. Two are known and neither
+                    # is visible in the exit code:
+                    #   * a DCH/mup DUP whose mup.xml declares no force
+                    #     parameter - the framework drops /f before the payload
+                    #     installer ever sees it, and says so on its first line;
+                    #   * PnP declining the INF on driver ranking, one line per
+                    #     INF, which is what "success with nothing installed"
+                    #     actually looks like from inside.
+                    $FwPin = & $ReadDupLog $DupFwLog
+                    $Reasons = [System.Collections.Generic.List[string]]::new()
+                    if ($FwPin -match 'dropping\s+/f\s+from\s+commandline') {
+                        $Reasons.Add("the DUP framework DROPPED /f before running the payload ('the parameter force is not found in mup file') - this is a DCH/mup package and the switch never took effect")
+                    }
+                    $RankDeclines = @([regex]::Matches($FwPin, 'is\s+not\s+a\s+better\s+match\s+than\s+the\s+current\s+driver')).Count
+                    if ($RankDeclines -gt 0) {
+                        $Reasons.Add("Windows declined $RankDeclines INF(s) as 'not a better match than the current driver' - PnP ranking kept the newer driver bound")
+                    }
+                    Write-Log ("$DriverLabel - PIN NOT APPLIED: the DUP exited $DupCode (success), but the device is STILL on v$AfterVersion instead of the pinned v$PinTarget. " +
+                        $(if ($Reasons.Count -gt 0) { "Framework log says: $($Reasons -join '; '). " } else { "The framework log names no known cause - read it at $(if ($DupFwLog) { $DupFwLog } else { 'not captured' }). " }) +
+                        "Neither Dell's /f nor a re-run can beat PnP ranking: two packages that match a device equally are separated by driver DATE, so the newer one keeps winning while it is in the DriverStore.") -Severity 3
+
+                    # Retiring the outranking package is the only durable fix -
+                    # a forced bind would be undone by the next re-evaluation
+                    # while that package is still present. It is opt-in per pin
+                    # because it is a real deletion.
+                    #
+                    # pnputil's /uninstall does it in the safe order: devices are
+                    # moved off the package FIRST, then it leaves the store. That
+                    # ordering is what keeps the device from being stranded -
+                    # provided the pinned package is already staged for PnP to
+                    # land on, which is checked before anything is touched.
+                    if (-not $Drv.AllowDriverStoreRemoval) {
+                        Write-Log ("$DriverLabel - the pinned revision is staged but outranked. To let the client retire the newer package automatically, re-add the pin with -RemoveOutrankingDriver " +
+                            "(or tick 'Retire the outranking driver' on the GUI's Driver Pins tab).") -Severity 2
+                    } else {
+                        $Bound = @(& $GetBoundPackages $Drv)
+                        # Only ever act on a package NEWER than the pin. An older
+                        # or equal one is not what is outranking us, and removing
+                        # it would be pure damage.
+                        $Outranking = @($Bound | Where-Object {
+                            $C = & $CompareVersion "$($_.DriverVersion)" $PinTarget
+                            ($null -ne $C) -and ($C -gt 0)
+                        })
+
+                        if ($Outranking.Count -eq 0) {
+                            Write-Log "$DriverLabel - no removable package matched this component with a version newer than v$PinTarget, so there is nothing to retire; the DriverStore is left untouched" -Severity 2
+                        } elseif (-not (& $PinnedPackageStaged $PinTarget "$($Outranking[0].DeviceClass)")) {
+                            Write-Log ("$DriverLabel - REFUSING to touch $(@($Outranking | ForEach-Object { $_.InfName }) -join ', '): the pinned v$PinTarget is NOT in the DriverStore, so PnP would have nothing to fall back to and the device could be left without a driver. " +
+                                "Check that the pinned DUP actually staged its INFs.") -Severity 3
+                        } else {
+                            $PnpUtil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
+                            foreach ($Pkg in $Outranking) {
+                                $Inf = "$($Pkg.InfName)"
+                                Write-Log "$DriverLabel - retiring outranking package $Inf (v$($Pkg.DriverVersion), $($Pkg.DeviceName)) so the pinned v$PinTarget becomes the best match"
+                                $PnpOut = ''
+                                $PnpCode = -1
+                                try {
+                                    $PnpOut = (& $PnpUtil '/delete-driver' $Inf '/uninstall' 2>&1 | Out-String).Trim()
+                                    $PnpCode = $LASTEXITCODE
+                                } catch {
+                                    Write-Log "$DriverLabel - pnputil failed to launch: $($_.Exception.Message)" -Severity 3
+                                    continue
+                                }
+                                if ($PnpCode -eq 3010) { $Rebooted = $true }
+                                # The exit code is NOT the outcome. pnputil does
+                                # the device re-bind first and the store removal
+                                # second, so it can re-bind successfully and
+                                # still report failure on the second step - which
+                                # is exactly what the field hit (259 after the
+                                # device had already moved). Only the device is
+                                # worth believing, and it is re-read below.
+                                Write-Log "$DriverLabel - pnputil exit $PnpCode$(if ($PnpOut) { ": $($PnpOut -replace '\s+', ' ')" })" -Severity $(if ($PnpCode -eq 0 -or $PnpCode -eq 3010) { 1 } else { 2 })
+                            }
+
+                            try {
+                                $LiveVideoAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+                            } catch {
+                                Write-Verbose "Post-retire display re-read failed: $($_.Exception.Message)"
+                            }
+                            if ($Drv.Category -ne 'Video') {
+                                try {
+                                    $LiveSignedDrivers = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+                                        Select-Object DeviceID, HardWareID, DriverVersion, DeviceName)
+                                } catch {
+                                    Write-Verbose "Post-retire signed-driver re-read failed: $($_.Exception.Message)"
+                                }
+                            }
+                            $FinalVersion = & $GetLiveDriverVersion $Drv
+                            $FinalCmp = if ($FinalVersion -and $PinTarget) { & $CompareVersion $FinalVersion $PinTarget } else { $null }
+                            if ($null -ne $FinalCmp -and $FinalCmp -le 0) {
+                                $PinNotApplied--
+                                $AfterVersion = $FinalVersion
+                                Write-Log "$DriverLabel - PIN VERIFIED after retiring the outranking package: device is now on v$FinalVersion (was v$LiveVersion)"
+                            } else {
+                                Write-Log ("$DriverLabel - PIN STILL NOT APPLIED after retiring the outranking package: device reports $(if ($FinalVersion) { "v$FinalVersion" } else { 'no readable version' }). " +
+                                    "A reboot may be pending; if it has not moved after one, enumerate the device's matching drivers to see what is outranking the pin now.") -Severity 3
+                            }
+                        }
+                    }
+                }
+            }
+
             # Record per-DUP version so subsequent deployments can skip this DUP
             # if its version hasn't moved. We deliberately only mark on success
             # codes (0/2/6) - not on N-A (3/4/5) - so that if hardware later
@@ -3202,6 +3728,24 @@ function Install-DriverUpdates {
                 New-ItemProperty -Path $CompKeyPath -Name 'Name'       -Value $Drv.Name    -PropertyType String -Force | Out-Null
                 New-ItemProperty -Path $CompKeyPath -Name 'InstalledOn' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
                 New-ItemProperty -Path $CompKeyPath -Name 'ExitCode'   -Value $DupCode     -PropertyType DWord -Force | Out-Null
+                # Rollback audit trail. Without these, "which machines took the
+                # rollback, and what were they on before?" is unanswerable from
+                # inventory - and on a DCU-managed device there is no other
+                # client-side record of what was installed at all.
+                New-ItemProperty -Path $CompKeyPath -Name 'Pinned' -Value ([int][bool]$AllowDowngrade) -PropertyType DWord -Force | Out-Null
+                if ($AllowDowngrade) {
+                    New-ItemProperty -Path $CompKeyPath -Name 'LiveVersionBefore' -Value ([string]$LiveVersion) -PropertyType String -Force | Out-Null
+                    New-ItemProperty -Path $CompKeyPath -Name 'ForcedDowngrade'   -Value ([int][bool]$ForceDowngrade) -PropertyType DWord -Force | Out-Null
+                    # What the device actually reported afterwards - the only
+                    # inventory-visible proof of whether the rollback took.
+                    if ($AfterVersion) {
+                        New-ItemProperty -Path $CompKeyPath -Name 'LiveVersionAfter' -Value ([string]$AfterVersion) -PropertyType String -Force | Out-Null
+                    }
+                } else {
+                    foreach ($PProp in 'LiveVersionBefore', 'ForcedDowngrade', 'LiveVersionAfter') {
+                        Remove-ItemProperty -Path $CompKeyPath -Name $PProp -ErrorAction SilentlyContinue
+                    }
+                }
                 # Success resets the persistent-failure ledger.
                 foreach ($FProp in 'FailedVersion', 'FailCount', 'LastFailExit', 'LastFailAt') {
                     Remove-ItemProperty -Path $CompKeyPath -Name $FProp -ErrorAction SilentlyContinue
@@ -3239,7 +3783,7 @@ function Install-DriverUpdates {
             $FwLogRaw = ''
             if ($DupCode -eq 1 -and $DupFwLog -and (Test-Path $DupFwLog)) {
                 try {
-                    $FwLogRaw = Get-Content -Path $DupFwLog -Raw -ErrorAction SilentlyContinue
+                    $FwLogRaw = & $ReadDupLog $DupFwLog
                 } catch {
                     $FwLogRaw = ''
                 }
@@ -3265,6 +3809,19 @@ function Install-DriverUpdates {
                     $Failed++
                     $FailureLines.Add(("{0} (exit {1})" -f $Drv.FileName, $DupCode))
                     if ($Elapsed -lt 2) { $InstantFailed++ }
+
+                    # A pinned row that fails is the rollback failing, which is
+                    # worth naming here rather than leaving to be inferred from a
+                    # generic exit code two hundred log lines later. The
+                    # not-applicable phrases matched above are hardware-absence
+                    # ones; a DUP refusing a downgrade does not use them, so it
+                    # lands here and would otherwise read as an ordinary failure.
+                    if ($AllowDowngrade) {
+                        Write-Log ("$DriverLabel - PIN NOT APPLIED: this is the version-pinned rollback and it failed$(if ($ForceDowngrade) { ' even with /f' } else { '' })" +
+                            "$(if ($LiveVersion) { "; the device is still on v$LiveVersion" } else { '' }). " +
+                            "The DUP's own framework log is the only place the reason is recorded - read the .dup.log for this DUP under C:\Windows\Temp\DATDupLogs. " +
+                            "If the vendor installer inside the DUP refuses the downgrade regardless of /f, the pinned revision cannot be delivered this way and the pin should be reconsidered.") -Severity 3
+                    }
 
                     # Persistent-failure ledger (consumed by the quarantine
                     # pre-check above). Same version failing again increments the
@@ -3381,7 +3938,7 @@ function Install-DriverUpdates {
                 "Manual differential (elevated cmd): run any failed DUP as '<name>.EXE /s /l=C:\Windows\Temp\duptest.log' - if it installs by hand, the block is specific to the CCMExec-spawned context.") -Severity 3
         }
     }
-    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Quarantined quarantined (persistent vendor failures, skipped), $Failed failed$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
+    Write-Log "DriverUpdates summary: $Successful succeeded, $AlreadyInst already-installed, $HwAdvisories hardware advisories (ran anyway), $SkippedGpu skipped (GPU brand absent), $NotApply not-applicable, $Quarantined quarantined (persistent vendor failures, skipped), $Failed failed$(if ($PinNotApplied -gt 0) { ", $PinNotApplied pinned rollback(s) NOT applied (DUP reported success, device unchanged)" })$(if ($DefenderFlagged -gt 0) { ", $DefenderFlagged Defender flag(s)" })"
     if ($Failed -gt 0) {
         Write-Log ("  Failures: " + ($FailureLines -join '; ')) -Severity 2
     }

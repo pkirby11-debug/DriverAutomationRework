@@ -6,6 +6,7 @@ $PrivatePaths = @(
     'Private\Core\LogManager.ps1'
     'Private\Core\ConfigManager.ps1'
     'Private\Core\DriverExclusionStore.ps1'
+    'Private\Core\DriverPinStore.ps1'
     'Private\Core\CacheManager.ps1'
     'Private\Core\CatalogParser.ps1'
     'Private\Core\DownloadManager.ps1'

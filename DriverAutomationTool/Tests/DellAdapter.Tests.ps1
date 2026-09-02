@@ -1,4 +1,4 @@
-BeforeAll {
+﻿BeforeAll {
     $ModuleRoot = Split-Path $PSScriptRoot -Parent
 
     # Dot-source the files we need for testing
@@ -147,5 +147,179 @@ Describe 'Get-DellDriverPack Windows 10 fallback' {
     It 'Returns null when the model has no pack for any OS' {
         $Result = Get-DellDriverPack -Model 'Nonexistent 1234' -OperatingSystem 'Windows 11 24H2'
         $Result | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-DellIndividualDrivers version pinning' {
+    BeforeAll {
+        . "$(Split-Path $PSScriptRoot -Parent)\Private\Core\DriverPinStore.ps1"
+
+        # Fixture per-model catalog carrying TWO revisions of one graphics driver
+        # family - the case a rollback depends on. The dedup keeps the newer one
+        # (A04) unless a pin says otherwise; the older one (A03) is what the
+        # operator is rolling back to.
+        $script:PinFixture = Join-Path $TestDrive 'FixtureModelCatalog.xml'
+        @'
+<?xml version="1.0" encoding="utf-8"?>
+<Manifest version="1.0" baseLocation="dl.dell.com">
+  <SoftwareComponent packageType="LW64" path="FOLDER1M/1/Video-Driver_NEW_WN64_32.0.11021.4004_A04.EXE" dellVersion="32.0.11021.4004" vendorVersion="32.0.11021.4004" dateTime="2026-08-27T00:00:00" hashMD5="new" size="500">
+    <Name><Display xml:lang="en"><![CDATA[AMD Radeon RX 6400 Graphics Driver]]></Display></Name>
+    <SupportedSystems><Brand><Model systemID="0B12" /></Brand></SupportedSystems>
+    <SupportedOperatingSystems><OperatingSystem osCode="Windows11" /></SupportedOperatingSystems>
+    <SupportedDDCMDevices><PCIInfo vendorID="1002" deviceID="73FF" /></SupportedDDCMDevices>
+  </SoftwareComponent>
+  <SoftwareComponent packageType="LW64" path="FOLDER2M/1/Video-Driver_OLD_WN64_31.0.15021.1001_A03.EXE" dellVersion="31.0.15021.1001" vendorVersion="31.0.15021.1001" dateTime="2026-02-10T00:00:00" hashMD5="old" size="490">
+    <Name><Display xml:lang="en"><![CDATA[AMD Radeon RX 6400 Graphics Driver]]></Display></Name>
+    <SupportedSystems><Brand><Model systemID="0B12" /></Brand></SupportedSystems>
+    <SupportedOperatingSystems><OperatingSystem osCode="Windows11" /></SupportedOperatingSystems>
+    <SupportedDDCMDevices><PCIInfo vendorID="1002" deviceID="73FF" /></SupportedDDCMDevices>
+  </SoftwareComponent>
+  <SoftwareComponent packageType="LW64" path="FOLDER3M/1/Network-Driver_WN64_23.160.0.4_A01.EXE" dellVersion="23.160.0.4" dateTime="2026-07-01T00:00:00" hashMD5="net" size="120">
+    <Name><Display xml:lang="en"><![CDATA[Intel BE2xx Wi-Fi Driver]]></Display></Name>
+    <SupportedSystems><Brand><Model systemID="0B12" /></Brand></SupportedSystems>
+    <SupportedOperatingSystems><OperatingSystem osCode="Windows11" /></SupportedOperatingSystems>
+  </SoftwareComponent>
+</Manifest>
+'@ | Set-Content -Path $script:PinFixture -Encoding UTF8
+
+        Mock Update-DellModelCatalog { @($script:PinFixture) }
+
+        # The package version is MD5 over sorted "Name=Version" pairs; recomputing
+        # it here is what proves a pin produces a STABLE fingerprint rather than
+        # one that churns on every sync.
+        function Get-TestFingerprint {
+            param($Drivers)
+            $Fp = ($Drivers | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Version)" }) -join '|'
+            $Md5 = [System.Security.Cryptography.MD5]::Create()
+            (($Md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Fp)) |
+                ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
+        }
+
+        $script:ResolveParams = @{
+            SystemID          = '0B12'
+            BaselineDate      = '1970-01-01T00:00:00'
+            OperatingSystem   = 'Windows 11 24H2'
+            MissingCategories = @('Video', 'Network', 'Audio', 'Chipset', 'Storage', 'Input', 'Other')
+        }
+    }
+
+    It 'Resolves the newest revision when nothing is pinned' {
+        $Drivers = @(Get-DellIndividualDrivers @script:ResolveParams)
+        $Video = $Drivers | Where-Object { $_.Category -eq 'Video' }
+        $Video.Version | Should -Be '32.0.11021.4004'
+        @($Video).Count | Should -Be 1
+    }
+
+    It 'Resolves the pinned revision instead, leaving other categories alone' {
+        $Pin = [PSCustomObject]@{
+            NamePattern = 'AMD Radeon'; PinnedVersion = '31.0.15021.1001'
+            SystemId = '0B12'; Manufacturer = 'Dell'; Enabled = $true
+            Reason = 'v32 breaks P2419H monitors'
+        }
+        $Drivers = @(Get-DellIndividualDrivers @script:ResolveParams -PinVersions @($Pin))
+
+        $Video = $Drivers | Where-Object { $_.Category -eq 'Video' }
+        $Video.Version  | Should -Be '31.0.15021.1001'
+        $Video.FileName | Should -Be 'Video-Driver_OLD_WN64_31.0.15021.1001_A03.EXE'
+        $Video.IsPinned | Should -BeTrue
+        # The pinned revision must arrive with its own catalog XML, or it cannot
+        # enter DCUCatalog.xml and the package's DCU end state loses it.
+        $Video.ComponentXml | Should -Not -BeNullOrEmpty
+
+        ($Drivers | Where-Object { $_.Category -eq 'Network' }).Version | Should -Be '23.160.0.4'
+    }
+
+    It 'Carries the vendor version through, so the client has something to compare' {
+        # Version is Dell's dellVersion, which is a revision letter ('A05') for
+        # most real components and orders against nothing the OS reports. The
+        # client decides a rollback on this field instead, so it has to survive
+        # the resolve - both for the newest revision and for a pinned one.
+        $Pin = [PSCustomObject]@{
+            NamePattern = 'AMD Radeon'; PinnedVersion = '31.0.15021.1001'
+            SystemId = '0B12'; Manufacturer = 'Dell'; Enabled = $true
+        }
+        (@(Get-DellIndividualDrivers @script:ResolveParams) |
+            Where-Object { $_.Category -eq 'Video' }).VendorVersion | Should -Be '32.0.11021.4004'
+        (@(Get-DellIndividualDrivers @script:ResolveParams -PinVersions @($Pin)) |
+            Where-Object { $_.Category -eq 'Video' }).VendorVersion | Should -Be '31.0.15021.1001'
+    }
+
+    It 'Produces a stable fingerprint across repeated resolves, so the package does not churn' {
+        $Pin = [PSCustomObject]@{
+            NamePattern = 'AMD Radeon'; PinnedVersion = '31.0.15021.1001'
+            SystemId = '0B12'; Manufacturer = 'Dell'; Enabled = $true
+        }
+        $First  = Get-TestFingerprint (@(Get-DellIndividualDrivers @script:ResolveParams -PinVersions @($Pin)))
+        $Second = Get-TestFingerprint (@(Get-DellIndividualDrivers @script:ResolveParams -PinVersions @($Pin)))
+        $First | Should -Be $Second
+
+        # And it must differ from the unpinned one, or the smart check would match
+        # the deployed package and skip the rebuild that applies the rollback.
+        $Unpinned = Get-TestFingerprint (@(Get-DellIndividualDrivers @script:ResolveParams))
+        $First | Should -Not -Be $Unpinned
+    }
+
+    It 'Drops the component when the pinned revision is absent and unrecoverable' {
+        $Pin = [PSCustomObject]@{
+            NamePattern = 'AMD Radeon'; PinnedVersion = '30.0.00000.0001'
+            SystemId = '0B12'; Manufacturer = 'Dell'; Enabled = $true
+        }
+        $Drivers = @(Get-DellIndividualDrivers @script:ResolveParams -PinVersions @($Pin))
+        @($Drivers | Where-Object { $_.Category -eq 'Video' }).Count | Should -Be 0
+
+        # The sync's gate is what turns that into a refusal to build.
+        $Unsatisfied = @(Test-DATDriverPinsSatisfied -Drivers $Drivers -Pins @($Pin))
+        $Unsatisfied.Count | Should -Be 1
+    }
+
+    It 'Discovery mode returns every revision, flagged with the one that ships today' {
+        # This is what makes a pin choosable: the dedup discards the predecessor
+        # revisions, so without -IncludeSuperseded an operator cannot see what to
+        # roll back to.
+        $All = @(Get-DellIndividualDrivers @script:ResolveParams -IncludeSuperseded)
+        @($All | Where-Object { $_.Category -eq 'Video' }).Count | Should -Be 2
+
+        $Current = @($All | Where-Object { $_.Category -eq 'Video' -and $_.IsCurrent })
+        $Current.Count   | Should -Be 1
+        $Current[0].Version | Should -Be '32.0.11021.4004'
+
+        $Rollback = @($All | Where-Object { $_.Category -eq 'Video' -and -not $_.IsCurrent })
+        $Rollback.Count | Should -Be 1
+        $Rollback[0].Version | Should -Be '31.0.15021.1001'
+        # The metadata that keeps a pin alive after Dell purges the revision.
+        $Rollback[0].Url          | Should -Not -BeNullOrEmpty
+        $Rollback[0].ComponentXml | Should -Not -BeNullOrEmpty
+        $Rollback[0].HashMD5      | Should -Be 'old'
+    }
+
+    It 'Discovery mode ignores pins - it is the menu, not the order' {
+        $Pin = [PSCustomObject]@{
+            NamePattern = 'AMD Radeon'; PinnedVersion = '31.0.15021.1001'
+            SystemId = '0B12'; Manufacturer = 'Dell'; Enabled = $true
+        }
+        $All = @(Get-DellIndividualDrivers @script:ResolveParams -IncludeSuperseded -PinVersions @($Pin))
+        @($All | Where-Object { $_.Category -eq 'Video' }).Count | Should -Be 2
+    }
+
+    It 'Rebuilds the pinned revision from captured metadata once the catalog drops it' {
+        $Pin = [PSCustomObject]@{
+            NamePattern    = 'AMD Radeon'; PinnedVersion = '30.0.00000.0001'
+            SystemId = '0B12'; Manufacturer = 'Dell'; Enabled = $true
+            PinnedName     = 'AMD Radeon RX 6400 Graphics Driver'
+            PinnedFileName = 'Video-Driver_ANCIENT_WN64_30.0.00000.0001_A01.EXE'
+            SourceUrl      = 'https://dl.dell.com/FOLDER9M/1/Video-Driver_ANCIENT_WN64_30.0.00000.0001_A01.EXE'
+            ComponentXml   = '<SoftwareComponent dellVersion="30.0.00000.0001" />'
+            Category       = 'Video'
+            VendorVersion  = '30.0.19999.0001'
+        }
+        $Drivers = @(Get-DellIndividualDrivers @script:ResolveParams -PinVersions @($Pin))
+        $Video = $Drivers | Where-Object { $_.Category -eq 'Video' }
+        $Video.Version | Should -Be '30.0.00000.0001'
+        $Video.Url     | Should -Be $Pin.SourceUrl
+        # A synthesized row must carry the captured vendor version too, or the
+        # client loses the only number it can compare the live driver against
+        # for exactly the pins that outlived the catalog.
+        $Video.VendorVersion | Should -Be '30.0.19999.0001'
+        @(Test-DATDriverPinsSatisfied -Drivers $Drivers -Pins @($Pin)).Count | Should -Be 0
     }
 }

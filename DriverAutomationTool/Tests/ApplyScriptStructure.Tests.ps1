@@ -1,4 +1,4 @@
-<#
+﻿<#
     Structural (AST) guards for Invoke-DATApply.ps1.
 
     Invoke-DATApply.ps1 is the client-side script; it is never dot-sourced by
@@ -230,5 +230,261 @@ Describe 'Firmware update status (ESRT) reader' {
         $script:EsrtLog.Extent.Text | Should -Match 'catch\s*\{'
         $Catch = $script:EsrtLog.Extent.Text -replace '(?s)^.*catch\s*\{', ''
         $Catch | Should -Match 'Write-Log'
+    }
+}
+
+Describe 'Version-pinned rollback (Dell DUP loop)' {
+    BeforeAll {
+        $script:InstallFn = Get-DATFunctionAst -Name 'Install-DriverUpdates'
+        $script:DrvLoop   = Get-DATPerDriverLoopAst
+
+        function Get-DATAssignmentAst {
+            param($Scope, [string]$Left, [string]$Operator)
+            @($Scope.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $n.Left.Extent.Text -eq $Left
+            }, $true) | Where-Object { -not $Operator -or $_.Operator -eq $Operator })
+        }
+    }
+
+    It 'Builds the default DUP argument list without /f' {
+        # /f overrides the DUP's own version and qualification checks. Applied
+        # unconditionally it would let every DUP roll back whatever is installed,
+        # including a driver a device got from Windows Update that we cannot see.
+        # It belongs on the pinned-rollback path only.
+        $Init = Get-DATAssignmentAst -Scope $script:DrvLoop -Left '$DupArgs' -Operator 'Equals'
+        @($Init).Count | Should -BeGreaterThan 0
+        foreach ($A in $Init) { $A.Extent.Text | Should -Not -Match "'/f'" }
+    }
+
+    It 'Appends /f only under $ForceDowngrade' {
+        $Appends = @(Get-DATAssignmentAst -Scope $script:DrvLoop -Left '$DupArgs' |
+            Where-Object { $_.Extent.Text -match "'/f'" })
+        @($Appends).Count | Should -Be 1
+
+        $Node = $Appends[0]
+        $Guard = $null
+        while ($Node -and -not $Guard) {
+            $Node = $Node.Parent
+            if ($Node -is [System.Management.Automation.Language.IfStatementAst]) { $Guard = $Node }
+        }
+        $Guard | Should -Not -BeNullOrEmpty
+        $Guard.Clauses[0].Item1.Extent.Text | Should -Match 'ForceDowngrade'
+    }
+
+    It 'Decides the downgrade from the live installed driver, never from the marker' {
+        # The Components marker cannot carry this decision: DCU-managed devices
+        # have no markers at all (Invoke-DCUDriverUpdates returns before the tree
+        # is created), and the key is derived from the DUP filename, which carries
+        # the version - so the pinned DUP looks at a different key than the bad one
+        # wrote. A marker-based rule would force the downgrade fleet-wide.
+        $Sets = @(Get-DATAssignmentAst -Scope $script:DrvLoop -Left '$ForceDowngrade' |
+            Where-Object { $_.Right.Extent.Text -eq '$true' })
+        # Two: the device is measurably newer than the target, and the device
+        # reports a version nothing on the row can be ordered against. Both are
+        # branches of the same $LiveCmp decision; neither may come from a marker.
+        @($Sets).Count | Should -Be 2
+
+        foreach ($Set in $Sets) {
+            $Node = $Set
+            $Guard = $null
+            while ($Node -and -not $Guard) {
+                $Node = $Node.Parent
+                if ($Node -is [System.Management.Automation.Language.IfStatementAst]) { $Guard = $Node }
+            }
+            $Guard | Should -Not -BeNullOrEmpty
+            ($Guard.Clauses | ForEach-Object { $_.Item1.Extent.Text }) -join ' ' | Should -Match 'LiveCmp'
+        }
+    }
+
+    It 'Compares the live driver against a resolved target, not the row version' {
+        # The field bug this guards: Dell's dellVersion is a revision letter
+        # ('A05') for most components, so comparing it with the dotted version
+        # Windows reports yields no ordering at all - and the rollback was never
+        # forced. $GetPinTargetVersion resolves a comparable number first; a
+        # $LiveCmp taken straight from $Drv.Version puts the bug back.
+        $LiveCmp = @(Get-DATAssignmentAst -Scope $script:DrvLoop -Left '$LiveCmp')
+        @($LiveCmp).Count | Should -Be 1
+        $LiveCmp[0].Right.Extent.Text | Should -Match 'PinTarget'
+        $LiveCmp[0].Right.Extent.Text | Should -Not -Match '\$Drv\.Version'
+    }
+
+    It 'Re-reads the device after a forced rollback instead of trusting the exit code' {
+        # The DUP can exit 0 having added the older package to the DriverStore
+        # while PnP keeps the newer driver bound. Nothing in the exit code shows
+        # that, so a success branch that never re-reads the device reports a
+        # rollback that did not happen - which is exactly what the field saw.
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match '\$AfterVersion'
+        $Loop | Should -Match 'PIN NOT APPLIED'
+
+        # The re-read must be a fresh CIM query, not the pre-loop enumeration.
+        $Verify = [regex]::Match($Loop, '\$AfterVersion\s*=\s*&\s*\$GetLiveDriverVersion')
+        $Verify.Success | Should -BeTrue
+        $Before = $Loop.Substring(0, $Verify.Index)
+        $Before | Should -Match 'Get-CimInstance -ClassName Win32_VideoController'
+    }
+
+    It 'Does not turn an unapplied pin into a deployment failure' {
+        # Retrying the install cannot fix PnP ranking, so failing the row would
+        # only loop ConfigMgr on a condition that never clears. It is counted
+        # and logged loudly instead.
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match '\$PinNotApplied\+\+'
+        $M = [regex]::Match($Loop, '\$PinNotApplied\+\+(.{0,400})', 'Singleline')
+        $M.Groups[1].Value | Should -Not -Match '\$Failed\+\+'
+    }
+
+    It 'Retires a driver package only behind both gates' {
+        # This is the one path that DELETES something off a machine. Two
+        # conditions have to hold above it, and neither is optional:
+        #   * the pin opted in (AllowDriverStoreRemoval), because the operator
+        #     is authorising a deletion;
+        #   * the pinned revision is already staged, because PnP re-binds the
+        #     device to the next best match and there has to BE one.
+        $Loop = $script:DrvLoop
+        $Calls = @($Loop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.Extent.Text -match 'delete-driver'
+        }, $true))
+        @($Calls).Count | Should -Be 1
+
+        $Node = $Calls[0]
+        $Guards = [System.Collections.Generic.List[string]]::new()
+        while ($Node -and $Node -ne $Loop) {
+            if ($Node -is [System.Management.Automation.Language.IfStatementAst]) {
+                foreach ($Clause in $Node.Clauses) { $Guards.Add($Clause.Item1.Extent.Text) }
+            }
+            $Node = $Node.Parent
+        }
+        $All = $Guards -join ' '
+        $All | Should -Match 'AllowDriverStoreRemoval'
+        $All | Should -Match 'PinnedPackageStaged'
+    }
+
+    It 'Only ever considers packages newer than the pinned version' {
+        # Removing an older or equal package is never the fix and is pure
+        # damage: it is not what is outranking the pin.
+        $Sel = [regex]::Match($script:DrvLoop.Extent.Text,
+            '\$Outranking\s*=\s*@\(\$Bound\s*\|\s*Where-Object\s*\{(.*?)\}\)', 'Singleline')
+        $Sel.Success | Should -BeTrue
+        $Sel.Groups[1].Value | Should -Match '\$PinTarget'
+        $Sel.Groups[1].Value | Should -Match '\-gt\s+0'
+    }
+
+    It 'Decides the retire outcome from the device, not from pnputil exit code' {
+        # pnputil re-binds the device first and removes the package second, so
+        # it can succeed at the part that matters and still report failure. The
+        # field hit exactly that (259 after the device had already moved).
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match '\$FinalVersion\s*=\s*&\s*\$GetLiveDriverVersion'
+        $Verdict = [regex]::Match($Loop, 'PIN VERIFIED after retiring(.{0,200})', 'Singleline')
+        $Verdict.Success | Should -BeTrue
+        # The success branch must be selected by the comparison, not by $PnpCode.
+        $Cond = [regex]::Match($Loop, 'if\s*\(\$null -ne \$FinalCmp -and \$FinalCmp -le 0\)')
+        $Cond.Success | Should -BeTrue
+    }
+
+    It 'Never lets an uncomparable pin quietly install without /f' {
+        # Installing a pinned DUP without /f is not the neutral choice: the DUP's
+        # own version check then declines the downgrade and exits 0, so the
+        # deployment reports success and the driver never moves. That was the
+        # observed failure. The uncomparable branch must force.
+        $Fn = $script:InstallFn.Extent.Text
+        $Fn | Should -Not -Match "installing without /f and letting the DUP decide"
+    }
+
+    It 'Narrows the marker skip to equality for a pinned row' {
+        # The ordinary ">= manifest version, skip" rule is backwards for a
+        # rollback: the marker holds the version being rolled back FROM, so it
+        # compares greater and would swallow the fix.
+        $script:DrvLoop.Extent.Text | Should -Match '\$SkipOnMarker'
+        $script:DrvLoop.Extent.Text | Should -Match 'AllowDowngrade'
+    }
+
+    It 'Never lets the component marker veto a pinned rollback' {
+        # The regression this guards shipped once: the pin block set
+        # $ForceDowngrade, and the marker check a few lines later skipped the DUP
+        # anyway. The marker key carries the DUP filename, which carries the
+        # version, so a pinned v31 DUP reads a v31 marker left over from an older
+        # install - equal to the manifest - and the rollback was swallowed. The
+        # run reported success and the driver never moved.
+        $Sets = @($script:DrvLoop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -eq '$SkipOnMarker'
+        }, $true))
+        @($Sets).Count | Should -BeGreaterThan 0
+
+        # Every assignment that can produce a skip must be reachable only when the
+        # row is unpinned, or when the live probe failed AND the marker itself was
+        # written by a previous pinned run.
+        foreach ($Set in $Sets) {
+            $Text = $Set.Right.Extent.Text
+            if ($Text -eq '$false') { continue }
+            $Node = $Set
+            $Guard = $null
+            while ($Node -and -not $Guard) {
+                $Node = $Node.Parent
+                if ($Node -is [System.Management.Automation.Language.IfStatementAst]) { $Guard = $Node }
+            }
+            $Guard | Should -Not -BeNullOrEmpty
+            $Conditions = ($Guard.Clauses | ForEach-Object { $_.Item1.Extent.Text }) -join ' '
+            $Conditions | Should -Match 'AllowDowngrade|LiveVersionKnown'
+        }
+
+        # And the blind path must consult the marker's own Pinned flag.
+        $script:DrvLoop.Extent.Text | Should -Match 'MarkerFromPinnedRun'
+        $script:DrvLoop.Extent.Text | Should -Match 'LiveVersionKnown'
+    }
+
+    It 'Routes a pinned package past the DCU engine' {
+        # dcu-cli only installs what it judges newer than the live device, so
+        # against a pinned catalog it reports "no applicable updates" and the run
+        # records success having installed nothing.
+        # Scoped to Install-DriverUpdates: Install-BIOSDCU calls the same engine
+        # and must keep calling it unchanged - BIOS packages are never pinned.
+        $Call = $script:InstallFn.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.GetCommandName() -eq 'Invoke-DCUDriverUpdates'
+        }, $true) | Select-Object -First 1
+        $Call | Should -Not -BeNullOrEmpty
+        $Call.Extent.Text | Should -Match 'SkipApply'
+    }
+
+    It 'Enumerates the live driver once up front, and re-reads only to verify a forced rollback' {
+        # Win32_PnPSignedDriver is a join across every PnP device and routinely
+        # takes tens of seconds. Per driver it would add minutes to every run,
+        # so the bulk enumeration stays ahead of the loop.
+        #
+        # The one permitted in-loop re-read is the post-install verification,
+        # which must be gated on $ForceDowngrade: at most one pinned rollback
+        # per component, against a device whose state just changed. An
+        # ungated call is the regression this guards - it would put the slow
+        # query back on every driver.
+        $script:InstallFn.Extent.Text | Should -Match 'Win32_PnPSignedDriver'
+
+        $CimCalls = @($script:DrvLoop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.GetCommandName() -eq 'Get-CimInstance'
+        }, $true) | Where-Object { $_.Extent.Text -match 'Win32_PnPSignedDriver|Win32_VideoController' })
+
+        foreach ($Cim in $CimCalls) {
+            # Walk every enclosing if, not just the nearest: the signed-driver
+            # re-read sits inside a category test nested in the pin guard.
+            $Node = $Cim
+            $Guards = [System.Collections.Generic.List[string]]::new()
+            while ($Node -and $Node -ne $script:DrvLoop) {
+                if ($Node -is [System.Management.Automation.Language.IfStatementAst]) {
+                    foreach ($Clause in $Node.Clauses) { $Guards.Add($Clause.Item1.Extent.Text) }
+                }
+                $Node = $Node.Parent
+            }
+            ($Guards -join ' ') | Should -Match 'ForceDowngrade' -Because "the in-loop CIM call '$($Cim.Extent.Text)' must run only for a forced rollback"
+        }
     }
 }
