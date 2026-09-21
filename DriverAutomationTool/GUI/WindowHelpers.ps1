@@ -556,6 +556,11 @@ function Select-DATKnownModelsInGrid {
         $RowMake  = $Row['Manufacturer']
         $RowModel = $Row['Model']
         $RowID    = $Row['SystemID']
+
+        if ([string]::IsNullOrWhiteSpace($RowModel) -or $RowModel.Trim() -eq '-') {
+            continue
+        }
+
         $IsKnown  = $false
 
         switch ($RowMake) {
@@ -696,3 +701,37 @@ function Update-DATPinGrid {
         $Table.Rows.Add($Row)
     }
 }
+
+function Set-DATPkgButtonsEnabled {
+    <#
+    .SYNOPSIS
+        Enables or disables all action buttons on the Package Management tab.
+    .DESCRIPTION
+        WPF event callbacks resolve commands from the runspace's global session state.
+        Defining this as a module-level helper in WindowHelpers ensures it is always
+        in scope across all WPF event handlers and timer ticks.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0, Mandatory = $true)]
+        [bool]$Enabled,
+
+        [Parameter(Position = 1, Mandatory = $false)]
+        [hashtable]$Controls
+    )
+
+    if (-not $Controls) {
+        $gui = Get-DATGui
+        if ($gui -and $gui.Controls) {
+            $Controls = $gui.Controls
+        }
+    }
+    if (-not $Controls) { return }
+
+    if ($Controls['PkgOptimizeStorageButton']) { $Controls['PkgOptimizeStorageButton'].IsEnabled = $Enabled }
+    if ($Controls['PkgCleanupOverlayButton'])  { $Controls['PkgCleanupOverlayButton'].IsEnabled  = $Enabled }
+    if ($Controls['PkgDeleteButton'])          { $Controls['PkgDeleteButton'].IsEnabled          = $Enabled }
+    if ($Controls['PkgRefreshButton'])         { $Controls['PkgRefreshButton'].IsEnabled         = $Enabled }
+    if ($Controls['PkgApplyButton'])           { $Controls['PkgApplyButton'].IsEnabled           = $Enabled }
+}
+

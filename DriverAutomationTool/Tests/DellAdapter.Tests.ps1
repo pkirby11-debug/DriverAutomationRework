@@ -1,4 +1,4 @@
-﻿BeforeAll {
+BeforeAll {
     $ModuleRoot = Split-Path $PSScriptRoot -Parent
 
     # Dot-source the files we need for testing
@@ -20,6 +20,10 @@
     New-Item -Path $script:CachePath -ItemType Directory -Force | Out-Null
     New-Item -Path $script:LogPath -ItemType Directory -Force | Out-Null
     New-Item -Path $script:SettingsPath -ItemType Directory -Force | Out-Null
+
+    if (Test-Path 'C:\ProgramData\DriverAutomationTool\Cache\Dell_DriverPackCatalog.xml') {
+        Copy-Item 'C:\ProgramData\DriverAutomationTool\Cache\Dell_DriverPackCatalog.*' $script:CachePath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Describe 'Get-DATOEMSources' {
@@ -112,6 +116,8 @@ Describe 'Get-DellDriverPack Windows 10 fallback' {
 </DriverPackManifest>
 '@ | Set-Content -Path $FixturePath -Encoding UTF8
 
+        $script:DellSystemIDModelMap = $null
+        Mock Get-DATCachedItem { $null }
         Mock Get-DATCachedItem { $FixturePath } -ParameterFilter { $Key -eq 'Dell_DriverPackCatalog.xml' }
     }
 
@@ -146,6 +152,51 @@ Describe 'Get-DellDriverPack Windows 10 fallback' {
 
     It 'Returns null when the model has no pack for any OS' {
         $Result = Get-DellDriverPack -Model 'Nonexistent 1234' -OperatingSystem 'Windows 11 24H2'
+        $Result | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Dell catalog anomaly handling (name="-")' {
+    BeforeAll {
+        $AnomalyFixturePath = Join-Path $TestDrive 'AnomalyDriverPackCatalog.xml'
+        @'
+<?xml version="1.0" encoding="utf-8"?>
+<DriverPackManifest version="1.0" baseLocation="downloads.dell.com">
+  <DriverPackage path="FOLDER1/MA14250-Win10-A06.exe" dellVersion="A06" dateTime="2026-09-08T01:20:27" hashMD5="aaa" size="100">
+    <SupportedSystems><Brand><Model Name="Dell Pro Max 14 Premium MA14250" SystemID="0D32" /></Brand></SupportedSystems>
+    <SupportedOperatingSystems><OperatingSystem osCode="Windows10" osArch="x64" /></SupportedOperatingSystems>
+  </DriverPackage>
+  <DriverPackage path="FOLDER2/MA14250-Win11-A06.exe" dellVersion="A06" dateTime="2026-09-08T01:20:27" hashMD5="bbb" size="100">
+    <SupportedSystems><Brand><Model Name="-" SystemID="0D32" /></Brand></SupportedSystems>
+    <SupportedOperatingSystems><OperatingSystem osCode="Windows11" osArch="x64" /></SupportedOperatingSystems>
+  </DriverPackage>
+</DriverPackManifest>
+'@ | Set-Content -Path $AnomalyFixturePath -Encoding UTF8
+
+        $script:DellSystemIDModelMap = $null
+        Mock Get-DATCachedItem { $null }
+        Mock Get-DATCachedItem { $AnomalyFixturePath } -ParameterFilter { $Key -eq 'Dell_DriverPackCatalog.xml' }
+    }
+
+    It 'Repairs anomalous model names and never exposes "-" in model list' {
+        $Models = Get-DellModelList
+        $DashModels = $Models | Where-Object { $_.Model -eq '-' }
+        $DashModels.Count | Should -Be 0
+
+        $Repaired = $Models | Where-Object { $_.SystemID -eq '0D32' }
+        $Repaired | Should -Not -BeNullOrEmpty
+        $Repaired.Model | Should -Be 'Dell Pro Max 14 Premium MA14250'
+    }
+
+    It 'Resolves the native Windows 11 driver pack despite Dell setting name="-" in catalog' {
+        $Result = Get-DellDriverPack -Model 'Dell Pro Max 14 Premium MA14250' -OperatingSystem 'Windows 11 24H2'
+        $Result | Should -Not -BeNullOrEmpty
+        $Result.FileName | Should -Be 'MA14250-Win11-A06.exe'
+        $Result.OSFallback | Should -BeNullOrEmpty
+    }
+
+    It 'Guards against whole-catalog wildcard expansion when model is "-"' {
+        $Result = Get-DellAllModelSystemIDs -Model '-'
         $Result | Should -BeNullOrEmpty
     }
 }

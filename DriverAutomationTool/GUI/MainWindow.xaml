@@ -1,4 +1,4 @@
-﻿<Window
+<Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:sys="clr-namespace:System;assembly=mscorlib"
@@ -469,7 +469,9 @@
                             </ComboBox>
                             <Button x:Name="PkgDeleteButton" Content="Remove Selected" Style="{StaticResource StandardButton}" Width="142" Margin="0,0,8,0" Foreground="#FFE74C3C" />
                             <CheckBox x:Name="PkgIncludeDriverPkgsCheckBox" Content="Include Driver Packages" Margin="0,0,16,0" />
-                            <Button x:Name="PkgCleanupOverlayButton" Content="Cleanup Overlay TS Packages..." Style="{StaticResource StandardButton}" Width="238" Foreground="#FFE74C3C" />
+                            <Button x:Name="PkgCleanupOverlayButton" Content="Cleanup Overlay TS Packages..." Style="{StaticResource StandardButton}" Width="238" Margin="0,0,8,0" Foreground="#FFE74C3C" />
+                            <Button x:Name="PkgOptimizeStorageButton" Content="Optimize Storage..." Style="{StaticResource StandardButton}" Width="150"
+                                    ToolTip="Scan package sources for duplicate binaries across models and convert them to zero-copy hardlinks to reclaim NAS storage." />
                         </WrapPanel>
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
                             <Label Content="Action:" Width="55" />

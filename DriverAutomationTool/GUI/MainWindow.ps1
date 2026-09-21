@@ -1,4 +1,4 @@
-﻿# GUI MainWindow (WPF) - layout loader + event handlers.
+# GUI MainWindow (WPF) - layout loader + event handlers.
 # New-DATMainWindow loads the XAML and returns the $Controls hashtable;
 # Initialize-DATMainWindow wires every event. Show-DATMainWindow is the entry
 # point used by Start-DATGui.
@@ -980,6 +980,7 @@ function Initialize-DATMainWindow {
         $Controls['PkgDeleteButton'].IsEnabled  = $false
         $Controls['PkgRefreshButton'].IsEnabled = $false
         $Controls['PkgApplyButton'].IsEnabled   = $false
+        if ($Controls['PkgOptimizeStorageButton']) { $Controls['PkgOptimizeStorageButton'].IsEnabled = $false }
         $Controls['StatusStripLabel'].Text      = "Removing $($PackagesToRemove.Count) package(s)..."
 
         $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
@@ -1011,6 +1012,7 @@ function Initialize-DATMainWindow {
             $Controls['PkgDeleteButton'].IsEnabled  = $true
             $Controls['PkgRefreshButton'].IsEnabled = $true
             $Controls['PkgApplyButton'].IsEnabled   = $true
+            if ($Controls['PkgOptimizeStorageButton']) { $Controls['PkgOptimizeStorageButton'].IsEnabled = $true }
 
             try {
                 $Results   = $G.DeleteRunspace.EndInvoke($G.DeleteHandle)
@@ -1047,6 +1049,7 @@ function Initialize-DATMainWindow {
                 $Controls['PkgDeleteButton'].IsEnabled  = $true
                 $Controls['PkgRefreshButton'].IsEnabled = $true
                 $Controls['PkgApplyButton'].IsEnabled   = $true
+                if ($Controls['PkgOptimizeStorageButton']) { $Controls['PkgOptimizeStorageButton'].IsEnabled = $true }
             }
         })
 
@@ -1072,6 +1075,7 @@ function Initialize-DATMainWindow {
         $Controls['PkgDeleteButton'].IsEnabled         = $false
         $Controls['PkgRefreshButton'].IsEnabled        = $false
         $Controls['PkgApplyButton'].IsEnabled          = $false
+        if ($Controls['PkgOptimizeStorageButton'])     { $Controls['PkgOptimizeStorageButton'].IsEnabled = $false }
         $Controls['StatusStripLabel'].Text = 'Scanning for legacy overlay TS packages...'
 
         $G.LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
@@ -1103,6 +1107,7 @@ function Initialize-DATMainWindow {
                 $Controls['PkgDeleteButton'].IsEnabled         = $true
                 $Controls['PkgRefreshButton'].IsEnabled        = $true
                 $Controls['PkgApplyButton'].IsEnabled          = $true
+                if ($Controls['PkgOptimizeStorageButton'])     { $Controls['PkgOptimizeStorageButton'].IsEnabled = $true }
             }
 
             try {
@@ -1215,6 +1220,279 @@ function Initialize-DATMainWindow {
             }
         })
         $G.OverlayDiscoveryTimer.Start()
+    })
+
+    # --- Package Management - Optimize Storage --------------------------------
+    # Two-phase:
+    # Phase 1: Analysis / Discovery (Optimize-DATPackageStorage without -Force).
+    # Prompts confirmation showing duplicate files and potential GB reclaimed.
+    # Phase 2: In-place optimization (Optimize-DATPackageStorage -Force).
+    # Replaces duplicate files with zero-copy hardlinks and restores timestamps.
+    $Controls['PkgOptimizeStorageButton'].Add_Click({
+        $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+
+        # Determine target package path and target directories
+        $PkgRoot = $Controls['PackagePathInput'].Text
+        if ([string]::IsNullOrWhiteSpace($PkgRoot)) {
+            $Config = Get-DATConfig
+            if ($Config.paths -and $Config.paths.package) {
+                $PkgRoot = $Config.paths.package
+            }
+        }
+
+        Complete-DATGridEdit $Controls['PkgGrid']
+        $SelectedRows = @(Get-DATGridSelectedRows -Table $Controls['PkgGridData'])
+        $TargetPaths = [System.Collections.Generic.List[string]]::new()
+
+        if ($SelectedRows.Count -gt 0) {
+            foreach ($Row in $SelectedRows) {
+                $Src = $Row['SourcePath']
+                if (-not [string]::IsNullOrWhiteSpace($Src) -and (Test-Path -LiteralPath $Src -PathType Container)) {
+                    $TargetPaths.Add($Src)
+                }
+            }
+        }
+
+        # If PkgRoot is not set, try deriving it from selected paths or prompt user
+        if ([string]::IsNullOrWhiteSpace($PkgRoot)) {
+            if ($TargetPaths.Count -gt 0) {
+                $First = $TargetPaths[0]
+                $Parent = [System.IO.Path]::GetDirectoryName($First)
+                $GrandParent = [System.IO.Path]::GetDirectoryName($Parent)
+                $PkgRoot = if ($GrandParent -and (Test-Path -LiteralPath $GrandParent)) { $GrandParent } else { $Parent }
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($PkgRoot) -or -not (Test-Path -LiteralPath $PkgRoot)) {
+            $PromptPath = Show-DATFolderDialog -Description 'Select Package Share Root to Optimize'
+            if ([string]::IsNullOrWhiteSpace($PromptPath) -or -not (Test-Path -LiteralPath $PromptPath)) {
+                Show-DATWindowMessage -Message 'Package storage path is required for optimization.' -Type Warning
+                return
+            }
+            $PkgRoot = $PromptPath
+            $Controls['PackagePathInput'].Text = $PkgRoot
+        }
+
+        $TargetDesc = if ($TargetPaths.Count -gt 0) {
+            "$($TargetPaths.Count) selected package folder(s)"
+        } else {
+            "all packages under '$PkgRoot'"
+        }
+
+        $ConfirmScan = Show-DATWindowMessage `
+            -Message "Scan package storage for duplicate binaries and calculate potential storage savings?`n`nTarget: $TargetDesc`nRoot: $PkgRoot" `
+            -Type Question
+        if ($ConfirmScan -ne 'Yes') { return }
+
+        Set-DATPkgButtonsEnabled $false
+        $Controls['StatusStripLabel'].Text = 'Analyzing package storage for duplicate files...'
+
+        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+        if (-not $ModulePath) { $ModulePath = $script:ModuleRoot }
+        if (-not $ModulePath) { $ModulePath = Split-Path $PSScriptRoot -Parent }
+        if (-not $ModulePath) { $ModulePath = 'C:\DriverAutomationTool' }
+
+        $G.OptModulePath  = $ModulePath
+        $G.OptPkgRoot     = $PkgRoot
+        $G.OptTargetPaths = @($TargetPaths)
+        $G.LogQueue       = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+        $OptAnalysisScript = {
+            param($ModulePath, $PkgRoot, $TargetPathsArray, $LogQueue)
+            if (-not $ModulePath) {
+                $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+                if (-not $ModulePath) { $ModulePath = 'C:\DriverAutomationTool' }
+            }
+            Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+            Register-DATQueueLogSubscriber -LogQueue $LogQueue
+            $Params = @{ PackagePath = $PkgRoot }
+            if ($TargetPathsArray -and $TargetPathsArray.Count -gt 0) {
+                $Params['TargetPaths'] = $TargetPathsArray
+            }
+            return (Optimize-DATPackageStorage @Params)
+        }
+
+        $G.OptAnalysisRunspace = [System.Management.Automation.PowerShell]::Create()
+        $G.OptAnalysisRunspace.AddScript($OptAnalysisScript).
+            AddArgument($ModulePath).AddArgument($PkgRoot).AddArgument(@($TargetPaths)).AddArgument($G.LogQueue) | Out-Null
+        $G.OptAnalysisHandle = $G.OptAnalysisRunspace.BeginInvoke()
+
+        if ($G.OptAnalysisTimer) { $G.OptAnalysisTimer.Stop() }
+        $G.OptAnalysisTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $G.OptAnalysisTimer.Interval = [timespan]::FromMilliseconds(500)
+        $G.OptAnalysisTimer.Add_Tick({
+            $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+            Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
+
+            if ($null -eq $G.OptAnalysisHandle -or -not $G.OptAnalysisHandle.IsCompleted) { return }
+            $G.OptAnalysisTimer.Stop()
+
+            try {
+                $RsErrors = @($G.OptAnalysisRunspace.Streams.Error)
+                if ($RsErrors.Count -gt 0) {
+                    $ErrorDetails = ($RsErrors | ForEach-Object { $_.ToString() }) -join "`n"
+                    Write-DATLog -Message "Storage analysis error: $ErrorDetails" -Severity 3
+                    $Controls['StatusStripLabel'].Text = 'Storage analysis failed'
+                    Show-DATWindowMessage -Message "Storage analysis encountered an error:`n`n$ErrorDetails" -Type Error
+                    $G.OptModulePath  = $null
+                    $G.OptPkgRoot     = $null
+                    $G.OptTargetPaths = $null
+                    Set-DATPkgButtonsEnabled $true
+                    return
+                }
+
+                $Results = @($G.OptAnalysisRunspace.EndInvoke($G.OptAnalysisHandle))
+                $Report = if ($Results.Count -gt 0) { $Results[0] } else { $null }
+
+                if ($null -eq $Report) {
+                    $Controls['StatusStripLabel'].Text = 'Storage analysis returned no results'
+                    Show-DATWindowMessage -Message 'Storage analysis returned no data. Check the log for details.' -Type Warning
+                    $G.OptModulePath  = $null
+                    $G.OptPkgRoot     = $null
+                    $G.OptTargetPaths = $null
+                    Set-DATPkgButtonsEnabled $true
+                    return
+                }
+
+                if ($Report.DuplicateFiles -eq 0) {
+                    $G.OptModulePath  = $null
+                    $G.OptPkgRoot     = $null
+                    $G.OptTargetPaths = $null
+                    Set-DATPkgButtonsEnabled $true
+                    $Controls['StatusStripLabel'].Text = 'Storage analysis complete - no duplicate files found.'
+                    Show-DATWindowMessage -Message "Storage analysis complete.`n`nFiles Scanned: $($Report.TotalFilesScanned) ($($Report.TotalScannedMB) MB)`nDuplicate Files: 0`n`nNo duplicate files found across the scanned packages. Storage is already optimal!" -Type Information
+                    return
+                }
+
+                $Msg = "Storage Optimization Analysis:`n`n" +
+                       "Files Scanned:       $($Report.TotalFilesScanned) ($($Report.TotalScannedMB) MB)`n" +
+                       "Duplicate Binaries:  $($Report.DuplicateFiles)`n" +
+                       "Already Hardlinked:  $($Report.AlreadyHardLinkedFiles)`n" +
+                       "Reclaimable Space:   $($Report.PotentialSavingsMB) MB ($($Report.PotentialSavingsGB) GB / $($Report.PotentialSavingsPercent)%)`n`n" +
+                       "Would you like to replace duplicate files with zero-copy hardlinks now?`n`n" +
+                       "Original file timestamps and attributes will be preserved so ConfigMgr package content will not be modified."
+
+                $Proceed = Show-DATWindowMessage -Message $Msg -Type Question
+                if ($Proceed -ne 'Yes') {
+                    $G.OptModulePath  = $null
+                    $G.OptPkgRoot     = $null
+                    $G.OptTargetPaths = $null
+                    Set-DATPkgButtonsEnabled $true
+                    $Controls['StatusStripLabel'].Text = "Storage optimization cancelled ($($Report.DuplicateFiles) duplicates found)."
+                    return
+                }
+
+                $Controls['StatusStripLabel'].Text = "Optimizing storage (replacing $($Report.DuplicateFiles) duplicates with hardlinks)..."
+
+                $OptExecScript = {
+                    param($ModulePath, $PkgRoot, $TargetPathsArray, $LogQueue, $CandidateDuplicates)
+                    if (-not $ModulePath) {
+                        $ModulePath = (Get-Module DriverAutomationTool).ModuleBase
+                        if (-not $ModulePath) { $ModulePath = 'C:\DriverAutomationTool' }
+                    }
+                    Import-Module (Join-Path $ModulePath 'DriverAutomationTool.psd1') -Force
+                    Register-DATQueueLogSubscriber -LogQueue $LogQueue
+                    $Params = @{ PackagePath = $PkgRoot; Force = $true; Confirm = $false }
+                    if ($TargetPathsArray -and $TargetPathsArray.Count -gt 0) {
+                        $Params['TargetPaths'] = $TargetPathsArray
+                    }
+                    if ($CandidateDuplicates -and $CandidateDuplicates.Count -gt 0) {
+                        $Params['DuplicateCandidates'] = $CandidateDuplicates
+                    }
+                    return (Optimize-DATPackageStorage @Params)
+                }
+
+                $ExecModulePath  = $G.OptModulePath
+                if (-not $ExecModulePath) {
+                    $ExecModulePath = (Get-Module DriverAutomationTool).ModuleBase
+                    if (-not $ExecModulePath) { $ExecModulePath = Split-Path $PSScriptRoot -Parent }
+                    if (-not $ExecModulePath) { $ExecModulePath = 'C:\DriverAutomationTool' }
+                }
+                $ExecPkgRoot     = $G.OptPkgRoot
+                $ExecTargetPaths = $G.OptTargetPaths
+
+                $G.OptExecRunspace = [System.Management.Automation.PowerShell]::Create()
+                $G.OptExecRunspace.AddScript($OptExecScript).
+                    AddArgument($ExecModulePath).
+                    AddArgument($ExecPkgRoot).
+                    AddArgument(@($ExecTargetPaths)).
+                    AddArgument($G.LogQueue).
+                    AddArgument(@($Report.CandidateDuplicates)) | Out-Null
+                $G.OptExecHandle = $G.OptExecRunspace.BeginInvoke()
+
+                if ($G.OptExecTimer) { $G.OptExecTimer.Stop() }
+                $G.OptExecTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $G.OptExecTimer.Interval = [timespan]::FromMilliseconds(500)
+                $G.OptExecTimer.Add_Tick({
+                    $gui = Get-DATGui; $Controls = $gui.Controls; $G = $gui.G
+                    Update-DATLogListFromQueue -ListBox $Controls['LogListBox'] -Queue $G.LogQueue
+
+                    if ($null -eq $G.OptExecHandle -or -not $G.OptExecHandle.IsCompleted) { return }
+                    $G.OptExecTimer.Stop()
+
+                    try {
+                        $RsErrors = @($G.OptExecRunspace.Streams.Error)
+                        if ($RsErrors.Count -gt 0) {
+                            $ErrorDetails = ($RsErrors | ForEach-Object { $_.ToString() }) -join "`n"
+                            Write-DATLog -Message "Storage optimization execution error: $ErrorDetails" -Severity 3
+                            $Controls['StatusStripLabel'].Text = 'Storage optimization failed'
+                            Show-DATWindowMessage -Message "Storage optimization failed:`n`n$ErrorDetails" -Type Error
+                            Set-DATPkgButtonsEnabled $true
+                            return
+                        }
+
+                        $Results = @($G.OptExecRunspace.EndInvoke($G.OptExecHandle))
+                        $ExecResult = if ($Results.Count -gt 0) { $Results[0] } else { $null }
+
+                        $OptCount  = if ($ExecResult) { $ExecResult.OptimizedFiles } else { 0 }
+                        $RecMB     = if ($ExecResult) { $ExecResult.ReclaimedMB } else { 0 }
+                        $RecGB     = if ($ExecResult) { $ExecResult.ReclaimedGB } else { 0 }
+                        $FailCount = if ($ExecResult) { $ExecResult.FailedFiles } else { 0 }
+
+                        if ($FailCount -eq 0) {
+                            $Controls['StatusStripLabel'].Text = "Storage optimization complete - reclaimed $RecMB MB ($RecGB GB)."
+                            Show-DATWindowMessage -Message "Storage optimization completed successfully!`n`nFiles Converted: $OptCount`nStorage Reclaimed: $RecMB MB ($RecGB GB)`n`nAll packages remain 100% intact with original timestamps preserved." -Type Information
+                        } else {
+                            $Controls['StatusStripLabel'].Text = "Storage optimization finished with $FailCount failure(s)."
+                            Show-DATWindowMessage -Message "Storage optimization finished with errors.`n`nConverted: $OptCount`nReclaimed: $RecMB MB`nFailed: $FailCount`n`nCheck the Progress Log for details." -Type Warning
+                        }
+                    } catch {
+                        $Controls['StatusStripLabel'].Text = 'Storage optimization execution failed'
+                        Show-DATWindowMessage -Message "Storage optimization failed: $($_.Exception.Message)" -Type Error
+                    } finally {
+                        if ($G.OptExecRunspace) {
+                            try { $G.OptExecRunspace.Dispose() } catch {
+                                [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+                            }
+                            $G.OptExecRunspace = $null
+                        }
+                        $G.OptExecHandle  = $null
+                        $G.OptModulePath  = $null
+                        $G.OptPkgRoot     = $null
+                        $G.OptTargetPaths = $null
+                        Set-DATPkgButtonsEnabled $true
+                    }
+                })
+
+                $G.OptExecTimer.Start()
+            } catch {
+                $Controls['StatusStripLabel'].Text = 'Storage analysis failed'
+                Show-DATWindowMessage -Message "Storage analysis failed: $($_.Exception.Message)" -Type Error
+            } finally {
+                if ($G.OptAnalysisRunspace) {
+                    try { $G.OptAnalysisRunspace.Dispose() } catch {
+                        [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+                    }
+                    $G.OptAnalysisRunspace = $null
+                }
+                $G.OptAnalysisHandle = $null
+                if (-not $G.OptExecHandle) {
+                    Set-DATPkgButtonsEnabled $true
+                }
+            }
+        })
+
+        $G.OptAnalysisTimer.Start()
     })
 
     # --- Package Management - Apply Action ---

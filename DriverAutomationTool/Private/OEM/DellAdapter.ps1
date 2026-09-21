@@ -1,4 +1,4 @@
-﻿# Dell OEM Adapter
+# Dell OEM Adapter
 # Handles Dell DriverPackCatalog.cab for driver packs, CatalogIndexPC.cab chain for
 # per-model individual driver lookup, and CatalogPC.cab as legacy fallback/BIOS updates.
 
@@ -35,7 +35,7 @@ function Update-DellCatalogCache {
             $XmlFile = $ExtractedFiles | Where-Object { $_ -like '*.xml' } | Select-Object -First 1
 
             if ($XmlFile) {
-                Set-DATCachedItem -Key $DriverCacheKey -SourcePath $XmlFile -SourceUrl $DellSources.driverPackCatalog
+                $null = Set-DATCachedItem -Key $DriverCacheKey -SourcePath $XmlFile -SourceUrl $DellSources.driverPackCatalog
                 Write-DATLog -Message "Dell DriverPackCatalog cached successfully" -Severity 1
             } else {
                 $CabFileInfo = Get-Item $CabPath -ErrorAction SilentlyContinue
@@ -64,7 +64,7 @@ function Update-DellCatalogCache {
             $XmlFile = $ExtractedFiles | Where-Object { $_ -like '*.xml' } | Select-Object -First 1
 
             if ($XmlFile) {
-                Set-DATCachedItem -Key $BiosCacheKey -SourcePath $XmlFile -SourceUrl $DellSources.biosCatalog
+                $null = Set-DATCachedItem -Key $BiosCacheKey -SourcePath $XmlFile -SourceUrl $DellSources.biosCatalog
                 Write-DATLog -Message "Dell CatalogPC (BIOS) cached successfully" -Severity 1
             } else {
                 $CabFileInfo = Get-Item $CabPath -ErrorAction SilentlyContinue
@@ -246,6 +246,75 @@ function Update-DellModelCatalog {
     return @($CachedPaths)
 }
 
+function Get-DellSystemIDModelMap {
+    <#
+    .SYNOPSIS
+        Builds a SystemID -> Canonical Model Name map to repair anomalous or missing
+        model names (such as Dell's 2026 releases where Win11 packages were published
+        with Model name="-").
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Xml
+    )
+
+    if ($script:DellSystemIDModelMap) {
+        return $script:DellSystemIDModelMap
+    }
+
+    $Map = @{}
+
+    # 1. Populate from valid model names across all driver packages in DriverPackCatalog
+    if ($Xml.DriverPackManifest.DriverPackage) {
+        foreach ($dp in $Xml.DriverPackManifest.DriverPackage) {
+            $mNames = @($dp.SupportedSystems.Brand.Model.Name)
+            $sIDs   = @($dp.SupportedSystems.Brand.Model.SystemID)
+            for ($i = 0; $i -lt [math]::Min($mNames.Count, $sIDs.Count); $i++) {
+                $nm = $mNames[$i]
+                $id = $sIDs[$i]
+                if ($nm -and $nm.Trim() -ne '-' -and $id) {
+                    foreach ($singleId in ($id -split '[;\s]+')) {
+                        $cleanId = $singleId.Trim().ToUpperInvariant()
+                        if ($cleanId -and -not $Map.ContainsKey($cleanId)) {
+                            $Map[$cleanId] = $nm.Trim()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    # 2. Enrich from CatalogIndexPC.xml if cached
+    $IndexCacheKey = 'Dell_CatalogIndexPC.xml'
+    $CachedIndex = Get-DATCachedItem -Key $IndexCacheKey
+    if ($CachedIndex -and (Test-Path -LiteralPath $CachedIndex)) {
+        try {
+            $IndexXml = Read-DATXml -Path $CachedIndex
+            foreach ($gm in $IndexXml.ManifestIndex.GroupManifest) {
+                foreach ($b in @($gm.SupportedSystems.Brand)) {
+                    foreach ($m in @($b.Model)) {
+                        $mName = if ($m.Display.InnerText) { $m.Display.InnerText.Trim() }
+                                 elseif ($m.Display) { $m.Display.Trim() }
+                                 else { '' }
+                        $sId = if ($m.systemID) { $m.systemID.ToString().Trim().ToUpperInvariant() }
+                               elseif ($m.SystemID) { $m.SystemID.ToString().Trim().ToUpperInvariant() }
+                               else { '' }
+                        if ($sId -and $mName -and $mName -ne '-' -and -not $Map.ContainsKey($sId)) {
+                            $Map[$sId] = $mName
+                        }
+                    }
+                }
+            }
+        } catch {
+            Write-Verbose "Could not enrich SystemID map from CatalogIndexPC: $($_.Exception.Message)"
+        }
+    }
+
+    $script:DellSystemIDModelMap = $Map
+    return $Map
+}
+
 function Get-DellModelList {
     <#
     .SYNOPSIS
@@ -258,7 +327,7 @@ function Get-DellModelList {
 
     $CatalogPath = Get-DATCachedItem -Key 'Dell_DriverPackCatalog.xml'
     if (-not $CatalogPath) {
-        Update-DellCatalogCache
+        $null = Update-DellCatalogCache
         $CatalogPath = Get-DATCachedItem -Key 'Dell_DriverPackCatalog.xml'
     }
 
@@ -269,6 +338,7 @@ function Get-DellModelList {
     $Xml = Read-DATXml -Path $CatalogPath
     $Models = [System.Collections.Generic.List[PSCustomObject]]::new()
     $Seen = [System.Collections.Generic.HashSet[string]]::new()
+    $SysMap = Get-DellSystemIDModelMap -Xml $Xml
 
     foreach ($DriverPack in $Xml.DriverPackManifest.DriverPackage) {
         $ModelName = $DriverPack.SupportedSystems.Brand.Model.Name
@@ -281,6 +351,20 @@ function Get-DellModelList {
         if ($ModelName -is [array]) {
             for ($i = 0; $i -lt $ModelName.Count; $i++) {
                 $Name = $ModelName[$i]
+                if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Trim() -eq '-') {
+                    $sId = if ($SystemIDs -is [array]) { $SystemIDs[$i] } else { $SystemIDs }
+                    if ($sId) {
+                        foreach ($singleId in ($sId -split '[;\s]+')) {
+                            $cleanId = $singleId.Trim().ToUpperInvariant()
+                            if ($cleanId -and $SysMap.ContainsKey($cleanId)) {
+                                $Name = $SysMap[$cleanId]
+                                break
+                            }
+                        }
+                    }
+                }
+                if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Trim() -eq '-') { continue }
+
                 if (-not $Seen.Contains($Name)) {
                     $Seen.Add($Name) | Out-Null
                     # Check model name + download path for CPU platform hints
@@ -297,19 +381,34 @@ function Get-DellModelList {
                     })
                 }
             }
-        } elseif ($ModelName -and -not $Seen.Contains($ModelName)) {
-            $Seen.Add($ModelName) | Out-Null
-            $AllHints = "$ModelName $PackPath"
-            $Plat = if ($AllHints -match '\bAMD\b') { 'AMD' }
-                    elseif ($AllHints -match '\bIntel\b') { 'Intel' }
-                    elseif ($AllHints -match '\bQualcomm\b|\bSnapdragon\b') { 'Qualcomm' }
-                    else { '' }
-            $Models.Add([PSCustomObject]@{
-                Manufacturer = 'Dell'
-                Model        = $ModelName
-                SystemID     = $SystemIDs
-                Platform     = $Plat
-            })
+        } else {
+            if ([string]::IsNullOrWhiteSpace($ModelName) -or $ModelName.Trim() -eq '-') {
+                if ($SystemIDs) {
+                    foreach ($singleId in ($SystemIDs -split '[;\s]+')) {
+                        $cleanId = $singleId.Trim().ToUpperInvariant()
+                        if ($cleanId -and $SysMap.ContainsKey($cleanId)) {
+                            $ModelName = $SysMap[$cleanId]
+                            break
+                        }
+                    }
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace($ModelName) -or $ModelName.Trim() -eq '-') { continue }
+
+            if (-not $Seen.Contains($ModelName)) {
+                $Seen.Add($ModelName) | Out-Null
+                $AllHints = "$ModelName $PackPath"
+                $Plat = if ($AllHints -match '\bAMD\b') { 'AMD' }
+                        elseif ($AllHints -match '\bIntel\b') { 'Intel' }
+                        elseif ($AllHints -match '\bQualcomm\b|\bSnapdragon\b') { 'Qualcomm' }
+                        else { '' }
+                $Models.Add([PSCustomObject]@{
+                    Manufacturer = 'Dell'
+                    Model        = $ModelName
+                    SystemID     = $SystemIDs
+                    Platform     = $Plat
+                })
+            }
         }
     }
 
@@ -338,6 +437,10 @@ function Get-DellAllModelSystemIDs {
         }
     }
 
+    if ([string]::IsNullOrWhiteSpace($Model) -or $Model.Trim() -eq '-') {
+        return (@($SystemIDSet) -join ';')
+    }
+
     try {
         $IndexCacheKey = 'Dell_CatalogIndexPC.xml'
         $CachedIndex = Get-DATCachedItem -Key $IndexCacheKey
@@ -349,6 +452,12 @@ function Get-DellAllModelSystemIDs {
             $IndexXml = Read-DATXml -Path $CachedIndex
             $ModelTokens = @($Model)
             if ($Model -match '(\d{4})') { $ModelTokens += $Matches[1] }
+            $SanitizedTokens = @($ModelTokens | Where-Object {
+                $_ -and $_.Trim().Length -ge 2 -and $_.Trim() -notmatch '^[\s\-_]+$'
+            })
+            if ($SanitizedTokens.Count -eq 0) {
+                return (@($SystemIDSet) -join ';')
+            }
 
             foreach ($GroupManifest in $IndexXml.ManifestIndex.GroupManifest) {
                 foreach ($B in @($GroupManifest.SupportedSystems.Brand)) {
@@ -356,8 +465,9 @@ function Get-DellAllModelSystemIDs {
                         $MName = if ($M.Display.InnerText) { $M.Display.InnerText } elseif ($M.Display) { $M.Display } else { '' }
                         $MSid  = if ($M.systemID) { $M.systemID.ToString() } elseif ($M.SystemID) { $M.SystemID.ToString() } else { '' }
                         if ($MSid) {
-                            foreach ($Tok in $ModelTokens) {
-                                if ($MName -and ($MName.Trim() -eq $Tok.Trim() -or $MName.Trim() -like "*$Tok*")) {
+                            foreach ($Tok in $SanitizedTokens) {
+                                $TrimmedTok = $Tok.Trim()
+                                if ($MName -and ($MName.Trim() -eq $TrimmedTok -or ($TrimmedTok.Length -ge 3 -and $MName.Trim() -like "*$TrimmedTok*"))) {
                                     $null = $SystemIDSet.Add($MSid.Trim().ToUpper())
                                     break
                                 }
@@ -415,6 +525,7 @@ function Get-DellDriverPack {
 
     $Xml = Read-DATXml -Path $CatalogPath
     $Sources = Get-DATOEMSources
+    $SysMap = Get-DellSystemIDModelMap -Xml $Xml
 
     # Map OS name to Dell's OS code format
     $OsCode = ConvertTo-DellOSCode -OperatingSystem $OperatingSystem
@@ -425,9 +536,29 @@ function Get-DellDriverPack {
         param([string]$Code)
         foreach ($DriverPack in $Xml.DriverPackManifest.DriverPackage) {
             $PackageModels = @($DriverPack.SupportedSystems.Brand.Model.Name)
+            $PackageSystemIDs = @($DriverPack.SupportedSystems.Brand.Model.SystemID)
             $PackageOS = $DriverPack.SupportedOperatingSystems.OperatingSystem
 
-            $ModelMatch = $PackageModels | Where-Object { $_ -eq $Model }
+            # Repair any anomalous ('-' or empty) model names from SystemID map
+            $ResolvedModels = [System.Collections.Generic.List[string]]::new()
+            for ($i = 0; $i -lt $PackageModels.Count; $i++) {
+                $pName = $PackageModels[$i]
+                if ([string]::IsNullOrWhiteSpace($pName) -or $pName.Trim() -eq '-') {
+                    $sId = if ($i -lt $PackageSystemIDs.Count) { $PackageSystemIDs[$i] } else { $PackageSystemIDs[0] }
+                    if ($sId) {
+                        foreach ($singleId in ($sId -split '[;\s]+')) {
+                            $cleanId = $singleId.Trim().ToUpperInvariant()
+                            if ($cleanId -and $SysMap.ContainsKey($cleanId)) {
+                                $pName = $SysMap[$cleanId]
+                                break
+                            }
+                        }
+                    }
+                }
+                if ($pName) { $ResolvedModels.Add($pName) }
+            }
+
+            $ModelMatch = $ResolvedModels | Where-Object { $_ -eq $Model }
 
             if ($ModelMatch) {
                 # Check OS match

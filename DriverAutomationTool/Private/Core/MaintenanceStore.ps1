@@ -309,6 +309,7 @@ function Get-DATOrphanedPackageSource {
     $Results = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     foreach ($Dir in @(Get-ChildItem -Path $PackagePath -Directory -Recurse -ErrorAction SilentlyContinue)) {
+        if ($Dir.FullName -split '[\\/]' -contains '_SharedPayloads') { continue }
         $Depth = @($Dir.FullName.TrimEnd('\', '/') -split '[\\/]').Count - $RootDepth
         if ($Depth -ne 4 -and $Depth -ne 5) { continue }
         if ($Depth -eq 5 -and @($Dir.FullName -split '[\\/]')[$RootDepth] -ne 'Test') { continue }

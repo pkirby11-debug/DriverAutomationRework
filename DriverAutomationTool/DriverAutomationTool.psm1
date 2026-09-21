@@ -11,6 +11,7 @@ $PrivatePaths = @(
     'Private\Core\CatalogParser.ps1'
     'Private\Core\DownloadManager.ps1'
     'Private\Core\MaintenanceStore.ps1'
+    'Private\Core\SharedPayloadStore.ps1'
     'Private\Core\VulnerableDriverScreen.ps1'
     'Private\OEM\DellAdapter.ps1'
     'Private\OEM\LenovoAdapter.ps1'

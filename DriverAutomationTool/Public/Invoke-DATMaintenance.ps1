@@ -68,6 +68,8 @@ function Invoke-DATMaintenance {
         CacheFreedMB     = 0
         OrphanedSources  = @()
         SourcesFreedMB   = 0
+        SharedPayloadsOrphaned = 0
+        SharedPayloadsFreedMB  = 0
         Deleted          = [bool]$Force
     }
 
@@ -162,15 +164,26 @@ function Invoke-DATMaintenance {
         } else {
             Write-DATLog -Message "Share: no orphaned source folders" -Severity 1
         }
+
+        # --- Shared payload store sweep --------------------------------------
+        $SharedSweep = Clear-DATOrphanedSharedPayloads -PackagePath $PackagePath -Force:$Force
+        $Report.SharedPayloadsOrphaned = $SharedSweep.OrphansFound
+        $Report.SharedPayloadsFreedMB  = $SharedSweep.FreedMB
+        if ($SharedSweep.OrphansFound -gt 0) {
+            Write-DATLog -Message "Shared store: $($SharedSweep.OrphansFound) unreferenced payload(s), $($SharedSweep.FreedMB) MB $(if ($Force) { 'reclaimed' } else { 'eligible for cleanup' })" -Severity 1
+        } else {
+            Write-DATLog -Message "Shared store: no unreferenced payloads found" -Severity 1
+        }
     }
 
-    $TotalMB = $Report.StagingFreedMB + $Report.LogsFreedMB + $Report.CacheFreedMB + $Report.SourcesFreedMB
+    $TotalMB = $Report.StagingFreedMB + $Report.LogsFreedMB + $Report.CacheFreedMB + $Report.SourcesFreedMB + $Report.SharedPayloadsFreedMB
     if ($Force) {
         Write-DATLog -Message "Maintenance complete - reclaimed $TotalMB MB" -Severity 1
     } else {
         $PendingMB = [math]::Round(
             ((($Report.StagingOrphans | Measure-Object SizeBytes -Sum).Sum) +
-             (($Report.OrphanedSources | Measure-Object SizeBytes -Sum).Sum)) / 1MB, 2)
+             (($Report.OrphanedSources | Measure-Object SizeBytes -Sum).Sum) +
+             ($Report.SharedPayloadsFreedMB * 1MB)) / 1MB, 2)
         Write-DATLog -Message "Maintenance report complete - $PendingMB MB reclaimable. Re-run with -Force to delete." -Severity 1
     }
 

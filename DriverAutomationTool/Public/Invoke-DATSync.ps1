@@ -1,4 +1,4 @@
-﻿function Invoke-DATSync {
+function Invoke-DATSync {
     <#
     .SYNOPSIS
         Main workflow: discovers, downloads, packages, and distributes driver packs and BIOS updates.
@@ -139,6 +139,7 @@
         [switch]$CleanUnusedDrivers,
         [switch]$CleanDownloads,
         [switch]$UpdateIndividualDrivers,
+        [bool]$EnableDeduplication = $true,
 
         [ValidateSet('ConfigMgr - Standard Pkg', 'ConfigMgr - Driver Pkg', 'ConfigMgr - Application', 'ConfigMgr - Standard Pkg (Test)', 'ConfigMgr - Driver Pkg (Test)', 'ConfigMgr - Application (Test)')]
         [string]$DeploymentPlatform = 'ConfigMgr - Standard Pkg',
@@ -192,6 +193,7 @@
     $StartTime = Get-Date
     $SyncResults = [System.Collections.Generic.List[PSCustomObject]]::new()
     $ErrorCount = 0
+    Reset-DATDeduplicationStats
 
     # Sweep staging directories stranded by earlier runs before staging anything
     # new. Remove-DATTempPath only runs in a finally block, so a crash, a killed
@@ -389,7 +391,8 @@
                             -VerifyDownloadHash:$VerifyDownloadHash `
                             -DistributionPoints $DistributionPoints `
                             -DistributionPointGroups $DistributionPointGroups `
-                            -ForceRefresh:$ForceRefresh
+                            -ForceRefresh:$ForceRefresh `
+                            -EnableDeduplication:$EnableDeduplication
 
                         $SyncResults.Add($DriverResult)
                     } else {
@@ -448,7 +451,8 @@
                                 -VerifyDownloadHash:$VerifyDownloadHash `
                                 -DistributionPoints $DistributionPoints `
                                 -DistributionPointGroups $DistributionPointGroups `
-                                -ForceRefresh:$ForceRefresh
+                                -ForceRefresh:$ForceRefresh `
+                                -EnableDeduplication:$EnableDeduplication
 
                             $SyncResults.Add($UpdResult)
                         }
@@ -497,7 +501,8 @@
                                 -VerifyDownloadHash:$VerifyDownloadHash `
                                 -DistributionPoints $DistributionPoints `
                                 -DistributionPointGroups $DistributionPointGroups `
-                                -ForceRefresh:$ForceRefresh
+                                -ForceRefresh:$ForceRefresh `
+                                -EnableDeduplication:$EnableDeduplication
 
                             $SyncResults.Add($UpdResult)
                         }
@@ -530,7 +535,8 @@
                             -BIOSPassword $BIOSPassword `
                             -DistributionPoints $DistributionPoints `
                             -DistributionPointGroups $DistributionPointGroups `
-                            -ForceRefresh:$ForceRefresh
+                            -ForceRefresh:$ForceRefresh `
+                            -EnableDeduplication:$EnableDeduplication
 
                         $SyncResults.Add($BiosResult)
                     } else {
@@ -566,7 +572,8 @@
                                 -BIOSPassword $BIOSPassword `
                                 -DistributionPoints $DistributionPoints `
                                 -DistributionPointGroups $DistributionPointGroups `
-                                -ForceRefresh:$ForceRefresh
+                                -ForceRefresh:$ForceRefresh `
+                                -EnableDeduplication:$EnableDeduplication
 
                             $SyncResults.Add($BiosDcuResult)
                         } else {
@@ -638,6 +645,9 @@
     Write-DATLog -Message "======== Sync Complete ========" -Severity 1
     Write-DATLog -Message "Duration: $([math]::Round($Duration.TotalMinutes, 1)) minutes" -Severity 1
     Write-DATLog -Message "Success: $SuccessCount | Skipped: $SkipCount | Nothing to package: $WarnCount | Errors: $ErrorCount" -Severity 1
+    if ($EnableDeduplication) {
+        Write-DATLog -Message (Get-DATDeduplicationSummary) -Severity 1
+    }
 
     # Send webhook notification
     if ($WebhookUrl) {
@@ -672,6 +682,7 @@ function Invoke-DATSyncSinglePackage {
         [switch]$CleanSource,
         [switch]$CompressPackage,
         [switch]$UpdateIndividualDrivers,
+        [bool]$EnableDeduplication = $true,
 
         [ValidateSet('ZIP', 'WIM')]
         [string]$CompressionType = 'ZIP',
@@ -1375,14 +1386,22 @@ function Invoke-DATSyncSinglePackage {
             $ExtractedCount = @(Get-ChildItem $PackageSourceDir -Recurse -File -ErrorAction SilentlyContinue).Count
             if ($ExtractedCount -eq 0) {
                 Write-DATLog -Message "Lenovo BIOS extraction produced no files - falling back to shipping the .exe (deployment script will need it pre-extracted)" -Severity 3
-                Copy-Item -Path $DownloadDest -Destination (Join-Path $PackageSourceDir $FileName) -Force
+                if ($EnableDeduplication) {
+                    $null = Save-DATSharedPayload -SourceFilePath $DownloadDest -DestinationPath (Join-Path $PackageSourceDir $FileName) -PackagePath $PackagePath -Manufacturer $Make
+                } else {
+                    Copy-Item -Path $DownloadDest -Destination (Join-Path $PackageSourceDir $FileName) -Force
+                }
             } else {
                 Write-DATLog -Message "Lenovo BIOS extracted: $ExtractedCount file(s) in $PackageSourceDir" -Severity 1
             }
         } else {
             # Dell BIOS .exe files are firmware update utilities, not self-extracting archives
             Write-DATLog -Message "Copying BIOS file $FileName to $PackageSourceDir" -Severity 1
-            Copy-Item -Path $DownloadDest -Destination (Join-Path $PackageSourceDir $FileName) -Force
+            if ($EnableDeduplication) {
+                $null = Save-DATSharedPayload -SourceFilePath $DownloadDest -DestinationPath (Join-Path $PackageSourceDir $FileName) -PackagePath $PackagePath -Manufacturer $Make
+            } else {
+                Copy-Item -Path $DownloadDest -Destination (Join-Path $PackageSourceDir $FileName) -Force
+            }
         }
 
         # For Dell BIOS: download Flash64W.exe utility (distributed as a ZIP archive)
@@ -1405,14 +1424,22 @@ function Invoke-DATSyncSinglePackage {
                         $FlashExe = Get-ChildItem -Path $FlashTempDir -Filter 'Flash64W.exe' -Recurse -File |
                             Select-Object -First 1
                         if ($FlashExe) {
-                            Copy-Item -Path $FlashExe.FullName -Destination (Join-Path $PackageSourceDir 'Flash64W.exe') -Force
+                            if ($EnableDeduplication) {
+                                $null = Save-DATSharedPayload -SourceFilePath $FlashExe.FullName -DestinationPath (Join-Path $PackageSourceDir 'Flash64W.exe') -PackagePath $PackagePath -Manufacturer 'Dell'
+                            } else {
+                                Copy-Item -Path $FlashExe.FullName -Destination (Join-Path $PackageSourceDir 'Flash64W.exe') -Force
+                            }
                             Write-DATLog -Message "Flash64W.exe extracted and copied to package source" -Severity 1
                         } else {
                             Write-DATLog -Message "Flash64W.exe not found inside $FlashZipName" -Severity 2
                         }
                     } else {
                         # Direct .exe fallback (if URL format changes in future)
-                        Copy-Item -Path $FlashZipDest -Destination (Join-Path $PackageSourceDir 'Flash64W.exe') -Force
+                        if ($EnableDeduplication) {
+                            $null = Save-DATSharedPayload -SourceFilePath $FlashZipDest -DestinationPath (Join-Path $PackageSourceDir 'Flash64W.exe') -PackagePath $PackagePath -Manufacturer 'Dell'
+                        } else {
+                            Copy-Item -Path $FlashZipDest -Destination (Join-Path $PackageSourceDir 'Flash64W.exe') -Force
+                        }
                         Write-DATLog -Message "Flash64W.exe downloaded to package source" -Severity 1
                     }
                 } catch {
@@ -1624,9 +1651,10 @@ function Invoke-DATSyncSinglePackage {
                     try {
                         Write-DATLog -Message "    Downloading: $($UpdFile.Name)" -Severity 1
                         $FileDest = Join-Path $PkgDir $UpdFile.Name
+                        $TargetDlPath = if ($EnableDeduplication) { Join-Path $DownloadPath $UpdFile.Name } else { $FileDest }
                         $DlParams = @{
                             Url             = $UpdFile.Url
-                            DestinationPath = $FileDest
+                            DestinationPath = $TargetDlPath
                             MaxRetries      = 2
                             TimeoutSeconds  = 600
                         }
@@ -1638,7 +1666,14 @@ function Invoke-DATSyncSinglePackage {
                         }
                         $DlPath = Invoke-DATDownload @DlParams
                         if (-not $DlPath) { throw 'download timed out' }
-                        Unblock-File -Path $FileDest -ErrorAction SilentlyContinue
+                        Unblock-File -Path $TargetDlPath -ErrorAction SilentlyContinue
+
+                        if ($EnableDeduplication) {
+                            $null = Save-DATSharedPayload -SourceFilePath $TargetDlPath -DestinationPath $FileDest -PackagePath $PackagePath -Manufacturer 'Lenovo' -ExpectedHash $UpdFile.CRC -HashAlgorithm 'SHA256'
+                            if ($CleanDownloads -and (Test-Path -LiteralPath $TargetDlPath)) {
+                                Remove-Item -LiteralPath $TargetDlPath -Force -ErrorAction SilentlyContinue
+                            }
+                        }
                     } catch {
                         Write-DATLog -Message "    WARNING: Download failed for $($UpdFile.Name): $($_.Exception.Message) - skipping package '$($Upd.Name)'" -Severity 2
                         $AllFilesOk = $false
@@ -2154,7 +2189,11 @@ function Invoke-DATSyncSinglePackage {
                                     }
 
                                     $StagedExe = Join-Path $PackageSourceDir $IndvDriver.FileName
-                                    Copy-Item -Path $DriverExePath -Destination $StagedExe -Force
+                                    if ($EnableDeduplication) {
+                                        $null = Save-DATSharedPayload -SourceFilePath $DriverExePath -DestinationPath $StagedExe -PackagePath $PackagePath -Manufacturer $Make
+                                    } else {
+                                        Copy-Item -Path $DriverExePath -Destination $StagedExe -Force
+                                    }
                                     $StagedSize = (Get-Item $StagedExe -ErrorAction SilentlyContinue).Length
                                     $ManifestEntries.Add([PSCustomObject]@{
                                         FileName    = $IndvDriver.FileName
@@ -2474,6 +2513,11 @@ function Invoke-DATSyncSinglePackage {
             }
         }
 
+        # Cross-model deduplication for standard driver packs
+        if ($EnableDeduplication -and $Type -eq 'Drivers') {
+            Invoke-DATDriverPackDeduplication -PackageSourceDir $PackageSourceDir -PackagePath $PackagePath -Manufacturer $Make
+        }
+
         # Compress driver package if requested (BIOS packages are never compressed,
         # and DriverUpdates/BIOSDCU skip it: DUPs are already vendor-compressed and
         # the apply script needs them as standalone .exe files, not WIM-mounted).
@@ -2698,6 +2742,9 @@ function Invoke-DATSyncSinglePackage {
         -DownloadUrl $DownloadUrl -DownloadTimeSec $StopWatch.Elapsed.TotalSeconds
 
     Write-DATLog -Message "Successfully synced $Type for $Make $ModelName v$Version (Package: $($PkgResult.PackageID))" -Severity 1
+    if ($EnableDeduplication) {
+        Write-DATLog -Message (Get-DATDeduplicationSummary) -Severity 1
+    }
 
     return [PSCustomObject]@{
         Manufacturer = $Make
