@@ -31,6 +31,7 @@ the sole update source).
 - [The Driver Updates (DCU) engine](#dcu-engine)
 - [Driver version pinning (rollback)](#pinning)
 - [Security features](#security)
+- [Shared payload pool (hard links)](#shared-payloads)
 - [The client apply script](#apply-script)
 - [Public cmdlets / automation](#cmdlets)
 - [Logging & diagnostics](#logging)
@@ -150,6 +151,10 @@ Inventory and clean up existing DAT-built ConfigMgr objects:
 - **Grid** of existing packages (ID, name, version, manufacturer, type, source path).
 - **Delete** selected packages, or **Clean up overlay packages** (removes superseded
   overlay revisions).
+- **Optimize Storage…** — scans the package share for identical binaries across models
+  and, after a confirmation showing what it found, replaces the duplicates with hard links
+  to one pooled copy under `<PackagePath>\_SharedPayloads`. See
+  [Shared payload pool](#shared-payloads).
 
 <a name="tab-driver-pins"></a>
 ### Driver Pins
@@ -533,6 +538,37 @@ by the deployment type's `BasedOnExitCode` behavior.
 
 ---
 
+<a name="shared-payloads"></a>
+## Shared payload pool (hard links)
+
+Since 2.46 a sync stores each payload it stages (Dell DUPs, BIOS utilities, Flash64W,
+Lenovo update packages, and the files of an extracted driver pack) once under
+`<PackagePath>\_SharedPayloads\<Make>\<sha256>\`, and puts a hard link to that copy in the
+model's package directory. Packages that carry the same bytes share one copy on disk, and a
+payload already in the pool is not uploaded from the admin host again. ConfigMgr never sees
+the pool: it sits beside the `<Make>` folders, outside every package source path.
+
+- **It is on by default.** `Invoke-DATSync -EnableDeduplication:$false` stages plain copies
+  and leaves the pool alone. There is no GUI toggle yet.
+- **Compressed driver packs are not pooled.** The extracted tree is deleted after the
+  WIM/ZIP is built, so pooling it would only strand an uncompressed copy.
+- **Existing packages** are pooled retroactively by `Optimize-DATPackageStorage` (or the
+  Package Management tab's *Optimize Storage…* button). Analysis mode reports; `-Force`
+  replaces; `-Force -WhatIf` lists what would be replaced. Each file is swapped by a temp
+  link plus one rename, and re-checked first, so a crash or a concurrent sync cannot leave
+  a package short a file or holding an older one.
+- **Never write in place into a package directory.** A hard link shares one file record, so
+  `Copy-Item -Force` over a linked file changes every package sharing it. DAT's own control
+  files (`Invoke-DATApply.ps1`, `manifest.json`, `*.json`, `*.xml`, `*.ps1`) are excluded
+  from pooling for this reason, and the apply script is unlinked before it is re-staged.
+- **Reclaiming space.** Deleting a package directory only drops its links. Pool entries
+  that nothing links to any more are removed by
+  `Invoke-DATMaintenance -PackagePath <share> -Force`.
+- **Shares without hard-link support** (some NAS and DFS layouts) get plain copies and the
+  pool is left untouched; the sync log's deduplication summary says so.
+
+---
+
 <a name="cmdlets"></a>
 ## Public cmdlets / automation
 
@@ -546,6 +582,8 @@ by the deployment type's `BasedOnExitCode` behavior.
 | `Invoke-DATDeployApplications` | Bulk-deploy Applications to a collection (+ optional maintenance window). |
 | `Update-DATApplicationCommands` | Repair install commands / return codes on existing Applications. |
 | `Invoke-DATRemovePackages` / `Invoke-DATCleanupOverlayPackages` | Package cleanup. |
+| `Optimize-DATPackageStorage` | Pool identical binaries across existing packages as hard links. Analysis by default; `-Force` replaces. See [Shared payload pool](#shared-payloads). |
+| `Invoke-DATMaintenance` | Report on, or with `-Force` reclaim, stranded staging, oversized logs, stale cache, orphaned package sources and unreferenced pooled payloads. |
 | `Test-DATVulnerableDrivers` | Screen a folder of DUPs / `.sys` files against the Microsoft blocklist. |
 | `Get-DATDriverPin` / `Add-DATDriverPin` / `Remove-DATDriverPin` / `Enable-DATDriverPin` / `Disable-DATDriverPin` | Hold a driver component at a specific version — the rollback mechanism. See [Driver version pinning](#pinning). |
 | `Get-DATDriverPinCandidate` | List the catalog revisions a pin could target for a model, newest and superseded alike. Pipes into `Add-DATDriverPin`. |

@@ -174,6 +174,107 @@ Describe 'Optimize-DATPackageStorage' {
             $Exec.OptimizedFiles | Should -Be 1
             $Exec.FailedFiles | Should -Be 0
         }
+
+        It 'Skips a candidate that changed after analysis instead of reverting it' {
+            $Analysis = Optimize-DATPackageStorage -PackagePath $script:RunRoot -MinFileSizeKB 64
+            $Analysis.DuplicateFiles | Should -Be 1
+            $Target = $Analysis.CandidateDuplicates[0].SourcePath
+
+            # A sync rebuilds that package with a newer driver while the GUI's
+            # confirmation dialog is open
+            $NewBytes = [byte[]]::new(129 * 1024)
+            for ($i = 0; $i -lt $NewBytes.Length; $i++) { $NewBytes[$i] = [byte]($i % 13) }
+            [System.IO.File]::WriteAllBytes($Target, $NewBytes)
+
+            $Exec = Optimize-DATPackageStorage -PackagePath $script:RunRoot -PreAnalyzedCandidates $Analysis.CandidateDuplicates -Force
+
+            $Exec.OptimizedFiles | Should -Be 0
+            $Exec.SkippedFiles | Should -Be 1
+            $Exec.FailedFiles | Should -Be 0
+            (Get-Item -LiteralPath $Target).Length | Should -Be (129 * 1024)
+            (Get-DATSharedPayloadLinkCount -Path $Target) | Should -Be 1
+        }
+
+        It 'Leaves no backup or temp files behind and never pools DAT control files' {
+            $DirA = Split-Path $script:FileA -Parent
+            $DirB = Split-Path $script:FileB -Parent
+            $Control = [byte[]]::new(128 * 1024)
+            foreach ($Name in @('Invoke-DATApply.ps1', 'manifest.json')) {
+                [System.IO.File]::WriteAllBytes((Join-Path $DirA $Name), $Control)
+                [System.IO.File]::WriteAllBytes((Join-Path $DirB $Name), $Control)
+            }
+
+            $Analysis = Optimize-DATPackageStorage -PackagePath $script:RunRoot -MinFileSizeKB 64
+            $Analysis.TotalFilesScanned | Should -Be 2   # only the two Audio.exe
+            $Analysis.DuplicateFiles | Should -Be 1
+
+            $Exec = Optimize-DATPackageStorage -PackagePath $script:RunRoot -MinFileSizeKB 64 -Force
+            $Exec.OptimizedFiles | Should -Be 1
+
+            @(Get-ChildItem -Path $script:RunRoot -Recurse -File -Force | Where-Object { $_.Extension -in '.dat_dedup_bak', '.dat_hl_tmp', '.tmp' }).Count | Should -Be 0
+            $ScriptA = Join-Path $DirA 'Invoke-DATApply.ps1'
+            Test-DATIsSameFileHardlink -PathA $ScriptA -PathB (Join-Path $DirB 'Invoke-DATApply.ps1') | Should -BeFalse
+            (Get-DATSharedPayloadLinkCount -Path $ScriptA) | Should -Be 1
+            @(Get-ChildItem -Path (Join-Path $script:RunRoot '_SharedPayloads') -Recurse -File | Where-Object { $_.Name -in 'Invoke-DATApply.ps1', 'manifest.json' }).Count | Should -Be 0
+        }
+
+        It 'Restores a file stranded as .dat_dedup_bak by an older build before optimizing' {
+            $DirC = Join-Path $script:RunRoot 'Dell\Win11\Latitude-7440'
+            New-Item -Path $DirC -ItemType Directory -Force | Out-Null
+            $Stranded = Join-Path $DirC 'Audio.exe'
+            Copy-Item -LiteralPath $script:FileA -Destination "$Stranded.dat_dedup_bak"
+            Test-Path -LiteralPath $Stranded | Should -BeFalse
+
+            # Analysis only reports it
+            $Report = Optimize-DATPackageStorage -PackagePath $script:RunRoot -MinFileSizeKB 64
+            Test-Path -LiteralPath $Stranded | Should -BeFalse
+            $Report.DuplicateFiles | Should -Be 1
+
+            # -Force puts it back first, so it joins the optimization
+            $Exec = Optimize-DATPackageStorage -PackagePath $script:RunRoot -MinFileSizeKB 64 -Force
+            Test-Path -LiteralPath $Stranded | Should -BeTrue
+            Test-Path -LiteralPath "$Stranded.dat_dedup_bak" | Should -BeFalse
+            $Exec.OptimizedFiles | Should -Be 2
+            Test-DATIsSameFileHardlink -PathA $Stranded -PathB $script:FileA | Should -BeTrue
+        }
+
+        It '-Force -WhatIf changes nothing and reports nothing converted' {
+            $Exec = Optimize-DATPackageStorage -PackagePath $script:RunRoot -MinFileSizeKB 64 -Force -WhatIf
+
+            $Exec.OptimizedFiles | Should -Be 0
+            (Get-DATSharedPayloadLinkCount -Path $script:FileA) | Should -Be 1
+            (Get-DATSharedPayloadLinkCount -Path $script:FileB) | Should -Be 1
+            Test-Path -LiteralPath (Join-Path $script:RunRoot '_SharedPayloads') | Should -BeFalse
+        }
     }
 }
 
+Describe 'Copy-DATApplyScript does not write through hard links' {
+    It 'Gives the target package its own file and leaves a linked sibling untouched' {
+        $Root = Join-Path $script:TestRoot 'ApplyScriptRun'
+        $DirA = Join-Path $Root 'AppA'
+        $DirB = Join-Path $Root 'AppB'
+        New-Item -Path $DirA, $DirB -ItemType Directory -Force | Out-Null
+        try {
+            $OldContent = "# stale apply script staged by an earlier build`n"
+            $FileA = Join-Path $DirA 'Invoke-DATApply.ps1'
+            $FileB = Join-Path $DirB 'Invoke-DATApply.ps1'
+            [System.IO.File]::WriteAllText($FileA, $OldContent)
+            # Optimize-DATPackageStorage would have pooled the two identical scripts
+            New-Item -ItemType HardLink -Path $FileB -Value $FileA | Out-Null
+            (Get-DATSharedPayloadLinkCount -Path $FileA) | Should -Be 2
+
+            $Changed = & (Get-Module DriverAutomationTool) { param($D) Copy-DATApplyScript -DestinationPath $D } $DirA
+            $Changed | Should -BeTrue
+
+            # A now carries the module's script; B still holds the old bytes on its own
+            $ModuleScript = Join-Path (Get-Module DriverAutomationTool).ModuleBase 'Scripts\Invoke-DATApply.ps1'
+            (Get-FileHash -LiteralPath $FileA -Algorithm SHA256).Hash | Should -Be (Get-FileHash -LiteralPath $ModuleScript -Algorithm SHA256).Hash
+            (Get-Content -LiteralPath $FileB -Raw) | Should -Be $OldContent
+            (Get-DATSharedPayloadLinkCount -Path $FileB) | Should -Be 1
+            Test-DATIsSameFileHardlink -PathA $FileA -PathB $FileB | Should -BeFalse
+        } finally {
+            Remove-Item -Path $Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}

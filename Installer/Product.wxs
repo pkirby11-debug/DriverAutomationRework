@@ -101,6 +101,7 @@
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\New-DATDcuModeApplication.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\New-DATIntuneDriverUpdateProfile.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\New-DATIntuneWin32App.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Optimize-DATPackageStorage.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Register-DATQueueLogSubscriber.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Remove-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Remove-DATDriverPin.ps1" KeyPath="yes" /></Component>
@@ -125,6 +126,7 @@
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\DriverPinStore.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\LogManager.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\MaintenanceStore.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\SharedPayloadStore.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\VulnerableDriverScreen.ps1" KeyPath="yes" /></Component>
         </ComponentGroup>
 
