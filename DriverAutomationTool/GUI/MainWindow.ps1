@@ -1370,7 +1370,7 @@ function Initialize-DATMainWindow {
                        "Already Hardlinked:  $($Report.AlreadyHardLinkedFiles)`n" +
                        "Reclaimable Space:   $($Report.PotentialSavingsMB) MB ($($Report.PotentialSavingsGB) GB / $($Report.PotentialSavingsPercent)%)`n`n" +
                        "Would you like to replace duplicate files with zero-copy hardlinks now?`n`n" +
-                       "Original file timestamps and attributes will be preserved so ConfigMgr package content will not be modified."
+                       "File content is unchanged byte for byte, so ConfigMgr content hashes are unaffected. Packages that share a payload will also share its timestamps and attributes."
 
                 $Proceed = Show-DATWindowMessage -Message $Msg -Type Question
                 if ($Proceed -ne 'Yes') {
@@ -1448,13 +1448,15 @@ function Initialize-DATMainWindow {
                         $RecMB     = if ($ExecResult) { $ExecResult.ReclaimedMB } else { 0 }
                         $RecGB     = if ($ExecResult) { $ExecResult.ReclaimedGB } else { 0 }
                         $FailCount = if ($ExecResult) { $ExecResult.FailedFiles } else { 0 }
+                        $SkipCount = if ($ExecResult -and $ExecResult.PSObject.Properties['SkippedFiles']) { $ExecResult.SkippedFiles } else { 0 }
+                        $SkipNote  = if ($SkipCount -gt 0) { "`nSkipped (changed since analysis): $SkipCount" } else { '' }
 
                         if ($FailCount -eq 0) {
                             $Controls['StatusStripLabel'].Text = "Storage optimization complete - reclaimed $RecMB MB ($RecGB GB)."
-                            Show-DATWindowMessage -Message "Storage optimization completed successfully!`n`nFiles Converted: $OptCount`nStorage Reclaimed: $RecMB MB ($RecGB GB)`n`nAll packages remain 100% intact with original timestamps preserved." -Type Information
+                            Show-DATWindowMessage -Message "Storage optimization completed successfully!`n`nFiles Converted: $OptCount`nStorage Reclaimed: $RecMB MB ($RecGB GB)$SkipNote`n`nPackage content is unchanged byte for byte." -Type Information
                         } else {
                             $Controls['StatusStripLabel'].Text = "Storage optimization finished with $FailCount failure(s)."
-                            Show-DATWindowMessage -Message "Storage optimization finished with errors.`n`nConverted: $OptCount`nReclaimed: $RecMB MB`nFailed: $FailCount`n`nCheck the Progress Log for details." -Type Warning
+                            Show-DATWindowMessage -Message "Storage optimization finished with errors.`n`nConverted: $OptCount`nReclaimed: $RecMB MB`nFailed: $FailCount$SkipNote`n`nCheck the Progress Log for details." -Type Warning
                         }
                     } catch {
                         $Controls['StatusStripLabel'].Text = 'Storage optimization execution failed'
@@ -2585,6 +2587,8 @@ function Initialize-DATMainWindow {
                 @{ Name='Deploy';           RS=$G.DeployRunspace;           Timer=$G.DeployTimer }
                 @{ Name='IntunePublish';    RS=$G.IntunePublishRunspace;    Timer=$G.IntunePublishTimer }
                 @{ Name='Pin';              RS=$G.PinRunspace;              Timer=$G.PinTimer }
+                @{ Name='OptAnalysis';      RS=$G.OptAnalysisRunspace;      Timer=$G.OptAnalysisTimer }
+                @{ Name='OptExec';          RS=$G.OptExecRunspace;          Timer=$G.OptExecTimer }
             )
 
             foreach ($Item in $TasksToStop) {

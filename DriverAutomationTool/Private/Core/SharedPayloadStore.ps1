@@ -10,6 +10,14 @@
 # NTFS and SMB2/SMB3 intra-volume hardlinks succeed transparently. When an identical driver
 # is already present in _SharedPayloads, the network upload from the admin host is skipped
 # completely - saving both NAS storage space and sync bandwidth/time.
+#
+# Two rules follow from hard links sharing one file record, and every writer here keeps them:
+#   * Never write in place to a file that may be a link (Copy-Item -Force over an existing
+#     file, Set-Content, SetLastWriteTime...) - it changes every package sharing it. Unlink
+#     first, or write to a temp name and rename over the target (Copy-DATPayloadAtomic).
+#   * Never leave a package file absent from its path, even for an instant. A swap is a
+#     link under a temp name plus one rename (Invoke-DATHardLinkSwap), not a rename-to-backup
+#     followed by a link.
 
 # Ensure Win32 file link inspection helper is compiled once
 if (-not ([System.Management.Automation.PSTypeName]'DATFileLinkHelper').Type) {
@@ -194,6 +202,9 @@ function Test-DATSharedStoreHardLinkSupport {
     .SYNOPSIS
         Tests whether the target destination directory supports NTFS/SMB hardlinks
         originating from the shared payload store root.
+    .DESCRIPTION
+        A diagnostic, so it ignores an inherited -WhatIf: a no-op probe would read
+        as "unsupported" and poison the per-directory cache for the session.
     #>
     [CmdletBinding()]
     param(
@@ -214,7 +225,7 @@ function Test-DATSharedStoreHardLinkSupport {
 
     if (-not (Test-Path -LiteralPath $SharedStoreRoot)) {
         try {
-            New-Item -Path $SharedStoreRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            New-Item -Path $SharedStoreRoot -ItemType Directory -Force -ErrorAction Stop -WhatIf:$false -Confirm:$false | Out-Null
         } catch {
             $script:DATHardLinkCapabilityCache[$CacheKey] = $false
             return $false
@@ -223,7 +234,7 @@ function Test-DATSharedStoreHardLinkSupport {
 
     if (-not (Test-Path -LiteralPath $TargetDir)) {
         try {
-            New-Item -Path $TargetDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            New-Item -Path $TargetDir -ItemType Directory -Force -ErrorAction Stop -WhatIf:$false -Confirm:$false | Out-Null
         } catch {
             $script:DATHardLinkCapabilityCache[$CacheKey] = $false
             return $false
@@ -237,14 +248,14 @@ function Test-DATSharedStoreHardLinkSupport {
     $Capable = $false
     try {
         [System.IO.File]::WriteAllText($DummySource, 'DAT_HARDLINK_TEST')
-        $null = New-Item -ItemType HardLink -Path $DummyLink -Value $DummySource -ErrorAction Stop
+        $null = New-Item -ItemType HardLink -Path $DummyLink -Value $DummySource -ErrorAction Stop -WhatIf:$false -Confirm:$false
         $Capable = $true
     } catch {
         Write-Verbose "Hardlink probe failed from '$SharedStoreRoot' to '$TargetDir': $($_.Exception.Message)"
         $Capable = $false
     } finally {
-        Remove-Item -LiteralPath $DummyLink -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $DummySource -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $DummyLink -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
+        Remove-Item -LiteralPath $DummySource -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
     }
 
     $script:DATHardLinkCapabilityCache[$CacheKey] = $Capable
@@ -264,13 +275,23 @@ function Reset-DATDeduplicationStats {
         TotalBytes          = [long]0
         UniquePayloads      = 0
         UniqueBytes         = [long]0
+        # Links made to a payload that was ALREADY in the pool - the only case
+        # that saves anything. The first link of a freshly stored payload is not
+        # counted here, and a file found already linked on a re-run is counted
+        # under AlreadyLinked.
         HardLinks           = 0
         HardLinkBytes       = [long]0
+        AlreadyLinked       = 0
         Copies              = 0
         CopyBytes           = [long]0
         NetworkSavedFiles   = 0
         NetworkSavedBytes   = [long]0
+        LinkFailures        = 0
+        # $null until a probe has run; $false as soon as any probe fails, so the
+        # summary never reports 'Supported' for a run that fell back to copies.
         HardLinkCapable     = $null
+        UnsupportedLogged   = $false
+        LinkFailureLogged   = $false
     }
 }
 
@@ -299,13 +320,233 @@ function Get-DATSharedPayloadLinkCount {
     return $null
 }
 
+# Files the deduplication never touches. Control files are rewritten in place by
+# the sync (manifest.json, the DCU catalog XML, Invoke-DATApply.ps1 via
+# Copy-DATApplyScript), and an in-place write to a hard link changes every
+# package that shares it. The temp and backup names are this feature's own
+# scratch files.
+$script:DATDedupExcludedExtensions = @('.ps1', '.psm1', '.psd1', '.json', '.xml', '.tmp', '.dat_dedup_bak', '.dat_hl_tmp')
+$script:DATDedupExcludedNames      = @('Invoke-DATApply.ps1', 'manifest.json', '.integrity.json')
+
+function Test-DATDedupEligibleFile {
+    <#
+    .SYNOPSIS
+        Decides whether a package file may be replaced by, or seeded as, a shared payload.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.IO.FileInfo]$File,
+
+        [long]$MinBytes = 0
+    )
+
+    if ($File.Length -lt $MinBytes) { return $false }
+    if ($File.Name.StartsWith('.')) { return $false }
+    if ($script:DATDedupExcludedNames -contains $File.Name) { return $false }
+    if ($script:DATDedupExcludedExtensions -contains $File.Extension) { return $false }
+    return $true
+}
+
+function Copy-DATPayloadAtomic {
+    <#
+    .SYNOPSIS
+        Copies a file into place through a temp name and a rename, so a partial
+        copy is never visible under the final name.
+    .DESCRIPTION
+        The rename replaces the destination's directory entry. If the destination
+        was a hard link shared with other packages, those keep the old file - the
+        new bytes never write through an existing link.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SourcePath,
+
+        [Parameter(Mandatory)]
+        [string]$DestinationPath
+    )
+
+    $TempPath = "$DestinationPath.tmp"
+    if (Test-Path -LiteralPath $TempPath) {
+        Remove-Item -LiteralPath $TempPath -Force -ErrorAction Stop
+    }
+    try {
+        Copy-Item -LiteralPath $SourcePath -Destination $TempPath -Force -ErrorAction Stop
+        [System.IO.File]::Move($TempPath, $DestinationPath, $true)
+    } catch {
+        Remove-Item -LiteralPath $TempPath -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Invoke-DATHardLinkSwap {
+    <#
+    .SYNOPSIS
+        Replaces a package file with a hard link to a canonical payload without the
+        file ever being absent from its path.
+    .DESCRIPTION
+        The link is created under a temporary name in the same directory and then
+        renamed over the original in one operation. A crash before the rename
+        leaves the original untouched plus a stray .dat_hl_tmp link that the next
+        run removes; a crash after it leaves the finished link. There is no window
+        in which the driver is missing - the previous rename-to-backup scheme had
+        one, and every later scan skipped the backup name, so an interrupted run
+        could leave a package short a file for good.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$TargetPath,
+
+        [Parameter(Mandatory)]
+        [string]$CanonicalPath
+    )
+
+    $TempLink = "$TargetPath.dat_hl_tmp"
+    if (Test-Path -LiteralPath $TempLink) {
+        Remove-Item -LiteralPath $TempLink -Force -ErrorAction Stop
+    }
+
+    New-Item -ItemType HardLink -Path $TempLink -Value $CanonicalPath -ErrorAction Stop | Out-Null
+    try {
+        # A read-only file cannot be renamed over. Clear just that bit rather than
+        # resetting every attribute (Hidden, System, Archive survive).
+        $Attributes = [System.IO.File]::GetAttributes($TargetPath)
+        if ($Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+            $Cleared = [int]$Attributes -band (-bnot [int][System.IO.FileAttributes]::ReadOnly)
+            [System.IO.File]::SetAttributes($TargetPath, [System.IO.FileAttributes]$Cleared)
+        }
+        [System.IO.File]::Move($TempLink, $TargetPath, $true)
+    } catch {
+        Remove-Item -LiteralPath $TempLink -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Repair-DATDedupLeftover {
+    <#
+    .SYNOPSIS
+        Puts back files stranded by an interrupted deduplication and removes stale
+        temp links.
+    .DESCRIPTION
+        Builds before 2.46.5 renamed a file to <name>.dat_dedup_bak before linking
+        it, so a crash in between left the driver only under the backup name - and
+        every scan then skipped it. This restores any such file whose original is
+        missing, drops a backup whose original is back and the same size, and
+        deletes .dat_hl_tmp links left by an interrupted swap (they hold no data
+        of their own).
+    .PARAMETER Path
+        Directories to sweep recursively.
+    .PARAMETER ExcludeRoot
+        A subtree to leave alone, normally the _SharedPayloads pool.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Path,
+
+        [string]$ExcludeRoot
+    )
+
+    $Restored  = 0
+    $Removed   = 0
+    $Conflicts = 0
+    $ExcludePrefix = if ($ExcludeRoot) { $ExcludeRoot.TrimEnd('\', '/') } else { $null }
+
+    foreach ($Dir in $Path) {
+        if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { continue }
+        $Leftovers = @(Get-ChildItem -LiteralPath $Dir -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -eq '.dat_dedup_bak' -or $_.Extension -eq '.dat_hl_tmp' })
+
+        foreach ($Item in $Leftovers) {
+            if ($ExcludePrefix -and $Item.FullName.StartsWith($ExcludePrefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            $Original = $Item.FullName.Substring(0, $Item.FullName.Length - $Item.Extension.Length)
+            try {
+                if ($Item.Extension -eq '.dat_hl_tmp') {
+                    if ($PSCmdlet.ShouldProcess($Item.FullName, 'Remove stale temp link')) {
+                        Remove-Item -LiteralPath $Item.FullName -Force -ErrorAction Stop
+                        $Removed++
+                    }
+                } elseif (-not (Test-Path -LiteralPath $Original -PathType Leaf)) {
+                    if ($PSCmdlet.ShouldProcess($Original, 'Restore file stranded by an interrupted deduplication')) {
+                        Move-Item -LiteralPath $Item.FullName -Destination $Original -Force -ErrorAction Stop
+                        Write-DATLog -Message "Restored '$Original' from a backup left by an interrupted deduplication" -Severity 2
+                        $Restored++
+                    }
+                } elseif ((Get-Item -LiteralPath $Original).Length -eq $Item.Length) {
+                    if ($PSCmdlet.ShouldProcess($Item.FullName, 'Remove completed deduplication backup')) {
+                        Remove-Item -LiteralPath $Item.FullName -Force -ErrorAction Stop
+                        $Removed++
+                    }
+                } else {
+                    Write-DATLog -Message "Backup '$($Item.FullName)' differs in size from '$Original' - leaving both in place for manual review" -Severity 3
+                    $Conflicts++
+                }
+            } catch {
+                Write-DATLog -Message "Could not repair deduplication leftover '$($Item.FullName)': $($_.Exception.Message)" -Severity 3
+                $Conflicts++
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Restored  = $Restored
+        Removed   = $Removed
+        Conflicts = $Conflicts
+    }
+}
+
+function Write-DATDedupLinkFailure {
+    <#
+    .SYNOPSIS
+        Records a failed hard-link creation. The first failure of a run is a
+        warning with the path; later ones go to the verbose stream so a share that
+        has stopped accepting links does not flood the log.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$TargetPath,
+
+        [Parameter(Mandatory)]
+        [string]$CanonicalPath,
+
+        [string]$Reason,
+
+        [string]$Outcome = 'the file is copied instead'
+    )
+
+    $Stats = $script:DATDeduplicationStats
+    $Stats.LinkFailures++
+    if (-not $Stats.LinkFailureLogged) {
+        Write-DATLog -Message "Hard link creation failed for '$TargetPath' -> '$CanonicalPath': $Reason - $Outcome. Further link failures in this run are logged at verbose level only; the run summary counts them." -Severity 2
+        $Stats.LinkFailureLogged = $true
+    } else {
+        Write-Verbose "Hard link creation failed for '$TargetPath' -> '$CanonicalPath': $Reason - $Outcome"
+    }
+}
+
 function Save-DATSharedPayload {
     <#
     .SYNOPSIS
-        Saves a payload file using cryptographic SHA-256 cross-model deduplication.
-        Ensures the shared store lives on the same share/volume as the package source,
-        allowing zero-copy intra-volume hardlinks on NAS and local shares.
-        If an identical payload already exists on the share, network upload is eliminated.
+        Stages a payload into a model's package directory, sharing it with every
+        other package that carries the same bytes.
+    .DESCRIPTION
+        The payload is hashed (SHA-256) and stored once under
+        <PackagePath>\_SharedPayloads\<Manufacturer>\<hash>\<name>; the package
+        directory receives a hard link to that canonical file. When the canonical
+        file is already on the share, the copy from the admin host is skipped.
+
+        Rules that keep the pool trustworthy:
+          * The pool key is always the hash of the staged bytes. -ExpectedHash is
+            a cross-check only - a catalog hash that disagrees with the file is
+            logged and ignored, never used as the key.
+          * A canonical file is never overwritten in place: it may be hard-linked
+            into other packages, and an in-place write would change all of them.
+          * When the destination directory cannot receive hard links from the
+            pool, the payload is copied straight from staging into the package and
+            the pool is not touched, so an unsupported share costs nothing extra.
     #>
     [CmdletBinding()]
     param(
@@ -339,83 +580,117 @@ function Save-DATSharedPayload {
     $FileSize = (Get-Item -LiteralPath $SourceFilePath).Length
     $FileName = [System.IO.Path]::GetFileName($DestinationPath)
 
-    # Use expected hash if provided with matching algorithm, otherwise compute SHA-256
-    $FileHash = if ($ExpectedHash -and $HashAlgorithm -eq 'SHA256') {
-        $ExpectedHash.ToUpperInvariant()
-    } else {
-        Get-DATPayloadHash -Path $SourceFilePath -Algorithm 'SHA256'
-    }
-
     if (-not $script:DATDeduplicationStats) {
         Reset-DATDeduplicationStats
     }
+    $Stats = $script:DATDeduplicationStats
+    $Stats.TotalFiles++
+    $Stats.TotalBytes += $FileSize
 
-    $script:DATDeduplicationStats.TotalFiles++
-    $script:DATDeduplicationStats.TotalBytes += $FileSize
-
-    # Shared store lives on the SAME volume/share as PackagePath
     $SharedStoreRoot = Get-DATSharedStoreRoot -PackagePath $PackagePath
-    $SharedModelDir  = Join-Path $SharedStoreRoot "$Manufacturer\$FileHash"
-    $CanonicalFile   = Join-Path $SharedModelDir $FileName
 
-    $NetworkUploadSkipped = $false
-
-    # Check if the canonical payload already exists on the share
-    if (Test-Path -LiteralPath $CanonicalFile -PathType Leaf) {
-        $ExistingSize = (Get-Item -LiteralPath $CanonicalFile).Length
-        if ($ExistingSize -eq $FileSize) {
-            # Payload is already staged on the NAS - skip network transfer!
-            $NetworkUploadSkipped = $true
-            $script:DATDeduplicationStats.NetworkSavedFiles++
-            $script:DATDeduplicationStats.NetworkSavedBytes += $FileSize
-        } else {
-            # Size mismatch - re-upload to ensure integrity
-            Copy-Item -LiteralPath $SourceFilePath -Destination $CanonicalFile -Force
-            $script:DATDeduplicationStats.UniquePayloads++
-            $script:DATDeduplicationStats.UniqueBytes += $FileSize
-        }
-    } else {
-        if (-not (Test-Path -LiteralPath $SharedModelDir)) {
-            New-Item -Path $SharedModelDir -ItemType Directory -Force | Out-Null
-        }
-        Copy-Item -LiteralPath $SourceFilePath -Destination $CanonicalFile -Force
-        $script:DATDeduplicationStats.UniquePayloads++
-        $script:DATDeduplicationStats.UniqueBytes += $FileSize
-    }
-
-    # Test/retrieve hardlink support between shared store and package directory
+    # Probe BEFORE touching the pool. Copying into the pool first and only then
+    # discovering that links fail would leave the share holding every payload twice.
     $IsHardLinkCapable = if ($DisableHardLinks) {
         $false
     } else {
         Test-DATSharedStoreHardLinkSupport -SharedStoreRoot $SharedStoreRoot -TargetDir $DestDir
     }
-
-    if ($null -eq $script:DATDeduplicationStats.HardLinkCapable) {
-        $script:DATDeduplicationStats.HardLinkCapable = $IsHardLinkCapable
+    if ($null -eq $Stats.HardLinkCapable -or -not $IsHardLinkCapable) {
+        $Stats.HardLinkCapable = $IsHardLinkCapable
     }
 
-    # Clean destination path if it already exists
-    if (Test-Path -LiteralPath $DestinationPath) {
-        Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
-    }
-
-    $UsedHardLink = $false
-    if ($IsHardLinkCapable) {
-        try {
-            New-Item -ItemType HardLink -Path $DestinationPath -Value $CanonicalFile -ErrorAction Stop | Out-Null
-            $UsedHardLink = $true
-            $script:DATDeduplicationStats.HardLinks++
-            $script:DATDeduplicationStats.HardLinkBytes += $FileSize
-        } catch {
-            Write-Verbose "Hardlink creation failed from '$CanonicalFile' to '$DestinationPath': $($_.Exception.Message) - falling back to Copy-Item"
-            $UsedHardLink = $false
+    if (-not $IsHardLinkCapable) {
+        if (-not $Stats.UnsupportedLogged) {
+            $Why = if ($DisableHardLinks) { 'hard links are disabled' } else { "'$DestDir' cannot receive hard links from '$SharedStoreRoot'" }
+            Write-DATLog -Message "Cross-model deduplication is off for this run: $Why. Payloads are copied directly into each package and nothing is written to _SharedPayloads." -Severity 2
+            $Stats.UnsupportedLogged = $true
+        }
+        if (Test-Path -LiteralPath $DestinationPath) {
+            Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction Stop
+        }
+        Copy-DATPayloadAtomic -SourcePath $SourceFilePath -DestinationPath $DestinationPath
+        $Stats.Copies++
+        $Stats.CopyBytes += $FileSize
+        return [PSCustomObject]@{
+            Destination          = $DestinationPath
+            CanonicalPath        = $null
+            Hash                 = $null
+            Size                 = $FileSize
+            HardLinked           = $false
+            NetworkUploadSkipped = $false
         }
     }
 
+    # The pool key is always the hash of the bytes actually staged.
+    $FileHash = Get-DATPayloadHash -Path $SourceFilePath -Algorithm 'SHA256'
+    if ($ExpectedHash -and $HashAlgorithm -eq 'SHA256' -and $ExpectedHash.ToUpperInvariant() -ne $FileHash) {
+        Write-DATLog -Message "Catalog hash for '$FileName' ($ExpectedHash) does not match the downloaded file ($FileHash) - keying the shared payload by the file's real hash" -Severity 2
+    }
+
+    $SharedModelDir = Join-Path $SharedStoreRoot "$Manufacturer\$FileHash"
+    $CanonicalFile  = Join-Path $SharedModelDir $FileName
+
+    $NetworkUploadSkipped = $false
+    if (Test-Path -LiteralPath $CanonicalFile -PathType Leaf) {
+        $ExistingSize = (Get-Item -LiteralPath $CanonicalFile).Length
+        if ($ExistingSize -eq $FileSize) {
+            # Already on the share - the copy from the admin host is skipped.
+            $NetworkUploadSkipped = $true
+            $Stats.NetworkSavedFiles++
+            $Stats.NetworkSavedBytes += $FileSize
+        } else {
+            # Same hash, different size can only be a damaged pool entry. It may be
+            # linked into other packages, so it is not rewritten in place: this
+            # package gets its own copy and the entry is reported.
+            Write-DATLog -Message "Shared payload '$CanonicalFile' is $ExistingSize bytes but the staged file is $FileSize bytes - not overwriting a pooled file; copying this payload directly into the package" -Severity 2
+            if (Test-Path -LiteralPath $DestinationPath) {
+                Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction Stop
+            }
+            Copy-DATPayloadAtomic -SourcePath $SourceFilePath -DestinationPath $DestinationPath
+            $Stats.Copies++
+            $Stats.CopyBytes += $FileSize
+            return [PSCustomObject]@{
+                Destination          = $DestinationPath
+                CanonicalPath        = $CanonicalFile
+                Hash                 = $FileHash
+                Size                 = $FileSize
+                HardLinked           = $false
+                NetworkUploadSkipped = $false
+            }
+        }
+    } else {
+        if (-not (Test-Path -LiteralPath $SharedModelDir)) {
+            New-Item -Path $SharedModelDir -ItemType Directory -Force | Out-Null
+        }
+        Copy-DATPayloadAtomic -SourcePath $SourceFilePath -DestinationPath $CanonicalFile
+        $Stats.UniquePayloads++
+        $Stats.UniqueBytes += $FileSize
+    }
+
+    # Unlink first: New-Item cannot replace an existing file, and a Copy-Item over
+    # an existing hard link would write through it into every linked package.
+    if (Test-Path -LiteralPath $DestinationPath) {
+        Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction Stop
+    }
+
+    $UsedHardLink = $false
+    try {
+        New-Item -ItemType HardLink -Path $DestinationPath -Value $CanonicalFile -ErrorAction Stop | Out-Null
+        $UsedHardLink = $true
+        if ($NetworkUploadSkipped) {
+            # Only a link to a payload that was already pooled saves anything.
+            $Stats.HardLinks++
+            $Stats.HardLinkBytes += $FileSize
+        }
+    } catch {
+        Write-DATDedupLinkFailure -TargetPath $DestinationPath -CanonicalPath $CanonicalFile -Reason $_.Exception.Message -Outcome 'the package receives a copy instead'
+    }
+
     if (-not $UsedHardLink) {
-        Copy-Item -LiteralPath $CanonicalFile -Destination $DestinationPath -Force
-        $script:DATDeduplicationStats.Copies++
-        $script:DATDeduplicationStats.CopyBytes += $FileSize
+        Copy-DATPayloadAtomic -SourcePath $CanonicalFile -DestinationPath $DestinationPath
+        $Stats.Copies++
+        $Stats.CopyBytes += $FileSize
     }
 
     return [PSCustomObject]@{
@@ -433,6 +708,13 @@ function Invoke-DATDriverPackDeduplication {
     .SYNOPSIS
         Deduplicates files in an extracted driver pack directory against _SharedPayloads
         on the destination share/volume using intra-volume zero-copy hardlinks.
+    .DESCRIPTION
+        Every eligible file (at least MinFileSizeKB and not a DAT control file - see
+        Test-DATDedupEligibleFile) is hashed. A file whose bytes are already in the
+        pool is swapped for a hard link to the pooled copy; one that is not is
+        seeded into the pool by linking the package file there. The swap never
+        leaves the file absent from its path (Invoke-DATHardLinkSwap), and a pool
+        entry is only trusted when its size matches the file it would replace.
     #>
     [CmdletBinding()]
     param(
@@ -459,9 +741,20 @@ function Invoke-DATDriverPackDeduplication {
         }
     }
 
-    $IsHardLinkCapable = Test-DATSharedStoreHardLinkSupport -SharedStoreRoot $SharedStoreRoot -TargetDir $PackageSourceDir
     if (-not $script:DATDeduplicationStats) { Reset-DATDeduplicationStats }
-    $script:DATDeduplicationStats.HardLinkCapable = $IsHardLinkCapable
+    $Stats = $script:DATDeduplicationStats
+
+    # Put back anything an interrupted earlier run left behind before deciding
+    # what to link.
+    $Repair = Repair-DATDedupLeftover -Path $PackageSourceDir -Confirm:$false
+    if ($Repair.Restored -gt 0 -or $Repair.Conflicts -gt 0) {
+        Write-DATLog -Message "Deduplication leftovers in '$PackageSourceDir': restored $($Repair.Restored), removed $($Repair.Removed), unresolved $($Repair.Conflicts)" -Severity 2
+    }
+
+    $IsHardLinkCapable = Test-DATSharedStoreHardLinkSupport -SharedStoreRoot $SharedStoreRoot -TargetDir $PackageSourceDir
+    if ($null -eq $Stats.HardLinkCapable -or -not $IsHardLinkCapable) {
+        $Stats.HardLinkCapable = $IsHardLinkCapable
+    }
 
     if (-not $IsHardLinkCapable) {
         Write-DATLog -Message "Destination share does not support intra-volume hardlinks between '$SharedStoreRoot' and '$PackageSourceDir' - skipping driver pack deduplication" -Severity 2
@@ -470,12 +763,7 @@ function Invoke-DATDriverPackDeduplication {
 
     $MinBytes = [long]($MinFileSizeKB * 1024)
     $Files = @(Get-ChildItem -LiteralPath $PackageSourceDir -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Length -ge $MinBytes -and
-            $_.Name -notlike '.*' -and
-            $_.Extension -ne '.tmp' -and
-            $_.Extension -ne '.dat_dedup_bak'
-        })
+        Where-Object { Test-DATDedupEligibleFile -File $_ -MinBytes $MinBytes })
 
     if ($Files.Count -eq 0) { return }
 
@@ -484,13 +772,14 @@ function Invoke-DATDriverPackDeduplication {
     $DeduplicatedCount = 0
     $DeduplicatedBytes = [long]0
     $SeededCount       = 0
+    $SkippedCount      = 0
 
     foreach ($File in $Files) {
         $FileSize = $File.Length
         $FileName = $File.Name
 
-        $script:DATDeduplicationStats.TotalFiles++
-        $script:DATDeduplicationStats.TotalBytes += $FileSize
+        $Stats.TotalFiles++
+        $Stats.TotalBytes += $FileSize
 
         try {
             $FileHash = Get-DATPayloadHash -Path $File.FullName -Algorithm 'SHA256'
@@ -501,80 +790,92 @@ function Invoke-DATDriverPackDeduplication {
             if (Test-Path -LiteralPath $CanonicalFile -PathType Leaf) {
                 $ExistingCanonical = $CanonicalFile
             } elseif (Test-Path -LiteralPath $SharedModelDir -PathType Container) {
-                $AnyInDir = Get-ChildItem -LiteralPath $SharedModelDir -File -ErrorAction SilentlyContinue | Select-Object -First 1
+                # The same bytes pooled under another file name: link to that instead.
+                $AnyInDir = Get-ChildItem -LiteralPath $SharedModelDir -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Extension -ne '.tmp' } | Select-Object -First 1
                 if ($AnyInDir) { $ExistingCanonical = $AnyInDir.FullName }
             }
 
             if ($ExistingCanonical) {
-                # Already exists in shared store!
                 if (Test-DATIsSameFileHardlink -PathA $File.FullName -PathB $ExistingCanonical) {
-                    $script:DATDeduplicationStats.HardLinks++
-                    $script:DATDeduplicationStats.HardLinkBytes += $FileSize
+                    $Stats.AlreadyLinked++
                     continue
                 }
 
-                # Replace with zero-copy hardlink preserving original timestamps
+                # Same hash directory but a different size means the pool entry is
+                # damaged (an interrupted copy, or something rewrote it). Never link
+                # a package to it.
+                $CanonicalSize = (Get-Item -LiteralPath $ExistingCanonical).Length
+                if ($CanonicalSize -ne $FileSize) {
+                    Write-DATLog -Message "Shared payload '$ExistingCanonical' is $CanonicalSize bytes but '$($File.FullName)' is $FileSize bytes - leaving the package file in place" -Severity 2
+                    $SkippedCount++
+                    continue
+                }
+
                 $CreationTimeUtc   = [System.IO.File]::GetCreationTimeUtc($File.FullName)
                 $LastWriteTimeUtc  = [System.IO.File]::GetLastWriteTimeUtc($File.FullName)
                 $LastAccessTimeUtc = [System.IO.File]::GetLastAccessTimeUtc($File.FullName)
                 $Attributes        = [System.IO.File]::GetAttributes($File.FullName)
 
-                if ($Attributes -band [System.IO.FileAttributes]::ReadOnly) {
-                    [System.IO.File]::SetAttributes($File.FullName, [System.IO.FileAttributes]::Normal)
+                try {
+                    Invoke-DATHardLinkSwap -TargetPath $File.FullName -CanonicalPath $ExistingCanonical
+                } catch {
+                    Write-DATDedupLinkFailure -TargetPath $File.FullName -CanonicalPath $ExistingCanonical -Reason $_.Exception.Message -Outcome 'the package file is left in place'
+                    $SkippedCount++
+                    continue
                 }
 
-                $BakPath = "$($File.FullName).dat_dedup_bak"
-                Move-Item -LiteralPath $File.FullName -Destination $BakPath -Force -ErrorAction Stop
-
+                # Timestamps and attributes live on the shared file record, so this
+                # is best effort: the values end up shared by every link.
                 try {
-                    New-Item -ItemType HardLink -Path $File.FullName -Value $ExistingCanonical -ErrorAction Stop | Out-Null
                     [System.IO.File]::SetCreationTimeUtc($File.FullName, $CreationTimeUtc)
                     [System.IO.File]::SetLastWriteTimeUtc($File.FullName, $LastWriteTimeUtc)
                     [System.IO.File]::SetLastAccessTimeUtc($File.FullName, $LastAccessTimeUtc)
                     [System.IO.File]::SetAttributes($File.FullName, $Attributes)
-                    Remove-Item -LiteralPath $BakPath -Force -ErrorAction SilentlyContinue
-
-                    $DeduplicatedCount++
-                    $DeduplicatedBytes += $FileSize
-                    $script:DATDeduplicationStats.HardLinks++
-                    $script:DATDeduplicationStats.HardLinkBytes += $FileSize
                 } catch {
-                    if (Test-Path -LiteralPath $File.FullName) { Remove-Item -LiteralPath $File.FullName -Force -ErrorAction SilentlyContinue }
-                    Move-Item -LiteralPath $BakPath -Destination $File.FullName -Force -ErrorAction SilentlyContinue
+                    Write-Verbose "Could not restore timestamps on '$($File.FullName)': $($_.Exception.Message)"
                 }
+
+                $DeduplicatedCount++
+                $DeduplicatedBytes += $FileSize
+                $Stats.HardLinks++
+                $Stats.HardLinkBytes += $FileSize
             } else {
-                # Not in shared store yet: SEED IT!
+                # Not in the pool yet: seed it by linking the package file in (no
+                # bytes move), falling back to an atomic copy.
                 if (-not (Test-Path -LiteralPath $SharedModelDir)) {
                     New-Item -Path $SharedModelDir -ItemType Directory -Force | Out-Null
                 }
 
-                # Hardlink from current package into _SharedPayloads (zero bytes, instant)
                 $Seeded = $false
                 try {
                     New-Item -ItemType HardLink -Path $CanonicalFile -Value $File.FullName -ErrorAction Stop | Out-Null
                     $Seeded = $true
                 } catch {
+                    Write-Verbose "Could not hardlink '$($File.FullName)' into the pool ($($_.Exception.Message)) - copying instead"
                     try {
-                        Copy-Item -LiteralPath $File.FullName -Destination $CanonicalFile -Force -ErrorAction Stop
+                        Copy-DATPayloadAtomic -SourcePath $File.FullName -DestinationPath $CanonicalFile
                         $Seeded = $true
                     } catch {
-                        Write-Verbose "Could not seed canonical payload '$CanonicalFile': $($_.Exception.Message)"
+                        Write-DATLog -Message "Could not seed shared payload '$CanonicalFile': $($_.Exception.Message)" -Severity 2
                     }
                 }
 
                 if ($Seeded) {
                     $SeededCount++
-                    $script:DATDeduplicationStats.UniquePayloads++
-                    $script:DATDeduplicationStats.UniqueBytes += $FileSize
+                    $Stats.UniquePayloads++
+                    $Stats.UniqueBytes += $FileSize
                 }
             }
         } catch {
-            Write-Verbose "Could not process driver file '$($File.FullName)' for deduplication: $($_.Exception.Message)"
+            Write-DATLog -Message "Could not process '$($File.FullName)' for deduplication: $($_.Exception.Message)" -Severity 2
+            $SkippedCount++
         }
     }
 
     $SavedMB = [math]::Round($DeduplicatedBytes / 1MB, 2)
-    Write-DATLog -Message "Driver pack deduplication: $SeededCount unique payload(s) seeded to _SharedPayloads, $DeduplicatedCount duplicate file(s) hardlinked ($SavedMB MB saved)." -Severity 1
+    $SkipNote = if ($SkippedCount -gt 0) { ", $SkippedCount left in place (see warnings)" } else { '' }
+    Write-DATLog -Message "Driver pack deduplication: $SeededCount unique payload(s) seeded to _SharedPayloads, $DeduplicatedCount duplicate file(s) hardlinked ($SavedMB MB saved)$SkipNote." -Severity 1
 }
 
 function Get-DATDeduplicationSummary {
@@ -590,22 +891,26 @@ function Get-DATDeduplicationSummary {
     }
 
     $Stats = $script:DATDeduplicationStats
-    $TotalMB = [math]::Round($Stats.TotalBytes / 1MB, 2)
+    $TotalMB  = [math]::Round($Stats.TotalBytes / 1MB, 2)
     $UniqueMB = [math]::Round($Stats.UniqueBytes / 1MB, 2)
+    $CopyMB   = [math]::Round($Stats.CopyBytes / 1MB, 2)
 
-    $SavedStorageBytes = [math]::Max([int64]0, [int64]($Stats.TotalBytes - $Stats.UniqueBytes))
-    $SavedStorageMB    = [math]::Round($SavedStorageBytes / 1MB, 2)
-    $SavedStoragePct   = if ($Stats.TotalBytes -gt 0) { [math]::Round(($SavedStorageBytes / $Stats.TotalBytes) * 100, 1) } else { 0 }
+    # Savings are what was actually linked to an already-pooled payload - not
+    # "everything that was not unique", which would count copies and failures.
+    $SavedStorageMB  = [math]::Round($Stats.HardLinkBytes / 1MB, 2)
+    $SavedStoragePct = if ($Stats.TotalBytes -gt 0) { [math]::Round(($Stats.HardLinkBytes / $Stats.TotalBytes) * 100, 1) } else { 0 }
 
     $NetworkSavedMB  = [math]::Round($Stats.NetworkSavedBytes / 1MB, 2)
     $NetworkSavedPct = if ($Stats.TotalBytes -gt 0) { [math]::Round(($Stats.NetworkSavedBytes / $Stats.TotalBytes) * 100, 1) } else { 0 }
 
     $HardlinkStatus = if ($null -eq $Stats.HardLinkCapable) {
         'Not Tested (No Driver Files Processed)'
-    } elseif ($Stats.HardLinkCapable) {
-        'Supported (Zero-Copy Hardlinks)'
+    } elseif (-not $Stats.HardLinkCapable) {
+        'Unsupported (Payloads Copied, Nothing Saved)'
+    } elseif ($Stats.LinkFailures -gt 0) {
+        "Degraded ($($Stats.LinkFailures) link failure(s) - see warnings)"
     } else {
-        'Unsupported (Fallback to File Copy)'
+        'Supported (Zero-Copy Hardlinks)'
     }
 
     $Lines = @(
@@ -613,9 +918,11 @@ function Get-DATDeduplicationSummary {
         ("Total driver files processed:   {0,5} files ({1,8:N2} MB)" -f $Stats.TotalFiles, $TotalMB),
         ("Unique SHA-256 payloads stored: {0,5} files ({1,8:N2} MB)" -f $Stats.UniquePayloads, $UniqueMB),
         ("Deduplicated via hardlinks:     {0,5} files ({1,8:N2} MB saved)" -f $Stats.HardLinks, $SavedStorageMB),
+        ("Already deduplicated earlier:   {0,5} files" -f $Stats.AlreadyLinked),
+        ("Copied without deduplication:   {0,5} files ({1,8:N2} MB)" -f $Stats.Copies, $CopyMB),
         ("Target share hardlink status:   {0}" -f $HardlinkStatus),
         ("Storage Savings on Share:       {0,5:N1}% disk space saved" -f $SavedStoragePct),
-        ("Network Uploads Eliminated:     {0,5} files ({1,8:N2} MB / {2:N1}% bandwidth saved)" -f $Stats.NetworkSavedFiles, $NetworkSavedMB, $NetworkSavedPct),
+        ("Share uploads skipped:          {0,5} files ({1,8:N2} MB / {2:N1}% of processed bytes; vendor downloads unaffected)" -f $Stats.NetworkSavedFiles, $NetworkSavedMB, $NetworkSavedPct),
         "============================================================================="
     )
 

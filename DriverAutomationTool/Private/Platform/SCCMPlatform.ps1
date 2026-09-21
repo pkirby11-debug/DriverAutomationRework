@@ -2786,6 +2786,14 @@ function Copy-DATApplyScript {
         }
         Write-DATLog -Message "Invoke-DATApply.ps1 in $DestinationPath is rev $($DestHash.Substring(0, 8).ToLower()) - replacing with rev $SrcRev" -Severity 1
     }
+    if (Test-Path -LiteralPath $DestFile) {
+        # Unlink before writing. The staged script may be a hard link shared with
+        # other packages (Optimize-DATPackageStorage pools identical files), and
+        # Copy-Item -Force onto an existing file writes through the link: every
+        # package sharing it would change at once, with no content refresh for
+        # any of them. Removing the name first gives this package its own file.
+        Remove-Item -LiteralPath $DestFile -Force -ErrorAction Stop
+    }
     Copy-Item -Path $SourceScript -Destination $DestFile -Force
     Write-DATLog -Message "Staged Invoke-DATApply.ps1 (rev $SrcRev) into $DestinationPath" -Severity 1
     return $true

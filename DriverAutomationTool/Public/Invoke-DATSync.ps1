@@ -51,6 +51,12 @@ function Invoke-DATSync {
     .PARAMETER CleanDownloads
         Clean up downloaded driver CAB/EXE files and extracted source content
         from the DownloadPath after sync completes.
+    .PARAMETER EnableDeduplication
+        Share identical payloads between packages through hard links into
+        <PackagePath>\_SharedPayloads (default $true). Pass -EnableDeduplication:$false
+        to stage plain copies and leave the pool untouched. Standard driver packs are
+        not pooled when -CompressPackage applies: the extracted tree is discarded after
+        compression, so pooled links would only strand a second copy.
     .PARAMETER ForceRefresh
         Force refresh of cached catalogs.
     .PARAMETER WebhookUrl
@@ -193,7 +199,7 @@ function Invoke-DATSync {
     $StartTime = Get-Date
     $SyncResults = [System.Collections.Generic.List[PSCustomObject]]::new()
     $ErrorCount = 0
-    Reset-DATDeduplicationStats
+    if ($EnableDeduplication) { Reset-DATDeduplicationStats }
 
     # Sweep staging directories stranded by earlier runs before staging anything
     # new. Remove-DATTempPath only runs in a finally block, so a crash, a killed
@@ -2513,9 +2519,17 @@ function Invoke-DATSyncSinglePackage {
             }
         }
 
-        # Cross-model deduplication for standard driver packs
+        # Cross-model deduplication for standard driver packs. Skipped when the pack
+        # is about to be compressed: the extracted tree is deleted once the WIM/ZIP
+        # is built (below), so pooling its files would strand a full uncompressed
+        # copy of the pack in _SharedPayloads with nothing linking to it.
+        $WillCompress = $CompressPackage -and $Type -ne 'DriverUpdates' -and $Type -ne 'BIOSDCU'
         if ($EnableDeduplication -and $Type -eq 'Drivers') {
-            Invoke-DATDriverPackDeduplication -PackageSourceDir $PackageSourceDir -PackagePath $PackagePath -Manufacturer $Make
+            if ($WillCompress) {
+                Write-DATLog -Message "Skipping cross-model deduplication: the extracted pack is compressed to $CompressionType and removed, so pooled links would only leave an orphaned copy in _SharedPayloads" -Severity 1
+            } else {
+                Invoke-DATDriverPackDeduplication -PackageSourceDir $PackageSourceDir -PackagePath $PackagePath -Manufacturer $Make
+            }
         }
 
         # Compress driver package if requested (BIOS packages are never compressed,

@@ -85,6 +85,7 @@
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Export-DATReport.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Find-DATIntuneEntraGroup.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATBIOSUpdate.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATComplianceSnapshot.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverPack.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Get-DATDriverPin.ps1" KeyPath="yes" /></Component>
@@ -101,6 +102,7 @@
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\New-DATDcuModeApplication.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\New-DATIntuneDriverUpdateProfile.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\New-DATIntuneWin32App.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Public\Optimize-DATPackageStorage.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Register-DATQueueLogSubscriber.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Remove-DATDriverExclusion.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Public\Remove-DATDriverPin.ps1" KeyPath="yes" /></Component>
@@ -117,14 +119,19 @@
         <!-- ==================== Private/Core ==================== -->
         <ComponentGroup Id="CoreFiles" Directory="CoreDir">
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\AppPaths.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\BIOSVersion.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\CacheManager.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\CatalogParser.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\ComplianceSnapshot.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\ConfigManager.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\DashboardRenderer.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\DownloadManager.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\DriverExclusionStore.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\DriverPinStore.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\LogManager.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\MaintenanceStore.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\ScreeningHistoryStore.ps1" KeyPath="yes" /></Component>
+            <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\SharedPayloadStore.ps1" KeyPath="yes" /></Component>
             <Component Guid="*"><File Source="$(var.SourceDir)\Private\Core\VulnerableDriverScreen.ps1" KeyPath="yes" /></Component>
         </ComponentGroup>
 
