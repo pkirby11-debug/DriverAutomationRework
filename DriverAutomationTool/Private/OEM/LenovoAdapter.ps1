@@ -312,7 +312,8 @@ function Get-LenovoBIOSUpdate {
     .PARAMETER MachineType
         Machine type code. If not provided, will be looked up.
     .PARAMETER OperatingSystem
-        Target OS (needed for Lenovo's OS-specific BIOS XML URLs).
+        Target OS (needed for Lenovo's OS-specific BIOS XML URLs). If that
+        OS's catalog lists no BIOS, the other Windows catalog is checked.
     .OUTPUTS
         PSCustomObject with Url, Version, ReleaseDate, FileName, or $null if not found.
     #>
@@ -328,6 +329,13 @@ function Get-LenovoBIOSUpdate {
 
     $Sources = Get-DATOEMSources
     $WinVersion = if ($OperatingSystem -match 'Windows 11') { '11' } else { '10' }
+
+    # Lenovo doesn't always list the BIOS in both OS catalogs. The ThinkPad
+    # L390 (20NR/20NS) Win11 catalog carries drivers but no BIOS; the BIOS is
+    # only in the Win10 catalog. The flash utility doesn't depend on the OS, so
+    # when the requested catalog has no BIOS for any machine type, try the
+    # other Windows catalog before giving up.
+    $CatalogVersions = if ($WinVersion -eq '11') { @('11', '10') } else { @('10', '11') }
 
     # Lenovo typically publishes only one BIOS catalog XML per model (at the
     # primary MTM); sibling MTMs often return an empty or stub XML. Iterate all
@@ -356,108 +364,114 @@ function Get-LenovoBIOSUpdate {
     #      the parent of the per-package XML URL combined with that filename.
     $TempDir = Get-DATTempPath -Prefix 'LenovoBios'
     try {
-        foreach ($MType in $CandidateTypes) {
-            $BiosXmlUrl = '{0}{1}_Win{2}.xml' -f $Sources.lenovo.biosBase, $MType, $WinVersion
-            Write-DATLog -Message "Checking Lenovo BIOS catalog: $BiosXmlUrl" -Severity 1
-
-            $CatalogPath = Join-Path $TempDir "$MType.xml"
-            try {
-                $null = Invoke-DATDownload -Url $BiosXmlUrl -DestinationPath $CatalogPath -MaxRetries 2
-            } catch {
-                Write-DATLog -Message "Lenovo BIOS XML not available for machine type $MType`: $($_.Exception.Message)" -Severity 2
-                continue
+        foreach ($CatalogWin in $CatalogVersions) {
+            if ($CatalogWin -ne $WinVersion) {
+                Write-DATLog -Message "No BIOS found in Lenovo's Win$WinVersion catalog for $Model - checking the Win$CatalogWin catalog instead (the BIOS flash utility does not depend on the OS)" -Severity 2
             }
 
-            if (-not (Test-Path $CatalogPath) -or (Get-Item $CatalogPath).Length -eq 0) {
-                Write-DATLog -Message "Lenovo BIOS XML empty for machine type $MType - trying next type" -Severity 2
-                continue
+            foreach ($MType in $CandidateTypes) {
+                $BiosXmlUrl = '{0}{1}_Win{2}.xml' -f $Sources.lenovo.biosBase, $MType, $CatalogWin
+                Write-DATLog -Message "Checking Lenovo BIOS catalog: $BiosXmlUrl" -Severity 1
+
+                $CatalogPath = Join-Path $TempDir "$($MType)_Win$CatalogWin.xml"
+                try {
+                    $null = Invoke-DATDownload -Url $BiosXmlUrl -DestinationPath $CatalogPath -MaxRetries 2
+                } catch {
+                    Write-DATLog -Message "Lenovo BIOS XML not available for machine type $MType`: $($_.Exception.Message)" -Severity 2
+                    continue
+                }
+
+                if (-not (Test-Path $CatalogPath) -or (Get-Item $CatalogPath).Length -eq 0) {
+                    Write-DATLog -Message "Lenovo BIOS XML empty for machine type $MType - trying next type" -Severity 2
+                    continue
+                }
+
+                try {
+                    $CatalogXml = Read-DATXml -Path $CatalogPath
+                } catch {
+                    Write-DATLog -Message "Unparseable Lenovo BIOS XML for machine type $MType - trying next type" -Severity 2
+                    continue
+                }
+
+                # Lenovo's per-MTM catalog XML uses lowercase <packages>/<package>/<category>/<location>.
+                # XPath is case-sensitive, so SelectNodes('//Package') misses everything. PowerShell's
+                # XML dot-accessor is case-insensitive, so navigate via property access instead.
+                $PackagesRoot = $CatalogXml.packages
+                if (-not $PackagesRoot) { $PackagesRoot = $CatalogXml.DocumentElement }
+                $AllPackages = @($PackagesRoot.package)
+                $BiosCatalogEntries = @($AllPackages | Where-Object { $_ -and ($_.category -match 'BIOS') })
+
+                if ($BiosCatalogEntries.Count -eq 0) {
+                    Write-DATLog -Message "No BIOS packages in the Win$CatalogWin catalog for $Model ($MType) - trying next machine type" -Severity 2
+                    continue
+                }
+
+                # Match original DAT: pick the latest entry by location string descending.
+                $LatestEntry = $BiosCatalogEntries | Sort-Object { $_.location } -Descending | Select-Object -First 1
+                $PackageXmlUrl = $LatestEntry.location
+                if (-not $PackageXmlUrl) {
+                    Write-DATLog -Message "Lenovo BIOS catalog entry has no Location URL for $Model ($MType) - trying next type" -Severity 2
+                    continue
+                }
+
+                $PackageXmlName = Split-Path $PackageXmlUrl -Leaf
+                $PackageXmlPath = Join-Path $TempDir $PackageXmlName
+                try {
+                    $null = Invoke-DATDownload -Url $PackageXmlUrl -DestinationPath $PackageXmlPath -MaxRetries 2
+                } catch {
+                    Write-DATLog -Message "Failed to download Lenovo BIOS package XML ($PackageXmlUrl): $($_.Exception.Message)" -Severity 2
+                    continue
+                }
+
+                try {
+                    $PackageXml = Read-DATXml -Path $PackageXmlPath
+                } catch {
+                    Write-DATLog -Message "Unparseable Lenovo BIOS package XML ($PackageXmlUrl) - trying next type" -Severity 2
+                    continue
+                }
+
+                # The per-package XML's root element casing varies. Use DocumentElement so we don't
+                # depend on a case-sensitive XPath like '/Package' vs '/package'.
+                $PackageNode = $PackageXml.DocumentElement
+                if (-not $PackageNode) {
+                    Write-DATLog -Message "Lenovo BIOS package XML has no root element for $Model - trying next type" -Severity 2
+                    continue
+                }
+
+                $ExtractCommand = $PackageNode.ExtractCommand
+                if (-not $ExtractCommand) {
+                    Write-DATLog -Message "Lenovo BIOS package XML missing ExtractCommand for $Model - trying next type" -Severity 2
+                    continue
+                }
+
+                $BiosFile = ($ExtractCommand -split '\s+')[0]
+                if (-not $BiosFile) {
+                    Write-DATLog -Message "Could not parse BIOS executable name from ExtractCommand for Lenovo $Model - trying next type" -Severity 2
+                    continue
+                }
+
+                $UrlParent = $PackageXmlUrl -replace '/[^/]+$', ''
+                $DownloadUrl = ("$UrlParent/$BiosFile") -replace '\\', '/'
+
+                $Result = [PSCustomObject]@{
+                    Manufacturer    = 'Lenovo'
+                    Model           = $Model
+                    MachineType     = $MType
+                    AllMachineTypes = $AllMachineTypesStr
+                    Type            = 'BIOS'
+                    Version         = $PackageNode.version
+                    ReleaseDate     = $PackageNode.ReleaseDate
+                    Url             = $DownloadUrl
+                    FileName        = $BiosFile
+                    ExtractCommand  = $ExtractCommand
+                }
+
+                Write-DATLog -Message "Found Lenovo BIOS update: v$($Result.Version) ($($Result.ReleaseDate)) for $Model via $MType (Win$CatalogWin catalog)" -Severity 1
+                return $Result
             }
-
-            try {
-                $CatalogXml = Read-DATXml -Path $CatalogPath
-            } catch {
-                Write-DATLog -Message "Unparseable Lenovo BIOS XML for machine type $MType - trying next type" -Severity 2
-                continue
-            }
-
-            # Lenovo's per-MTM catalog XML uses lowercase <packages>/<package>/<category>/<location>.
-            # XPath is case-sensitive, so SelectNodes('//Package') misses everything. PowerShell's
-            # XML dot-accessor is case-insensitive, so navigate via property access instead.
-            $PackagesRoot = $CatalogXml.packages
-            if (-not $PackagesRoot) { $PackagesRoot = $CatalogXml.DocumentElement }
-            $AllPackages = @($PackagesRoot.package)
-            $BiosCatalogEntries = @($AllPackages | Where-Object { $_ -and ($_.category -match 'BIOS') })
-
-            if ($BiosCatalogEntries.Count -eq 0) {
-                Write-DATLog -Message "No BIOS packages in catalog for $Model ($MType) - trying next machine type" -Severity 2
-                continue
-            }
-
-            # Match original DAT: pick the latest entry by location string descending.
-            $LatestEntry = $BiosCatalogEntries | Sort-Object { $_.location } -Descending | Select-Object -First 1
-            $PackageXmlUrl = $LatestEntry.location
-            if (-not $PackageXmlUrl) {
-                Write-DATLog -Message "Lenovo BIOS catalog entry has no Location URL for $Model ($MType) - trying next type" -Severity 2
-                continue
-            }
-
-            $PackageXmlName = Split-Path $PackageXmlUrl -Leaf
-            $PackageXmlPath = Join-Path $TempDir $PackageXmlName
-            try {
-                $null = Invoke-DATDownload -Url $PackageXmlUrl -DestinationPath $PackageXmlPath -MaxRetries 2
-            } catch {
-                Write-DATLog -Message "Failed to download Lenovo BIOS package XML ($PackageXmlUrl): $($_.Exception.Message)" -Severity 2
-                continue
-            }
-
-            try {
-                $PackageXml = Read-DATXml -Path $PackageXmlPath
-            } catch {
-                Write-DATLog -Message "Unparseable Lenovo BIOS package XML ($PackageXmlUrl) - trying next type" -Severity 2
-                continue
-            }
-
-            # The per-package XML's root element casing varies. Use DocumentElement so we don't
-            # depend on a case-sensitive XPath like '/Package' vs '/package'.
-            $PackageNode = $PackageXml.DocumentElement
-            if (-not $PackageNode) {
-                Write-DATLog -Message "Lenovo BIOS package XML has no root element for $Model - trying next type" -Severity 2
-                continue
-            }
-
-            $ExtractCommand = $PackageNode.ExtractCommand
-            if (-not $ExtractCommand) {
-                Write-DATLog -Message "Lenovo BIOS package XML missing ExtractCommand for $Model - trying next type" -Severity 2
-                continue
-            }
-
-            $BiosFile = ($ExtractCommand -split '\s+')[0]
-            if (-not $BiosFile) {
-                Write-DATLog -Message "Could not parse BIOS executable name from ExtractCommand for Lenovo $Model - trying next type" -Severity 2
-                continue
-            }
-
-            $UrlParent = $PackageXmlUrl -replace '/[^/]+$', ''
-            $DownloadUrl = ("$UrlParent/$BiosFile") -replace '\\', '/'
-
-            $Result = [PSCustomObject]@{
-                Manufacturer    = 'Lenovo'
-                Model           = $Model
-                MachineType     = $MType
-                AllMachineTypes = $AllMachineTypesStr
-                Type            = 'BIOS'
-                Version         = $PackageNode.version
-                ReleaseDate     = $PackageNode.ReleaseDate
-                Url             = $DownloadUrl
-                FileName        = $BiosFile
-                ExtractCommand  = $ExtractCommand
-            }
-
-            Write-DATLog -Message "Found Lenovo BIOS update: v$($Result.Version) ($($Result.ReleaseDate)) for $Model via $MType" -Severity 1
-            return $Result
         }
 
-        Write-DATLog -Message "No BIOS package found for Lenovo $Model after checking machine types: $($CandidateTypes -join ', ')" -Severity 2
+        Write-DATLog -Message "No BIOS package found for Lenovo $Model after checking machine types $($CandidateTypes -join ', ') in the Win$($CatalogVersions -join ' and Win') catalogs" -Severity 2
         return $null
     } finally {
         Remove-DATTempPath -Path $TempDir

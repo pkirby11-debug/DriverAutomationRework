@@ -323,3 +323,102 @@ Describe 'Get-LenovoIndividualUpdates' {
         Should -Invoke Invoke-DATDownload -Exactly -Times 1 -ParameterFilter { $Url -like '*21TE_Win10.xml' }
     }
 }
+
+Describe 'Get-LenovoBIOSUpdate' {
+    BeforeAll {
+        # Mirrors the live ThinkPad L390 feed (20NS/20NR): the Win11 catalogs
+        # list drivers but no BIOS, and the BIOS only appears in the Win10
+        # catalogs. 20NR is the sibling MTM that lists nothing useful.
+        $script:BiosFixtures = @{
+            '20NS_Win11.xml' = @'
+<?xml version="1.0" encoding="UTF-8"?>
+<packages count="1">
+  <package><category>Audio</category><location>https://download.lenovo.com/pccbbs/mobiles/r10a316w_2_.xml</location></package>
+</packages>
+'@
+            '20NR_Win11.xml' = @'
+<?xml version="1.0" encoding="UTF-8"?>
+<packages count="1">
+  <package><category>Audio</category><location>https://download.lenovo.com/pccbbs/mobiles/r10a316w_2_.xml</location></package>
+</packages>
+'@
+            '20NS_Win10.xml' = @'
+<?xml version="1.0" encoding="UTF-8"?>
+<packages count="3">
+  <package><category>Audio</category><location>https://download.lenovo.com/pccbbs/mobiles/r10a316w_2_.xml</location></package>
+  <package><category>BIOS UEFI</category><location>https://download.lenovo.com/pccbbs/mobiles/r10uj04w_2_.xml</location></package>
+  <package><category>BIOS UEFI</category><location>https://download.lenovo.com/pccbbs/mobiles/r10uj32w_2_.xml</location></package>
+</packages>
+'@
+            'r10uj32w_2_.xml' = @'
+<Package name="BIOS_R10UJ_US" id="r10uj32w" version="1.53">
+  <ExtractCommand>r10uj32w.exe /VERYSILENT /DIR=%PACKAGEPATH% /EXTRACT="YES"</ExtractCommand>
+  <ReleaseDate>2026-06-04</ReleaseDate>
+</Package>
+'@
+            # A model whose Win11 catalog does carry its BIOS.
+            '21TE_Win11.xml' = @'
+<?xml version="1.0" encoding="UTF-8"?>
+<packages count="1">
+  <package><category>BIOS UEFI</category><location>https://download.lenovo.com/pccbbs/mobiles/n40uj10w_2_.xml</location></package>
+</packages>
+'@
+            'n40uj10w_2_.xml' = @'
+<Package name="BIOS_N40UJ_US" id="n40uj10w" version="1.10">
+  <ExtractCommand>n40uj10w.exe /VERYSILENT /DIR=%PACKAGEPATH% /EXTRACT="YES"</ExtractCommand>
+  <ReleaseDate>2026-05-01</ReleaseDate>
+</Package>
+'@
+        }
+    }
+
+    BeforeEach {
+        Mock Find-LenovoMachineType { @('20NS', '20NR') } -ParameterFilter { $Model -like '*L390*' }
+        Mock Find-LenovoMachineType { @('21TE') } -ParameterFilter { $Model -like '*T14*' }
+        Mock Invoke-DATDownload {
+            $Leaf = Split-Path $Url -Leaf
+            if (-not $script:BiosFixtures.ContainsKey($Leaf)) {
+                throw "404 (no fixture): $Url"
+            }
+            Set-Content -Path $DestinationPath -Value $script:BiosFixtures[$Leaf] -Encoding UTF8
+            return $DestinationPath
+        }
+    }
+
+    It 'Falls back to the Win10 catalog when no Win11 catalog lists a BIOS (ThinkPad L390)' {
+        $Result = Get-LenovoBIOSUpdate -Model 'ThinkPad L390 Type 20NR 20NS' -OperatingSystem 'Windows 11 22H2'
+        $Result | Should -Not -BeNullOrEmpty
+        $Result.Version         | Should -Be '1.53'
+        $Result.FileName        | Should -Be 'r10uj32w.exe'
+        $Result.Url             | Should -Be 'https://download.lenovo.com/pccbbs/mobiles/r10uj32w.exe'
+        $Result.MachineType     | Should -Be '20NS'
+        $Result.AllMachineTypes | Should -Be '20NS;20NR'
+
+        # Every Win11 catalog is tried before the fallback kicks in.
+        Should -Invoke Invoke-DATDownload -Exactly -Times 1 -ParameterFilter { $Url -like '*20NS_Win11.xml' }
+        Should -Invoke Invoke-DATDownload -Exactly -Times 1 -ParameterFilter { $Url -like '*20NR_Win11.xml' }
+        Should -Invoke Invoke-DATDownload -Exactly -Times 1 -ParameterFilter { $Url -like '*20NS_Win10.xml' }
+    }
+
+    It 'Uses the requested OS catalog and never fetches the other one when it lists a BIOS' {
+        $Result = Get-LenovoBIOSUpdate -Model 'ThinkPad T14 Gen 4' -OperatingSystem 'Windows 11 24H2'
+        $Result.Version  | Should -Be '1.10'
+        $Result.FileName | Should -Be 'n40uj10w.exe'
+        Should -Invoke Invoke-DATDownload -Exactly -Times 0 -ParameterFilter { $Url -like '*_Win10.xml' }
+    }
+
+    It 'Falls back to the Win11 catalog for Windows 10 targets' {
+        # No 21TE_Win10.xml fixture exists (the mock throws for it).
+        $Result = Get-LenovoBIOSUpdate -Model 'ThinkPad T14 Gen 4' -OperatingSystem 'Windows 10 22H2'
+        $Result.Version | Should -Be '1.10'
+        Should -Invoke Invoke-DATDownload -Exactly -Times 1 -ParameterFilter { $Url -like '*21TE_Win10.xml' }
+        Should -Invoke Invoke-DATDownload -Exactly -Times 1 -ParameterFilter { $Url -like '*21TE_Win11.xml' }
+    }
+
+    It 'Returns null when neither catalog lists a BIOS' {
+        $Result = Get-LenovoBIOSUpdate -Model 'ThinkPad L390 Type 20NR 20NS' -MachineType '20NR' -OperatingSystem 'Windows 11 22H2'
+        $Result | Should -BeNullOrEmpty
+        Should -Invoke Invoke-DATDownload -Exactly -Times 1 -ParameterFilter { $Url -like '*20NR_Win11.xml' }
+        Should -Invoke Invoke-DATDownload -Exactly -Times 1 -ParameterFilter { $Url -like '*20NR_Win10.xml' }
+    }
+}

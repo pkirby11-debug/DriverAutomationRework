@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.46.6'
+    ModuleVersion     = '2.46.7'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.46.6 - Removes the unfinished compliance-reporting code that 2.46.4 carried without wiring it up: the snapshot panels, the HTML dashboard renderer, the BIOS version comparer, the screening-history store, Get-DATComplianceSnapshot and their tests. None of it was loaded by the module or exported, and its tests asserted a Reports tab that does not exist, which kept CI red. Nothing an operator could reach has changed. Also carries the 2.46.5 fixes that make cross-model deduplication (hard links into <PackagePath>\_SharedPayloads, on by default; -EnableDeduplication:$false turns it off) safe to leave on: compressed driver packs are no longer pooled, a file is swapped for its hard link by a temp link plus one rename so an interrupted run cannot strand it as <name>.dat_dedup_bak (and files stranded by 2.46.4 are restored), Optimize-DATPackageStorage re-checks each candidate before swapping it and honours -WhatIf, a pooled payload is never rewritten in place and the pool is keyed by the real hash of the staged bytes, Copy-DATApplyScript unlinks the staged apply script before replacing it and DAT control files are excluded from pooling, an unsupported share gets a plain copy instead of two copies of every payload, the run summary reports only real savings, and the MSI manifest ships SharedPayloadStore.ps1 and Optimize-DATPackageStorage.ps1.'
+    Description       = '2.46.7 - Lenovo BIOS lookup now falls back to the other Windows catalog when the requested one lists no BIOS. Lenovo does not always publish the BIOS in both: the ThinkPad L390 (20NR/20NS) Win11 catalog has drivers but no BIOS, so a Windows 11 sync reported "No BIOS update found" even though BIOS 1.53 is in the Win10 catalog. The flash utility does not depend on the OS, so a Windows 11 sync now checks the Win10 catalog (and a Windows 10 sync the Win11 one) before giving up, and logs a warning naming the catalog it used.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(
