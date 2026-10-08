@@ -500,8 +500,18 @@ On the client, a pinned package:
     `ATISetup.exe` must carry a valid AMD or Dell signature. Under `C:\Temp`,
     every parent folder is user-modifiable. Kept a week after a failed run, for
     diagnosis.
-  - **Success comes from AMD's result file and the device**, not the undocumented
-    exit code. A run that wrote nothing at all counts as failed.
+  - **The device decides**, not the undocumented exit code. AMD's result file
+    (`ResultCode`) and its `C:\Program Files\AMD\CIM\Log\Install.log` give AMD's
+    verdict - both read while AMD may still hold them open, and Install.log
+    only for this run's lines (found by the run's own folder name, which AMD
+    logs). "Install of AMD Display Driver is successful" counts as a pass when
+    the result file has no `ResultCode`. Then the GPU is re-read: a run AMD
+    called a failure that left it on the pinned version is treated as
+    installed, and the rest of the stack is checked as after any rollback. A
+    run is called "did not run" only when there is no result file and an
+    Install.log read before and after has no line from it; when the client
+    could not read AMD's files, the log says what it could not read and the
+    device is checked instead.
   - **Bounded.** It runs at most twice per pinned revision on a device, and only
     once on a device already on the pin. Its failures never count toward the DUP
     quarantine, so they cannot block the DUP that reinstalls the display driver.

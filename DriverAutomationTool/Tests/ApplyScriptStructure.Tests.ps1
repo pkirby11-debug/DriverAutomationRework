@@ -873,6 +873,38 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         $Block | Should -Not -Match "ExitCode -eq 0\)\s*\{\s*\`$Out\.Outcome = 'Passed'"
     }
 
+    It 'Reads AMD''s result file and Install.log shared, never with a reader that locks out AMD''s writer' {
+        # File.ReadAllText allows other readers only; on a file AMD still had
+        # open for writing it failed, and a successful install was logged as
+        # one that "did not run".
+        $Block = (Get-DATScriptBlockAssignment -Name '$InvokeVendorInstaller').Extent.Text
+        $Block | Should -Not -Match 'ReadAllText|Get-Content'
+        $Block | Should -Match '\$ResultRead = & \$ReadSharedText \$ResultLog'
+        $Block | Should -Match '\$LogBefore = & \$ReadSharedText \$InstallLog'
+        $Block | Should -Match '\$LogAfter = & \$ReadSharedText \$InstallLog'
+        (Get-DATScriptBlockAssignment -Name '$ReadSharedText').Extent.Text | Should -Match "\[System\.IO\.FileShare\]'ReadWrite, Delete'"
+    }
+
+    It 'Calls a clean install "did not run" only on proof, never because it could not read the logs' {
+        $Block = (Get-DATScriptBlockAssignment -Name '$InvokeVendorInstaller').Extent.Text
+        $M = [regex]::Match($Block, "elseif \(([^\n]*)\) \{(\s*#[^\n]*)*\s*\`$Out\.Outcome = 'Failed'\s*\`$Out\.Reason = [^\n]*did not run")
+        $M.Success | Should -BeTrue
+        foreach ($Need in '-not \$ResultRead\.Exists', '\$LogBefore\.Ok', '\$LogAfter\.Ok', '\$LogScoped', '-not \$NewLog\.Trim\(\)') {
+            $M.Groups[1].Value | Should -Match $Need
+        }
+    }
+
+    It 'Lets the device overrule a clean install AMD called a failure, after the ledger has recorded AMD''s verdict' {
+        $Loop = $script:DrvLoop.Extent.Text
+        $M = [regex]::Match($Loop, "(?s)if \(\`$VendorRun\.Outcome -eq 'Failed'\) \{\s*\`$Verdict = & \`$GetVendorDeviceVerdict \`$Drv \`$PinTarget \`$LiveVersion\s*if \(\`$Verdict\.OnPin -and \(\`$Verdict\.Moved -or \`$Verdict\.StackClean\)\) \{\s*\`$DupCode = 2")
+        $M.Success | Should -BeTrue
+        $Ledger = [regex]::Match($Loop, "-Name 'VendorAttemptOutcome' -Value \(\[string\]\`$VendorRun\.Outcome\)")
+        $Map = [regex]::Match($Loop, "\`$DupCode = switch \(\`$VendorRun\.Outcome\)")
+        $Ledger.Success | Should -BeTrue
+        $Ledger.Index | Should -BeLessThan $Map.Index
+        $Map.Index | Should -BeLessThan $M.Index
+    }
+
     It 'Keeps a deferred clean install out of the quarantine ledger' {
         # AMD stops on 202/206 before changing anything; that is timing, not a
         # broken installer, and must not quarantine the rollback.

@@ -53,6 +53,8 @@ BeforeAll {
     $script:RetireDriverPackage  = Get-ApplyScriptBlock -Fn $InstallFn -Name '$RetireDriverPackage'
     $script:ReconcilePinnedStack = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ReconcilePinnedStack'
     $script:InvokeVendorInstaller = Get-ApplyScriptBlock -Fn $InstallFn -Name '$InvokeVendorInstaller'
+    $script:ReadSharedText       = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ReadSharedText'
+    $script:GetVendorDeviceVerdict = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetVendorDeviceVerdict'
     # Plain values the scriptblocks above read from their caller's scope.
     $script:ExtendedConfigKeys      = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ExtendedConfigKeys'
     $script:AmdCleanInstallSwitch   = Get-ApplyScriptBlock -Fn $InstallFn -Name '$AmdCleanInstallSwitch'
@@ -814,6 +816,7 @@ Describe 'AMD clean installer from the pinned DUP' {
     # "installer" writes AMD's documented result file and Install.log lines.
     BeforeAll {
         $script:SavedProgramFiles = $env:ProgramFiles
+        $script:SavedProgramW6432 = $env:ProgramW6432
 
         function New-FakeProcess {
             param([int]$ExitCode = 0)
@@ -844,10 +847,38 @@ Describe 'AMD clean installer from the pinned DUP' {
             $Line = $ArgumentList -join ' '
             if ($Line -match '-LOG\s+"([^"]+)"') { $script:ResultPath = $Matches[1] }
             if ($null -ne $script:AmdResultCode -and -not $script:ResultLate -and $script:ResultPath) {
-                Set-Content -Path $script:ResultPath -Value "[ResponseResult]`r`nResultCode = $($script:AmdResultCode)`r`n[Details]`r`nPackage Name = Display Driver`r`nErrorCode = 0"
+                Write-FakeResult "[ResponseResult]`r`nResultCode = $($script:AmdResultCode)`r`n[Details]`r`nPackage Name = Display Driver`r`nErrorCode = 0"
+            } elseif ($null -ne $script:ResultText -and $script:ResultPath) {
+                Write-FakeResult $script:ResultText
             }
-            if ($script:AmdLogLines) { Add-Content -Path $script:InstallLog -Value $script:AmdLogLines }
+            # AMD logs its own command line upper-cased, -LOG path and all:
+            # {RUN} stands for that path.
+            $Lines = @($script:AmdLogLines | ForEach-Object { $_.Replace('{RUN}', "$($script:ResultPath)".ToUpperInvariant()) })
+            if ($null -ne $script:AmdLogRewrite) {
+                # AMD starting the log afresh rather than appending to it.
+                Set-Content -Path $script:InstallLog -Value (@($script:AmdLogRewrite) + $Lines)
+            } elseif ($Lines.Count -gt 0) {
+                Add-Content -Path $script:InstallLog -Value $Lines
+            }
+            # Something of AMD's still holding its files open for writing, as
+            # the field run suggests: readers that do not share write access
+            # cannot open them.
+            if ($script:HoldOpen) {
+                foreach ($F in @($script:ResultPath, $script:InstallLog)) {
+                    if ($F -and (Test-Path $F)) {
+                        $script:Held.Add([System.IO.File]::Open((Get-Item -LiteralPath $F).FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite))
+                    }
+                }
+            }
             return New-FakeProcess -ExitCode 0
+        }
+        function Write-FakeResult {
+            param([string]$Text)
+            switch ($script:ResultEncoding) {
+                'utf16' { [System.IO.File]::WriteAllBytes($script:ResultPath, [byte[]](@(0xFF, 0xFE) + [System.Text.Encoding]::Unicode.GetBytes($Text))) }
+                'utf16nobom' { [System.IO.File]::WriteAllBytes($script:ResultPath, [System.Text.Encoding]::Unicode.GetBytes($Text)) }
+                default { Set-Content -Path $script:ResultPath -Value $Text }
+            }
         }
         # Win32_Process while AMD's installer runs: the scripted processes for
         # the first polls, then nothing. A "late" result is written only once
@@ -889,10 +920,20 @@ Describe 'AMD clean installer from the pinned DUP' {
 
     AfterAll {
         $env:ProgramFiles = $script:SavedProgramFiles
+        $env:ProgramW6432 = $script:SavedProgramW6432
+    }
+
+    AfterEach {
+        foreach ($H in $script:Held) { $H.Dispose() }
     }
 
     BeforeEach {
         $script:LogLines.Clear()
+        $script:Held = [System.Collections.Generic.List[object]]::new()
+        $script:HoldOpen = $false
+        $script:ResultText = $null
+        $script:ResultEncoding = $null
+        $script:AmdLogRewrite = $null
         $script:Launches = [System.Collections.Generic.List[object]]::new()
         $script:Killed = $false
         $script:Packages = @([PSCustomObject]@{ Root = '14393/Drivers/251014a-420077C-Dell'; Help = '-FACTORYRESETINSTALL Silently uninstalls the existing driver'; InfVersion = '32.0.12046.3001'; Dev = '15C8' })
@@ -918,8 +959,11 @@ Describe 'AMD clean installer from the pinned DUP' {
         $script:AmdLogLines = @('InstallMan::performInstall Install has completed. Reboot is required.')
 
         $Case = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 8))
-        $env:ProgramFiles = Join-Path $Case 'ProgramFiles'
-        $script:InstallLog = Join-Path $env:ProgramFiles 'AMD/CIM/Log/Install.log'
+        # AMD writes under the 64-bit Program Files, which a 32-bit process
+        # sees as ProgramW6432, not ProgramFiles.
+        $env:ProgramW6432 = Join-Path $Case 'ProgramFiles'
+        $env:ProgramFiles = Join-Path $Case 'ProgramFiles (x86)'
+        $script:InstallLog = Join-Path $env:ProgramW6432 'AMD/CIM/Log/Install.log'
         New-Item -ItemType Directory -Path (Split-Path $script:InstallLog) -Force | Out-Null
         $script:WorkDir = Join-Path $Case 'work'
         $script:LogDir  = Join-Path $Case 'logs'
@@ -928,6 +972,7 @@ Describe 'AMD clean installer from the pinned DUP' {
         Set-Content -Path $script:DupPath -Value 'MZ'
 
         $AmdCleanInstallSwitch    = $script:AmdCleanInstallSwitch
+        $ReadSharedText           = $script:ReadSharedText
         $AmdDeferCodes            = $script:AmdDeferCodes
         # The real pattern: without it '-match $null' would count every
         # process as AMD's installer and the poll tests would prove nothing.
@@ -1102,14 +1147,116 @@ Describe 'AMD clean installer from the pinned DUP' {
         $R.Outcome | Should -Be 'Unknown'
     }
 
-    It 'Fails a run that left no trace at all, rather than letting it pass as unknown' {
-        # No result file and not a line in Install.log: the installer did not
-        # do anything (a rejected argument, a prompt nobody can see as SYSTEM).
+    It 'Fails a run that provably did nothing' {
+        # No result file, and an Install.log read before and after the run
+        # without a line from it: the installer did not do anything (a
+        # rejected argument, a prompt nobody can see as SYSTEM).
+        Set-Content -Path $script:InstallLog -Value 'an earlier run'
         $script:AmdResultCode = $null
         $script:AmdLogLines = @()
         $R = Invoke-Vendor
         $R.Outcome | Should -Be 'Failed'
         $R.Reason | Should -Match 'did not run'
+    }
+
+    It 'Leaves it to the device, rather than calling it "did not run", when it could not look' {
+        # No Install.log where it was looked for: that proves nothing about
+        # AMD - and in the field a "did not run" verdict was a run that had
+        # installed the pinned driver.
+        $script:AmdResultCode = $null
+        $script:AmdLogLines = @()
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Unknown'
+        $R.Reason | Should -Not -Match 'did not run'
+        $R.Detail | Should -Match 'result file not written'
+        $R.Detail | Should -Match 'Install\.log not found at '
+    }
+
+    It 'Reads AMD''s files while something of AMD''s still holds them open for writing' {
+        # The field run (FX308309): AMD's result file was there, and its
+        # Install.log said the display driver installed, yet a reader that
+        # does not share write access saw neither.
+        $script:HoldOpen = $true
+        $script:AmdLogLines = @(
+            'InstallMan::InstallMan Starting install: "...\BIN64\AtiSetup.exe" -FACTORYRESETINSTALL -LOG "{RUN}"'
+            'InstallMan::performInstall Install has completed. Reboot is required.'
+        )
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Passed'
+        $R.ResultCode | Should -Be 0
+        $R.Detail | Should -Match 'Install\.log 2 line\(s\) from this run'
+        # Kept with the run's logs, from what was read.
+        (Get-Content -Path $R.ResultLog -Raw) | Should -Match 'ResultCode = 0'
+    }
+
+    It 'Reads a result file written as UTF-16, with or without a byte-order mark' {
+        foreach ($Enc in 'utf16', 'utf16nobom') {
+            $script:ResultEncoding = $Enc
+            $script:AmdResultCode = 1
+            $script:Launches.Clear()
+            $R = Invoke-Vendor
+            $R.ResultCode | Should -Be 1 -Because "a $Enc result file says ResultCode 1"
+            $R.Outcome | Should -Be 'Failed'
+        }
+    }
+
+    It 'Passes on AMD''s own display-driver success line when the result file gives no verdict' {
+        # The field run's Install.log, word for word.
+        $script:AmdResultCode = $null
+        $script:ResultText = "[ResponseResult]`r`n"
+        $script:AmdLogLines = @(
+            'InstallMan::InstallMan Starting install: "...\BIN64\AtiSetup.exe" -FACTORYRESETINSTALL -LOG "{RUN}"'
+            'InstallMan::performInstall Install of AMD Display Driver is successful. - iResult - 0'
+            'InstallMan::performInstall AMD HDMI Audio Driver requires a system reboot'
+            'InstallMan::performInstall The current active display driver is AMD Radeon 740M Graphics, version 32.0.12046.3001, inf oem57.inf'
+            'InstallMan::performInstall Install has completed. Reboot is required.'
+        )
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Passed'
+        $R.Reason | Should -Match 'display driver installed'
+        $R.Detail | Should -Match 'result file there but has no ResultCode \(\d+ bytes: ''\[ResponseResult\]''\)'
+        $R.Detail | Should -Match 'Install of AMD Display Driver is successful'
+        $R.Detail | Should -Not -Match 'absent'
+    }
+
+    It 'Says what it could not read instead of calling the result file absent' {
+        $script:AmdResultCode = $null
+        $script:ResultText = 'Result: something AMD has not documented'
+        $script:AmdLogLines = @('InstallMan::InstallMan Starting install: "...\BIN64\AtiSetup.exe" -FACTORYRESETINSTALL -LOG "{RUN}"')
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Unknown'
+        $R.Detail | Should -Match "there but has no ResultCode \(\d+ bytes: 'Result: something AMD has not documented'\)"
+        $R.Detail | Should -Not -Match 'absent'
+    }
+
+    It 'Finds this run''s Install.log lines by its own folder when AMD started the log afresh' {
+        # Not an extension of what was there before, so the lines are found
+        # from the first one naming this run's folder - and an error from an
+        # earlier run above it is not read as this run's.
+        Set-Content -Path $script:InstallLog -Value 'an earlier run'
+        $script:AmdLogRewrite = @('a header', 'Error code to display to user: 182')
+        $script:AmdResultCode = $null
+        $script:AmdLogLines = @(
+            'InstallMan::InstallMan Starting install: "...\BIN64\AtiSetup.exe" -FACTORYRESETINSTALL -LOG "{RUN}"'
+            'InstallMan::performInstall Install of AMD Display Driver is successful. - iResult - 0'
+        )
+        $R = Invoke-Vendor
+        $R.AmdError | Should -BeNullOrEmpty
+        $R.Outcome | Should -Be 'Passed'
+        $R.Detail | Should -Match 'Install\.log 2 line\(s\) from this run'
+    }
+
+    It 'Takes nothing from an Install.log it cannot tie to this run' {
+        # Started afresh and never naming this run: an error in it may be
+        # anyone's, so it decides nothing - and neither does its silence.
+        Set-Content -Path $script:InstallLog -Value 'an earlier run'
+        $script:AmdLogRewrite = @('Error code to display to user: 206')
+        $script:AmdResultCode = $null
+        $script:AmdLogLines = @()
+        $R = Invoke-Vendor
+        $R.AmdError | Should -BeNullOrEmpty
+        $R.Outcome | Should -Be 'Unknown'
+        $R.Detail | Should -Match "could not tell this run's lines from earlier ones"
     }
 
     It 'Waits for the hand-off to ATISetup before reading the result' {
@@ -1237,6 +1384,118 @@ Describe 'AMD clean installer from the pinned DUP' {
     It 'Never kills the installer' {
         $null = Invoke-Vendor
         $script:Killed | Should -BeFalse
+    }
+}
+
+Describe 'Reading a log AMD may still hold open' {
+    BeforeEach {
+        $script:File = Join-Path $TestDrive ([guid]::NewGuid().ToString('N') + '.log')
+    }
+
+    It 'Decodes <Name>' -TestCases @(
+        @{ Name = 'UTF-8 with a BOM';     Bytes = { [byte[]](@(0xEF, 0xBB, 0xBF) + [System.Text.Encoding]::UTF8.GetBytes($args[0])) } }
+        @{ Name = 'UTF-16 with a BOM';    Bytes = { [byte[]](@(0xFF, 0xFE) + [System.Text.Encoding]::Unicode.GetBytes($args[0])) } }
+        @{ Name = 'UTF-16 without a BOM'; Bytes = { [System.Text.Encoding]::Unicode.GetBytes($args[0]) } }
+        @{ Name = 'UTF-16 big-endian';    Bytes = { [byte[]](@(0xFE, 0xFF) + [System.Text.Encoding]::BigEndianUnicode.GetBytes($args[0])) } }
+        @{ Name = 'plain UTF-8';          Bytes = { [System.Text.Encoding]::UTF8.GetBytes($args[0]) } }
+    ) {
+        param($Name, $Bytes)
+        $Text = "[ResponseResult]`r`nResultCode = 0`r`nPackage Name = Pilote d'affichage AMD"
+        [System.IO.File]::WriteAllBytes($script:File, (& $Bytes $Text))
+        $R = & $script:ReadSharedText $script:File
+        $R.Ok | Should -BeTrue
+        $R.Text | Should -BeExactly $Text
+    }
+
+    It 'Keeps a non-ASCII name intact in UTF-16 without a BOM' {
+        # Stripping the NULs alone would read ASCII, but not this.
+        [System.IO.File]::WriteAllBytes($script:File, [System.Text.Encoding]::Unicode.GetBytes('Pilote vidéo AMD installé'))
+        (& $script:ReadSharedText $script:File).Text | Should -BeExactly 'Pilote vidéo AMD installé'
+    }
+
+    It 'Says a missing file is missing, not unreadable' {
+        $R = & $script:ReadSharedText (Join-Path $TestDrive 'nope.log')
+        $R.Exists | Should -BeFalse
+        $R.Ok | Should -BeFalse
+    }
+
+    It 'Reads a file another process still has open for writing' {
+        Set-Content -Path $script:File -Value 'Install has completed. Reboot is required.'
+        $Held = [System.IO.File]::Open($script:File, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+        try {
+            $R = & $script:ReadSharedText $script:File
+        } finally {
+            $Held.Dispose()
+        }
+        $R.Ok | Should -BeTrue
+        $R.Text | Should -Match 'Install has completed'
+    }
+}
+
+Describe 'Judging a clean install by the device' {
+    # AMD's verdict is paperwork; the device is the outcome. In the field a
+    # run reported as failed had put the GPU on the pinned driver.
+    BeforeAll {
+        function Get-CimInstance {
+            [CmdletBinding()]
+            param([string]$ClassName)
+            if ($script:CimThrows) { throw 'WMI is busy' }
+            $script:Now
+        }
+        function Set-Gpu { param([string]$Version) $script:Now = @(New-FakeVideoController -PnpId 'PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7\4&18e01285&0&0041' -DriverVersion $Version) }
+    }
+
+    BeforeEach {
+        $CompareVersion   = $script:CompareVersion
+        $GetDupGpuVendor  = $script:GetDupGpuVendor
+        $GetPinnedDevices = $script:GetPinnedDevices
+        $GetLiveDriverVersion = $script:GetLiveDriverVersion
+        $GetDriverStackDrift = { param($Row, $TargetVersion) $script:DriftCalls++; $script:Drift }
+        $script:DriftCalls = 0
+        $script:CimThrows = $false
+        $script:Drift = [PSCustomObject]@{ Readable = $true; Items = @(); Summary = 'base v32.0.12046.3001' }
+        $LiveSignedDrivers = @()
+        # What the loop enumerated before AMD ran: the newer driver.
+        $LiveVideoAdapters = @(New-FakeVideoController -PnpId 'PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7\4&18e01285&0&0041' -DriverVersion '32.0.31033.3')
+        $script:Row = New-ManifestRow -Name 'AMD Radeon Graphics Driver' -HardwareIds @('VEN_1002&DEV_15C8') -Version 'A01'
+    }
+
+    It 'Counts a GPU AMD moved onto the pin, re-read rather than taken from before the run' {
+        Set-Gpu '32.0.12046.3001'
+        $V = & $script:GetVendorDeviceVerdict $script:Row '32.0.12046.3001' '32.0.31033.3'
+        $V.OnPin | Should -BeTrue
+        $V.Moved | Should -BeTrue
+        $V.Version | Should -Be '32.0.12046.3001'
+        $script:DriftCalls | Should -Be 0 -Because 'a move is AMD''s doing; the stack is checked by the verification after'
+    }
+
+    It 'Does not count a GPU still above the pin, or below it on the inbox driver' {
+        Set-Gpu '32.0.31033.3'
+        (& $script:GetVendorDeviceVerdict $script:Row '32.0.12046.3001' '32.0.31033.3').OnPin | Should -BeFalse
+        Set-Gpu '10.0.26100.1'
+        (& $script:GetVendorDeviceVerdict $script:Row '32.0.12046.3001' '32.0.31033.3').OnPin | Should -BeFalse
+    }
+
+    It 'Does not count anything when the GPU cannot be re-read' {
+        # The enumeration from before the run still says the newer driver.
+        $script:CimThrows = $true
+        (& $script:GetVendorDeviceVerdict $script:Row '32.0.12046.3001' '32.0.31033.3').OnPin | Should -BeFalse
+        $script:CimThrows = $false
+        $script:Now = @()
+        (& $script:GetVendorDeviceVerdict $script:Row '32.0.12046.3001' '32.0.31033.3').OnPin | Should -BeFalse
+    }
+
+    It 'On a device already on the pin, counts it only when nothing newer is left on top' {
+        Set-Gpu '32.0.12046.3001'
+        $V = & $script:GetVendorDeviceVerdict $script:Row '32.0.12046.3001' '32.0.12046.3001'
+        $V.Moved | Should -BeFalse
+        $V.StackClean | Should -BeTrue
+
+        $script:Drift = [PSCustomObject]@{ Readable = $true; Items = @([PSCustomObject]@{ Kind = 'Extension'; Name = 'oem92.inf'; Version = '32.0.31033.3' }); Summary = '' }
+        (& $script:GetVendorDeviceVerdict $script:Row '32.0.12046.3001' '32.0.12046.3001').StackClean | Should -BeFalse
+
+        $script:Drift = [PSCustomObject]@{ Readable = $false; Items = @(); Summary = '' }
+        (& $script:GetVendorDeviceVerdict $script:Row '32.0.12046.3001' '32.0.12046.3001').StackClean | Should -BeFalse -Because 'unreadable is not clean'
     }
 }
 

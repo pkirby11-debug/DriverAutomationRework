@@ -3535,12 +3535,71 @@ function Install-DriverUpdates {
         }
     }
 
+    # Reads a log AMD's installer may still hold open for writing. File's own
+    # ReadAllText allows other readers only, so it fails on a file another
+    # process is writing - which in the field read as "AMD wrote nothing"
+    # while its Install.log said the install had succeeded. Opened sharing
+    # read, write and delete, retried briefly, and decoded whatever way it was
+    # written: with a BOM, as UTF-16 without one (every other byte NUL), or as
+    # ANSI/UTF-8.
+    $ReadSharedText = {
+        param([string]$Path)
+        $R = [PSCustomObject]@{ Exists = $false; Ok = $false; Text = ''; Bytes = [byte[]]@(); Size = 0; Error = '' }
+        $Item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if (-not $Item -or $Item.PSIsContainer) { return $R }
+        $R.Exists = $true
+        for ($Try = 1; $Try -le 3; $Try++) {
+            try {
+                $Fs = [System.IO.File]::Open($Item.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'ReadWrite, Delete')
+                try {
+                    $Ms = New-Object System.IO.MemoryStream
+                    $Fs.CopyTo($Ms)
+                    $B = $Ms.ToArray()
+                } finally {
+                    $Fs.Dispose()
+                }
+                $R.Bytes = $B
+                $R.Size = $B.Length
+                $Text = if ($B.Length -ge 3 -and $B[0] -eq 0xEF -and $B[1] -eq 0xBB -and $B[2] -eq 0xBF) {
+                    [System.Text.Encoding]::UTF8.GetString($B, 3, $B.Length - 3)
+                } elseif ($B.Length -ge 2 -and $B[0] -eq 0xFF -and $B[1] -eq 0xFE) {
+                    [System.Text.Encoding]::Unicode.GetString($B, 2, $B.Length - 2)
+                } elseif ($B.Length -ge 2 -and $B[0] -eq 0xFE -and $B[1] -eq 0xFF) {
+                    [System.Text.Encoding]::BigEndianUnicode.GetString($B, 2, $B.Length - 2)
+                } else {
+                    # No BOM: UTF-16 shows as NULs in every other byte of
+                    # mostly-ASCII text.
+                    $Even = 0; $Odd = 0
+                    $N = [Math]::Min($B.Length, 4096)
+                    for ($I = 0; $I -lt $N; $I++) {
+                        if ($B[$I] -eq 0) { if ($I % 2) { $Odd++ } else { $Even++ } }
+                    }
+                    if ($N -ge 4 -and $Odd -ge ($N / 4) -and $Odd -gt ($Even * 4)) {
+                        [System.Text.Encoding]::Unicode.GetString($B)
+                    } elseif ($N -ge 4 -and $Even -ge ($N / 4) -and $Even -gt ($Odd * 4)) {
+                        [System.Text.Encoding]::BigEndianUnicode.GetString($B)
+                    } else {
+                        [System.Text.Encoding]::UTF8.GetString($B)
+                    }
+                }
+                $R.Text = $Text -replace "`0", ''
+                $R.Ok = $true
+                $R.Error = ''
+                return $R
+            } catch {
+                $R.Error = $_.Exception.Message
+                if ($Try -lt 3) { Start-Sleep -Seconds 2 }
+            }
+        }
+        return $R
+    }
+
     $InvokeVendorInstaller = {
         param($Row, [string]$DupPath, [string]$WorkDir, [string]$LogDir, [string]$Label, [string]$TargetVersion)
 
         $Out = [PSCustomObject]@{
             Ran = $false; Outcome = 'NotRun'; Reason = ''; ExitCode = $null
-            ResultCode = $null; AmdError = $null; InstallerPath = ''; ResultLog = ''; Detail = ''; WorkDir = ''
+            ResultCode = $null; AmdError = $null; InstallerPath = ''; ResultLog = ''; InstallLog = ''; Detail = ''; WorkDir = ''
         }
         $SafeName = "$($Row.FileName)" -replace '[^\w\.\-]', '_'
 
@@ -3689,12 +3748,12 @@ function Install-DriverUpdates {
         $ArgLine += " -LOG `"$ResultLog`""
 
         # AMD's own Install.log is appended per run; remember where this run
-        # starts so only its own lines are quoted.
-        $InstallLog = Join-Path $env:ProgramFiles 'AMD\CIM\Log\Install.log'
-        $LogBefore = ''
-        if (Test-Path $InstallLog) {
-            try { $LogBefore = [System.IO.File]::ReadAllText($InstallLog) } catch { $LogBefore = '' }
-        }
+        # starts so only its own lines are judged. The 64-bit Program Files,
+        # where AMD writes it, even if this ever runs as a 32-bit process.
+        $ProgramFiles64 = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+        $InstallLog = Join-Path $ProgramFiles64 'AMD\CIM\Log\Install.log'
+        $Out.InstallLog = $InstallLog
+        $LogBefore = & $ReadSharedText $InstallLog
         # What AMD's installer changes around Windows Update, from its own
         # binaries: during a clean install it stops the wuauserv service
         # (Manual start - Windows starts it again on demand, so nothing to
@@ -3784,36 +3843,81 @@ function Install-DriverUpdates {
             return $Out
         }
 
-        # 5. Read the outcome: AMD's result file, then this run's Install.log lines.
-        if (Test-Path $ResultLog) {
-            try {
-                $RText = [System.IO.File]::ReadAllText($ResultLog)
-                if ($RText -match '(?im)^\s*ResultCode\s*=\s*(\d+)') { $Out.ResultCode = [int]$Matches[1] }
-                if ($RText -match '(?im)^\s*ErrorCode\s*=\s*3\s*$') { $Out.Detail = 'a package asked for a restart' }
-            } catch {
-                Write-Verbose "AMD result file unreadable: $($_.Exception.Message)"
+        # 5. Read the outcome: AMD's result file, then this run's Install.log
+        #    lines. Both are read shared (see $ReadSharedText), and the result
+        #    file gets a short grace for its verdict to land. Whatever cannot
+        #    be read is said so in the log - in the field, a result file that
+        #    was there but not read reported "absent", and a successful
+        #    install "did not run".
+        $ResultCodePattern = '(?i)\bResultCode\b["'']?\s*(?:=|:|>)\s*["'']?\s*(\d+)'
+        $ResultRead = $null
+        for ($Wait = 0; $Wait -lt 6; $Wait++) {
+            $ResultRead = & $ReadSharedText $ResultLog
+            if ($ResultRead.Ok -and $ResultRead.Text -match $ResultCodePattern) { break }
+            if ($Wait -lt 5) { Start-Sleep -Seconds 5 }
+        }
+        $ResultNote = 'not written'
+        if ($ResultRead.Exists -and -not $ResultRead.Ok) {
+            $ResultNote = "there but unreadable ($($ResultRead.Error))"
+        } elseif ($ResultRead.Ok) {
+            if ($ResultRead.Text -match $ResultCodePattern) { $Out.ResultCode = [int]$Matches[1] }
+            if ($ResultRead.Text -match '(?im)^\s*ErrorCode\s*=\s*3\s*$') { $Out.Detail = 'a package asked for a restart' }
+            $ResultNote = if ($null -ne $Out.ResultCode) {
+                "ResultCode $($Out.ResultCode)"
+            } else {
+                $Peek = (($ResultRead.Text -replace '[^\x20-\x7E]+', ' ') -replace '\s+', ' ').Trim()
+                if ($Peek.Length -gt 160) { $Peek = $Peek.Substring(0, 160) + '...' }
+                "there but has no ResultCode ($($ResultRead.Size) bytes$(if ($Peek) { ": '$Peek'" }))"
             }
+            # Kept with the run's other logs, byte for byte as AMD wrote it -
+            # from what was read, so a file AMD still holds open is kept too.
             $Copy = Join-Path $LogDir ($SafeName + '.amd-result.log')
             try {
-                Copy-Item -Path $ResultLog -Destination $Copy -Force -ErrorAction Stop
+                [System.IO.File]::WriteAllBytes($Copy, $ResultRead.Bytes)
                 $Out.ResultLog = $Copy
             } catch {
                 Write-Verbose "Could not copy AMD's result file: $($_.Exception.Message)"
             }
         }
+
+        # This run's Install.log lines: what was added since the run started
+        # or, when that cannot be told (the file was unreadable before, or
+        # AMD started it afresh), from the first line naming this run's own
+        # folder - AMD logs its command line, -LOG path included.
+        $LogAfter = & $ReadSharedText $InstallLog
         $NewLog = ''
-        if (Test-Path $InstallLog) {
-            try {
-                $LogAfter = [System.IO.File]::ReadAllText($InstallLog)
-                $NewLog = if ($LogBefore -and $LogAfter.Length -ge $LogBefore.Length -and $LogAfter.StartsWith($LogBefore)) { $LogAfter.Substring($LogBefore.Length) } else { $LogAfter }
-            } catch {
-                Write-Verbose "AMD Install.log unreadable: $($_.Exception.Message)"
+        $LogScoped = $false
+        $LogNote = ''
+        if (-not $LogAfter.Exists) {
+            $LogNote = "not found at $InstallLog"
+        } elseif (-not $LogAfter.Ok) {
+            $LogNote = "unreadable ($($LogAfter.Error))"
+        } else {
+            $RunTag = $LogAfter.Text.IndexOf((Split-Path -Path $Vendor -Leaf), [System.StringComparison]::OrdinalIgnoreCase)
+            if ($LogBefore.Ok -and $LogAfter.Text.Length -ge $LogBefore.Text.Length -and $LogAfter.Text.StartsWith($LogBefore.Text, [System.StringComparison]::Ordinal)) {
+                $NewLog = $LogAfter.Text.Substring($LogBefore.Text.Length)
+                $LogScoped = $true
+            } elseif ($RunTag -ge 0) {
+                $NewLog = $LogAfter.Text.Substring($LogAfter.Text.LastIndexOf([char]10, $RunTag) + 1)
+                $LogScoped = $true
+            } elseif (-not $LogBefore.Exists) {
+                # Created during this run.
+                $NewLog = $LogAfter.Text
+                $LogScoped = $true
+            }
+            $LogNote = if ($LogScoped) {
+                "$(@(($NewLog -split "`r?`n") | Where-Object { $_.Trim() }).Count) line(s) from this run"
+            } else {
+                "could not tell this run's lines from earlier ones$(if (-not $LogBefore.Ok) { " (unreadable before the run: $($LogBefore.Error))" })"
             }
         }
         $ErrHits = @([regex]::Matches($NewLog, 'Error code to display to user:\s*(\d+)'))
         if ($ErrHits.Count -gt 0) { $Out.AmdError = [int]$ErrHits[$ErrHits.Count - 1].Groups[1].Value }
-        $Notable = @(($NewLog -split "`r?`n") | Where-Object { $_ -match '(?i)error|reboot is required|starting install|factory' } |
-            Select-Object -Last 4 | ForEach-Object { ($_ -replace '\s+', ' ').Trim() })
+        # AMD's own line for the display driver, as the field run logged it:
+        # "Install of AMD Display Driver is successful. - iResult - 0".
+        $DisplayOk = $NewLog -match '(?i)Install of AMD Display Driver is successful'
+        $Notable = @(($NewLog -split "`r?`n") | Where-Object { $_ -match '(?i)error|reboot is required|requires a system reboot|starting install|factory|is successful|active display driver' } |
+            Select-Object -Last 5 | ForEach-Object { ($_ -replace '\s+', ' ').Trim() })
         $Quote = if ($Notable.Count -gt 0) { " | Install.log: $($Notable -join ' / ')" } else { '' }
 
         $PoliciesAfter = & $ReadPolicies
@@ -3834,18 +3938,23 @@ function Install-DriverUpdates {
         } elseif ($null -ne $Out.AmdError) {
             $Out.Outcome = 'Failed'
             $Out.Reason = "AMD error $($Out.AmdError)"
-        } elseif (-not "$NewLog".Trim()) {
-            # Not a word from AMD anywhere: the installer did not do anything
-            # (an argument it rejected, a prompt nobody can see in session 0).
+        } elseif ($DisplayOk) {
+            $Out.Outcome = 'Passed'
+            $Out.Reason = "AMD's Install.log reports the display driver installed"
+        } elseif (-not $ResultRead.Exists -and $LogBefore.Ok -and $LogAfter.Ok -and $LogScoped -and -not $NewLog.Trim()) {
+            # Proof, not a guess: no result file, and an Install.log that was
+            # read before and after has not a line from this run. The
+            # installer did nothing (an argument it rejected, a prompt nobody
+            # can see in session 0).
             $Out.Outcome = 'Failed'
             $Out.Reason = "AMD's installer wrote no result file and nothing to Install.log (exit $($Out.ExitCode)) - it did not run"
         } else {
-            # It worked on something but wrote no verdict; it may have ended
-            # in a restart AMD scheduled itself. The device decides.
+            # No verdict that could be read. It may have finished, or ended in
+            # a restart AMD scheduled itself: the device decides.
             $Out.Outcome = 'Unknown'
-            $Out.Reason = 'AMD wrote no result file'
+            $Out.Reason = 'AMD gave no verdict that could be read'
         }
-        $Out.Detail = "exit $($Out.ExitCode), result file $(if ($null -ne $Out.ResultCode) { "ResultCode $($Out.ResultCode)" } else { 'absent' }) ($($Out.ResultLog))$(if ($Out.Detail) { ", $($Out.Detail)" })$Quote"
+        $Out.Detail = "exit $($Out.ExitCode); result file $ResultNote ($($Out.ResultLog)); Install.log $LogNote$(if ($Out.Detail) { "; $($Out.Detail)" })$Quote"
         Write-Log "$Label - AMD's installer finished: $($Out.Outcome)$(if ($Out.Reason) { " - $($Out.Reason)" }); $($Out.Detail)" -Severity $(if ($Out.Outcome -eq 'Passed') { 1 } else { 2 })
 
         # The extract is the size of the whole display package. Kept only when
@@ -3855,6 +3964,35 @@ function Install-DriverUpdates {
             Remove-Item -Path $Vendor -Recurse -Force -ErrorAction SilentlyContinue
         }
         return $Out
+    }
+
+    # The device decides, not AMD's paperwork. After a clean install AMD
+    # called a failure, re-read the GPU: is it where the pin wants it? Either
+    # moved onto the pinned version by this run, or - on it already - with
+    # nothing newer from the rolled-back release left on top. A component
+    # AMD failed on (an audio driver, the AMD Software app) does not undo a
+    # display driver that did install.
+    $GetVendorDeviceVerdict = {
+        param($Row, [string]$TargetVersion, [string]$BeforeVersion)
+        $V = [PSCustomObject]@{ Version = $null; OnPin = $false; Moved = $false; StackClean = $false }
+        # A fresh read, in this block's own scope - where $GetLiveDriverVersion
+        # looks for it - so the caller's enumeration is left as it was; the
+        # caller re-reads the device for itself.
+        try {
+            Set-Variable -Name LiveVideoAdapters -Value @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+        } catch {
+            Write-Verbose "Post-install display re-read failed: $($_.Exception.Message)"
+        }
+        $V.Version = & $GetLiveDriverVersion $Row
+        $Cmp = if ($V.Version -and $TargetVersion) { & $CompareVersion $V.Version $TargetVersion } else { $null }
+        if ($null -eq $Cmp -or $Cmp -ne 0) { return $V }
+        $V.OnPin = $true
+        $V.Moved = ("$($V.Version)" -ne "$BeforeVersion")
+        if (-not $V.Moved) {
+            $Drift = & $GetDriverStackDrift $Row $TargetVersion
+            $V.StackClean = [bool]($Drift.Readable -and @($Drift.Items).Count -eq 0)
+        }
+        return $V
     }
 
     # Defender correlation. DUPs run serially, so any Defender ASR/quarantine
@@ -4365,14 +4503,14 @@ function Install-DriverUpdates {
                 # is not the answer; use what does not need the clean installer.
                 $VendorRun = [PSCustomObject]@{
                     Ran = $false; Outcome = 'NotRun'; Reason = "a restart is still pending ($PendingWhy) although the device has restarted since this was last deferred ($VendorDeferredAt)"
-                    ExitCode = $null; ResultCode = $null; AmdError = $null; InstallerPath = ''; ResultLog = ''; Detail = ''
+                    ExitCode = $null; ResultCode = $null; AmdError = $null; InstallerPath = ''; ResultLog = ''; InstallLog = ''; Detail = ''
                 }
             } elseif ($PendingWhy) {
                 # Same verdict AMD would reach (error 206), without extracting
                 # a whole display package first. Nothing has changed.
                 $VendorRun = [PSCustomObject]@{
                     Ran = $false; Outcome = 'Deferred'; Reason = $PendingWhy; ExitCode = $null
-                    ResultCode = $null; AmdError = 206; InstallerPath = ''; ResultLog = ''; Detail = 'not started'
+                    ResultCode = $null; AmdError = 206; InstallerPath = ''; ResultLog = ''; InstallLog = ''; Detail = 'not started'
                 }
             } else {
                 $VendorRun = & $InvokeVendorInstaller $Drv $DriverExe (Join-Path $env:WINDIR 'Temp') $DupLogDir $DriverLabel $PinTarget
@@ -4420,6 +4558,20 @@ function Install-DriverUpdates {
                 }
                 # Left running past its timeout: nothing else installs this run.
                 if ($VendorRun.Outcome -eq 'TimedOut') { $VendorStillRunning = $true }
+                # AMD called it a failure: ask the device before believing it.
+                # On the pin now, it goes the success way, where the
+                # verification below checks the version and the rest of the
+                # stack and asks for the restart. The ledger keeps AMD's own
+                # verdict, so a failed run is still never repeated on the pin.
+                if ($VendorRun.Outcome -eq 'Failed') {
+                    $Verdict = & $GetVendorDeviceVerdict $Drv $PinTarget $LiveVersion
+                    if ($Verdict.OnPin -and ($Verdict.Moved -or $Verdict.StackClean)) {
+                        $DupCode = 2
+                        Write-Log ("$DriverLabel - AMD's installer reported a failure ($($VendorRun.Reason)), but the device " +
+                            $(if ($Verdict.Moved) { "moved from v$LiveVersion to the pinned v$($Verdict.Version)" } else { "is on the pinned v$($Verdict.Version) with nothing newer left on top of it" }) +
+                            " - going by the device, not AMD's verdict. AMD's result: $($VendorRun.Detail)") -Severity 2
+                    }
+                }
             } elseif ($ForceDowngrade -and $DupQuarantined) {
                 Write-Log "$DriverLabel - AMD's clean installer could not be used: $($VendorRun.Reason) - and the DUP is quarantined on this device, so the pin is not enforced this run" -Severity 2
                 $Quarantined++
@@ -4583,6 +4735,9 @@ function Install-DriverUpdates {
                     }
                 }
                 $Installer = if ($VendorRoute) { "AMD's clean installer" } else { 'the DUP' }
+                # What the installer said, in its own terms: AMD's verdict, not
+                # the Dell exit code it is mapped onto for the bookkeeping.
+                $InstallerSaid = if ($VendorRoute) { "$Installer finished ($($VendorRun.Outcome))" } else { "$Installer exited $DupCode (success)" }
                 $AfterVersion = & $GetLiveDriverVersion $Drv
                 $AfterCmp = if ($AfterVersion -and $PinTarget) { & $CompareVersion $AfterVersion $PinTarget } else { $null }
                 # AMD can finish a clean install after a restart. While it still
@@ -4685,7 +4840,7 @@ function Install-DriverUpdates {
                     $RetireNote = ''
                     $Applied = $false
                     if ($Drv.AllowDriverStoreRemoval) {
-                        Write-Log "$DriverLabel - $Installer exited $DupCode (success), but the device is still on v$AfterVersion instead of the pinned v$PinTarget. $($Cause)Retiring the package that outranks it." -Severity 2
+                        Write-Log "$DriverLabel - $InstallerSaid, but the device is still on v$AfterVersion instead of the pinned v$PinTarget. $($Cause)Retiring the package that outranks it." -Severity 2
                         $Bound = @(& $GetBoundPackages $Drv)
                         # Only ever act on a package NEWER than the pin. An older
                         # or equal one is not what is outranking us, and removing
@@ -4766,7 +4921,7 @@ function Install-DriverUpdates {
 
                     if (-not $Applied) {
                         $PinNotApplied++
-                        Write-Log ("$DriverLabel - PIN NOT APPLIED: $Installer exited $DupCode (success), but the device is STILL on v$AfterVersion instead of the pinned v$PinTarget. " +
+                        Write-Log ("$DriverLabel - PIN NOT APPLIED: $InstallerSaid, but the device is STILL on v$AfterVersion instead of the pinned v$PinTarget. " +
                             $Cause + $RetireNote +
                             "Neither Dell's /f nor a re-run can beat PnP ranking: two packages that match a device equally are separated by driver DATE, so the newer one keeps winning while it is in the DriverStore.") -Severity 3
                     }
@@ -4971,9 +5126,23 @@ function Install-DriverUpdates {
                             }
                             Write-Log "$DriverLabel - after the failed clean install the device reports $(if ($FailVersion) { "v$FailVersion" } else { 'no readable display driver version' }); requesting a restart, after which the application runs again and, if needed, installs the pinned DUP" -Severity 2
                         }
-                        Write-Log ("$DriverLabel - PIN NOT APPLIED: AMD's clean installer failed ($($VendorRun.Outcome)$(if ($VendorRun.Reason) { ": $($VendorRun.Reason)" }))" +
+                        # Named for what the device shows. Still running: not
+                        # judged yet. On the pin (an AMD failure that had
+                        # moved it there went the success way, so this one
+                        # was on it before AMD ran): the base driver is right
+                        # and it is the rest of the stack that was not
+                        # replaced - not "PIN NOT APPLIED".
+                        $FailHead = if ($VendorRun.Outcome -eq 'TimedOut') {
+                            "PIN UNCONFIRMED: AMD's clean installer has not finished"
+                        } elseif ($null -ne $FailCmp -and $FailCmp -eq 0) {
+                            "CLEAN INSTALL FAILED: the base driver is on the pinned v$FailVersion, but AMD's clean installer did not replace the rest of the stack"
+                        } else {
+                            "PIN NOT APPLIED: AMD's clean installer failed"
+                        }
+                        Write-Log ("$DriverLabel - $FailHead ($($VendorRun.Outcome)$(if ($VendorRun.Reason) { ": $($VendorRun.Reason)" }))" +
                             "$(if ($LiveVersion) { "; the device was on v$LiveVersion before it ran" } else { '' }). " +
-                            "AMD's own log is C:\Program Files\AMD\CIM\Log\Install.log, its result file $($VendorRun.ResultLog), and the extracted package is kept in $($VendorRun.WorkDir) for a week. " +
+                            "AMD's own log is $(if ($VendorRun.InstallLog) { $VendorRun.InstallLog } else { 'C:\Program Files\AMD\CIM\Log\Install.log' }), its result file $($VendorRun.ResultLog), and the extracted package is kept in $($VendorRun.WorkDir) for a week. " +
+                            "$(if ($VendorRun.Detail) { "AMD's result: $($VendorRun.Detail). " })" +
                             "Re-read the device before anything else: a failed clean install can leave the display on Microsoft Basic Display Adapter until a driver is installed again.") -Severity 3
                     } elseif ($AllowDowngrade) {
                         Write-Log ("$DriverLabel - PIN NOT APPLIED: this is the version-pinned rollback and it failed$(if ($ForceDowngrade) { ' even with /f' } else { '' })" +
