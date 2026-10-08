@@ -468,8 +468,11 @@ On the client, a pinned package:
   AMD's package root (the `Setup.exe` with `Bin64\ATISetup.exe` beside it) and runs:
 
   ```
-  Setup.exe -FACTORYRESETINSTALL -LOG "C:\Windows\Temp\DATDupLogs\<run>\<DUP>.amd-result.log"
+  Setup.exe -FACTORYRESETINSTALL -LOG "C:\Windows\Temp\DAT-Vendor-<random>\amd-result.log"
   ```
+
+  AMD's result file is copied afterwards to
+  `C:\Windows\Temp\DATDupLogs\<run>\<DUP>.amd-result.log` beside the DUP logs.
 
   `-FACTORYRESETINSTALL` is the silent form of the GUI's Factory Reset checkbox.
   AMD's own command-line guides do not list it; Microsoft's *Install AMD GPU drivers
@@ -489,8 +492,12 @@ On the client, a pinned package:
     used. It is also skipped when the package's display INFs do not list the
     device's GPU.
   - **A protected work folder.** SYSTEM runs everything in the AMD package, so it is
-    extracted into a folder only SYSTEM and Administrators can write to, not one
-    that inherits `C:\Temp`'s user write access.
+    extracted into `C:\Windows\Temp\DAT-Vendor-<random>`, created with a DACL
+    only SYSTEM and Administrators can write to (users may read). Its owner and
+    permissions are read back before anything goes into it, and `Setup.exe` and
+    `ATISetup.exe` must carry a valid AMD or Dell signature. Under `C:\Temp`,
+    every parent folder is user-modifiable. Kept a week after a failed run, for
+    diagnosis.
   - **Success comes from AMD's result file and the device**, not the undocumented
     exit code. A run that wrote nothing at all counts as failed.
   - **Bounded.** It runs at most twice per pinned revision on a device, and only
@@ -498,17 +505,24 @@ On the client, a pinned package:
     quarantine, so they cannot block the DUP that reinstalls the display driver.
   - **Restart, then check again.** AMD can finish a clean install after a
     restart, and leaves the GPU on Microsoft Basic Display Adapter until it does.
-    A device not yet on the pin is therefore never called verified. The run exits
+    A device not yet on the pin - or left without a readable display driver by a
+    failed clean install - is therefore never called verified. The run exits
     3010 with the detection marker set to `PendingRestart` instead of
-    `Installed`, so ConfigMgr restarts the device and runs the application again
-    to check it.
+    `Installed` (or `Failed`, when other rows failed too), so ConfigMgr restarts
+    the device and, finding the application not installed, runs it again at its
+    next evaluation. A display DUP that is putting a missing driver back is never
+    quarantined.
   - **Pending restarts.** AMD refuses to run while a restart is pending (error
     206). Pinned rows that may use the clean installer run before the other
     DUPs, so those DUPs cannot leave one pending first. If one is pending anyway,
-    nothing is changed and the run asks for the restart the same way. It asks
-    once; if the restart does not clear it, the run reports a failure.
-    Windows Update installing (error 202) is a plain retry. Neither counts toward
-    quarantine.
+    nothing is changed and the run asks for the restart the same way - once. If
+    a restart is pending again after it, the clean installer is not used: a
+    device above the pin is rolled back with the DUP, one on the pin gets the
+    stack check. Windows Update installing (error 202) is a plain retry. None of
+    this counts toward quarantine.
+  - **Nothing runs beside it.** If AMD's installer is still running at its
+    30-minute limit it is left to finish, and the run's remaining DUPs wait for
+    the next run instead of installing alongside it.
 
   A clean install always requests a restart. AMD Radeon graphics DUPs only; any
   other pinned driver logs that and keeps the DUP.

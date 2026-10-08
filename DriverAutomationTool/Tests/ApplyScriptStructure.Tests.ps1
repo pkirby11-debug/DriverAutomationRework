@@ -519,7 +519,9 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
                 }
                 $Node = $Node.Parent
             }
-            ($Guards -join ' ') | Should -Match 'ForceDowngrade' -Because "the in-loop CIM call '$($Cim.Extent.Text)' must run only for a forced rollback"
+            # A forced rollback, or AMD's clean installer having just run -
+            # the two cases where this device's driver was just changed.
+            ($Guards -join ' ') | Should -Match 'ForceDowngrade|VendorRoute' -Because "the in-loop CIM call '$($Cim.Extent.Text)' must run only after this row changed the driver"
         }
     }
 }
@@ -662,7 +664,7 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
 
     It 'Bounds the clean install: once on a device already on the pin, a fixed number of times per revision' {
         $Loop = $script:DrvLoop.Extent.Text
-        $Loop | Should -Match 'if \(\$WantVendor -and \$VendorAttempts -eq 0\)'
+        $Loop | Should -Match "if \(\`$WantVendor -and \(\`$VendorAttempts -eq 0 -or \`$VendorLastOutcome -eq 'Unknown'\)\)"
         $Loop | Should -Match 'if \(\$VendorAttempts -ge \$VendorMaxAttempts\)'
         $Loop | Should -Match "'VendorAttemptCount'"
         # The attempt is recorded straight after the run, before anything else
@@ -728,7 +730,73 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
 
         $Protect = (Get-DATScriptBlockAssignment -Name '$NewProtectedDirectory').Extent.Text
         $Protect | Should -Match 'SetAccessRuleProtection\(\$true, \$false\)'
-        $Protect | Should -Match "'S-1-5-18', 'S-1-5-32-544'"
+        # Read back before anything is extracted into it, and the folder is a
+        # fresh random name under %WINDIR%\Temp - not C:\Temp, where every
+        # parent is user-modifiable.
+        $Check = [regex]::Match($Block, '& \$TestProtectedDirectory \$Vendor')
+        $Check.Success | Should -BeTrue
+        $Check.Index | Should -BeLessThan $Extract.Index
+        $Block | Should -Match "'DAT-Vendor-' \+ \[guid\]::NewGuid\(\)"
+        $script:DrvLoop.Extent.Text | Should -Match "& \`$InvokeVendorInstaller \`$Drv \`$DriverExe \(Join-Path \`$env:WINDIR 'Temp'\)"
+        # And both executables must be signed before either is started.
+        $Sig = [regex]::Match($Block, 'Get-AuthenticodeSignature')
+        $Run = [regex]::Match($Block, 'Start-Process -FilePath \$Setup')
+        $Sig.Success | Should -BeTrue
+        $Sig.Index | Should -BeLessThan $Run.Index
+    }
+
+    It 'Lets a pending re-check win over a plain failure when the run exits' {
+        # Exiting 1 because another row failed used to drop the restart the
+        # pinned row was waiting for, and every retry hit the same state.
+        $Main = $script:ApplyAst.Extent.Text
+        $M = [regex]::Match($Main, "if \(\`$ExitCode -ne 0\) \{(.*?)\n    \}", 'Singleline')
+        $M.Success | Should -BeTrue
+        $M.Groups[1].Value | Should -Match "Write-DetectionMarker -Status 'Failed'"
+        $M.Groups[1].Value | Should -Match 'if \(\$script:PinCheckAfterRestart\) \{[^}]*exit 3010'
+    }
+
+    It 'Holds back the remaining DUPs while a timed-out clean install is still running' {
+        $Loop = $script:DrvLoop.Extent.Text
+        $Hold = [regex]::Match($Loop, 'if \(\$VendorStillRunning\) \{(.*?)continue', 'Singleline')
+        $Hold.Success | Should -BeTrue
+        $Hold.Groups[1].Value | Should -Not -Match 'FailCount'
+        $Hold.Index | Should -BeLessThan ([regex]::Match($Loop, 'Start-Process @SpParams').Index)
+        $Loop | Should -Match "if \(\`$VendorRun\.Outcome -eq 'TimedOut'\) \{ \`$VendorStillRunning = \`$true \}"
+    }
+
+    It 'Never trusts the marker of a run that asked to be re-measured' {
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match "-Name 'PendingCheck' -Value \(\[int\]\`$RowPendingCheck\)"
+        $Loop | Should -Match "\`$MarkerFromPinnedRun = \[bool\]\[int\]\`$MarkerProps\.Pinned -and -not \(.*PendingCheck"
+        # Every request for a re-check flags the row.
+        $Sets = [regex]::Matches($Loop, '\$script:PinCheckAfterRestart = \$true\s*\n\s*\$RowPendingCheck = \$true')
+        $All  = [regex]::Matches($Loop, '\$script:PinCheckAfterRestart = \$true')
+        $Sets.Count | Should -Be $All.Count
+        $All.Count | Should -BeGreaterThan 4
+    }
+
+    It 'Does not ask for restart after restart when one is pending again' {
+        # The second time, the clean installer is skipped instead: the DUP for
+        # a device above the pin, the stack reconcile for one on it.
+        $Loop = $script:DrvLoop.Extent.Text
+        $Repeat = [regex]::Match($Loop, 'if \(\$PendingWhy -and \$VendorDeferredAt -and \(& \$RestartedSince \$VendorDeferredAt\)\) \{')
+        $First  = [regex]::Match($Loop, '\} elseif \(\$PendingWhy\) \{')
+        $Repeat.Success | Should -BeTrue
+        $First.Success  | Should -BeTrue
+        $Repeat.Index | Should -BeLessThan $First.Index
+    }
+
+    It 'Lets the clean installer past a DUP quarantine, and never quarantines a display DUP restoring a missing driver' {
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match 'if \(\$VendorRoute\) \{\s*#[^\n]*\n(\s*#[^\n]*\n)*\s*\$DupQuarantined = \$true'
+        $Loop | Should -Match "\} elseif \(\`$AllowDowngrade -and \`$LiveBelowPin -and \`$Drv\.Category -eq 'Video'\) \{"
+        $Loop | Should -Match '\} elseif \(\$ForceDowngrade -and \$DupQuarantined\) \{'
+    }
+
+    It 'Refuses the brand-matched retire only for display packages' {
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match "\`$OutrankingGpus = @\(\`$Outranking \| Where-Object \{ `"\`$\(\`$_\.DeviceClass\)`" -match '\^\(\?i\)display\`$' \}"
+        $Loop | Should -Match '\} elseif \(\$OutrankingGpus\.Count -gt 1 -or \$BrandAmbiguous\) \{'
     }
 
     It 'Runs the vendor installer only on the vendor route' {
@@ -786,5 +854,28 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         $M.Success | Should -BeTrue
         $M.Groups[1].Value | Should -Match '\$Failed\+\+'
         $M.Groups[1].Value | Should -Not -Match 'FailCount|FailedVersion'
+    }
+
+    It 'Re-measures after every clean-install outcome that can leave the device unconfirmed' {
+        $Loop = $script:DrvLoop.Extent.Text
+        # A failed run that may have removed the driver: AMD said a restart is
+        # needed, or the GPU now reads below the pin or not at all.
+        $Loop | Should -Match "if \(\`$VendorRun\.Outcome -ne 'TimedOut' -and \(\`$VendorRun\.ResultCode -eq 2 -or \`$null -eq \`$FailCmp -or \`$FailCmp -lt 0\)\) \{\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true"
+        # A run on the pin that gave no verdict and left the stack mixed.
+        $Loop | Should -Match "if \(\`$Stack\.Mixed -and \`$VendorRetryOk -and \`$VendorRun\.Outcome -eq 'Unknown'\) \{(\s*#[^\n]*)*\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true"
+        # AMD is credited only for a change it made.
+        $Loop | Should -Match '"\$AfterVersion" -ne "\$LiveVersion"'
+    }
+
+    It 'Falls back to the stack reconcile wherever the clean install cannot run on a device already on the pin' {
+        $Loop = $script:DrvLoop.Extent.Text
+        # The DUP file missing: only the optional clean install needed it.
+        $Missing = [regex]::Match($Loop, 'if \(-not \(Test-Path \$DriverExe\)\) \{(.*?)\$Failed\+\+', 'Singleline')
+        $Missing.Success | Should -BeTrue
+        $Missing.Groups[1].Value | Should -Match '(?s)if \(\$VendorRoute -and -not \$ForceDowngrade\) \{.*?\$ReconcilePinnedStack.*?\$AlreadyInst\+\+\s*continue'
+        # Deferred again on the pin: reconcile, not a failure.
+        $Deferred = [regex]::Match($Loop, "elseif \(\`$VendorRoute -and \`$VendorRun\.Outcome -eq 'Deferred'\) \{(.*?)\} elseif \(\`$DupCode -in \`$NotApplicable\)", 'Singleline')
+        $Deferred.Success | Should -BeTrue
+        $Deferred.Groups[1].Value | Should -Match '(?s)\} elseif \(-not \$ForceDowngrade\) \{.*?\$ReconcilePinnedStack.*?\$AlreadyInst\+\+.*?\} else \{'
     }
 }

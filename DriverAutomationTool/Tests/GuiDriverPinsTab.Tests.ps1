@@ -96,6 +96,14 @@ Describe 'Driver Pins tab - XAML' {
         $Missing -join ', ' | Should -BeNullOrEmpty
     }
 
+    It 'Wraps the pin options row, so Pin Selected Revision never leaves the window' {
+        # With both pin options the row is wider than the default window; a
+        # horizontal StackPanel pushed the button past the edge.
+        $Button = $script:PinTab.SelectSingleNode(".//d:Button[@*[local-name()='Name']='PinCreateButton']", $Ns)
+        $Button | Should -Not -BeNullOrEmpty
+        $Button.ParentNode.LocalName | Should -Be 'WrapPanel'
+    }
+
     It 'Carries the metadata columns a pin needs, beyond what the grid shows' {
         # The picker's whole reason for existing is that it captures the
         # perishable catalog metadata a hand-typed pin forgets. If these columns

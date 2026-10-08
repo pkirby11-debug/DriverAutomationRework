@@ -3448,26 +3448,51 @@ function Install-DriverUpdates {
     # is never reinstalled - and the screen never blanked - on every run.
     $VendorMaxAttempts = 2
 
-    # A folder only SYSTEM and Administrators can touch, created that way in
-    # one step. SYSTEM runs everything the AMD package contains out of it;
-    # under C:\Temp it would otherwise inherit write access for ordinary users,
-    # who could swap Bin64\ATISetup.exe after it is checked or plant a DLL
-    # beside Setup.exe, and have it run as SYSTEM.
+    # A folder only SYSTEM and Administrators can write to, created that way
+    # in one step. SYSTEM runs everything the AMD package contains out of it;
+    # anywhere users can write, they could swap Bin64\ATISetup.exe after it is
+    # checked or plant a DLL beside Setup.exe, and have it run as SYSTEM.
+    # Users keep read access only, in case AMD finishes its install from the
+    # package after a restart in a user's context.
+    $ProtectedSids = @{ 'S-1-5-18' = 'FullControl'; 'S-1-5-32-544' = 'FullControl'; 'S-1-5-32-545' = 'ReadAndExecute' }
     $NewProtectedDirectory = {
         param([string]$Path)
         $Sec = New-Object System.Security.AccessControl.DirectorySecurity
         $Sec.SetAccessRuleProtection($true, $false)
-        foreach ($Sid in 'S-1-5-18', 'S-1-5-32-544') {
+        foreach ($Sid in $ProtectedSids.Keys) {
             $Id = New-Object System.Security.Principal.SecurityIdentifier $Sid
-            $Sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($Id, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            $Sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($Id, $ProtectedSids[$Sid], 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
         }
         if ($PSVersionTable.PSEdition -eq 'Desktop') {
             # Windows PowerShell 5.1, the client runtime: created with its ACL,
             # so there is no moment where the folder is writable by users.
+            # (It silently keeps an EXISTING folder's ACL - which is why the
+            # caller uses a fresh random name and checks the result below.)
             [void][System.IO.Directory]::CreateDirectory($Path, $Sec)
         } else {
             New-Item -Path $Path -ItemType Directory -Force | Out-Null
             Set-Acl -Path $Path -AclObject $Sec
+        }
+    }
+    # Is this folder actually protected? Read back, not assumed: owner SYSTEM
+    # or Administrators, inheritance cut, and no allow rule granting write to
+    # anyone but SYSTEM and Administrators. Returns why not, or $null.
+    $TestProtectedDirectory = {
+        param([string]$Path)
+        try {
+            $Acl = Get-Acl -Path $Path -ErrorAction Stop
+            $Owner = $Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+            if ($Owner -notin @('S-1-5-18', 'S-1-5-32-544')) { return "owned by $Owner" }
+            if (-not $Acl.AreAccessRulesProtected) { return 'inherits permissions from its parent' }
+            $WriteRights = [System.Security.AccessControl.FileSystemRights]'Write, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+            foreach ($Rule in $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+                if ($Rule.AccessControlType -ne 'Allow') { continue }
+                if ($Rule.IdentityReference.Value -in @('S-1-5-18', 'S-1-5-32-544')) { continue }
+                if (([int]$Rule.FileSystemRights -band [int]$WriteRights) -ne 0) { return "$($Rule.IdentityReference.Value) can write to it" }
+            }
+            return $null
+        } catch {
+            return "its permissions could not be read ($($_.Exception.Message))"
         }
     }
 
@@ -3482,8 +3507,16 @@ function Install-DriverUpdates {
         return $null
     }
 
+    # Ledger timestamps, written culture-invariantly. 'HH:mm:ss' in a format
+    # string means the CURRENT culture's time separator and calendar - '.' on
+    # a Finnish system, a Buddhist-era year on a Thai one - and a value that
+    # cannot be read back the same way breaks the restart guard below.
+    $InvariantNow = { (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) }
+
     # Has the device restarted since this moment? Used so a deferral for a
-    # pending restart asks for ONE restart, not one per run.
+    # pending restart asks for ONE restart, not one per run. Fails closed: if
+    # the moment or the boot time cannot be read, answer "yes, restarted" -
+    # the cost is a fallback instead of a clean install, never a restart loop.
     $RestartedSince = {
         param([string]$When)
         try {
@@ -3491,7 +3524,7 @@ function Install-DriverUpdates {
             $Boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
             return ($Boot -gt $Then)
         } catch {
-            return $false
+            return $true
         }
     }
 
@@ -3514,21 +3547,27 @@ function Install-DriverUpdates {
             return $Out
         }
 
-        if (-not $WorkDir) {
-            $WorkDir = Join-Path $env:SystemDrive ('Temp\DriverAutomationTool\DupExtract\vendor-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-        }
+        # Where the package is unpacked and run. Under %WINDIR%\Temp, not
+        # C:\Temp: users may create things there but cannot rename or delete
+        # what they do not own, so no part of the path to Setup.exe can be
+        # swapped under SYSTEM's feet - under C:\Temp every parent folder is
+        # user-modifiable. A random name, so it cannot be created in advance,
+        # and its permissions are read back before anything goes into it.
+        if (-not $WorkDir) { $WorkDir = Join-Path $env:WINDIR 'Temp' }
         if (-not $LogDir) { $LogDir = $WorkDir }
-        $Vendor  = Join-Path $WorkDir 'vendor'
+        Get-ChildItem -Path $WorkDir -Filter 'DAT-Vendor-*' -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        $Vendor  = Join-Path $WorkDir ('DAT-Vendor-' + [guid]::NewGuid().ToString('N'))
         $Extract = Join-Path $Vendor 'extract'
         try {
-            if (-not (Test-Path $WorkDir)) { New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null }
-            if (Test-Path $Vendor) { Remove-Item -Path $Vendor -Recurse -Force -ErrorAction Stop }
             & $NewProtectedDirectory $Vendor
-            # Created a moment ago with only SYSTEM and Administrators on it, so
-            # anything already inside was not put there by this run.
+            $NotProtected = & $TestProtectedDirectory $Vendor
+            if ($NotProtected) { throw "it is not protected: $NotProtected" }
             if (@(Get-ChildItem -Path $Vendor -Force -ErrorAction Stop).Count -gt 0) { throw 'the new folder is not empty' }
             New-Item -Path $Extract -ItemType Directory -Force | Out-Null
         } catch {
+            Remove-Item -Path $Vendor -Recurse -Force -ErrorAction SilentlyContinue
             $Out.Reason = "could not create a protected work folder at $($Vendor): $($_.Exception.Message)"
             return $Out
         }
@@ -3605,7 +3644,9 @@ function Install-DriverUpdates {
         #    build of ATISetup.exe actually knows it.
         $Custom = "$($Row.VendorInstallerArguments)".Trim()
         if ($Custom) {
-            $Stripped = (($Custom -replace '(?i)(^|\s)-LOG(\s+("[^"]*"|(?!-)\S+))?(?=\s|$)', ' ') -replace '(?i)(^|\s)-BOOT(?=\s|$)', ' ') -replace '\s{2,}', ' '
+            # Either switch prefix, and -LOG with its path given after a space,
+            # ':' or '=', quoted or not; -LOGFILE and the like are left alone.
+            $Stripped = (($Custom -replace '(?i)(^|\s)[-/]LOG(?:(?:\s+|[:=]|(?="))("[^"]*"|(?![-/])\S+))?(?=\s|$)', ' ') -replace '(?i)(^|\s)[-/]BOOT(?=\s|$)', ' ') -replace '\s{2,}', ' '
             $Stripped = $Stripped.Trim()
             if ($Stripped -ne $Custom) {
                 Write-Log "$Label - removed -LOG/-BOOT from the pin's installer arguments ('$Custom'): the client reads AMD's result from its own file, and ConfigMgr owns the restart" -Severity 2
@@ -3660,6 +3701,17 @@ function Install-DriverUpdates {
             $P
         }
         $PauseBefore = & $ReadPause
+
+        # Both executables must carry a valid AMD (or Dell) signature. The
+        # folder is protected, so this is a second line, not the only one.
+        foreach ($Exe in @($Setup, (Join-Path $Root 'Bin64\ATISetup.exe'))) {
+            $Sig = $null
+            try { $Sig = Get-AuthenticodeSignature -FilePath $Exe -ErrorAction Stop } catch { Write-Verbose "Signature unreadable: $($_.Exception.Message)" }
+            if (-not $Sig -or "$($Sig.Status)" -ne 'Valid' -or "$($Sig.SignerCertificate.Subject)" -notmatch '(?i)Advanced Micro Devices|Dell') {
+                $Out.Reason = "$Exe is not validly signed by AMD or Dell ($(if ($Sig) { "status $($Sig.Status), signer $($Sig.SignerCertificate.Subject)" } else { 'no signature information' }))"
+                return $Out
+            }
+        }
 
         # 4. Run it. The root Setup.exe hands off to Bin64\ATISetup.exe, so the
         #    root exiting is not the end: wait for the installer processes
@@ -3776,9 +3828,10 @@ function Install-DriverUpdates {
         $Out.Detail = "exit $($Out.ExitCode), result file $(if ($null -ne $Out.ResultCode) { "ResultCode $($Out.ResultCode)" } else { 'absent' }) ($($Out.ResultLog))$(if ($Out.Detail) { ", $($Out.Detail)" })$Quote"
         Write-Log "$Label - AMD's installer finished: $($Out.Outcome)$(if ($Out.Reason) { " - $($Out.Reason)" }); $($Out.Detail)" -Severity $(if ($Out.Outcome -eq 'Passed') { 1 } else { 2 })
 
-        # The extract is the size of the whole display package. Keep it only
-        # when something went wrong and it may be needed to look into.
-        if ($Out.Outcome -eq 'Passed') {
+        # The extract is the size of the whole display package. Kept only when
+        # something went wrong and it may be needed to look into, or AMD may
+        # still finish from it after a restart ('Unknown'); pruned after a week.
+        if ($Out.Outcome -in @('Passed', 'Deferred')) {
             Remove-Item -Path $Vendor -Recurse -Force -ErrorAction SilentlyContinue
         }
         return $Out
@@ -3917,6 +3970,11 @@ function Install-DriverUpdates {
         Write-Log "Running $($VendorFirst.Count) pinned row(s) that may use AMD's clean installer first, before other DUPs can leave a restart pending"
     }
 
+    # Set when AMD's clean installer is left running past its timeout (it is
+    # never killed). Nothing else installs alongside it: the remaining DUPs
+    # would collide with it, and their failures would count toward quarantine.
+    $VendorStillRunning = $false
+
     $Index = 0
     foreach ($Drv in $Drivers) {
         $Index++
@@ -3924,6 +3982,13 @@ function Install-DriverUpdates {
         $DriverLabel = "[$Index/$($Drivers.Count)] $($Drv.Category) - $($Drv.Name) v$($Drv.Version)"
         $CompKey = & $SanitizeKey $Drv.FileName
         $CompKeyPath = Join-Path $ComponentsRoot $CompKey
+
+        if ($VendorStillRunning) {
+            Write-Log "$DriverLabel - not run: AMD's clean installer from an earlier row is still running. Reported as a failure so ConfigMgr runs it again later; not counted toward quarantine." -Severity 2
+            $Failed++
+            $FailureLines.Add(("{0} (held back: AMD installer still running)" -f $Drv.FileName))
+            continue
+        }
 
         # GPU brand this DUP targets (only inferred for Video DUPs). Used both by the
         # vendor pre-skip just below and the failure-forgive in the exit-code handler.
@@ -3977,9 +4042,15 @@ function Install-DriverUpdates {
         $VendorRoute = $false
         $VendorRun = $null
         $StackDrift = $null
+        # This row asked to be re-measured after a restart; its component
+        # marker must not later be trusted as proof (see PendingCheck below).
+        $RowPendingCheck = $false
+        $LiveBelowPin = $false
+        $DupQuarantined = $false
         $WantVendor = $false
         $VendorAttempts = 0
         $VendorLastAt = ''
+        $VendorLastOutcome = ''
         $VendorDeferredAt = ''
         if ($AllowDowngrade -and $Drv.UseVendorInstaller) {
             if ($DupVendor -eq 'AMD') {
@@ -3993,6 +4064,7 @@ function Install-DriverUpdates {
                     if ("$($VProps.VendorAttemptVersion)" -eq "$($Drv.Version)") {
                         $VendorAttempts = [int]$VProps.VendorAttemptCount
                         $VendorLastAt = "$($VProps.VendorAttemptAt)"
+                        $VendorLastOutcome = "$($VProps.VendorAttemptOutcome)"
                     }
                     if ("$($VProps.VendorDeferredVersion)" -eq "$($Drv.Version)") { $VendorDeferredAt = "$($VProps.VendorDeferredAt)" }
                 } catch {
@@ -4048,7 +4120,9 @@ function Install-DriverUpdates {
                         continue
                     }
                     $LiveVersionKnown = $true
-                    if ($WantVendor -and $VendorAttempts -eq 0) {
+                    # Once - or a second time when the first ended without a
+                    # verdict from AMD and asked to be re-measured after a restart.
+                    if ($WantVendor -and ($VendorAttempts -eq 0 -or $VendorLastOutcome -eq 'Unknown')) {
                         Write-Log ("$DriverLabel - PINNED: device is on the pinned v$TargetLabel, but newer pieces of the release being rolled back are still applied on top of it: " +
                             (@($StackDrift.Items | ForEach-Object { "$($_.Kind.ToLowerInvariant()) $($_.Name) v$($_.Version)" }) -join ', ') +
                             " - running AMD's clean installer from the pinned DUP to replace the whole stack") -Severity 2
@@ -4065,6 +4139,7 @@ function Install-DriverUpdates {
                     }
                 } else {
                     $LiveVersionKnown = $true
+                    $LiveBelowPin = $true
                     Write-Log "$DriverLabel - PINNED: device is on v$LiveVersion, older than the pinned v$TargetLabel - installing normally (no downgrade needed)"
                 }
             } else {
@@ -4103,7 +4178,10 @@ function Install-DriverUpdates {
                     } elseif (-not $LiveVersionKnown) {
                         $MarkerFromPinnedRun = $false
                         try {
-                            $MarkerFromPinnedRun = [bool][int](Get-ItemProperty -Path $CompKeyPath -Name 'Pinned' -ErrorAction Stop).Pinned
+                            $MarkerProps = Get-ItemProperty -Path $CompKeyPath -ErrorAction Stop
+                            # A run that asked to be re-measured after a restart
+                            # proved nothing, so its marker cannot skip this one.
+                            $MarkerFromPinnedRun = [bool][int]$MarkerProps.Pinned -and -not ($MarkerProps.PSObject.Properties['PendingCheck'] -and [bool][int]$MarkerProps.PendingCheck)
                         } catch {
                             # No 'Pinned' value - the marker predates this pin.
                             Write-Verbose "Component marker carries no Pinned flag"
@@ -4136,19 +4214,27 @@ function Install-DriverUpdates {
                 if ($CProps.PSObject.Properties['FailedVersion'] -and
                     $CProps.FailedVersion -eq $Drv.Version -and
                     [int]$CProps.FailCount -ge $QuarantineThreshold) {
-                    $QuarantineNote = if ($AllowDowngrade) {
-                        ' This row is VERSION-PINNED, so the quarantine is holding off a rollback: read the framework log under C:\Windows\Temp\DATDupLogs to see whether the DUP is refusing the downgrade outright, and check with Get-DATDriverPin that you pinned a revision this device will accept.'
-                    } else { '' }
-                    Write-Log "$DriverLabel - QUARANTINED: v$($Drv.Version) failed $($CProps.FailCount) consecutive time(s) on this device (last exit $($CProps.LastFailExit) at $($CProps.LastFailAt)) - the vendor installer is deterministically broken here. Skipping; a newer version in the manifest re-arms it automatically. To force a retry now, delete HKLM:\...\DriverUpdates\Components\$CompKey.$QuarantineNote" -Severity 2
-                    # A device already on the pin with a mixed stack still gets
-                    # the stack reconcile - it does not need the DUP at all.
-                    if ($VendorRoute -and -not $ForceDowngrade) {
-                        $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $StackDrift
-                        if ($Stack.RebootRequired) { $Rebooted = $true }
-                        if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
+                    if ($VendorRoute) {
+                        # The ledger counts DUP failures; AMD's clean installer
+                        # is a different engine with its own bounded ledger.
+                        # It goes ahead - and should it turn out unusable, the
+                        # DUP fallback below honours this quarantine.
+                        $DupQuarantined = $true
+                        Write-Log "$DriverLabel - the DUP is quarantined here (v$($Drv.Version) failed $($CProps.FailCount) time(s)), but this row runs AMD's clean installer instead, which the quarantine does not cover" -Severity 2
+                    } elseif ($AllowDowngrade -and $LiveBelowPin -and $Drv.Category -eq 'Video') {
+                        # Below the pin, this DUP is putting a display driver
+                        # BACK (after a clean install removed it, say). Skipping
+                        # it could leave the device on Microsoft Basic Display
+                        # with an Installed marker; failing again is better.
+                        Write-Log "$DriverLabel - not quarantined although v$($Drv.Version) failed $($CProps.FailCount) time(s): the device is below the pinned version, so this DUP is what restores its display driver" -Severity 2
+                    } else {
+                        $QuarantineNote = if ($AllowDowngrade) {
+                            ' This row is VERSION-PINNED, so the quarantine is holding off a rollback: read the framework log under C:\Windows\Temp\DATDupLogs to see whether the DUP is refusing the downgrade outright, and check with Get-DATDriverPin that you pinned a revision this device will accept.'
+                        } else { '' }
+                        Write-Log "$DriverLabel - QUARANTINED: v$($Drv.Version) failed $($CProps.FailCount) consecutive time(s) on this device (last exit $($CProps.LastFailExit) at $($CProps.LastFailAt)) - the vendor installer is deterministically broken here. Skipping; a newer version in the manifest re-arms it automatically. To force a retry now, delete HKLM:\...\DriverUpdates\Components\$CompKey.$QuarantineNote" -Severity 2
+                        $Quarantined++
+                        continue
                     }
-                    $Quarantined++
-                    continue
                 }
             } catch {
         # Non-fatal hardware or registry probe error
@@ -4165,9 +4251,14 @@ function Install-DriverUpdates {
             # error when the file is present.)
             Write-Log "$DriverLabel - DUP not found at $DriverExe. Most likely AV/Defender quarantined it - exclude the CCM cache (e.g. %WINDIR%\ccmcache) from real-time scanning." -Severity 2
             if ($VendorRoute -and -not $ForceDowngrade) {
+                # Already on the pin: only the optional clean install needed the
+                # file. Same as any other reason it cannot run - reconcile the
+                # stack and move on rather than fail every run.
                 $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $StackDrift
                 if ($Stack.RebootRequired) { $Rebooted = $true }
                 if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
+                $AlreadyInst++
+                continue
             }
             $Failed++
             $FailureLines.Add(("{0} (missing file - possible AV quarantine)" -f $Drv.FileName))
@@ -4233,7 +4324,16 @@ function Install-DriverUpdates {
         # one already on it, where running the DUP again would do nothing.
         if ($VendorRoute) {
             $PendingWhy = & $GetPendingRestartReason $Rebooted
-            if ($PendingWhy) {
+            if ($PendingWhy -and $VendorDeferredAt -and (& $RestartedSince $VendorDeferredAt)) {
+                # Deferred once already, the device has restarted since, and a
+                # restart is pending AGAIN (Windows Update queued the next one,
+                # or a flag that never clears). Asking for restart after restart
+                # is not the answer; use what does not need the clean installer.
+                $VendorRun = [PSCustomObject]@{
+                    Ran = $false; Outcome = 'NotRun'; Reason = "a restart is still pending ($PendingWhy) although the device has restarted since this was last deferred ($VendorDeferredAt)"
+                    ExitCode = $null; ResultCode = $null; AmdError = $null; InstallerPath = ''; ResultLog = ''; Detail = ''
+                }
+            } elseif ($PendingWhy) {
                 # Same verdict AMD would reach (error 206), without extracting
                 # a whole display package first. Nothing has changed.
                 $VendorRun = [PSCustomObject]@{
@@ -4241,7 +4341,7 @@ function Install-DriverUpdates {
                     ResultCode = $null; AmdError = 206; InstallerPath = ''; ResultLog = ''; Detail = 'not started'
                 }
             } else {
-                $VendorRun = & $InvokeVendorInstaller $Drv $DriverExe $DupTempDir $DupLogDir $DriverLabel $PinTarget
+                $VendorRun = & $InvokeVendorInstaller $Drv $DriverExe (Join-Path $env:WINDIR 'Temp') $DupLogDir $DriverLabel $PinTarget
             }
             if ($VendorRun.Outcome -eq 'Deferred') {
                 # Handled with the results below; it is neither a pass nor a
@@ -4256,7 +4356,7 @@ function Install-DriverUpdates {
                     if (-not (Test-Path $CompKeyPath)) { New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null }
                     New-ItemProperty -Path $CompKeyPath -Name 'VendorAttemptVersion' -Value ([string]$Drv.Version) -PropertyType String -Force | Out-Null
                     New-ItemProperty -Path $CompKeyPath -Name 'VendorAttemptCount' -Value $VendorAttempts -PropertyType DWord -Force | Out-Null
-                    New-ItemProperty -Path $CompKeyPath -Name 'VendorAttemptAt' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
+                    New-ItemProperty -Path $CompKeyPath -Name 'VendorAttemptAt' -Value (& $InvariantNow) -PropertyType String -Force | Out-Null
                     New-ItemProperty -Path $CompKeyPath -Name 'VendorAttemptOutcome' -Value ([string]$VendorRun.Outcome) -PropertyType String -Force | Out-Null
                     foreach ($DProp in 'VendorDeferredVersion', 'VendorDeferredAt') {
                         Remove-ItemProperty -Path $CompKeyPath -Name $DProp -ErrorAction SilentlyContinue
@@ -4275,6 +4375,12 @@ function Install-DriverUpdates {
                     'Unknown' { 2 }
                     default   { 1 }
                 }
+                # Left running past its timeout: nothing else installs this run.
+                if ($VendorRun.Outcome -eq 'TimedOut') { $VendorStillRunning = $true }
+            } elseif ($ForceDowngrade -and $DupQuarantined) {
+                Write-Log "$DriverLabel - AMD's clean installer could not be used: $($VendorRun.Reason) - and the DUP is quarantined on this device, so the pin is not enforced this run" -Severity 2
+                $Quarantined++
+                continue
             } elseif ($ForceDowngrade) {
                 Write-Log "$DriverLabel - AMD's clean installer could not be used: $($VendorRun.Reason) - enforcing the pin with the DUP instead" -Severity 2
                 $VendorRoute = $false
@@ -4447,6 +4553,7 @@ function Install-DriverUpdates {
                     if ($VendorRoute) {
                         $Rebooted = $true
                         $script:PinCheckAfterRestart = $true
+                        $RowPendingCheck = $true
                         Write-Log "$DriverLabel - requesting a restart after AMD's clean install; the application runs again afterwards to check the device" -Severity 2
                     }
                 } elseif ($VendorRoute -and $AfterCmp -lt 0) {
@@ -4461,17 +4568,30 @@ function Install-DriverUpdates {
                     # that run installs the pinned DUP normally.
                     $Rebooted = $true
                     $script:PinCheckAfterRestart = $true
+                    $RowPendingCheck = $true
                     Write-Log "$DriverLabel - PIN: after AMD's clean install the device reports v$AfterVersion, below the pinned v$PinTarget - most likely the inbox display driver while AMD's install completes after a restart. Requesting a restart; the application runs again afterwards and checks the device." -Severity 2
                 } elseif ($AfterCmp -le 0) {
-                    Write-Log "$DriverLabel - PIN VERIFIED: device is now on v$AfterVersion (was v$LiveVersion)$(if ($VendorRoute) { " - installed by AMD's clean installer" })"
+                    # Credit AMD only for a change it made: on a device that was
+                    # already on the pin, an unchanged version says nothing.
+                    $Credit = if (-not $VendorRoute) { '' } elseif ("$AfterVersion" -ne "$LiveVersion") { " - installed by AMD's clean installer" } else { " - the base driver is unchanged by AMD's clean installer ($($VendorRun.Outcome))" }
+                    Write-Log "$DriverLabel - PIN VERIFIED: device is now on v$AfterVersion (was v$LiveVersion)$Credit"
                     # The base is right; check the rest of the stack before
                     # calling the rollback done.
                     $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $null
                     if ($Stack.RebootRequired) { $Rebooted = $true }
                     if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
+                    if ($Stack.Mixed -and $VendorRetryOk -and $VendorRun.Outcome -eq 'Unknown') {
+                        # AMD worked without giving a verdict and the stack is
+                        # still mixed - it may be finishing after a restart.
+                        $Rebooted = $true
+                        $script:PinCheckAfterRestart = $true
+                        $RowPendingCheck = $true
+                        Write-Log "$DriverLabel - AMD's clean installer gave no verdict and the stack is still mixed; requesting a restart, after which the application runs again and checks the device" -Severity 2
+                    }
                 } elseif ($VendorRetryOk) {
                     $Rebooted = $true
                     $script:PinCheckAfterRestart = $true
+                    $RowPendingCheck = $true
                     Write-Log "$DriverLabel - PIN: the device still reports v$AfterVersion after AMD's clean installer ($($VendorRun.Outcome)); AMD can finish installing after a restart. Requesting one - the application runs again afterwards and checks the device." -Severity 2
                 } elseif (-not $VendorRoute -and $DupCode -in $RebootCodes) {
                     Write-Log "$DriverLabel - PIN: device still reports v$AfterVersion, but $Installer asked for a restart - the rollback cannot be confirmed until the device restarts" -Severity 2
@@ -4537,14 +4657,24 @@ function Install-DriverUpdates {
                         # discrete card of the same brand, matched by brand) are
                         # not - the pinned package may not cover the second, and
                         # retiring its driver could leave it on none.
-                        $OutrankingGpus = @($Outranking | ForEach-Object {
-                            if ("$($_.DeviceID) $($_.HardWareID)" -match 'VEN_[0-9A-Fa-f]{4}&DEV_[0-9A-Fa-f]{4}') { $Matches[0].ToUpperInvariant() } else { "$($_.DeviceID)" }
+                        # Display packages only: one Serial IO or USB package
+                        # driving several functions is ordinary, not a risk.
+                        $OutrankingGpus = @($Outranking | Where-Object { "$($_.DeviceClass)" -match '^(?i)display$' } | ForEach-Object {
+                            if ("$($_.DeviceID) $($_.HardWareID)" -match 'VEN_[0-9A-Fa-f]{4}&DEV_[0-9A-Fa-f]{4}') { $Matches[0].ToUpperInvariant() } else { "$($_.HardWareID)" }
                         } | Sort-Object -Unique)
+                        # A row matched by GPU brand alone, on a device with two
+                        # GPUs of that brand, cannot tell whose package it is
+                        # removing even when only one of them is above the pin.
+                        $BrandAmbiguous = $false
+                        if (@($Drv.HardwareIds | Where-Object { $_ }).Count -eq 0 -and $Drv.Category -eq 'Video') {
+                            $BrandVen = switch (& $GetDupGpuVendor $Drv.Name) { 'AMD' { 'VEN_1002' } 'NVIDIA' { 'VEN_10DE' } 'Intel' { 'VEN_8086' } default { '' } }
+                            $BrandAmbiguous = $BrandVen -and @($LiveVideoAdapters | Where-Object { "$($_.PNPDeviceID)" -match $BrandVen }).Count -gt 1
+                        }
 
                         if ($Outranking.Count -eq 0) {
                             $RetireNote = "No removable package matching this component is newer than v$PinTarget, so there was nothing to retire and the DriverStore was left untouched. "
-                        } elseif ($OutrankingGpus.Count -gt 1) {
-                            $RetireNote = "Did NOT retire $(@($Outranking | ForEach-Object { $_.InfName }) -join ', '): they drive $($OutrankingGpus.Count) different GPUs ($($OutrankingGpus -join ', ')), and the pinned package may not cover them all - retire by hand after checking, or add the target GPU's hardware ID to the pin. "
+                        } elseif ($OutrankingGpus.Count -gt 1 -or $BrandAmbiguous) {
+                            $RetireNote = "Did NOT retire $(@($Outranking | ForEach-Object { $_.InfName }) -join ', '): $(if ($BrandAmbiguous) { 'this pin matches its GPU by brand alone and the device has more than one GPU of that brand' } else { "they drive $($OutrankingGpus.Count) different GPUs ($($OutrankingGpus -join ', '))" }), and the pinned package may not cover them all - retire by hand after checking, or add the target GPU's hardware ID to the pin. "
                         } elseif (-not (& $PinnedPackageStaged $PinTarget "$($Outranking[0].DeviceClass)")) {
                             $RetireNote = "Did NOT retire $(@($Outranking | ForEach-Object { $_.InfName }) -join ', '): the pinned v$PinTarget is not in the DriverStore, so Windows would have nothing to fall back to and the device could be left without a driver - check that the pinned DUP actually staged its INFs. "
                         } else {
@@ -4618,6 +4748,10 @@ function Install-DriverUpdates {
                 # inventory - and on a DCU-managed device there is no other
                 # client-side record of what was installed at all.
                 New-ItemProperty -Path $CompKeyPath -Name 'Pinned' -Value ([int][bool]$AllowDowngrade) -PropertyType DWord -Force | Out-Null
+                # Set when this run could not confirm the pin and asked to be
+                # re-measured after a restart: such a marker proves nothing,
+                # and the blind-probe skip rule above refuses to trust it.
+                New-ItemProperty -Path $CompKeyPath -Name 'PendingCheck' -Value ([int]$RowPendingCheck) -PropertyType DWord -Force | Out-Null
                 if ($AllowDowngrade) {
                     New-ItemProperty -Path $CompKeyPath -Name 'LiveVersionBefore' -Value ([string]$LiveVersion) -PropertyType String -Force | Out-Null
                     New-ItemProperty -Path $CompKeyPath -Name 'ForcedDowngrade'   -Value ([int][bool]$ForceDowngrade) -PropertyType DWord -Force | Out-Null
@@ -4654,19 +4788,28 @@ function Install-DriverUpdates {
                 $VendorDeferred++
                 $Rebooted = $true
                 $script:PinCheckAfterRestart = $true
+                $RowPendingCheck = $true
                 try {
                     if (-not (Test-Path $CompKeyPath)) { New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null }
                     New-ItemProperty -Path $CompKeyPath -Name 'VendorDeferredVersion' -Value ([string]$Drv.Version) -PropertyType String -Force | Out-Null
-                    New-ItemProperty -Path $CompKeyPath -Name 'VendorDeferredAt' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -PropertyType String -Force | Out-Null
+                    New-ItemProperty -Path $CompKeyPath -Name 'VendorDeferredAt' -Value (& $InvariantNow) -PropertyType String -Force | Out-Null
                 } catch {
                     Write-Log "$DriverLabel - could not record the deferral ($($_.Exception.Message))" -Severity 2
                 }
                 Write-Log "$DriverLabel - AMD's clean installer waits for a restart: $($VendorRun.Reason). Nothing was changed. Requesting a restart; ConfigMgr runs this application again afterwards." -Severity 2
+            } elseif (-not $ForceDowngrade) {
+                # Already on the pin: only the optional clean install is
+                # waiting. Do what does not need it - the stack reconcile -
+                # rather than fail the application over it.
+                Write-Log "$DriverLabel - AMD's clean installer did not run: $($VendorRun.Reason). Nothing was changed; reconciling the driver stack without it." -Severity 2
+                $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $StackDrift
+                if ($Stack.RebootRequired) { $Rebooted = $true }
+                if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
+                $AlreadyInst++
             } else {
-                # Windows Update installing (202), or a restart still pending
-                # although the device has restarted since the last deferral -
-                # asking for another would only loop. A plain failure: ConfigMgr
-                # retries on its own schedule.
+                # Above the pin, and Windows Update is installing (202) or a
+                # restart is still pending after the one already asked for. A
+                # plain failure: ConfigMgr retries on its own schedule.
                 $Failed++
                 $FailureLines.Add(("{0} (AMD clean install deferred: {1})" -f $Drv.FileName, $VendorRun.Reason))
                 Write-Log "$DriverLabel - AMD's clean installer did not run: $($VendorRun.Reason)$(if ($VendorRun.AmdError -eq 206) { ", and the device has restarted since this was last deferred ($VendorDeferredAt) - not asking for another restart" }). Nothing was changed. This run reports failure so ConfigMgr tries again later; it does not count toward quarantine." -Severity $(if ($VendorRun.AmdError -eq 206) { 3 } else { 2 })
@@ -4735,6 +4878,25 @@ function Install-DriverUpdates {
                     # ones; a DUP refusing a downgrade does not use them, so it
                     # lands here and would otherwise read as an ordinary failure.
                     if ($AllowDowngrade -and $VendorRoute) {
+                        # Factory Reset removes the old driver first, so a
+                        # failed run can leave the GPU on Microsoft Basic
+                        # Display. Re-read it; if it is below the pin or
+                        # unreadable, or AMD said a restart is needed, ask for
+                        # the restart and re-measure after it rather than
+                        # leave the display that way until a later retry.
+                        try {
+                            $LiveVideoAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+                        } catch {
+                            Write-Verbose "Post-failure display re-read failed: $($_.Exception.Message)"
+                        }
+                        $FailVersion = & $GetLiveDriverVersion $Drv
+                        $FailCmp = if ($FailVersion -and $PinTarget) { & $CompareVersion $FailVersion $PinTarget } else { $null }
+                        if ($VendorRun.Outcome -ne 'TimedOut' -and ($VendorRun.ResultCode -eq 2 -or $null -eq $FailCmp -or $FailCmp -lt 0)) {
+                            $Rebooted = $true
+                            $script:PinCheckAfterRestart = $true
+                            $RowPendingCheck = $true
+                            Write-Log "$DriverLabel - after the failed clean install the device reports $(if ($FailVersion) { "v$FailVersion" } else { 'no readable display driver version' }); requesting a restart, after which the application runs again and, if needed, installs the pinned DUP" -Severity 2
+                        }
                         Write-Log ("$DriverLabel - PIN NOT APPLIED: AMD's clean installer failed ($($VendorRun.Outcome)$(if ($VendorRun.Reason) { ": $($VendorRun.Reason)" }))" +
                             "$(if ($LiveVersion) { "; the device was on v$LiveVersion before it ran" } else { '' }). " +
                             "AMD's own log is C:\Program Files\AMD\CIM\Log\Install.log, its result file $($VendorRun.ResultLog), and the extracted package is kept under $DupExtractRoot for a week. " +
@@ -6189,6 +6351,14 @@ try {
     if ($ExitCode -ne 0) {
         Write-Log "Vendor utility returned non-zero exit code: $ExitCode" -Severity 3
         Write-DetectionMarker -Status 'Failed'
+        # A pinned rollback that needs a restart before it can be checked
+        # still gets one when other rows failed: exiting 1 would drop it, and
+        # every retry would hit the same state without the restart. The Failed
+        # marker keeps detection failing, so everything is run again after.
+        if ($script:PinCheckAfterRestart) {
+            Write-Log 'A pinned rollback needs a restart before it can be checked, so this run exits 3010 despite the failures above; ConfigMgr restarts the device and, finding the application not installed, runs it again' -Severity 3
+            exit 3010
+        }
         exit $ExitCode
     }
 
@@ -6210,7 +6380,7 @@ try {
     # The ccmcache copy is kept for the re-run.
     if ($script:PinCheckAfterRestart) {
         Write-DetectionMarker -Status 'PendingRestart'
-        Write-Log 'A pinned rollback can only be checked after a restart - marker = PendingRestart, so ConfigMgr runs this application again once the device has restarted (exiting 3010)' -Severity 2
+        Write-Log 'A pinned rollback can only be checked after a restart - marker = PendingRestart, so after ConfigMgr restarts the device it finds the application not installed and runs it again (exiting 3010)' -Severity 2
         exit 3010
     }
 

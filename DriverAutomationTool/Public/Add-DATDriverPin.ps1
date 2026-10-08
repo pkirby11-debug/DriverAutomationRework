@@ -316,7 +316,7 @@
             Write-DATLog -Message "Driver pin added: '$NamePattern' pinned to v$PinnedVersion on SystemID $SystemId$(if ($Reason) { " - $Reason" }). Applies from the next sync; the package rebuilds once and the application updates in place." -Severity 1
         }
 
-        if ($PSBoundParameters.ContainsKey('VendorInstallerArguments') -and $VendorInstallerArguments -match '(?i)(^|\s)-(LOG|BOOT)(\s|$)') {
+        if ($PSBoundParameters.ContainsKey('VendorInstallerArguments') -and $VendorInstallerArguments -match '(?i)(^|\s)[-/](LOG|BOOT)(?![A-Za-z])') {
             Write-DATLog -Message "Driver pin '$NamePattern': the client removes -LOG and -BOOT from -VendorInstallerArguments - it reads AMD's result from its own -LOG file, and ConfigMgr owns the restart." -Severity 2
         }
 

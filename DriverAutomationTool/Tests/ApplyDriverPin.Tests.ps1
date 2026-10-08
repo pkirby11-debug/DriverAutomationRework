@@ -57,6 +57,11 @@ BeforeAll {
     $script:ExtendedConfigKeys      = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ExtendedConfigKeys'
     $script:AmdCleanInstallSwitch   = Get-ApplyScriptBlock -Fn $InstallFn -Name '$AmdCleanInstallSwitch'
     $script:AmdDeferCodes           = Get-ApplyScriptBlock -Fn $InstallFn -Name '$AmdDeferCodes'
+    $script:InvariantNow            = Get-ApplyScriptBlock -Fn $InstallFn -Name '$InvariantNow'
+    $script:RestartedSince          = Get-ApplyScriptBlock -Fn $InstallFn -Name '$RestartedSince'
+    $script:NewProtectedDirectory   = Get-ApplyScriptBlock -Fn $InstallFn -Name '$NewProtectedDirectory'
+    $script:TestProtectedDirectory  = Get-ApplyScriptBlock -Fn $InstallFn -Name '$TestProtectedDirectory'
+    $script:ProtectedSids           = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ProtectedSids'
 
     # The apply script's logger, captured so tests can assert on what the
     # client would write to DATApply.log.
@@ -850,6 +855,12 @@ Describe 'AMD clean installer from the pinned DUP' {
             [CmdletBinding()]
             param([string]$ClassName)
             $script:Polls++
+            if ($script:PollSeq -and $script:PollSeq.Count -gt 0) {
+                $Next = $script:PollSeq[0]
+                $script:PollSeq = @($script:PollSeq | Select-Object -Skip 1)
+                if ($Next -eq 'busy') { [PSCustomObject]@{ Name = 'ATISetup.exe'; ExecutablePath = 'C:\x\Bin64\ATISetup.exe' } }
+                return
+            }
             if ($script:PollThrows -gt 0) { $script:PollThrows--; throw 'WMI is busy' }
             if ($script:BusyPolls -gt 0) {
                 $script:BusyPolls--
@@ -861,6 +872,12 @@ Describe 'AMD clean installer from the pinned DUP' {
             }
         }
         function Start-Sleep { param($Seconds) }
+        # Authenticode on a fake file: whatever the test says it is.
+        function Get-AuthenticodeSignature {
+            [CmdletBinding()]
+            param([string]$FilePath)
+            [PSCustomObject]@{ Status = $script:SigStatus; SignerCertificate = [PSCustomObject]@{ Subject = $script:SigSubject } }
+        }
         function Invoke-Vendor {
             & $script:InvokeVendorInstaller $script:Row $script:DupPath $script:WorkDir $script:LogDir 'test' '32.0.12046.3001'
         }
@@ -881,11 +898,16 @@ Describe 'AMD clean installer from the pinned DUP' {
         $script:Polls = 0
         $script:BusyPolls = 0
         $script:PollThrows = 0
+        $script:PollSeq = @()
+        $script:SigStatus = 'Valid'
+        $script:SigSubject = 'CN=Advanced Micro Devices, Inc., O=Advanced Micro Devices, Inc.'
+        $script:FolderVerdict = $null
         # The FX308309 GPU, on the newer driver.
         $LiveVideoAdapters = @(New-FakeVideoController -PnpId 'PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7\4&18e01285&0&0041' -DriverVersion '32.0.31033.3')
         # The real folder gets a protected ACL (a Windows-only API); here it
         # only has to exist. Covered on its own below.
         $NewProtectedDirectory = { param($Path) New-Item -Path $Path -ItemType Directory -Force | Out-Null }
+        $TestProtectedDirectory = { param($Path) $script:FolderVerdict }
         $script:AmdLogLines = @('InstallMan::performInstall Install has completed. Reboot is required.')
 
         $Case = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -925,7 +947,7 @@ Describe 'AMD clean installer from the pinned DUP' {
     It 'Asks for the clean install alone - never -INSTALL, -BOOT or -OUTPUT alongside it' {
         $null = Invoke-Vendor
         $Line = $script:Launches[1].Args
-        $Line | Should -Match '^-FACTORYRESETINSTALL -LOG "[^"]+[\\/]vendor[\\/]amd-result\.log"$'
+        $Line | Should -Match '^-FACTORYRESETINSTALL -LOG "[^"]+[\\/]DAT-Vendor-[0-9a-f]{32}[\\/]amd-result\.log"$'
         $Line | Should -Not -Match '(?i)-INSTALL\b|-BOOT\b|-OUTPUT\b|-UI\b'
     }
 
@@ -933,7 +955,7 @@ Describe 'AMD clean installer from the pinned DUP' {
         $R = Invoke-Vendor
         $R.Outcome | Should -Be 'Passed'
         $R.ResultCode | Should -Be 0
-        Test-Path (Join-Path $script:WorkDir 'vendor') | Should -BeFalse
+        @(Get-ChildItem -Path $script:WorkDir -Filter 'DAT-Vendor-*').Count | Should -Be 0
         # AMD's verdict is kept with the run's other logs.
         $R.ResultLog | Should -BeLike (Join-Path $script:LogDir '*.amd-result.log')
         Test-Path $R.ResultLog | Should -BeTrue
@@ -943,7 +965,57 @@ Describe 'AMD clean installer from the pinned DUP' {
         $script:AmdResultCode = 1
         $R = Invoke-Vendor
         $R.Outcome | Should -Be 'Failed'
-        Test-Path (Join-Path $script:WorkDir 'vendor/extract') | Should -BeTrue
+        $Kept = @(Get-ChildItem -Path $script:WorkDir -Filter 'DAT-Vendor-*')
+        $Kept.Count | Should -Be 1
+        Test-Path (Join-Path $Kept[0].FullName 'extract') | Should -BeTrue
+    }
+
+    It 'Drops the extract after a deferral - nothing was installed from it' {
+        $script:AmdResultCode = 1
+        $script:AmdLogLines = @('Error code to display to user: 206')
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Deferred'
+        @(Get-ChildItem -Path $script:WorkDir -Filter 'DAT-Vendor-*').Count | Should -Be 0
+    }
+
+    It 'Does not run anything from a work folder that is not actually protected' {
+        $script:FolderVerdict = 'S-1-5-11 can write to it'
+        $R = Invoke-Vendor
+        $R.Ran | Should -BeFalse
+        $R.Reason | Should -Match 'not protected'
+        $script:Launches.Count | Should -Be 0
+    }
+
+    It 'Does not run an installer that is not validly signed by AMD or Dell' {
+        $script:SigSubject = 'CN=Someone Else'
+        $R = Invoke-Vendor
+        $R.Ran | Should -BeFalse
+        $R.Reason | Should -Match 'not validly signed'
+        $script:Launches.Count | Should -Be 1 -Because 'only the extract may have run'
+
+        $script:SigSubject = 'CN=Advanced Micro Devices, Inc.'
+        $script:SigStatus = 'HashMismatch'
+        $script:Launches.Clear()
+        (Invoke-Vendor).Ran | Should -BeFalse
+    }
+
+    It 'Keeps waiting through gaps between AMD''s installer processes' {
+        # Empty, busy, empty, busy: only two empty polls IN A ROW mean done. A
+        # count that is not reset would stop at the second gap, mid-install.
+        $script:ResultLate = $true
+        $script:PollSeq = @('empty', 'busy', 'empty', 'busy')
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Passed'
+        $script:Polls | Should -BeGreaterOrEqual 6
+    }
+
+    It 'Times out - without reading a verdict - when AMD''s installer outlasts the limit' {
+        $VendorInstallerTimeoutMs = 1
+        $script:BusyPolls = 100000
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'TimedOut'
+        $R.ResultCode | Should -BeNullOrEmpty
+        $script:Killed | Should -BeFalse
     }
 
     It 'Defers, rather than fails, when AMD stops for a pending restart' {
@@ -1038,9 +1110,23 @@ Describe 'AMD clean installer from the pinned DUP' {
         # would leave it blind - and ConfigMgr owns the restart.
         $script:Row.VendorInstallerArguments = '-FACTORYRESETINSTALL -LOG "C:\x.log" -BOOT'
         $R = Invoke-Vendor
-        $script:Launches[1].Args | Should -Match '^-FACTORYRESETINSTALL -LOG "[^"]+[\\/]vendor[\\/]amd-result\.log"$'
+        $script:Launches[1].Args | Should -Match '^-FACTORYRESETINSTALL -LOG "[^"]+[\\/]DAT-Vendor-[0-9a-f]{32}[\\/]amd-result\.log"$'
         $R.Outcome | Should -Be 'Passed' -Because 'the result is read from the file the client asked for'
         ($script:LogLines -join "`n") | Should -Match 'removed -LOG/-BOOT'
+    }
+
+    It 'Strips every spelling of -LOG and -BOOT, and nothing else' {
+        foreach ($Case in @(
+            @{ In = '-INSTALL /LOG "C:\a b.log"';      Out = '-INSTALL' }
+            @{ In = '-INSTALL -LOG:C:\a.log /BOOT';    Out = '-INSTALL' }
+            @{ In = '-INSTALL -log="C:\a.log"';        Out = '-INSTALL' }
+            @{ In = '-INSTALL -LOGFILE x -BOOTSTRAP';   Out = '-INSTALL -LOGFILE x -BOOTSTRAP' }
+        )) {
+            $script:Launches.Clear()
+            $script:Row.VendorInstallerArguments = $Case.In
+            $null = Invoke-Vendor
+            $script:Launches[1].Args | Should -Match ('^' + [regex]::Escape($Case.Out) + ' -LOG "') -Because "'$($Case.In)' should become '$($Case.Out)'"
+        }
     }
 
     It 'Falls back to the default switch when an override is nothing but -LOG' {
@@ -1072,15 +1158,82 @@ Describe 'AMD clean installer from the pinned DUP' {
 }
 
 Describe 'Protected work folder for the vendor installer' {
-    It 'Creates the folder with inheritance cut and only SYSTEM and Administrators on it' -Skip:(-not ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop')) {
+    It 'Creates the folder with inheritance cut: SYSTEM and Administrators write, users only read' -Skip:(-not ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop')) {
         $Dir = Join-Path $TestDrive 'protected'
-        $NewProtectedDirectory = Get-ApplyScriptBlock -Fn ($script:ApplyAst.FindAll({
-            param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Install-DriverUpdates'
-        }, $true) | Select-Object -First 1) -Name '$NewProtectedDirectory'
-        & $NewProtectedDirectory $Dir
+        $ProtectedSids = $script:ProtectedSids
+        & $script:NewProtectedDirectory $Dir
         $Acl = Get-Acl -Path $Dir
         $Acl.AreAccessRulesProtected | Should -BeTrue
         $Sids = @($Acl.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } | Sort-Object -Unique)
-        $Sids | Should -Be @('S-1-5-18', 'S-1-5-32-544')
+        $Sids | Should -Be @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-32-545')
+    }
+}
+
+Describe 'Restart guard timestamps' {
+    # The guard that makes a pending-restart deferral ask for ONE restart reads
+    # back a timestamp the script wrote. Written in the current culture, it
+    # came out as '14.21.05' on a Finnish system and as year 2569 on a Thai
+    # one, and the guard never tripped - a restart on every run.
+    BeforeAll {
+        function Get-CimInstance {
+            [CmdletBinding()]
+            param([string]$ClassName)
+            if ($script:BootThrows) { throw 'WMI is broken' }
+            [PSCustomObject]@{ LastBootUpTime = $script:Boot }
+        }
+    }
+
+    BeforeEach {
+        $script:BootThrows = $false
+        $script:SavedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+    }
+
+    AfterEach {
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = $script:SavedCulture
+    }
+
+    It 'Round-trips under <Culture>' -TestCases @(
+        @{ Culture = 'en-US' }, @{ Culture = 'fi-FI' }, @{ Culture = 'th-TH' }, @{ Culture = 'da-DK' }
+    ) {
+        param($Culture)
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::new($Culture)
+        $Stamp = & $script:InvariantNow
+        $Stamp | Should -Match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$'
+        [int]$Stamp.Substring(0, 4) | Should -Be (Get-Date).Year -Because 'never a non-Gregorian year'
+
+        $script:Boot = (Get-Date).AddHours(1)
+        & $script:RestartedSince $Stamp | Should -BeTrue -Because 'a boot after the deferral is a restart since'
+        $script:Boot = (Get-Date).AddHours(-1)
+        & $script:RestartedSince $Stamp | Should -BeFalse
+    }
+
+    It 'Fails closed - "restarted" - when it cannot tell' {
+        & $script:RestartedSince 'not a date' | Should -BeTrue
+        $script:BootThrows = $true
+        & $script:RestartedSince (& $script:InvariantNow) | Should -BeTrue
+    }
+}
+
+Describe 'Protected folder check' {
+    It 'Accepts the folder the script creates, and rejects one users can write to' -Skip:(-not ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop')) {
+        $ProtectedSids = $script:ProtectedSids
+        $Good = Join-Path $TestDrive 'good'
+        & $script:NewProtectedDirectory $Good
+        & $script:TestProtectedDirectory $Good | Should -BeNullOrEmpty
+
+        $Plain = Join-Path $TestDrive 'plain'
+        New-Item -Path $Plain -ItemType Directory | Out-Null
+        $Acl = Get-Acl $Plain
+        $Acl.SetAccessRuleProtection($true, $true)
+        $Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-11'), 'Modify', 'Allow')))
+        Set-Acl -Path $Plain -AclObject $Acl
+        & $script:TestProtectedDirectory $Plain | Should -Match 'can write to it|owned by'
+    }
+
+    It 'Gives users read access only' {
+        $script:ProtectedSids['S-1-5-18']     | Should -Be 'FullControl'
+        $script:ProtectedSids['S-1-5-32-544'] | Should -Be 'FullControl'
+        $script:ProtectedSids['S-1-5-32-545'] | Should -Be 'ReadAndExecute'
+        $script:ProtectedSids.Count | Should -Be 3
     }
 }
