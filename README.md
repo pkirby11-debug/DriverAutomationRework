@@ -522,7 +522,8 @@ On the client, a pinned package:
     this counts toward quarantine.
   - **Nothing runs beside it.** If AMD's installer is still running at its
     30-minute limit it is left to finish, and the run's remaining DUPs wait for
-    the next run instead of installing alongside it.
+    the next run instead of installing alongside it. A run that finds one still
+    running from an earlier run installs nothing at all.
 
   A clean install always requests a restart. AMD Radeon graphics DUPs only; any
   other pinned driver logs that and keeps the DUP.

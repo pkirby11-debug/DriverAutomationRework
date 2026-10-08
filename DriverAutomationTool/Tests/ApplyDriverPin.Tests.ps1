@@ -876,7 +876,9 @@ Describe 'AMD clean installer from the pinned DUP' {
         function Get-AuthenticodeSignature {
             [CmdletBinding()]
             param([string]$FilePath)
-            [PSCustomObject]@{ Status = $script:SigStatus; SignerCertificate = [PSCustomObject]@{ Subject = $script:SigSubject } }
+            if ($script:SigThrowFor -and $FilePath -match $script:SigThrowFor) { throw 'signature unreadable' }
+            $Subject = if ($script:SigBadFor -and $FilePath -match $script:SigBadFor) { 'CN=Someone Else' } else { $script:SigSubject }
+            [PSCustomObject]@{ Status = $script:SigStatus; SignerCertificate = [PSCustomObject]@{ Subject = $Subject } }
         }
         function Invoke-Vendor {
             & $script:InvokeVendorInstaller $script:Row $script:DupPath $script:WorkDir $script:LogDir 'test' '32.0.12046.3001'
@@ -900,6 +902,8 @@ Describe 'AMD clean installer from the pinned DUP' {
         $script:PollThrows = 0
         $script:PollSeq = @()
         $script:SigStatus = 'Valid'
+        $script:SigThrowFor = $null
+        $script:SigBadFor = $null
         $script:SigSubject = 'CN=Advanced Micro Devices, Inc., O=Advanced Micro Devices, Inc.'
         $script:FolderVerdict = $null
         # The FX308309 GPU, on the newer driver.
@@ -968,6 +972,8 @@ Describe 'AMD clean installer from the pinned DUP' {
         $Kept = @(Get-ChildItem -Path $script:WorkDir -Filter 'DAT-Vendor-*')
         $Kept.Count | Should -Be 1
         Test-Path (Join-Path $Kept[0].FullName 'extract') | Should -BeTrue
+        # The failure log names where it is kept.
+        $R.WorkDir | Should -Be $Kept[0].FullName
     }
 
     It 'Drops the extract after a deferral - nothing was installed from it' {
@@ -997,6 +1003,29 @@ Describe 'AMD clean installer from the pinned DUP' {
         $script:SigStatus = 'HashMismatch'
         $script:Launches.Clear()
         (Invoke-Vendor).Ran | Should -BeFalse
+    }
+
+    It 'Checks ATISetup.exe as well as Setup.exe, and fails closed on an unreadable signature' {
+        $script:SigBadFor = 'ATISetup\.exe$'
+        $R = Invoke-Vendor
+        $R.Ran | Should -BeFalse
+        $R.Reason | Should -Match 'ATISetup\.exe is not validly signed'
+        $script:Launches.Count | Should -Be 1
+
+        $script:SigBadFor = $null
+        $script:SigThrowFor = '(?<!ATI)Setup\.exe$'
+        $script:Launches.Clear()
+        $R = Invoke-Vendor
+        $R.Ran | Should -BeFalse
+        $script:Launches.Count | Should -Be 1
+    }
+
+    It 'Accepts only AMD or Dell as the signing publisher, not any subject containing the word' {
+        $script:SigSubject = 'CN=Wendell Software, O=Wendell Software, C=US'
+        (Invoke-Vendor).Ran | Should -BeFalse
+        $script:Launches.Clear()
+        $script:SigSubject = 'CN=Dell Inc, O=Dell Inc, L=Round Rock, S=Texas, C=US'
+        (Invoke-Vendor).Ran | Should -BeTrue
     }
 
     It 'Keeps waiting through gaps between AMD''s installer processes' {
@@ -1209,13 +1238,26 @@ Describe 'Restart guard timestamps' {
 
     It 'Fails closed - "restarted" - when it cannot tell' {
         & $script:RestartedSince 'not a date' | Should -BeTrue
+        # What a Thai-calendar write used to look like: parses, but in 2569.
+        $script:Boot = (Get-Date).AddHours(-1)
+        & $script:RestartedSince '2569-10-08 15:37:03' | Should -BeTrue
         $script:BootThrows = $true
         & $script:RestartedSince (& $script:InvariantNow) | Should -BeTrue
     }
 }
 
 Describe 'Protected folder check' {
-    It 'Accepts the folder the script creates, and rejects one users can write to' -Skip:(-not ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop')) {
+    BeforeAll {
+        # Elevated Windows only: the folder's owner then is SYSTEM or
+        # Administrators, as it is for the SYSTEM-run client. A non-elevated
+        # session owns what it creates, which the check rightly rejects.
+        $script:Elevated = $false
+        if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') {
+            $script:Elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        }
+    }
+
+    It 'Accepts the folder the script creates, and rejects one users can write to' -Skip:(-not $script:Elevated) {
         $ProtectedSids = $script:ProtectedSids
         $Good = Join-Path $TestDrive 'good'
         & $script:NewProtectedDirectory $Good
@@ -1224,10 +1266,14 @@ Describe 'Protected folder check' {
         $Plain = Join-Path $TestDrive 'plain'
         New-Item -Path $Plain -ItemType Directory | Out-Null
         $Acl = Get-Acl $Plain
-        $Acl.SetAccessRuleProtection($true, $true)
+        $Acl.SetAccessRuleProtection($true, $false)
+        foreach ($Rule in @($Acl.Access)) { [void]$Acl.RemoveAccessRule($Rule) }
+        foreach ($Sid in 'S-1-5-18', 'S-1-5-32-544') {
+            $Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier $Sid), 'FullControl', 'Allow')))
+        }
         $Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-11'), 'Modify', 'Allow')))
         Set-Acl -Path $Plain -AclObject $Acl
-        & $script:TestProtectedDirectory $Plain | Should -Match 'can write to it|owned by'
+        & $script:TestProtectedDirectory $Plain | Should -Be 'S-1-5-11 can write to it'
     }
 
     It 'Gives users read access only' {
@@ -1235,5 +1281,67 @@ Describe 'Protected folder check' {
         $script:ProtectedSids['S-1-5-32-544'] | Should -Be 'FullControl'
         $script:ProtectedSids['S-1-5-32-545'] | Should -Be 'ReadAndExecute'
         $script:ProtectedSids.Count | Should -Be 3
+    }
+}
+
+Describe 'Protected folder check reasons' {
+    # Every way the read-back can reject a folder, against a scripted ACL -
+    # so each one is exercised on any platform, not only the one the
+    # runner's default-owner policy happens to reach.
+    BeforeAll {
+        function New-FakeRule {
+            param([string]$Sid, [System.Security.AccessControl.FileSystemRights]$Rights, [string]$Type = 'Allow')
+            [PSCustomObject]@{ AccessControlType = $Type; IdentityReference = [PSCustomObject]@{ Value = $Sid }; FileSystemRights = $Rights }
+        }
+        function New-FakeAcl {
+            param([string]$Owner, [bool]$Protected, [object[]]$Rules)
+            $A = [PSCustomObject]@{ AreAccessRulesProtected = $Protected; OwnerSid = $Owner; Rules = $Rules }
+            $A | Add-Member -MemberType ScriptMethod -Name GetOwner -Value { param($Type) [PSCustomObject]@{ Value = $this.OwnerSid } }
+            $A | Add-Member -MemberType ScriptMethod -Name GetAccessRules -Value { param($Explicit, $Inherited, $Type) $this.Rules }
+            $A
+        }
+        function Get-Acl {
+            [CmdletBinding()]
+            param($Path)
+            if ($script:FakeAcl -eq 'throw') { throw 'access denied' }
+            $script:FakeAcl
+        }
+        $script:GoodRules = @(
+            New-FakeRule -Sid 'S-1-5-18' -Rights FullControl
+            New-FakeRule -Sid 'S-1-5-32-544' -Rights FullControl
+            New-FakeRule -Sid 'S-1-5-32-545' -Rights ReadAndExecute
+        )
+    }
+
+    It 'Accepts SYSTEM and Administrators with full control and users reading' {
+        $script:FakeAcl = New-FakeAcl -Owner 'S-1-5-32-544' -Protected $true -Rules $script:GoodRules
+        & $script:TestProtectedDirectory 'x' | Should -BeNullOrEmpty
+    }
+
+    It 'Rejects a folder owned by anyone else' {
+        $script:FakeAcl = New-FakeAcl -Owner 'S-1-5-21-1' -Protected $true -Rules $script:GoodRules
+        & $script:TestProtectedDirectory 'x' | Should -Be 'owned by S-1-5-21-1'
+    }
+
+    It 'Rejects a folder that inherits from its parent' {
+        $script:FakeAcl = New-FakeAcl -Owner 'S-1-5-18' -Protected $false -Rules $script:GoodRules
+        & $script:TestProtectedDirectory 'x' | Should -Be 'inherits permissions from its parent'
+    }
+
+    It 'Rejects any other SID that can write, however the right is spelled' {
+        foreach ($Rights in 'Modify', 'Write', 'Delete', 'ChangePermissions', 'TakeOwnership', 'FullControl') {
+            $script:FakeAcl = New-FakeAcl -Owner 'S-1-5-18' -Protected $true -Rules @($script:GoodRules + (New-FakeRule -Sid 'S-1-5-11' -Rights $Rights))
+            & $script:TestProtectedDirectory 'x' | Should -Be 'S-1-5-11 can write to it' -Because "$Rights is a write right"
+        }
+    }
+
+    It 'Ignores deny rules and read-only rules for other SIDs' {
+        $script:FakeAcl = New-FakeAcl -Owner 'S-1-5-18' -Protected $true -Rules @($script:GoodRules + (New-FakeRule -Sid 'S-1-5-11' -Rights Modify -Type 'Deny') + (New-FakeRule -Sid 'S-1-1-0' -Rights ReadAndExecute))
+        & $script:TestProtectedDirectory 'x' | Should -BeNullOrEmpty
+    }
+
+    It 'Fails closed when the permissions cannot be read' {
+        $script:FakeAcl = 'throw'
+        & $script:TestProtectedDirectory 'x' | Should -Match 'could not be read'
     }
 }

@@ -673,6 +673,8 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         $Rec = [regex]::Match($Loop, "-Name 'VendorAttemptCount'")
         $Run.Index | Should -BeLessThan $Rec.Index
         (Get-DATScriptBlockAssignment -Name '$VendorMaxAttempts').Right.Extent.Text | Should -Be '2'
+        $Loop | Should -Match '\$VendorLastOutcome = "\$\(\$VProps\.VendorAttemptOutcome\)"'
+        $Loop | Should -Match "-Name 'VendorAttemptAt' -Value \(& \`$InvariantNow\)"
     }
 
     It 'Runs rows that may use the clean installer before the other DUPs' {
@@ -717,6 +719,10 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         $M.Success | Should -BeTrue
         $M.Groups[1].Value | Should -Match '\$script:PinCheckAfterRestart = \$true'
         $M.Groups[1].Value | Should -Match '\$RestartedSince'
+        # The timestamp the guard reads back is written culture-invariantly,
+        # and the existing marker is flagged so a blind probe cannot skip.
+        $M.Groups[1].Value | Should -Match "-Name 'VendorDeferredAt' -Value \(& \`$InvariantNow\)"
+        $M.Groups[1].Value | Should -Match "-Name 'PendingCheck' -Value 1"
     }
 
     It 'Creates the vendor work folder protected, before anything is extracted into it' {
@@ -775,6 +781,22 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         $All.Count | Should -BeGreaterThan 4
     }
 
+    It 'Treats AMD''s own repeat 206 after a restart like the pre-check''s' {
+        # Something the pre-check cannot see keeps a restart pending; the
+        # result is the same fallback, not a failure on every run.
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match "(?s)if \(\`$VendorRun\.Outcome -eq 'Deferred' -and \`$VendorRun\.AmdError -eq 206 -and \`$VendorDeferredAt -and \(& \`$RestartedSince \`$VendorDeferredAt\)\) \{\s*\`$VendorRun\.Ran = \`$false\s*\`$VendorRun\.Outcome = 'NotRun'"
+    }
+
+    It 'Holds everything back while an AMD installer from an earlier run is still alive' {
+        $Fn = $script:InstallFn.Extent.Text
+        $Check = [regex]::Match($Fn, '(?s)\$Leftover = @\(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop \| Where-Object \{ "\$\(\$_\.Name\)" -match \$AmdInstallerNames \}\)\s*if \(\$Leftover\.Count -gt 0\) \{\s*\$VendorStillRunning = \$true')
+        $Check.Success | Should -BeTrue
+        $Check.Index | Should -BeLessThan ($script:DrvLoop.Extent.StartOffset - $script:InstallFn.Extent.StartOffset)
+        # The same names the clean install waits on.
+        (Get-DATScriptBlockAssignment -Name '$InvokeVendorInstaller').Extent.Text | Should -Match '-match \$AmdInstallerNames'
+    }
+
     It 'Does not ask for restart after restart when one is pending again' {
         # The second time, the clean installer is skipped instead: the DUP for
         # a device above the pin, the stack reconcile for one on it.
@@ -789,7 +811,10 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
     It 'Lets the clean installer past a DUP quarantine, and never quarantines a display DUP restoring a missing driver' {
         $Loop = $script:DrvLoop.Extent.Text
         $Loop | Should -Match 'if \(\$VendorRoute\) \{\s*#[^\n]*\n(\s*#[^\n]*\n)*\s*\$DupQuarantined = \$true'
-        $Loop | Should -Match "\} elseif \(\`$AllowDowngrade -and \`$LiveBelowPin -and \`$Drv\.Category -eq 'Video'\) \{"
+        # Only after AMD's clean installer ran for this revision - a pinned
+        # display DUP failing for any other reason quarantines as usual.
+        $Loop | Should -Match "\} elseif \(\`$AllowDowngrade -and \`$LiveBelowPin -and \`$Drv\.Category -eq 'Video' -and \`$VendorAttempts -gt 0\) \{"
+        $Loop | Should -Match '\$LiveBelowPin = \$true\s*\n\s*Write-Log "\$DriverLabel - PINNED: device is on v\$LiveVersion, older than'
         $Loop | Should -Match '\} elseif \(\$ForceDowngrade -and \$DupQuarantined\) \{'
     }
 
@@ -797,6 +822,7 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         $Loop = $script:DrvLoop.Extent.Text
         $Loop | Should -Match "\`$OutrankingGpus = @\(\`$Outranking \| Where-Object \{ `"\`$\(\`$_\.DeviceClass\)`" -match '\^\(\?i\)display\`$' \}"
         $Loop | Should -Match '\} elseif \(\$OutrankingGpus\.Count -gt 1 -or \$BrandAmbiguous\) \{'
+        $Loop | Should -Match '\$BrandAmbiguous = \$BrandVen -and @\(\$LiveVideoAdapters'
     }
 
     It 'Runs the vendor installer only on the vendor route' {
@@ -861,6 +887,13 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         # A failed run that may have removed the driver: AMD said a restart is
         # needed, or the GPU now reads below the pin or not at all.
         $Loop | Should -Match "if \(\`$VendorRun\.Outcome -ne 'TimedOut' -and \(\`$VendorRun\.ResultCode -eq 2 -or \`$null -eq \`$FailCmp -or \`$FailCmp -lt 0\)\) \{\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true"
+        # ...judged on a FRESH read of the device, and the marker flagged.
+        $Fail = [regex]::Match($Loop, '(?s)if \(\$AllowDowngrade -and \$VendorRoute\) \{(.*?)\$FailVersion = & \$GetLiveDriverVersion \$Drv')
+        $Fail.Success | Should -BeTrue
+        $Fail.Groups[1].Value | Should -Match '\$LiveVideoAdapters = @\(Get-CimInstance -ClassName Win32_VideoController'
+        # And it says where the kept extract is.
+        $Loop | Should -Match 'kept in \$\(\$VendorRun\.WorkDir\) for a week'
+        $Loop | Should -Match "(?s)\`$FailCmp -lt 0\)\) \{.*?-Name 'PendingCheck' -Value 1.*?after the failed clean install"
         # A run on the pin that gave no verdict and left the stack mixed.
         $Loop | Should -Match "if \(\`$Stack\.Mixed -and \`$VendorRetryOk -and \`$VendorRun\.Outcome -eq 'Unknown'\) \{(\s*#[^\n]*)*\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true"
         # AMD is credited only for a change it made.
@@ -876,6 +909,10 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         # Deferred again on the pin: reconcile, not a failure.
         $Deferred = [regex]::Match($Loop, "elseif \(\`$VendorRoute -and \`$VendorRun\.Outcome -eq 'Deferred'\) \{(.*?)\} elseif \(\`$DupCode -in \`$NotApplicable\)", 'Singleline')
         $Deferred.Success | Should -BeTrue
-        $Deferred.Groups[1].Value | Should -Match '(?s)\} elseif \(-not \$ForceDowngrade\) \{.*?\$ReconcilePinnedStack.*?\$AlreadyInst\+\+.*?\} else \{'
+        $Deferred.Groups[1].Value | Should -Match '(?s)\} elseif \(-not \$ForceDowngrade -and \$VendorRun\.AmdError -eq 206\) \{.*?\$ReconcilePinnedStack.*?\$AlreadyInst\+\+.*?\} else \{'
+        # A 202 (Windows Update installing) is transient: on the pin it still
+        # fails for a retry rather than settling as installed.
+        $Else = [regex]::Match($Deferred.Groups[1].Value, '(?s)\} else \{(.*)$')
+        $Else.Groups[1].Value | Should -Match '\$Failed\+\+'
     }
 }

@@ -3439,6 +3439,10 @@ function Install-DriverUpdates {
     # install of the display stack takes a fraction of this.
     $VendorExtractTimeoutMs   = 600000    # 10 minutes
     $VendorInstallerTimeoutMs = 1800000   # 30 minutes
+    # AMD's installer processes: the package's own and the cleanup utility.
+    # Used to wait for a clean install to finish, and to notice one still
+    # running from an earlier run.
+    $AmdInstallerNames = '^(?i)(ATISetup|AMDCleanupUtility|RadeonInstaller|AMDSoftwareInstaller|InstallManagerApp)\.exe$'
     # AMD installer errors that mean "not now", not "broken": 202 Windows
     # Update is installing, 206 a Windows install or restart is pending.
     # Nothing has been changed when AMD stops on these.
@@ -3521,6 +3525,9 @@ function Install-DriverUpdates {
         param([string]$When)
         try {
             $Then = [datetime]::ParseExact($When, 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+            # A moment in the future was not written by this clock (a
+            # Buddhist-era year, say) - as unreadable as garbage.
+            if ($Then -gt (Get-Date).AddDays(1)) { return $true }
             $Boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
             return ($Boot -gt $Then)
         } catch {
@@ -3533,7 +3540,7 @@ function Install-DriverUpdates {
 
         $Out = [PSCustomObject]@{
             Ran = $false; Outcome = 'NotRun'; Reason = ''; ExitCode = $null
-            ResultCode = $null; AmdError = $null; InstallerPath = ''; ResultLog = ''; Detail = ''
+            ResultCode = $null; AmdError = $null; InstallerPath = ''; ResultLog = ''; Detail = ''; WorkDir = ''
         }
         $SafeName = "$($Row.FileName)" -replace '[^\w\.\-]', '_'
 
@@ -3560,6 +3567,7 @@ function Install-DriverUpdates {
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         $Vendor  = Join-Path $WorkDir ('DAT-Vendor-' + [guid]::NewGuid().ToString('N'))
         $Extract = Join-Path $Vendor 'extract'
+        $Out.WorkDir = $Vendor
         try {
             & $NewProtectedDirectory $Vendor
             $NotProtected = & $TestProtectedDirectory $Vendor
@@ -3707,7 +3715,9 @@ function Install-DriverUpdates {
         foreach ($Exe in @($Setup, (Join-Path $Root 'Bin64\ATISetup.exe'))) {
             $Sig = $null
             try { $Sig = Get-AuthenticodeSignature -FilePath $Exe -ErrorAction Stop } catch { Write-Verbose "Signature unreadable: $($_.Exception.Message)" }
-            if (-not $Sig -or "$($Sig.Status)" -ne 'Valid' -or "$($Sig.SignerCertificate.Subject)" -notmatch '(?i)Advanced Micro Devices|Dell') {
+            # The publisher's own CN or O, not any subject that merely contains
+            # the word ('Wendell Software' would pass a bare 'Dell' match).
+            if (-not $Sig -or "$($Sig.Status)" -ne 'Valid' -or "$($Sig.SignerCertificate.Subject)" -notmatch '(?i)(^|,\s*)(CN|O)=(Advanced Micro Devices|Dell)\b') {
                 $Out.Reason = "$Exe is not validly signed by AMD or Dell ($(if ($Sig) { "status $($Sig.Status), signer $($Sig.SignerCertificate.Subject)" } else { 'no signature information' }))"
                 return $Out
             }
@@ -3732,7 +3742,6 @@ function Install-DriverUpdates {
         $Finished = $Proc.WaitForExit($VendorInstallerTimeoutMs)
         if ($Finished) {
             $Out.ExitCode = $Proc.ExitCode
-            $InstallerNames = '^(?i)(ATISetup|AMDCleanupUtility|RadeonInstaller|AMDSoftwareInstaller|InstallManagerApp)\.exe$'
             # Done means two successful polls in a row that find nothing. A
             # failed poll proves nothing, so it never counts as "finished" -
             # reading the result while ATISetup is still working would report
@@ -3743,7 +3752,7 @@ function Install-DriverUpdates {
                 try {
                     $Busy = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object {
                         ("$($_.ExecutablePath)" -and "$($_.ExecutablePath)".StartsWith($Root, [System.StringComparison]::OrdinalIgnoreCase)) -or
-                        ("$($_.Name)" -match $InstallerNames)
+                        ("$($_.Name)" -match $AmdInstallerNames)
                     })
                 } catch {
                     Write-Verbose "Process poll failed: $($_.Exception.Message)"
@@ -3974,6 +3983,19 @@ function Install-DriverUpdates {
     # never killed). Nothing else installs alongside it: the remaining DUPs
     # would collide with it, and their failures would count toward quarantine.
     $VendorStillRunning = $false
+    # ...including one left running by an EARLIER run: a timeout asks for no
+    # restart, so a hung installer can outlive the run that started it.
+    if ($VendorFirst.Count -gt 0) {
+        try {
+            $Leftover = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object { "$($_.Name)" -match $AmdInstallerNames })
+            if ($Leftover.Count -gt 0) {
+                $VendorStillRunning = $true
+                Write-Log "AMD's installer is still running from an earlier run ($(@($Leftover | ForEach-Object { $_.Name }) -join ', ')) - nothing is installed this run, so nothing runs beside it" -Severity 2
+            }
+        } catch {
+            Write-Verbose "Leftover installer check failed: $($_.Exception.Message)"
+        }
+    }
 
     $Index = 0
     foreach ($Drv in $Drivers) {
@@ -4221,9 +4243,10 @@ function Install-DriverUpdates {
                         # DUP fallback below honours this quarantine.
                         $DupQuarantined = $true
                         Write-Log "$DriverLabel - the DUP is quarantined here (v$($Drv.Version) failed $($CProps.FailCount) time(s)), but this row runs AMD's clean installer instead, which the quarantine does not cover" -Severity 2
-                    } elseif ($AllowDowngrade -and $LiveBelowPin -and $Drv.Category -eq 'Video') {
-                        # Below the pin, this DUP is putting a display driver
-                        # BACK (after a clean install removed it, say). Skipping
+                    } elseif ($AllowDowngrade -and $LiveBelowPin -and $Drv.Category -eq 'Video' -and $VendorAttempts -gt 0) {
+                        # Below the pin after AMD's clean installer has run for
+                        # this revision: this DUP is putting back the display
+                        # driver the clean install removed. Skipping
                         # it could leave the device on Microsoft Basic Display
                         # with an Installed marker; failing again is better.
                         Write-Log "$DriverLabel - not quarantined although v$($Drv.Version) failed $($CProps.FailCount) time(s): the device is below the pinned version, so this DUP is what restores its display driver" -Severity 2
@@ -4342,6 +4365,15 @@ function Install-DriverUpdates {
                 }
             } else {
                 $VendorRun = & $InvokeVendorInstaller $Drv $DriverExe (Join-Path $env:WINDIR 'Temp') $DupLogDir $DriverLabel $PinTarget
+                # AMD's own 206, after the device has already restarted for an
+                # earlier one: something the pre-check cannot see keeps a
+                # restart pending. Same answer as the pre-check gives - fall
+                # back - rather than fail every run.
+                if ($VendorRun.Outcome -eq 'Deferred' -and $VendorRun.AmdError -eq 206 -and $VendorDeferredAt -and (& $RestartedSince $VendorDeferredAt)) {
+                    $VendorRun.Ran = $false
+                    $VendorRun.Outcome = 'NotRun'
+                    $VendorRun.Reason = "AMD still reports a pending restart (error 206) although the device has restarted since this was last deferred ($VendorDeferredAt)"
+                }
             }
             if ($VendorRun.Outcome -eq 'Deferred') {
                 # Handled with the results below; it is neither a pass nor a
@@ -4793,12 +4825,16 @@ function Install-DriverUpdates {
                     if (-not (Test-Path $CompKeyPath)) { New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null }
                     New-ItemProperty -Path $CompKeyPath -Name 'VendorDeferredVersion' -Value ([string]$Drv.Version) -PropertyType String -Force | Out-Null
                     New-ItemProperty -Path $CompKeyPath -Name 'VendorDeferredAt' -Value (& $InvariantNow) -PropertyType String -Force | Out-Null
+                    # A marker from an earlier pinned run must not let a blind
+                    # probe skip the row after this restart.
+                    New-ItemProperty -Path $CompKeyPath -Name 'PendingCheck' -Value 1 -PropertyType DWord -Force | Out-Null
                 } catch {
                     Write-Log "$DriverLabel - could not record the deferral ($($_.Exception.Message))" -Severity 2
                 }
                 Write-Log "$DriverLabel - AMD's clean installer waits for a restart: $($VendorRun.Reason). Nothing was changed. Requesting a restart; ConfigMgr runs this application again afterwards." -Severity 2
-            } elseif (-not $ForceDowngrade) {
-                # Already on the pin: only the optional clean install is
+            } elseif (-not $ForceDowngrade -and $VendorRun.AmdError -eq 206) {
+                # Already on the pin, a restart still pending after the one
+                # already asked for: only the optional clean install is
                 # waiting. Do what does not need it - the stack reconcile -
                 # rather than fail the application over it.
                 Write-Log "$DriverLabel - AMD's clean installer did not run: $($VendorRun.Reason). Nothing was changed; reconciling the driver stack without it." -Severity 2
@@ -4807,9 +4843,16 @@ function Install-DriverUpdates {
                 if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
                 $AlreadyInst++
             } else {
-                # Above the pin, and Windows Update is installing (202) or a
-                # restart is still pending after the one already asked for. A
-                # plain failure: ConfigMgr retries on its own schedule.
+                # Windows Update is installing (202) - transient, so a plain
+                # failure ConfigMgr retries on its own schedule, with no attempt
+                # used - or, above the pin, a restart still pending after the
+                # one already asked for. On the pin the stack reconcile still
+                # gets its turn meanwhile.
+                if (-not $ForceDowngrade) {
+                    $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $StackDrift
+                    if ($Stack.RebootRequired) { $Rebooted = $true }
+                    if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
+                }
                 $Failed++
                 $FailureLines.Add(("{0} (AMD clean install deferred: {1})" -f $Drv.FileName, $VendorRun.Reason))
                 Write-Log "$DriverLabel - AMD's clean installer did not run: $($VendorRun.Reason)$(if ($VendorRun.AmdError -eq 206) { ", and the device has restarted since this was last deferred ($VendorDeferredAt) - not asking for another restart" }). Nothing was changed. This run reports failure so ConfigMgr tries again later; it does not count toward quarantine." -Severity $(if ($VendorRun.AmdError -eq 206) { 3 } else { 2 })
@@ -4895,11 +4938,20 @@ function Install-DriverUpdates {
                             $Rebooted = $true
                             $script:PinCheckAfterRestart = $true
                             $RowPendingCheck = $true
+                            # This branch writes no marker of its own, so flag
+                            # the existing one: after the restart a blind probe
+                            # must not skip on a marker from an earlier run.
+                            try {
+                                if (-not (Test-Path $CompKeyPath)) { New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null }
+                                New-ItemProperty -Path $CompKeyPath -Name 'PendingCheck' -Value 1 -PropertyType DWord -Force | Out-Null
+                            } catch {
+                                Write-Verbose "PendingCheck write failed: $($_.Exception.Message)"
+                            }
                             Write-Log "$DriverLabel - after the failed clean install the device reports $(if ($FailVersion) { "v$FailVersion" } else { 'no readable display driver version' }); requesting a restart, after which the application runs again and, if needed, installs the pinned DUP" -Severity 2
                         }
                         Write-Log ("$DriverLabel - PIN NOT APPLIED: AMD's clean installer failed ($($VendorRun.Outcome)$(if ($VendorRun.Reason) { ": $($VendorRun.Reason)" }))" +
                             "$(if ($LiveVersion) { "; the device was on v$LiveVersion before it ran" } else { '' }). " +
-                            "AMD's own log is C:\Program Files\AMD\CIM\Log\Install.log, its result file $($VendorRun.ResultLog), and the extracted package is kept under $DupExtractRoot for a week. " +
+                            "AMD's own log is C:\Program Files\AMD\CIM\Log\Install.log, its result file $($VendorRun.ResultLog), and the extracted package is kept in $($VendorRun.WorkDir) for a week. " +
                             "Re-read the device before anything else: a failed clean install can leave the display on Microsoft Basic Display Adapter until a driver is installed again.") -Severity 3
                     } elseif ($AllowDowngrade) {
                         Write-Log ("$DriverLabel - PIN NOT APPLIED: this is the version-pinned rollback and it failed$(if ($ForceDowngrade) { ' even with /f' } else { '' })" +
