@@ -415,6 +415,16 @@ Describe 'Which packages are eligible to be retired' {
         @(& $script:GetBoundPackages $Row).Count | Should -Be 0
     }
 
+    It 'Lets the row''s own hardware token decide, so a second GPU of the brand is never reached' {
+        # An APU pin (DEV_15C8) on a box with a Radeon card (DEV_7480): the
+        # brand fallback must not add the card's package to what may be retired.
+        $script:FakeSigned += New-FakeSignedPackage -DeviceId 'PCI\VEN_1002&DEV_7480&SUBSYS_1234\DGPU' `
+            -HardwareId 'PCI\VEN_1002&DEV_7480' -DriverVersion '32.0.21025.1' `
+            -DeviceName 'AMD Radeon RX 7600' -InfName 'oem77.inf' -DeviceClass 'DISPLAY'
+        $Row = [PSCustomObject]@{ Name = 'AMD Radeon Graphics Driver'; Category = 'Video'; HardwareIds = @('VEN_1002&DEV_15C8') }
+        @(& $script:GetBoundPackages $Row | ForEach-Object { $_.InfName }) | Should -Be @('oem80.inf')
+    }
+
     It 'Returns one element per bound package, so each is judged on its own version' {
         # Regression: the list used to come back wrapped (,@($Hits)) and the
         # caller's @() then held ONE element - the whole list. With two bound
@@ -820,19 +830,37 @@ Describe 'AMD clean installer from the pinned DUP' {
                     New-Item -ItemType Directory -Path (Join-Path $Root 'Packages/Drivers/Display/WT6A_INF') -Force | Out-Null
                     Set-Content -Path (Join-Path $Root 'Setup.exe') -Value 'MZ'
                     [System.IO.File]::WriteAllBytes((Join-Path $Root 'Bin64/ATISetup.exe'), [System.Text.Encoding]::Unicode.GetBytes("MZ...$($Pkg.Help)..."))
-                    Set-Content -Path (Join-Path $Root 'Packages/Drivers/Display/WT6A_INF/u0420077.inf') -Value "DriverVer = 10/14/2025,$($Pkg.InfVersion)"
+                    Set-Content -Path (Join-Path $Root 'Packages/Drivers/Display/WT6A_INF/u0420077.inf') -Value @("DriverVer = 10/14/2025,$($Pkg.InfVersion)", "%AMD15C8.1% = ati2mtag_Phoenix, PCI\VEN_1002&DEV_$($Pkg.Dev)&SUBSYS_0D581028&REV_D7")
                 }
                 return New-FakeProcess
             }
             # The installer: honour -LOG "<path>" the way AMD documents it.
             $Line = $ArgumentList -join ' '
-            if ($null -ne $script:AmdResultCode -and $Line -match '-LOG\s+"([^"]+)"') {
-                Set-Content -Path $Matches[1] -Value "[ResponseResult]`r`nResultCode = $($script:AmdResultCode)`r`n[Details]`r`nPackage Name = Display Driver`r`nErrorCode = 0"
+            if ($Line -match '-LOG\s+"([^"]+)"') { $script:ResultPath = $Matches[1] }
+            if ($null -ne $script:AmdResultCode -and -not $script:ResultLate -and $script:ResultPath) {
+                Set-Content -Path $script:ResultPath -Value "[ResponseResult]`r`nResultCode = $($script:AmdResultCode)`r`n[Details]`r`nPackage Name = Display Driver`r`nErrorCode = 0"
             }
             if ($script:AmdLogLines) { Add-Content -Path $script:InstallLog -Value $script:AmdLogLines }
             return New-FakeProcess -ExitCode 0
         }
-        function Get-CimInstance { [CmdletBinding()] param([string]$ClassName) }
+        # Win32_Process while AMD's installer runs: the scripted processes for
+        # the first polls, then nothing. A "late" result is written only once
+        # the installer processes are gone, as ATISetup would.
+        function Get-CimInstance {
+            [CmdletBinding()]
+            param([string]$ClassName)
+            $script:Polls++
+            if ($script:PollThrows -gt 0) { $script:PollThrows--; throw 'WMI is busy' }
+            if ($script:BusyPolls -gt 0) {
+                $script:BusyPolls--
+                [PSCustomObject]@{ Name = 'ATISetup.exe'; ExecutablePath = 'C:\x\Bin64\ATISetup.exe' }
+                return
+            }
+            if ($script:ResultLate -and $script:ResultPath -and -not (Test-Path $script:ResultPath)) {
+                Set-Content -Path $script:ResultPath -Value "[ResponseResult]`r`nResultCode = 0"
+            }
+        }
+        function Start-Sleep { param($Seconds) }
         function Invoke-Vendor {
             & $script:InvokeVendorInstaller $script:Row $script:DupPath $script:WorkDir $script:LogDir 'test' '32.0.12046.3001'
         }
@@ -846,8 +874,18 @@ Describe 'AMD clean installer from the pinned DUP' {
         $script:LogLines.Clear()
         $script:Launches = [System.Collections.Generic.List[object]]::new()
         $script:Killed = $false
-        $script:Packages = @([PSCustomObject]@{ Root = '14393/Drivers/251014a-420077C-Dell'; Help = '-FACTORYRESETINSTALL Silently uninstalls the existing driver'; InfVersion = '32.0.12046.3001' })
+        $script:Packages = @([PSCustomObject]@{ Root = '14393/Drivers/251014a-420077C-Dell'; Help = '-FACTORYRESETINSTALL Silently uninstalls the existing driver'; InfVersion = '32.0.12046.3001'; Dev = '15C8' })
         $script:AmdResultCode = 0
+        $script:ResultPath = $null
+        $script:ResultLate = $false
+        $script:Polls = 0
+        $script:BusyPolls = 0
+        $script:PollThrows = 0
+        # The FX308309 GPU, on the newer driver.
+        $LiveVideoAdapters = @(New-FakeVideoController -PnpId 'PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7\4&18e01285&0&0041' -DriverVersion '32.0.31033.3')
+        # The real folder gets a protected ACL (a Windows-only API); here it
+        # only has to exist. Covered on its own below.
+        $NewProtectedDirectory = { param($Path) New-Item -Path $Path -ItemType Directory -Force | Out-Null }
         $script:AmdLogLines = @('InstallMan::performInstall Install has completed. Reboot is required.')
 
         $Case = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -862,8 +900,10 @@ Describe 'AMD clean installer from the pinned DUP' {
 
         $AmdCleanInstallSwitch    = $script:AmdCleanInstallSwitch
         $AmdDeferCodes            = $script:AmdDeferCodes
-        $VendorExtractTimeoutMs   = 1000
-        $VendorInstallerTimeoutMs = 1000
+        # Start-Sleep is stubbed, so these are never waited out; they only have
+        # to outlast a few polls on a slow runner.
+        $VendorExtractTimeoutMs   = 60000
+        $VendorInstallerTimeoutMs = 60000
         $script:Row = [PSCustomObject]@{ Name = 'AMD Radeon Graphics Driver'; FileName = (Split-Path $script:DupPath -Leaf); VendorInstallerArguments = '' }
     }
 
@@ -885,7 +925,7 @@ Describe 'AMD clean installer from the pinned DUP' {
     It 'Asks for the clean install alone - never -INSTALL, -BOOT or -OUTPUT alongside it' {
         $null = Invoke-Vendor
         $Line = $script:Launches[1].Args
-        $Line | Should -Match '^-FACTORYRESETINSTALL -LOG "[^"]+\.amd-result\.log"$'
+        $Line | Should -Match '^-FACTORYRESETINSTALL -LOG "[^"]+[\\/]vendor[\\/]amd-result\.log"$'
         $Line | Should -Not -Match '(?i)-INSTALL\b|-BOOT\b|-OUTPUT\b|-UI\b'
     }
 
@@ -893,14 +933,17 @@ Describe 'AMD clean installer from the pinned DUP' {
         $R = Invoke-Vendor
         $R.Outcome | Should -Be 'Passed'
         $R.ResultCode | Should -Be 0
-        Test-Path (Join-Path $script:WorkDir 'vendor-extract') | Should -BeFalse
+        Test-Path (Join-Path $script:WorkDir 'vendor') | Should -BeFalse
+        # AMD's verdict is kept with the run's other logs.
+        $R.ResultLog | Should -BeLike (Join-Path $script:LogDir '*.amd-result.log')
+        Test-Path $R.ResultLog | Should -BeTrue
     }
 
     It 'Fails on a failing result code, and keeps the extract to look into' {
         $script:AmdResultCode = 1
         $R = Invoke-Vendor
         $R.Outcome | Should -Be 'Failed'
-        Test-Path (Join-Path $script:WorkDir 'vendor-extract') | Should -BeTrue
+        Test-Path (Join-Path $script:WorkDir 'vendor/extract') | Should -BeTrue
     }
 
     It 'Defers, rather than fails, when AMD stops for a pending restart' {
@@ -920,11 +963,57 @@ Describe 'AMD clean installer from the pinned DUP' {
         $R.AmdError | Should -BeNullOrEmpty
     }
 
-    It 'Leaves the verdict to the device when AMD writes no result file' {
+    It 'Leaves the verdict to the device when AMD worked but wrote no result file' {
+        $script:AmdResultCode = $null
+        $script:AmdLogLines = @('InstallMan::InstallMan Starting install: "...\BIN64\AtiSetup.exe" -FACTORYRESETINSTALL')
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Unknown'
+    }
+
+    It 'Fails a run that left no trace at all, rather than letting it pass as unknown' {
+        # No result file and not a line in Install.log: the installer did not
+        # do anything (a rejected argument, a prompt nobody can see as SYSTEM).
         $script:AmdResultCode = $null
         $script:AmdLogLines = @()
         $R = Invoke-Vendor
-        $R.Outcome | Should -Be 'Unknown'
+        $R.Outcome | Should -Be 'Failed'
+        $R.Reason | Should -Match 'did not run'
+    }
+
+    It 'Waits for the hand-off to ATISetup before reading the result' {
+        # Setup.exe exits at once and ATISetup carries on; the result file
+        # only exists once it is done. Reading early would report Unknown.
+        $script:ResultLate = $true
+        $script:BusyPolls = 2
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Passed'
+        $script:Polls | Should -BeGreaterOrEqual 4 -Because 'two busy polls, then two empty ones in a row'
+    }
+
+    It 'Does not take a failed process poll for "finished"' {
+        $script:ResultLate = $true
+        $script:PollThrows = 3
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Passed'
+        $script:Polls | Should -BeGreaterOrEqual 5
+    }
+
+    It 'Does not run on a device with a second AMD GPU' {
+        # Factory Reset removes every AMD display driver; the pinned package
+        # may not cover a Radeon card beside the APU.
+        $LiveVideoAdapters += New-FakeVideoController -PnpId 'PCI\VEN_1002&DEV_7480&SUBSYS_1234\5&1' -DriverVersion '32.0.21025.1'
+        $R = Invoke-Vendor
+        $R.Ran | Should -BeFalse
+        $R.Reason | Should -Match '2 AMD display adapters'
+        $script:Launches.Count | Should -Be 0
+    }
+
+    It 'Does not run a package that does not list this GPU' {
+        $script:Packages[0].Dev = '1681'
+        $R = Invoke-Vendor
+        $R.Ran | Should -BeFalse
+        $R.Reason | Should -Match 'VEN_1002&DEV_15C8'
+        $script:Launches.Count | Should -Be 1 -Because 'only the extract may have run'
     }
 
     It 'Does not run a package whose ATISetup.exe does not know the switch' {
@@ -944,13 +1033,20 @@ Describe 'AMD clean installer from the pinned DUP' {
         $script:Launches[1].Args | Should -Match '^-INSTALL -LOG "'
     }
 
-    It 'Does not add a second -LOG to an override that has one' {
-        # No result file from the fake installer: the override's path is a
-        # Windows one and would land in the working directory here.
-        $script:AmdResultCode = $null
-        $script:Row.VendorInstallerArguments = '-FACTORYRESETINSTALL -LOG "C:\x.log"'
+    It 'Replaces an override''s own -LOG, and drops -BOOT' {
+        # The client reads AMD's verdict from its own file - an override's -LOG
+        # would leave it blind - and ConfigMgr owns the restart.
+        $script:Row.VendorInstallerArguments = '-FACTORYRESETINSTALL -LOG "C:\x.log" -BOOT'
+        $R = Invoke-Vendor
+        $script:Launches[1].Args | Should -Match '^-FACTORYRESETINSTALL -LOG "[^"]+[\\/]vendor[\\/]amd-result\.log"$'
+        $R.Outcome | Should -Be 'Passed' -Because 'the result is read from the file the client asked for'
+        ($script:LogLines -join "`n") | Should -Match 'removed -LOG/-BOOT'
+    }
+
+    It 'Falls back to the default switch when an override is nothing but -LOG' {
+        $script:Row.VendorInstallerArguments = '-LOG C:\amd.log'
         $null = Invoke-Vendor
-        $script:Launches[1].Args | Should -Be '-FACTORYRESETINSTALL -LOG "C:\x.log"'
+        $script:Launches[1].Args | Should -Match '^-FACTORYRESETINSTALL -LOG "'
     }
 
     It 'Does not run anything when the extract holds no AMD package' {
@@ -962,8 +1058,8 @@ Describe 'AMD clean installer from the pinned DUP' {
 
     It 'Picks the package that carries the pinned version when the DUP holds more than one' {
         $script:Packages = @(
-            [PSCustomObject]@{ Root = '10240/Drivers/old'; Help = '-FACTORYRESETINSTALL'; InfVersion = '31.0.1.1' }
-            [PSCustomObject]@{ Root = '14393/Drivers/251014a-420077C-Dell'; Help = '-FACTORYRESETINSTALL'; InfVersion = '32.0.12046.3001' }
+            [PSCustomObject]@{ Root = '10240/Drivers/old'; Help = '-FACTORYRESETINSTALL'; InfVersion = '31.0.1.1'; Dev = '15C8' }
+            [PSCustomObject]@{ Root = '14393/Drivers/251014a-420077C-Dell'; Help = '-FACTORYRESETINSTALL'; InfVersion = '32.0.12046.3001'; Dev = '15C8' }
         )
         $null = Invoke-Vendor
         $script:Launches[1].FilePath | Should -Match '251014a-420077C-Dell'
@@ -972,5 +1068,19 @@ Describe 'AMD clean installer from the pinned DUP' {
     It 'Never kills the installer' {
         $null = Invoke-Vendor
         $script:Killed | Should -BeFalse
+    }
+}
+
+Describe 'Protected work folder for the vendor installer' {
+    It 'Creates the folder with inheritance cut and only SYSTEM and Administrators on it' -Skip:(-not ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop')) {
+        $Dir = Join-Path $TestDrive 'protected'
+        $NewProtectedDirectory = Get-ApplyScriptBlock -Fn ($script:ApplyAst.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Install-DriverUpdates'
+        }, $true) | Select-Object -First 1) -Name '$NewProtectedDirectory'
+        & $NewProtectedDirectory $Dir
+        $Acl = Get-Acl -Path $Dir
+        $Acl.AreAccessRulesProtected | Should -BeTrue
+        $Sids = @($Acl.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } | Sort-Object -Unique)
+        $Sids | Should -Be @('S-1-5-18', 'S-1-5-32-544')
     }
 }

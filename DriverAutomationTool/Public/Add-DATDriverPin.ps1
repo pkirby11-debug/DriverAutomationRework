@@ -112,9 +112,10 @@
     .PARAMETER VendorInstallerArguments
         Replace the arguments the client passes to the vendor installer. Leave
         empty for the default AMD clean install (see the README). Only needed if
-        AMD changes its switches; the client always adds its own -LOG argument
-        so the result can be read back. Kept when the pin is re-added without
-        this parameter, so re-pinning from the GUI does not reset it.
+        AMD changes its switches. The client removes any -LOG or -BOOT from it
+        and adds its own -LOG: it reads AMD's result from its own file, and
+        ConfigMgr owns the restart. Kept when the pin is re-added without this
+        parameter, so re-pinning from the GUI does not reset it.
     .PARAMETER VendorVersion
         The vendor's own dotted version for the pinned revision (Dell's
         vendorVersion, e.g. '32.0.23040.1006'). This is the number the client
@@ -313,6 +314,10 @@
                 UpdatedAt       = $Now
             })
             Write-DATLog -Message "Driver pin added: '$NamePattern' pinned to v$PinnedVersion on SystemID $SystemId$(if ($Reason) { " - $Reason" }). Applies from the next sync; the package rebuilds once and the application updates in place." -Severity 1
+        }
+
+        if ($PSBoundParameters.ContainsKey('VendorInstallerArguments') -and $VendorInstallerArguments -match '(?i)(^|\s)-(LOG|BOOT)(\s|$)') {
+            Write-DATLog -Message "Driver pin '$NamePattern': the client removes -LOG and -BOOT from -VendorInstallerArguments - it reads AMD's result from its own -LOG file, and ConfigMgr owns the restart." -Severity 2
         }
 
         if ($UseVendorInstaller) {

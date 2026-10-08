@@ -391,6 +391,11 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
             $All = $Guards -join ' '
             $All | Should -Match 'AllowDriverStoreRemoval' -Because "line $($Call.Extent.StartLineNumber) deletes a package"
             $All | Should -Match 'PinnedPackageStaged|Counterpart' -Because "line $($Call.Extent.StartLineNumber) deletes a package"
+            # The base-driver retire also refuses when the packages drive two
+            # different GPUs (an APU and a discrete card of the same brand).
+            if ($All -match 'PinnedPackageStaged') {
+                $All | Should -Match 'OutrankingGpus\.Count -gt 1'
+            }
         }
     }
 
@@ -655,9 +660,75 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         }
     }
 
-    It 'Does not repeat the clean install for a stack it already could not fix' {
-        $script:DrvLoop.Extent.Text | Should -Match 'if \(\$WantVendor -and -not \$VendorAlreadyRan\)'
-        $script:DrvLoop.Extent.Text | Should -Match "'VendorInstallerVersion'"
+    It 'Bounds the clean install: once on a device already on the pin, a fixed number of times per revision' {
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match 'if \(\$WantVendor -and \$VendorAttempts -eq 0\)'
+        $Loop | Should -Match 'if \(\$VendorAttempts -ge \$VendorMaxAttempts\)'
+        $Loop | Should -Match "'VendorAttemptCount'"
+        # The attempt is recorded straight after the run, before anything else
+        # can end the iteration.
+        $Run = [regex]::Match($Loop, '\$VendorRun = & \$InvokeVendorInstaller')
+        $Rec = [regex]::Match($Loop, "-Name 'VendorAttemptCount'")
+        $Run.Index | Should -BeLessThan $Rec.Index
+        (Get-DATScriptBlockAssignment -Name '$VendorMaxAttempts').Right.Extent.Text | Should -Be '2'
+    }
+
+    It 'Runs rows that may use the clean installer before the other DUPs' {
+        # AMD refuses on a pending restart, and the audio/chipset DUPs ahead of
+        # the video row commonly leave one.
+        $Fn = $script:InstallFn.Extent.Text
+        $Sort = [regex]::Match($Fn, '\$Drivers = @\(\$VendorFirst\) \+')
+        $Sort.Success | Should -BeTrue
+        $Sort.Index | Should -BeLessThan ($script:DrvLoop.Extent.StartOffset - $script:InstallFn.Extent.StartOffset)
+    }
+
+    It 'Keeps AMD''s clean installer off the DUP quarantine ledger' {
+        # Its failures must never quarantine the DUP that would reinstall the
+        # display driver; it has its own bounded attempt ledger.
+        $Writes = @($script:DrvLoop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.GetCommandName() -eq 'New-ItemProperty' -and $n.Extent.Text -match "-Name 'FailCount'"
+        }, $true))
+        @($Writes).Count | Should -Be 1
+        (Get-DATEnclosingGuardText -Node $Writes[0] -Stop $script:DrvLoop) | Should -Match '-not \$VendorRoute'
+    }
+
+    It 'Re-measures after a restart instead of calling an unconfirmed clean install done' {
+        # A device not yet on the pin after AMD's clean install exits 3010
+        # WITHOUT an Installed marker, so ConfigMgr runs the application again.
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match '\$VendorRetryOk = \$VendorRoute -and'
+        $Loop | Should -Match '\} elseif \(\$VendorRetryOk\) \{\s*\$Rebooted = \$true\s*\$script:PinCheckAfterRestart = \$true'
+        $Loop | Should -Match '\} elseif \(-not \$VendorRoute -and \$DupCode -in \$RebootCodes\) \{'
+
+        $Main = $script:ApplyAst.Extent.Text
+        $Pending = [regex]::Match($Main, "if \(\`$script:PinCheckAfterRestart\) \{\s*Write-DetectionMarker -Status 'PendingRestart'")
+        $Installed = [regex]::Match($Main, "\n    Write-DetectionMarker -Status 'Installed'\s*\n\s*# Auto-purge")
+        $Pending.Success   | Should -BeTrue
+        $Installed.Success | Should -BeTrue
+        $Pending.Index | Should -BeLessThan $Installed.Index
+    }
+
+    It 'Asks for the restart a pending-restart deferral needs, but only once' {
+        $M = [regex]::Match($script:DrvLoop.Extent.Text, "elseif \(\`$VendorRoute -and \`$VendorRun\.Outcome -eq 'Deferred'\) \{(.*?)\} elseif \(\`$DupCode -in \`$NotApplicable\)", 'Singleline')
+        $M.Success | Should -BeTrue
+        $M.Groups[1].Value | Should -Match '\$script:PinCheckAfterRestart = \$true'
+        $M.Groups[1].Value | Should -Match '\$RestartedSince'
+    }
+
+    It 'Creates the vendor work folder protected, before anything is extracted into it' {
+        $Block = (Get-DATScriptBlockAssignment -Name '$InvokeVendorInstaller').Extent.Text
+        $Make = [regex]::Match($Block, '& \$NewProtectedDirectory \$Vendor')
+        $Extract = [regex]::Match($Block, '"/e=\$Extract"')
+        $Make.Success | Should -BeTrue
+        $Extract.Success | Should -BeTrue
+        $Make.Index | Should -BeLessThan $Extract.Index
+        $Block | Should -Match "Join-Path \`$Vendor 'amd-result\.log'"
+
+        $Protect = (Get-DATScriptBlockAssignment -Name '$NewProtectedDirectory').Extent.Text
+        $Protect | Should -Match 'SetAccessRuleProtection\(\$true, \$false\)'
+        $Protect | Should -Match "'S-1-5-18', 'S-1-5-32-544'"
     }
 
     It 'Runs the vendor installer only on the vendor route' {
@@ -667,7 +738,10 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
             $n.CommandElements[0].Extent.Text -eq '$InvokeVendorInstaller'
         }, $true))
         @($Calls).Count | Should -Be 1
-        (Get-DATEnclosingGuardText -Node $Calls[0] -Stop $script:DrvLoop) | Should -Match '\$VendorRoute'
+        $Guard = Get-DATEnclosingGuardText -Node $Calls[0] -Stop $script:DrvLoop
+        $Guard | Should -Match '\$VendorRoute'
+        # ...and only once nothing says a restart is pending (AMD error 206).
+        $Guard | Should -Match '\$PendingWhy'
     }
 
     It 'Never asks AMD to reboot the device itself, or to install twice' {

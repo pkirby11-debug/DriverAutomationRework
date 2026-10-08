@@ -447,7 +447,8 @@ On the client, a pinned package:
   `-RemoveOutrankingDriver` the newer extension is retired, but only when the
   pinned release's own copy of the same INF is staged to replace it. Software
   components are reported, never removed. The run summary counts stacks it cleared
-  and stacks still mixed.
+  and stacks still mixed. The base-driver retire also refuses when the packages it
+  would remove drive two different GPUs of the same brand.
 - **checks that a retired package actually left.** `pnputil /delete-driver
   /uninstall` moves devices off the package first and deletes it second, and it
   can manage the first, fail the second and still exit 0 (`Unable to uninstall
@@ -474,15 +475,41 @@ On the client, a pinned package:
   AMD's own command-line guides do not list it; Microsoft's *Install AMD GPU drivers
   on N-series VMs* page documents `setup.exe -factoryresetinstall`, and AMD's
   `ATISetup.exe -HELP` lists it. Because of that, the client first checks that the
-  package's own `ATISetup.exe` knows the switch and falls back to the DUP if it does
-  not. `-VendorInstallerArguments` replaces the switch if AMD ever changes it (the
-  client still adds `-LOG`). It never passes `-INSTALL` alongside it (AMD lists them
-  as exclusive modes) or `-BOOT` (ConfigMgr owns the restart), and it never kills
-  the installer on timeout. Success is read from AMD's documented result file
-  (`[ResponseResult] ResultCode`), not the undocumented exit code, and then from the
-  device itself. AMD errors 202 (Windows Update installing) and 206 (restart
-  pending) are reported as a **deferral**: nothing changed, the run reports failure
-  so ConfigMgr retries after the restart, and it does not count toward quarantine.
+  package's own `ATISetup.exe` knows the switch. If it does not - or the clean
+  installer cannot be used for another reason below - a device above the pin is
+  rolled back with the DUP instead, and one already on it gets the stack check
+  above. `-VendorInstallerArguments` replaces the switch if AMD ever changes it;
+  the client removes any `-LOG` or `-BOOT` from it and adds its own `-LOG`. It never
+  passes `-INSTALL` alongside it (AMD lists them as exclusive modes) or `-BOOT`
+  (ConfigMgr owns the restart), and it never kills the installer on timeout.
+
+  Safeguards:
+  - **One AMD GPU only.** Factory Reset removes the driver of every AMD display
+    adapter, so with two (an APU beside a Radeon card) the clean installer is not
+    used. It is also skipped when the package's display INFs do not list the
+    device's GPU.
+  - **A protected work folder.** SYSTEM runs everything in the AMD package, so it is
+    extracted into a folder only SYSTEM and Administrators can write to, not one
+    that inherits `C:\Temp`'s user write access.
+  - **Success comes from AMD's result file and the device**, not the undocumented
+    exit code. A run that wrote nothing at all counts as failed.
+  - **Bounded.** It runs at most twice per pinned revision on a device, and only
+    once on a device already on the pin. Its failures never count toward the DUP
+    quarantine, so they cannot block the DUP that reinstalls the display driver.
+  - **Restart, then check again.** AMD can finish a clean install after a
+    restart, and leaves the GPU on Microsoft Basic Display Adapter until it does.
+    A device not yet on the pin is therefore never called verified. The run exits
+    3010 with the detection marker set to `PendingRestart` instead of
+    `Installed`, so ConfigMgr restarts the device and runs the application again
+    to check it.
+  - **Pending restarts.** AMD refuses to run while a restart is pending (error
+    206). Pinned rows that may use the clean installer run before the other
+    DUPs, so those DUPs cannot leave one pending first. If one is pending anyway,
+    nothing is changed and the run asks for the restart the same way. It asks
+    once; if the restart does not clear it, the run reports a failure.
+    Windows Update installing (error 202) is a plain retry. Neither counts toward
+    quarantine.
+
   A clean install always requests a restart. AMD Radeon graphics DUPs only; any
   other pinned driver logs that and keeps the DUP.
 

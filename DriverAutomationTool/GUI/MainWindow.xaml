@@ -566,7 +566,10 @@
                         </DataGrid.Columns>
                     </DataGrid>
 
-                    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
+                    <!-- WrapPanel, not a horizontal StackPanel: with both pin options the row is
+                         wider than the window's default width, and a StackPanel would push
+                         Pin Selected Revision off the edge instead of onto a second line. -->
+                    <WrapPanel Grid.Row="2" Margin="0,0,0,10">
                         <Label Content="Reason:" Width="55" />
                         <TextBox x:Name="PinReasonBox" Width="380" Margin="0,0,8,0"
                                  ToolTip="Why this driver is being held back. Carried into the package manifest and the client apply log." />
@@ -579,7 +582,7 @@
                         <Button x:Name="PinCreateButton" Content="Pin Selected Revision" Style="{StaticResource AccentButton}" Width="168" Margin="0,0,8,0" />
                         <TextBlock x:Name="PinStatusLabel" Text="" VerticalAlignment="Center"
                                    Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" />
-                    </StackPanel>
+                    </WrapPanel>
 
                     <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,6">
                         <TextBlock Text="Active pins" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,16,0"
