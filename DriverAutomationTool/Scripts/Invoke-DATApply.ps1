@@ -3717,7 +3717,9 @@ function Install-DriverUpdates {
             try { $Sig = Get-AuthenticodeSignature -FilePath $Exe -ErrorAction Stop } catch { Write-Verbose "Signature unreadable: $($_.Exception.Message)" }
             # The publisher's own CN or O, not any subject that merely contains
             # the word ('Wendell Software' would pass a bare 'Dell' match).
-            if (-not $Sig -or "$($Sig.Status)" -ne 'Valid' -or "$($Sig.SignerCertificate.Subject)" -notmatch '(?i)(^|,\s*)(CN|O)=(Advanced Micro Devices|Dell)\b') {
+            # Windows quotes a value that contains a comma -
+            # CN="Advanced Micro Devices, Inc." - so the quote is optional.
+            if (-not $Sig -or "$($Sig.Status)" -ne 'Valid' -or "$($Sig.SignerCertificate.Subject)" -notmatch '(?i)(^|,\s*)(CN|O)="?(Advanced Micro Devices|Dell)\b') {
                 $Out.Reason = "$Exe is not validly signed by AMD or Dell ($(if ($Sig) { "status $($Sig.Status), signer $($Sig.SignerCertificate.Subject)" } else { 'no signature information' }))"
                 return $Out
             }
@@ -4848,14 +4850,25 @@ function Install-DriverUpdates {
                 # used - or, above the pin, a restart still pending after the
                 # one already asked for. On the pin the stack reconcile still
                 # gets its turn meanwhile.
+                $Stack = $null
                 if (-not $ForceDowngrade) {
                     $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $StackDrift
-                    if ($Stack.RebootRequired) { $Rebooted = $true }
+                    if ($Stack.RebootRequired) {
+                        # The reconcile retired a newer extension, which only
+                        # takes effect at a restart. A plain failure would
+                        # drop that restart, and the retry - finding the stack
+                        # no longer mixed - would settle as Installed without
+                        # it. Ask for it now; the Failed marker still brings
+                        # the application back afterwards.
+                        $Rebooted = $true
+                        $script:PinCheckAfterRestart = $true
+                        $RowPendingCheck = $true
+                    }
                     if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
                 }
                 $Failed++
                 $FailureLines.Add(("{0} (AMD clean install deferred: {1})" -f $Drv.FileName, $VendorRun.Reason))
-                Write-Log "$DriverLabel - AMD's clean installer did not run: $($VendorRun.Reason)$(if ($VendorRun.AmdError -eq 206) { ", and the device has restarted since this was last deferred ($VendorDeferredAt) - not asking for another restart" }). Nothing was changed. This run reports failure so ConfigMgr tries again later; it does not count toward quarantine." -Severity $(if ($VendorRun.AmdError -eq 206) { 3 } else { 2 })
+                Write-Log "$DriverLabel - AMD's clean installer did not run: $($VendorRun.Reason)$(if ($VendorRun.AmdError -eq 206) { ", and the device has restarted since this was last deferred ($VendorDeferredAt) - not asking for another restart" }). $(if ($Stack -and $Stack.Retired -gt 0) { 'The newer extension was retired meanwhile; the clean install itself waits.' } else { 'Nothing was changed.' }) This run reports failure so ConfigMgr tries again later; it does not count toward quarantine." -Severity $(if ($VendorRun.AmdError -eq 206) { 3 } else { 2 })
             }
         } elseif ($DupCode -in $NotApplicable) {
             # Dell catalog returns drivers for the model regardless of installed

@@ -914,5 +914,7 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         # fails for a retry rather than settling as installed.
         $Else = [regex]::Match($Deferred.Groups[1].Value, '(?s)\} else \{(.*)$')
         $Else.Groups[1].Value | Should -Match '\$Failed\+\+'
+        # ...and a reconcile there that retired something keeps its restart.
+        $Else.Groups[1].Value | Should -Match '(?s)if \(\$Stack\.RebootRequired\) \{.*?\$script:PinCheckAfterRestart = \$true'
     }
 }

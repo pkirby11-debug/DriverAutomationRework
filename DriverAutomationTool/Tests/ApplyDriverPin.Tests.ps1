@@ -57,6 +57,7 @@ BeforeAll {
     $script:ExtendedConfigKeys      = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ExtendedConfigKeys'
     $script:AmdCleanInstallSwitch   = Get-ApplyScriptBlock -Fn $InstallFn -Name '$AmdCleanInstallSwitch'
     $script:AmdDeferCodes           = Get-ApplyScriptBlock -Fn $InstallFn -Name '$AmdDeferCodes'
+    $script:AmdInstallerNames       = Get-ApplyScriptBlock -Fn $InstallFn -Name '$AmdInstallerNames'
     $script:InvariantNow            = Get-ApplyScriptBlock -Fn $InstallFn -Name '$InvariantNow'
     $script:RestartedSince          = Get-ApplyScriptBlock -Fn $InstallFn -Name '$RestartedSince'
     $script:NewProtectedDirectory   = Get-ApplyScriptBlock -Fn $InstallFn -Name '$NewProtectedDirectory'
@@ -859,6 +860,7 @@ Describe 'AMD clean installer from the pinned DUP' {
                 $Next = $script:PollSeq[0]
                 $script:PollSeq = @($script:PollSeq | Select-Object -Skip 1)
                 if ($Next -eq 'busy') { [PSCustomObject]@{ Name = 'ATISetup.exe'; ExecutablePath = 'C:\x\Bin64\ATISetup.exe' } }
+                if ($Next -eq 'other') { [PSCustomObject]@{ Name = 'notepad.exe'; ExecutablePath = 'C:\Windows\notepad.exe' } }
                 return
             }
             if ($script:PollThrows -gt 0) { $script:PollThrows--; throw 'WMI is busy' }
@@ -904,7 +906,8 @@ Describe 'AMD clean installer from the pinned DUP' {
         $script:SigStatus = 'Valid'
         $script:SigThrowFor = $null
         $script:SigBadFor = $null
-        $script:SigSubject = 'CN=Advanced Micro Devices, Inc., O=Advanced Micro Devices, Inc.'
+        # As Windows renders AMD's certificate: a value with a comma is quoted.
+        $script:SigSubject = 'CN="Advanced Micro Devices, Inc.", O="Advanced Micro Devices, Inc.", L=Santa Clara, S=California, C=US'
         $script:FolderVerdict = $null
         # The FX308309 GPU, on the newer driver.
         $LiveVideoAdapters = @(New-FakeVideoController -PnpId 'PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7\4&18e01285&0&0041' -DriverVersion '32.0.31033.3')
@@ -926,6 +929,9 @@ Describe 'AMD clean installer from the pinned DUP' {
 
         $AmdCleanInstallSwitch    = $script:AmdCleanInstallSwitch
         $AmdDeferCodes            = $script:AmdDeferCodes
+        # The real pattern: without it '-match $null' would count every
+        # process as AMD's installer and the poll tests would prove nothing.
+        $AmdInstallerNames        = $script:AmdInstallerNames
         # Start-Sleep is stubbed, so these are never waited out; they only have
         # to outlast a few polls on a slow runner.
         $VendorExtractTimeoutMs   = 60000
@@ -1024,8 +1030,33 @@ Describe 'AMD clean installer from the pinned DUP' {
         $script:SigSubject = 'CN=Wendell Software, O=Wendell Software, C=US'
         (Invoke-Vendor).Ran | Should -BeFalse
         $script:Launches.Clear()
+        $script:SigSubject = 'CN="Wendell, Inc.", O="Wendell, Inc.", C=US'
+        (Invoke-Vendor).Ran | Should -BeFalse
+        $script:Launches.Clear()
+        # An older AMD certificate rendered without the quotes still passes.
+        $script:SigSubject = 'CN=Advanced Micro Devices Inc., O=Advanced Micro Devices Inc., C=US'
+        (Invoke-Vendor).Ran | Should -BeTrue
+        $script:Launches.Clear()
         $script:SigSubject = 'CN=Dell Inc, O=Dell Inc, L=Round Rock, S=Texas, C=US'
         (Invoke-Vendor).Ran | Should -BeTrue
+    }
+
+    It 'Knows AMD''s installer processes by name, and nothing else' {
+        foreach ($N in 'ATISetup.exe', 'AMDCleanupUtility.exe', 'RadeonInstaller.exe', 'AMDSoftwareInstaller.exe', 'InstallManagerApp.exe', 'atisetup.EXE') {
+            $N | Should -Match $script:AmdInstallerNames
+        }
+        foreach ($N in 'svchost.exe', 'explorer.exe', 'RadeonSoftware.exe', 'Setup.exe', 'System Idle Process', '') {
+            $N | Should -Not -Match $script:AmdInstallerNames
+        }
+    }
+
+    It 'Does not wait on processes that are not AMD''s installer' {
+        # Something unrelated running elsewhere must not hold the result back
+        # - only AMD's installer names, or anything under the package, do.
+        $script:PollSeq = @('other', 'other')
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Passed'
+        $script:Polls | Should -Be 2
     }
 
     It 'Keeps waiting through gaps between AMD''s installer processes' {
