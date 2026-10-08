@@ -46,6 +46,25 @@ BeforeAll {
     $script:GetPinTargetVersion  = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetPinTargetVersion'
     $script:ReadDupLog           = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ReadDupLog'
     $script:GetBoundPackages     = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetBoundPackages'
+    $script:GetPinnedDevices     = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetPinnedDevices'
+    $script:GetDriverStackDrift  = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetDriverStackDrift'
+    $script:GetDriverStore       = Get-ApplyScriptBlock -Fn $InstallFn -Name '$GetDriverStore'
+    $script:FindStagedCounterpart = Get-ApplyScriptBlock -Fn $InstallFn -Name '$FindStagedCounterpart'
+    $script:RetireDriverPackage  = Get-ApplyScriptBlock -Fn $InstallFn -Name '$RetireDriverPackage'
+    $script:ReconcilePinnedStack = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ReconcilePinnedStack'
+    $script:InvokeVendorInstaller = Get-ApplyScriptBlock -Fn $InstallFn -Name '$InvokeVendorInstaller'
+    # Plain values the scriptblocks above read from their caller's scope.
+    $script:ExtendedConfigKeys      = Get-ApplyScriptBlock -Fn $InstallFn -Name '$ExtendedConfigKeys'
+    $script:AmdCleanInstallSwitch   = Get-ApplyScriptBlock -Fn $InstallFn -Name '$AmdCleanInstallSwitch'
+    $script:AmdDeferCodes           = Get-ApplyScriptBlock -Fn $InstallFn -Name '$AmdDeferCodes'
+
+    # The apply script's logger, captured so tests can assert on what the
+    # client would write to DATApply.log.
+    $script:LogLines = [System.Collections.Generic.List[string]]::new()
+    function Write-Log {
+        param([string]$Message, [int]$Severity = 1)
+        $script:LogLines.Add("[$Severity] $Message")
+    }
 
     function New-FakeSignedPackage {
         param(
@@ -164,6 +183,7 @@ Describe 'Live driver version probe' {
         # scope, exactly as it does inside Install-DriverUpdates.
         $CompareVersion  = $script:CompareVersion
         $GetDupGpuVendor = $script:GetDupGpuVendor
+        $GetPinnedDevices = $script:GetPinnedDevices
         $LiveVideoAdapters = @()
         $LiveSignedDrivers = @()
     }
@@ -217,6 +237,21 @@ Describe 'Live driver version probe' {
     It 'Returns nothing when hardware enumeration produced nothing' {
         $Row = New-ManifestRow -Name 'AMD Radeon Graphics Driver' -HardwareIds @('VEN_1002&DEV_73FF')
         & $script:GetLiveDriverVersion $Row | Should -BeNullOrEmpty
+    }
+
+    It 'Names the same devices to the stack check that it read the version from' {
+        # The stack check asks $GetPinnedDevices which devices a row is about.
+        # Two GPUs: both come back, each with its own instance ID, so the
+        # extension check looks at every device the version decision did.
+        $LiveVideoAdapters = @(
+            New-FakeVideoController -PnpId 'PCI\VEN_1002&DEV_73FF\1' -DriverVersion '31.0.15021.1001'
+            New-FakeVideoController -PnpId 'PCI\VEN_1002&DEV_73FE\2' -DriverVersion '32.0.11021.4004'
+            New-FakeVideoController -PnpId 'PCI\VEN_10DE&DEV_2504\3' -DriverVersion '55.1.2.3'
+        )
+        $Row = New-ManifestRow -Name 'AMD Radeon Graphics Driver' -HardwareIds @()
+        $Devices = @(& $script:GetPinnedDevices $Row)
+        $Devices.Count | Should -Be 2 -Because 'the result must not come back wrapped as a single element'
+        @($Devices | ForEach-Object { $_.InstanceId }) | Should -Be @('PCI\VEN_1002&DEV_73FF\1', 'PCI\VEN_1002&DEV_73FE\2')
     }
 }
 
@@ -378,5 +413,564 @@ Describe 'Which packages are eligible to be retired' {
         $script:CimThrows = $true
         $Row = [PSCustomObject]@{ Name = 'AMD Radeon Graphics Driver'; Category = 'Video'; HardwareIds = @() }
         @(& $script:GetBoundPackages $Row).Count | Should -Be 0
+    }
+
+    It 'Returns one element per bound package, so each is judged on its own version' {
+        # Regression: the list used to come back wrapped (,@($Hits)) and the
+        # caller's @() then held ONE element - the whole list. With two bound
+        # packages the per-package version test compared their joined
+        # versions, matched nothing, and the retire silently did nothing.
+        $script:FakeSigned += New-FakeSignedPackage -DeviceId 'PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7\SECOND' `
+            -HardwareId 'PCI\VEN_1002&DEV_15C8' -DriverVersion '32.0.31033.3' `
+            -DeviceName 'AMD Radeon 740M Graphics' -InfName 'oem91.inf' -DeviceClass 'DISPLAY'
+        $Row = [PSCustomObject]@{ Name = 'AMD Radeon Graphics Driver'; Category = 'Video'; HardwareIds = @() }
+
+        $Bound = @(& $script:GetBoundPackages $Row)
+        $Bound.Count | Should -Be 2
+        $CompareVersion = $script:CompareVersion
+        $Newer = @($Bound | Where-Object {
+            $C = & $CompareVersion "$($_.DriverVersion)" '32.0.12046.3001'
+            ($null -ne $C) -and ($C -gt 0)
+        })
+        @($Newer | ForEach-Object { $_.InfName }) | Should -Be @('oem80.inf', 'oem91.inf')
+    }
+}
+
+Describe 'Driver stack check (extension and component drift)' {
+    # Built from the two field snapshots. FX308309: the DAT rollback retired
+    # the newer base, Device Manager showed the pinned driver, and the monitor
+    # fault stayed - because AMD's amduw23e EXTENSION from the newer release
+    # was still applied on top. NT308578: AMD's Setup.exe with Factory Reset
+    # fixed it, and every piece of the stack is on the pinned release.
+    BeforeAll {
+        function Get-PnpDeviceProperty {
+            [CmdletBinding()]
+            param([string]$InstanceId, [string[]]$KeyName)
+            if ($script:PnpThrows) { throw 'device properties unavailable' }
+            $Props = $script:FakeProps[$InstanceId]
+            if ($null -eq $Props) { throw "no such device: $InstanceId" }
+            foreach ($P in $Props) {
+                if (-not $KeyName -or $KeyName -contains $P.KeyName) { [PSCustomObject]$P }
+            }
+        }
+
+        $script:Gpu = 'PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7\4&18e01285&0&0041'
+        function New-GpuProps {
+            param([string]$ExtensionEntry, [string]$ExtKeyName = 'DEVPKEY_Device_ExtendedConfigurationIds', [string]$UwpVersion = '32.2610.0.0', [string]$OclVersion = '32.0.12046.3001')
+            $script:FakeProps = @{
+                $script:Gpu = @(
+                    @{ KeyName = 'DEVPKEY_Device_DriverVersion'; Data = '32.0.12046.3001' }
+                    @{ KeyName = $ExtKeyName; Data = @($ExtensionEntry) }
+                    @{ KeyName = 'DEVPKEY_Device_Children'; Data = @('SWD\DRIVERENUM\AMDOCL&5&63a53c8&0', 'SWD\DRIVERENUM\AMDUWP&5&63a53c8&0', 'DISPLAY\DELA262\5&63a53c8&0&UID256') }
+                )
+                'SWD\DRIVERENUM\AMDOCL&5&63a53c8&0' = @(
+                    @{ KeyName = 'DEVPKEY_Device_DriverVersion'; Data = $OclVersion }
+                    @{ KeyName = 'DEVPKEY_Device_DriverInfPath'; Data = 'oem58.inf' }
+                    @{ KeyName = 'DEVPKEY_Device_DeviceDesc'; Data = 'AMD-OpenCL User Mode Driver' }
+                )
+                'SWD\DRIVERENUM\AMDUWP&5&63a53c8&0' = @(
+                    @{ KeyName = 'DEVPKEY_Device_DriverVersion'; Data = $UwpVersion }
+                    @{ KeyName = 'DEVPKEY_Device_DriverInfPath'; Data = 'oem93.inf' }
+                    @{ KeyName = 'DEVPKEY_Device_DeviceDesc'; Data = 'AMD-UWP Version Control' }
+                )
+                'DISPLAY\DELA262\5&63a53c8&0&UID256' = @(
+                    @{ KeyName = 'DEVPKEY_Device_DriverVersion'; Data = '10.0.26100.9278' }
+                    @{ KeyName = 'DEVPKEY_Device_DriverInfPath'; Data = 'monitor.inf' }
+                    @{ KeyName = 'DEVPKEY_Device_DeviceDesc'; Data = 'Generic PnP Monitor' }
+                )
+            }
+        }
+        $script:FxExtension = "oem92.inf:PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7,ati2mtag_Phoenix,07/30/2026,32.0.31033.3"
+        $script:NtExtension = "oem50.inf:PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7,ati2mtag_Phoenix,10/14/2025,32.0.12046.3001"
+    }
+
+    BeforeEach {
+        $script:PnpThrows = $false
+        $CompareVersion     = $script:CompareVersion
+        $GetDupGpuVendor    = $script:GetDupGpuVendor
+        $GetPinnedDevices   = $script:GetPinnedDevices
+        $ExtendedConfigKeys = $script:ExtendedConfigKeys
+        $LiveVideoAdapters  = @(New-FakeVideoController -PnpId $script:Gpu -DriverVersion '32.0.12046.3001')
+        $LiveSignedDrivers  = @()
+        $script:Row = New-ManifestRow -Name 'AMD Radeon Graphics Driver' -HardwareIds @()
+    }
+
+    It 'Is extractable from the shipped script' {
+        $script:GetDriverStackDrift | Should -Not -BeNullOrEmpty
+        $script:ExtendedConfigKeys  | Should -Contain 'DEVPKEY_Device_ExtendedConfigurationIds'
+    }
+
+    It 'Flags the newer extension left on the rolled-back device (FX308309)' {
+        New-GpuProps -ExtensionEntry $script:FxExtension
+        $Drift = & $script:GetDriverStackDrift $script:Row '32.0.12046.3001'
+        $Drift.Readable | Should -BeTrue
+        @($Drift.Items).Count | Should -Be 1
+        $Drift.Items[0].Kind    | Should -Be 'Extension'
+        $Drift.Items[0].Inf     | Should -Be 'oem92.inf'
+        $Drift.Items[0].Version | Should -Be '32.0.31033.3'
+    }
+
+    It 'Finds nothing on the device the clean install fixed (NT308578)' {
+        New-GpuProps -ExtensionEntry $script:NtExtension -UwpVersion '32.2420.0.0'
+        $Drift = & $script:GetDriverStackDrift $script:Row '32.0.12046.3001'
+        $Drift.Readable | Should -BeTrue
+        @($Drift.Items).Count | Should -Be 0
+        $Drift.Summary | Should -Match 'extension oem50\.inf v32\.0\.12046\.3001'
+    }
+
+    It 'Reads the extension under its raw property key on builds that do not name it' {
+        New-GpuProps -ExtensionEntry $script:FxExtension -ExtKeyName '{540B947E-8B40-45BC-A8A2-6A0B894CBDA2} 15'
+        $Drift = & $script:GetDriverStackDrift $script:Row '32.0.12046.3001'
+        @($Drift.Items | ForEach-Object { $_.Inf }) | Should -Be @('oem92.inf')
+    }
+
+    It 'Ignores parts AMD versions on a scheme of its own' {
+        # uwppair is 32.2610 on FX and 32.2420 on NT - a different numbering,
+        # not "newer than 32.0.12046.3001". Flagging it would make the check
+        # cry wolf on a healthy device; acting on it would be worse. The
+        # monitor child (10.0.x) is not part of the driver at all.
+        New-GpuProps -ExtensionEntry $script:NtExtension -UwpVersion '32.2610.0.0'
+        $Drift = & $script:GetDriverStackDrift $script:Row '32.0.12046.3001'
+        @($Drift.Items).Count | Should -Be 0
+        $Drift.Summary | Should -Match "AMD-UWP Version Control"
+    }
+
+    It 'Flags a same-release software component that is newer than the pin' {
+        New-GpuProps -ExtensionEntry $script:NtExtension -OclVersion '32.0.31033.3'
+        $Drift = & $script:GetDriverStackDrift $script:Row '32.0.12046.3001'
+        @($Drift.Items).Count | Should -Be 1
+        $Drift.Items[0].Kind | Should -Be 'Component'
+        $Drift.Items[0].Inf  | Should -Be 'oem58.inf'
+    }
+
+    It 'Reports unreadable rather than consistent when device properties cannot be read' {
+        $script:PnpThrows = $true
+        $Drift = & $script:GetDriverStackDrift $script:Row '32.0.12046.3001'
+        $Drift.Readable | Should -BeFalse
+        @($Drift.Items).Count | Should -Be 0
+    }
+
+    It 'Does not guess a release family from a Dell revision letter' {
+        New-GpuProps -ExtensionEntry $script:FxExtension
+        $Drift = & $script:GetDriverStackDrift $script:Row 'A01'
+        $Drift.Readable | Should -BeFalse
+        @($Drift.Items).Count | Should -Be 0
+    }
+}
+
+Describe 'Pinned-release counterpart of a newer package' {
+    BeforeAll {
+        function New-StorePackage {
+            param([string]$Driver, [string]$Inf, [string]$ClassName, [string]$Version)
+            [PSCustomObject]@{
+                Driver = $Driver; ClassName = $ClassName; Version = $Version
+                OriginalFileName = "C:\Windows\System32\DriverStore\FileRepository\$($Inf)_amd64_$($Driver -replace '\D', '')\$Inf"
+            }
+        }
+        # The FX308309 DriverStore, AMD display stack only.
+        $script:FxStore = @(
+            New-StorePackage -Driver 'oem57.inf'  -Inf 'u0420077.inf' -ClassName 'Display'   -Version '32.0.12046.3001'
+            New-StorePackage -Driver 'oem47.inf'  -Inf 'amduw23e.inf' -ClassName 'Extension' -Version '32.0.12046.3001'
+            New-StorePackage -Driver 'oem92.inf'  -Inf 'amduw23e.inf' -ClassName 'Extension' -Version '32.0.31033.3'
+            New-StorePackage -Driver 'oem100.inf' -Inf 'amdpcibridgeextension.inf' -ClassName 'Extension' -Version '25.20.0.0'
+        )
+    }
+
+    It 'Finds the pinned release''s copy of the same extension' {
+        $C = & $script:FindStagedCounterpart 'oem92.inf' '32.0.12046.3001' $script:FxStore
+        $C.Driver | Should -Be 'oem47.inf'
+    }
+
+    It 'Finds nothing when the pinned copy is not staged' {
+        $Store = @($script:FxStore | Where-Object { $_.Driver -ne 'oem47.inf' })
+        & $script:FindStagedCounterpart 'oem92.inf' '32.0.12046.3001' $Store | Should -BeNullOrEmpty
+    }
+
+    It 'Never offers the package itself, or a different INF at the right version' {
+        # oem57 is at the pinned version but is the base INF, not amduw23e.
+        & $script:FindStagedCounterpart 'oem92.inf' '32.0.31033.3' $script:FxStore | Should -BeNullOrEmpty
+        $Store = @($script:FxStore | Where-Object { $_.Driver -ne 'oem47.inf' })
+        & $script:FindStagedCounterpart 'oem92.inf' '32.0.12046.3001' $Store | Should -BeNullOrEmpty
+    }
+
+    It 'Requires the same class' {
+        $Store = @($script:FxStore | ForEach-Object {
+            if ($_.Driver -eq 'oem47.inf') { $_ | Select-Object Driver, OriginalFileName, Version, @{ n = 'ClassName'; e = { 'Display' } } } else { $_ }
+        })
+        & $script:FindStagedCounterpart 'oem92.inf' '32.0.12046.3001' $Store | Should -BeNullOrEmpty
+    }
+
+    It 'Returns nothing for a package that is not in the store' {
+        & $script:FindStagedCounterpart 'oem999.inf' '32.0.12046.3001' $script:FxStore | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Retiring a driver package and checking it left' {
+    # Runs the shipped scriptblock against a stand-in pnputil (a PowerShell
+    # script, so it runs on the Windows CI host and anywhere else) and a
+    # scripted DriverStore.
+    BeforeAll {
+        $script:FakePnp = Join-Path $TestDrive 'pnputil.ps1'
+        $script:PnpLog  = Join-Path $TestDrive 'pnputil-calls.log'
+        # Logs each call's arguments, prints FAKE_PNP_OUT, exits FAKE_PNP_EXIT.
+        Set-Content -Path $script:FakePnp -Value @(
+            'Add-Content -Path $env:FAKE_PNP_LOG -Value ($args -join " ")'
+            'Write-Output $env:FAKE_PNP_OUT'
+            'exit [int]$env:FAKE_PNP_EXIT'
+        )
+
+        # Each call to Get-WindowsDriver returns the next scripted store state;
+        # $null in the queue means "the store could not be enumerated".
+        function Get-WindowsDriver {
+            [CmdletBinding()]
+            param([switch]$Online)
+            $State = $script:StoreStates[0]
+            if ($script:StoreStates.Count -gt 1) { $script:StoreStates = @($script:StoreStates | Select-Object -Skip 1) }
+            if ($null -eq $State) { throw 'DISM is unavailable' }
+            foreach ($P in @($State)) { $P }
+        }
+        $script:Oem92 = [PSCustomObject]@{ Driver = 'oem92.inf'; ClassName = 'Extension'; Version = '32.0.31033.3'; OriginalFileName = 'x\amduw23e.inf' }
+        $script:Oem47 = [PSCustomObject]@{ Driver = 'oem47.inf'; ClassName = 'Extension'; Version = '32.0.12046.3001'; OriginalFileName = 'y\amduw23e.inf' }
+    }
+
+    BeforeEach {
+        $PnpUtilExe = $script:FakePnp
+        $env:FAKE_PNP_LOG = $script:PnpLog
+        $env:FAKE_PNP_OUT = 'Driver package deleted successfully.'
+        $env:FAKE_PNP_EXIT = '0'
+        Remove-Item -Path $script:PnpLog -Force -ErrorAction SilentlyContinue
+        $script:LogLines.Clear()
+        $GetDriverStore = $script:GetDriverStore
+    }
+
+    It 'Reports the package gone when the store no longer holds it' {
+        $script:StoreStates = @(, @($script:Oem47))
+        $R = & $script:RetireDriverPackage 'oem92.inf' 'test'
+        $R.Gone | Should -BeTrue
+        $Calls = @(Get-Content $script:PnpLog)
+        $Calls | Should -Be @('/delete-driver oem92.inf /uninstall')
+    }
+
+    It 'Does not believe exit 0 when pnputil says it could not uninstall, and retries a plain delete' {
+        # The field case: "Unable to uninstall driver package: No more data is
+        # available." under exit 0, with the package still in the store.
+        $env:FAKE_PNP_OUT = 'Unable to uninstall driver package: No more data is available.'
+        $script:StoreStates = @(@($script:Oem47, $script:Oem92), @($script:Oem47))
+        $R = & $script:RetireDriverPackage 'oem92.inf' 'test'
+        $R.Gone | Should -BeTrue
+        $Calls = @(Get-Content $script:PnpLog)
+        $Calls | Should -Be @('/delete-driver oem92.inf /uninstall', '/delete-driver oem92.inf')
+        ($script:LogLines -join "`n") | Should -Match '\[2\].*still in the DriverStore'
+    }
+
+    It 'Warns, and reports not gone, when the package survives the retry' {
+        $script:StoreStates = @(@($script:Oem92), @($script:Oem92))
+        $R = & $script:RetireDriverPackage 'oem92.inf' 'test'
+        $R.Gone | Should -BeFalse
+        ($script:LogLines -join "`n") | Should -Match '\[2\].*STILL in the DriverStore'
+    }
+
+    It 'Passes a restart request from pnputil on' {
+        $env:FAKE_PNP_EXIT = '3010'
+        $script:StoreStates = @(, @($script:Oem47))
+        $R = & $script:RetireDriverPackage 'oem92.inf' 'test'
+        $R.ExitCode | Should -Be 3010
+        $R.RebootRequired | Should -BeTrue
+        $R.Gone | Should -BeTrue
+    }
+
+    It 'Never forces a delete' {
+        $script:StoreStates = @(@($script:Oem92), @($script:Oem92))
+        $null = & $script:RetireDriverPackage 'oem92.inf' 'test'
+        @(Get-Content $script:PnpLog) | Should -Not -Match '/force'
+    }
+
+    It 'Says it could not confirm, rather than claiming success, when the store cannot be read' {
+        $script:StoreStates = @($null)
+        $R = & $script:RetireDriverPackage 'oem92.inf' 'test'
+        $R.Gone | Should -BeNullOrEmpty
+        ($script:LogLines -join "`n") | Should -Match 'unconfirmed'
+    }
+}
+
+Describe 'Reconciling the rest of a pinned driver stack' {
+    # Gating is what matters here: this is the path that deletes an extension
+    # package, so the tests pin down when it may and may not.
+    BeforeEach {
+        $script:LogLines.Clear()
+        $script:Retired = [System.Collections.Generic.List[string]]::new()
+        $script:DriftQueue = @()
+        # Stand-ins for the helpers the scriptblock calls, resolved from this
+        # scope exactly as they are from Install-DriverUpdates'.
+        $GetDriverStackDrift = {
+            param($Row, $TargetVersion)
+            $D = $script:DriftQueue[0]
+            if ($script:DriftQueue.Count -gt 1) { $script:DriftQueue = @($script:DriftQueue | Select-Object -Skip 1) }
+            $D
+        }
+        $GetDriverStore = { [PSCustomObject]@{ Ok = $script:StoreOk; Packages = @($script:Packages) } }
+        $FindStagedCounterpart = $script:FindStagedCounterpart
+        $RetireDriverPackage = {
+            param($Inf, $Label)
+            $script:Retired.Add($Inf)
+            [PSCustomObject]@{ Inf = $Inf; ExitCode = 0; Gone = $true; RebootRequired = $false }
+        }
+        $script:StoreOk = $true
+        $script:Packages = @(
+            [PSCustomObject]@{ Driver = 'oem47.inf'; ClassName = 'Extension'; Version = '32.0.12046.3001'; OriginalFileName = 'a\amduw23e.inf' }
+            [PSCustomObject]@{ Driver = 'oem92.inf'; ClassName = 'Extension'; Version = '32.0.31033.3';    OriginalFileName = 'b\amduw23e.inf' }
+        )
+        $script:FxDrift = [PSCustomObject]@{
+            Readable = $true; Summary = 'base v32.0.12046.3001; extension oem92.inf v32.0.31033.3'
+            Items = @([PSCustomObject]@{ Kind = 'Extension'; Inf = 'oem92.inf'; Version = '32.0.31033.3'; Name = 'oem92.inf'; InstanceId = 'gpu' })
+        }
+    }
+
+    It 'Retires the newer extension when the pin allows it and the pinned copy is staged' {
+        $Row = [PSCustomObject]@{ AllowDriverStoreRemoval = $true }
+        $R = & $script:ReconcilePinnedStack $Row '32.0.12046.3001' 'test' $script:FxDrift
+        @($script:Retired) | Should -Be @('oem92.inf')
+        $R.Retired | Should -Be 1
+        $R.Mixed | Should -BeFalse
+        $R.RebootRequired | Should -BeTrue -Because 'the device finishes switching extensions at a restart'
+        ($script:LogLines -join "`n") | Should -Match 'MIXED STACK'
+    }
+
+    It 'Deletes nothing when the pin does not allow removal' {
+        $Row = [PSCustomObject]@{ AllowDriverStoreRemoval = $false }
+        $R = & $script:ReconcilePinnedStack $Row '32.0.12046.3001' 'test' $script:FxDrift
+        $script:Retired.Count | Should -Be 0
+        $R.Mixed | Should -BeTrue
+        ($script:LogLines -join "`n") | Should -Match 'UseVendorInstaller'
+    }
+
+    It 'Deletes nothing when the pinned release''s copy is not staged' {
+        $script:Packages = @($script:Packages | Where-Object { $_.Driver -ne 'oem47.inf' })
+        $Row = [PSCustomObject]@{ AllowDriverStoreRemoval = $true }
+        $R = & $script:ReconcilePinnedStack $Row '32.0.12046.3001' 'test' $script:FxDrift
+        $script:Retired.Count | Should -Be 0
+        $R.Mixed | Should -BeTrue
+    }
+
+    It 'Deletes nothing when the DriverStore cannot be enumerated' {
+        $script:StoreOk = $false
+        $Row = [PSCustomObject]@{ AllowDriverStoreRemoval = $true }
+        $R = & $script:ReconcilePinnedStack $Row '32.0.12046.3001' 'test' $script:FxDrift
+        $script:Retired.Count | Should -Be 0
+        $R.Mixed | Should -BeTrue
+    }
+
+    It 'Reports software components but never removes them' {
+        $Drift = [PSCustomObject]@{
+            Readable = $true; Summary = 's'
+            Items = @([PSCustomObject]@{ Kind = 'Component'; Inf = 'oem58.inf'; Version = '32.0.31033.3'; Name = "'AMD-OpenCL User Mode Driver'"; InstanceId = 'c' })
+        }
+        $Row = [PSCustomObject]@{ AllowDriverStoreRemoval = $true }
+        $R = & $script:ReconcilePinnedStack $Row '32.0.12046.3001' 'test' $Drift
+        $script:Retired.Count | Should -Be 0
+        $R.Mixed | Should -BeTrue
+    }
+
+    It 'Says nothing is mixed when the stack is consistent' {
+        $Drift = [PSCustomObject]@{ Readable = $true; Summary = 'base v32.0.12046.3001'; Items = @() }
+        $R = & $script:ReconcilePinnedStack ([PSCustomObject]@{ AllowDriverStoreRemoval = $true }) '32.0.12046.3001' 'test' $Drift
+        $R.Mixed | Should -BeFalse
+        ($script:LogLines -join "`n") | Should -Not -Match 'MIXED STACK'
+    }
+
+    It 'Says it could not tell, rather than consistent, when the stack is unreadable' {
+        $Drift = [PSCustomObject]@{ Readable = $false; Summary = ''; Items = @() }
+        $R = & $script:ReconcilePinnedStack ([PSCustomObject]@{ AllowDriverStoreRemoval = $true }) '32.0.12046.3001' 'test' $Drift
+        $R.Mixed | Should -BeNullOrEmpty
+    }
+
+    It 'Reads the stack itself when the caller has none' {
+        $script:DriftQueue = @($script:FxDrift)
+        $Row = [PSCustomObject]@{ AllowDriverStoreRemoval = $true }
+        $R = & $script:ReconcilePinnedStack $Row '32.0.12046.3001' 'test' $null
+        @($script:Retired) | Should -Be @('oem92.inf')
+    }
+}
+
+Describe 'AMD clean installer from the pinned DUP' {
+    # The vendor route, run against a fake DUP: Start-Process is replaced, the
+    # "extract" lays down AMD's package layout from the field DUP, and the
+    # "installer" writes AMD's documented result file and Install.log lines.
+    BeforeAll {
+        $script:SavedProgramFiles = $env:ProgramFiles
+
+        function New-FakeProcess {
+            param([int]$ExitCode = 0)
+            $P = [PSCustomObject]@{ Handle = 1; ExitCode = $ExitCode }
+            $P | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Ms) $true }
+            $P | Add-Member -MemberType ScriptMethod -Name Kill -Value { $script:Killed = $true }
+            $P
+        }
+
+        function Start-Process {
+            [CmdletBinding()]
+            param([string]$FilePath, [string[]]$ArgumentList, [string]$WorkingDirectory, [switch]$NoNewWindow, [switch]$PassThru)
+            $script:Launches.Add([PSCustomObject]@{ FilePath = $FilePath; Args = ($ArgumentList -join ' '); WorkingDirectory = $WorkingDirectory })
+            $Extract = @($ArgumentList | Where-Object { $_ -like '/e=*' }) | Select-Object -First 1
+            if ($Extract) {
+                $Dir = $Extract.Substring(3)
+                foreach ($Pkg in $script:Packages) {
+                    $Root = Join-Path $Dir $Pkg.Root
+                    New-Item -ItemType Directory -Path (Join-Path $Root 'Bin64') -Force | Out-Null
+                    New-Item -ItemType Directory -Path (Join-Path $Root 'Packages/Drivers/Display/WT6A_INF') -Force | Out-Null
+                    Set-Content -Path (Join-Path $Root 'Setup.exe') -Value 'MZ'
+                    [System.IO.File]::WriteAllBytes((Join-Path $Root 'Bin64/ATISetup.exe'), [System.Text.Encoding]::Unicode.GetBytes("MZ...$($Pkg.Help)..."))
+                    Set-Content -Path (Join-Path $Root 'Packages/Drivers/Display/WT6A_INF/u0420077.inf') -Value "DriverVer = 10/14/2025,$($Pkg.InfVersion)"
+                }
+                return New-FakeProcess
+            }
+            # The installer: honour -LOG "<path>" the way AMD documents it.
+            $Line = $ArgumentList -join ' '
+            if ($null -ne $script:AmdResultCode -and $Line -match '-LOG\s+"([^"]+)"') {
+                Set-Content -Path $Matches[1] -Value "[ResponseResult]`r`nResultCode = $($script:AmdResultCode)`r`n[Details]`r`nPackage Name = Display Driver`r`nErrorCode = 0"
+            }
+            if ($script:AmdLogLines) { Add-Content -Path $script:InstallLog -Value $script:AmdLogLines }
+            return New-FakeProcess -ExitCode 0
+        }
+        function Get-CimInstance { [CmdletBinding()] param([string]$ClassName) }
+        function Invoke-Vendor {
+            & $script:InvokeVendorInstaller $script:Row $script:DupPath $script:WorkDir $script:LogDir 'test' '32.0.12046.3001'
+        }
+    }
+
+    AfterAll {
+        $env:ProgramFiles = $script:SavedProgramFiles
+    }
+
+    BeforeEach {
+        $script:LogLines.Clear()
+        $script:Launches = [System.Collections.Generic.List[object]]::new()
+        $script:Killed = $false
+        $script:Packages = @([PSCustomObject]@{ Root = '14393/Drivers/251014a-420077C-Dell'; Help = '-FACTORYRESETINSTALL Silently uninstalls the existing driver'; InfVersion = '32.0.12046.3001' })
+        $script:AmdResultCode = 0
+        $script:AmdLogLines = @('InstallMan::performInstall Install has completed. Reboot is required.')
+
+        $Case = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 8))
+        $env:ProgramFiles = Join-Path $Case 'ProgramFiles'
+        $script:InstallLog = Join-Path $env:ProgramFiles 'AMD/CIM/Log/Install.log'
+        New-Item -ItemType Directory -Path (Split-Path $script:InstallLog) -Force | Out-Null
+        $script:WorkDir = Join-Path $Case 'work'
+        $script:LogDir  = Join-Path $Case 'logs'
+        New-Item -ItemType Directory -Path $script:WorkDir, $script:LogDir -Force | Out-Null
+        $script:DupPath = Join-Path $Case 'AMD-Radeon-Graphics-Driver_WT24T_WIN64_32.0.12046.3001_A01.EXE'
+        Set-Content -Path $script:DupPath -Value 'MZ'
+
+        $AmdCleanInstallSwitch    = $script:AmdCleanInstallSwitch
+        $AmdDeferCodes            = $script:AmdDeferCodes
+        $VendorExtractTimeoutMs   = 1000
+        $VendorInstallerTimeoutMs = 1000
+        $script:Row = [PSCustomObject]@{ Name = 'AMD Radeon Graphics Driver'; FileName = (Split-Path $script:DupPath -Leaf); VendorInstallerArguments = '' }
+    }
+
+    It 'Is extractable from the shipped script, with the documented clean-install switch' {
+        $script:InvokeVendorInstaller | Should -Not -BeNullOrEmpty
+        $script:AmdCleanInstallSwitch | Should -Be '-FACTORYRESETINSTALL'
+    }
+
+    It 'Extracts the DUP the documented way and runs Setup.exe from AMD''s package root' {
+        $R = Invoke-Vendor
+        $script:Launches.Count | Should -Be 2
+        $script:Launches[0].Args | Should -Match '^/s /e=' -Because "Dell: /s is required with /e=, and /f is not valid with it"
+        @($script:Launches[0].Args -split ' ') | Should -Not -Contain '/f'
+        $script:Launches[1].FilePath | Should -Match '251014a-420077C-Dell[\\/]Setup\.exe$'
+        $R.Ran | Should -BeTrue
+        $R.InstallerPath | Should -Match 'Setup\.exe$'
+    }
+
+    It 'Asks for the clean install alone - never -INSTALL, -BOOT or -OUTPUT alongside it' {
+        $null = Invoke-Vendor
+        $Line = $script:Launches[1].Args
+        $Line | Should -Match '^-FACTORYRESETINSTALL -LOG "[^"]+\.amd-result\.log"$'
+        $Line | Should -Not -Match '(?i)-INSTALL\b|-BOOT\b|-OUTPUT\b|-UI\b'
+    }
+
+    It 'Passes when AMD''s result file says ResultCode 0, and drops the extract' {
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Passed'
+        $R.ResultCode | Should -Be 0
+        Test-Path (Join-Path $script:WorkDir 'vendor-extract') | Should -BeFalse
+    }
+
+    It 'Fails on a failing result code, and keeps the extract to look into' {
+        $script:AmdResultCode = 1
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Failed'
+        Test-Path (Join-Path $script:WorkDir 'vendor-extract') | Should -BeTrue
+    }
+
+    It 'Defers, rather than fails, when AMD stops for a pending restart' {
+        $script:AmdResultCode = 1
+        $script:AmdLogLines = @('InstallMan::performMyState ERROR --- InstallMan -> Caught an AMD Exception. Error code to display to user: 206. Debug hint: "pending"')
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Deferred'
+        $R.AmdError | Should -Be 206
+    }
+
+    It 'Judges only this run''s Install.log lines' {
+        # AMD appends to Install.log. An error from an earlier run must not be
+        # read as this run's.
+        Set-Content -Path $script:InstallLog -Value 'Error code to display to user: 182'
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Passed'
+        $R.AmdError | Should -BeNullOrEmpty
+    }
+
+    It 'Leaves the verdict to the device when AMD writes no result file' {
+        $script:AmdResultCode = $null
+        $script:AmdLogLines = @()
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Unknown'
+    }
+
+    It 'Does not run a package whose ATISetup.exe does not know the switch' {
+        $script:Packages[0].Help = '-INSTALL -UNINSTALL'
+        $R = Invoke-Vendor
+        $R.Ran | Should -BeFalse
+        $R.Outcome | Should -Be 'NotRun'
+        $R.Reason | Should -Match 'FACTORYRESETINSTALL'
+        $script:Launches.Count | Should -Be 1 -Because 'only the extract may have run'
+    }
+
+    It 'Uses an operator override verbatim, adding only the result log' {
+        $script:Packages[0].Help = '-INSTALL -UNINSTALL'
+        $script:Row.VendorInstallerArguments = '-INSTALL'
+        $R = Invoke-Vendor
+        $R.Ran | Should -BeTrue
+        $script:Launches[1].Args | Should -Match '^-INSTALL -LOG "'
+    }
+
+    It 'Does not add a second -LOG to an override that has one' {
+        # No result file from the fake installer: the override's path is a
+        # Windows one and would land in the working directory here.
+        $script:AmdResultCode = $null
+        $script:Row.VendorInstallerArguments = '-FACTORYRESETINSTALL -LOG "C:\x.log"'
+        $null = Invoke-Vendor
+        $script:Launches[1].Args | Should -Be '-FACTORYRESETINSTALL -LOG "C:\x.log"'
+    }
+
+    It 'Does not run anything when the extract holds no AMD package' {
+        $script:Packages = @()
+        $R = Invoke-Vendor
+        $R.Ran | Should -BeFalse
+        $R.Reason | Should -Match 'no AMD Setup\.exe'
+    }
+
+    It 'Picks the package that carries the pinned version when the DUP holds more than one' {
+        $script:Packages = @(
+            [PSCustomObject]@{ Root = '10240/Drivers/old'; Help = '-FACTORYRESETINSTALL'; InfVersion = '31.0.1.1' }
+            [PSCustomObject]@{ Root = '14393/Drivers/251014a-420077C-Dell'; Help = '-FACTORYRESETINSTALL'; InfVersion = '32.0.12046.3001' }
+        )
+        $null = Invoke-Vendor
+        $script:Launches[1].FilePath | Should -Match '251014a-420077C-Dell'
+    }
+
+    It 'Never kills the installer' {
+        $null = Invoke-Vendor
+        $script:Killed | Should -BeFalse
     }
 }

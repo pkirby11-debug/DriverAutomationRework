@@ -697,6 +697,9 @@ function Update-DATPinGrid {
         # Which pins are allowed to retire the package outranking them. Worth a
         # column of its own: it is the one pin setting that deletes something.
         $Row['RetireOutranking'] = if ($Pin.RemoveOutrankingDriver) { 'Yes' } else { 'No' }
+        # The other setting that changes what runs on the device. A hand-set
+        # argument override (cmdlet only) is called out so it is not invisible.
+        $Row['VendorInstaller'] = if (-not $Pin.UseVendorInstaller) { 'No' } elseif ("$($Pin.VendorInstallerArguments)".Trim()) { 'Yes (custom args)' } else { 'Yes' }
         $Row['Reason']          = [string]$Pin.Reason
         $Table.Rows.Add($Row)
     }

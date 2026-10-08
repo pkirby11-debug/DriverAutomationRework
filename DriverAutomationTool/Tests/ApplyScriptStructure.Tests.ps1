@@ -336,32 +336,62 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
         $M.Groups[1].Value | Should -Not -Match '\$Failed\+\+'
     }
 
-    It 'Retires a driver package only behind both gates' {
-        # This is the one path that DELETES something off a machine. Two
-        # conditions have to hold above it, and neither is optional:
-        #   * the pin opted in (AllowDriverStoreRemoval), because the operator
-        #     is authorising a deletion;
-        #   * the pinned revision is already staged, because PnP re-binds the
-        #     device to the next best match and there has to BE one.
-        $Loop = $script:DrvLoop
-        $Calls = @($Loop.FindAll({
+    It 'Deletes driver packages in exactly one place, and never with /force' {
+        # Every deletion goes through $RetireDriverPackage, which re-reads the
+        # DriverStore afterwards (pnputil's exit code is not the outcome). A
+        # second pnputil call site would be a deletion nobody verifies.
+        $Deletes = @($script:InstallFn.FindAll({
             param($n)
             $n -is [System.Management.Automation.Language.CommandAst] -and
             $n.Extent.Text -match 'delete-driver'
         }, $true))
-        @($Calls).Count | Should -Be 1
+        @($Deletes).Count | Should -BeGreaterThan 0
 
-        $Node = $Calls[0]
-        $Guards = [System.Collections.Generic.List[string]]::new()
-        while ($Node -and $Node -ne $Loop) {
-            if ($Node -is [System.Management.Automation.Language.IfStatementAst]) {
-                foreach ($Clause in $Node.Clauses) { $Guards.Add($Clause.Item1.Extent.Text) }
-            }
-            $Node = $Node.Parent
+        $Retire = $script:InstallFn.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -eq '$RetireDriverPackage'
+        }, $true) | Select-Object -First 1
+        $Retire | Should -Not -BeNullOrEmpty
+
+        foreach ($D in $Deletes) {
+            $D.Extent.StartOffset | Should -BeGreaterThan $Retire.Extent.StartOffset -Because "pnputil '$($D.Extent.Text)' must live inside `$RetireDriverPackage"
+            $D.Extent.EndOffset   | Should -BeLessThan $Retire.Extent.EndOffset
+            $D.Extent.Text | Should -Not -Match '(?i)/force'
         }
-        $All = $Guards -join ' '
-        $All | Should -Match 'AllowDriverStoreRemoval'
-        $All | Should -Match 'PinnedPackageStaged'
+    }
+
+    It 'Retires a driver package only behind both gates' {
+        # This is the one path that DELETES something off a machine. Two
+        # conditions have to hold above every call, and neither is optional:
+        #   * the pin opted in (AllowDriverStoreRemoval), because the operator
+        #     is authorising a deletion;
+        #   * what Windows binds instead is already staged - the pinned base
+        #     package ($PinnedPackageStaged) or the pinned release's own copy of
+        #     the extension ($Counterpart) - because PnP re-binds the device to
+        #     the next best match and there has to BE one.
+        $Calls = @($script:InstallFn.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand -and
+            $n.CommandElements[0].Extent.Text -eq '$RetireDriverPackage'
+        }, $true))
+        # One for the outranking base driver, one for a newer extension.
+        @($Calls).Count | Should -Be 2
+
+        foreach ($Call in $Calls) {
+            $Node = $Call
+            $Guards = [System.Collections.Generic.List[string]]::new()
+            while ($Node -and $Node -ne $script:InstallFn) {
+                if ($Node -is [System.Management.Automation.Language.IfStatementAst]) {
+                    foreach ($Clause in $Node.Clauses) { $Guards.Add($Clause.Item1.Extent.Text) }
+                }
+                $Node = $Node.Parent
+            }
+            $All = $Guards -join ' '
+            $All | Should -Match 'AllowDriverStoreRemoval' -Because "line $($Call.Extent.StartLineNumber) deletes a package"
+            $All | Should -Match 'PinnedPackageStaged|Counterpart' -Because "line $($Call.Extent.StartLineNumber) deletes a package"
+        }
     }
 
     It 'Only ever considers packages newer than the pinned version' {
@@ -486,5 +516,201 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
             }
             ($Guards -join ' ') | Should -Match 'ForceDowngrade' -Because "the in-loop CIM call '$($Cim.Extent.Text)' must run only for a forced rollback"
         }
+    }
+}
+
+Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
+    BeforeAll {
+        $script:InstallFn = Get-DATFunctionAst -Name 'Install-DriverUpdates'
+        $script:DrvLoop   = Get-DATPerDriverLoopAst
+
+        function Get-DATEnclosingGuardText {
+            param($Node, $Stop)
+            $Guards = [System.Collections.Generic.List[string]]::new()
+            while ($Node -and $Node -ne $Stop) {
+                if ($Node -is [System.Management.Automation.Language.IfStatementAst]) {
+                    foreach ($Clause in $Node.Clauses) { $Guards.Add($Clause.Item1.Extent.Text) }
+                }
+                $Node = $Node.Parent
+            }
+            $Guards -join ' '
+        }
+        function Get-DATScriptBlockAssignment {
+            param([string]$Name)
+            $script:InstallFn.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $n.Left.Extent.Text -eq $Name
+            }, $true) | Select-Object -First 1
+        }
+    }
+
+    It 'Checks the rest of the stack before skipping a device already on the pin' {
+        # The field device FX308309 was exactly this: base driver on the pin,
+        # AMD's extension from the newer release still applied on top, and the
+        # fault still there. "Already on the pinned version - skipping" alone
+        # would never look again.
+        $Clause = $null
+        foreach ($If in $script:DrvLoop.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] }, $true)) {
+            foreach ($C in $If.Clauses) {
+                if ($C.Item1.Extent.Text -match '^\$LiveCmp -eq 0$') { $Clause = $C }
+            }
+        }
+        $Clause | Should -Not -BeNullOrEmpty
+        # The CALL, not the name: the branch's comment mentions the scriptblock
+        # too, and a text match would pass with the call deleted.
+        $Drift = $Clause.Item2.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.CommandElements[0].Extent.Text -eq '$GetDriverStackDrift'
+        }, $true) | Select-Object -First 1
+        $Skip = $Clause.Item2.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and
+            $n.Value -match 'already on the pinned'
+        }, $true) | Select-Object -First 1
+        $Drift | Should -Not -BeNullOrEmpty
+        $Skip  | Should -Not -BeNullOrEmpty
+        $Drift.Extent.StartOffset | Should -BeLessThan $Skip.Extent.StartOffset
+        # And the skip must depend on what the check found.
+        $Guard = $Skip
+        while ($Guard -and $Guard -isnot [System.Management.Automation.Language.IfStatementAst]) { $Guard = $Guard.Parent }
+        $Guard.Clauses[0].Item1.Extent.Text | Should -Match 'StackDrift\.Items'
+    }
+
+    It 'Checks the stack after every verified rollback' {
+        $Loop = $script:DrvLoop.Extent.Text
+        foreach ($Verdict in 'PIN VERIFIED: device is now on', 'PIN VERIFIED after retiring') {
+            $M = [regex]::Match($Loop, [regex]::Escape($Verdict) + '(.{0,700})', 'Singleline')
+            $M.Success | Should -BeTrue
+            $M.Groups[1].Value | Should -Match '\$ReconcilePinnedStack' -Because "the stack must be checked after '$Verdict'"
+        }
+    }
+
+    It 'Does not count the inbox driver after a clean install as a verified rollback' {
+        # AMD's Factory Reset removes the old driver first and can finish after
+        # a restart; until then the GPU reports Microsoft Basic Display's inbox
+        # 10.0.x version, which is "at or below the pin" - but not the pin.
+        $Loop = $script:DrvLoop.Extent.Text
+        $Below    = [regex]::Match($Loop, 'elseif \(\$VendorRoute -and \$AfterCmp -lt 0\)')
+        $Verified = [regex]::Match($Loop, 'elseif \(\$AfterCmp -le 0\)')
+        $Below.Success    | Should -BeTrue
+        $Verified.Success | Should -BeTrue
+        $Below.Index | Should -BeLessThan $Verified.Index
+    }
+
+    It 'Asks for a restart after swapping the base driver on a running device' {
+        # The field run logged "Success - no reboot required" right after a
+        # live base-driver swap; the extension and components only settle onto
+        # the new base at a restart.
+        $M = [regex]::Match($script:DrvLoop.Extent.Text, '\$FinalCmp -le 0\)\s*\{(.{0,600})', 'Singleline')
+        $M.Success | Should -BeTrue
+        $M.Groups[1].Value | Should -Match '\$Rebooted = \$true'
+    }
+
+    It 'Logs PIN NOT APPLIED only as the final verdict of a successful install' {
+        # It used to be logged at Severity 3 BEFORE the retire ran, so a
+        # rollback that then succeeded still left a red line in the log.
+        $Success = $script:DrvLoop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.IfStatementAst] -and
+            $n.Clauses[0].Item1.Extent.Text -eq '$DupCode -in $SuccessCodes'
+        }, $true) | Select-Object -First 1
+        $Success | Should -Not -BeNullOrEmpty
+        $Hits = @($Success.Clauses[0].Item2.FindAll({
+            param($n)
+            ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -or
+             $n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -and
+            $n.Value -match 'PIN NOT APPLIED'
+        }, $true))
+        @($Hits).Count | Should -Be 1
+        (Get-DATEnclosingGuardText -Node $Hits[0] -Stop $Success) | Should -Match '-not \$Applied'
+    }
+
+    It 'Takes the vendor route only for AMD rows that asked for it' {
+        $Sets = @($script:DrvLoop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -eq '$WantVendor' -and $n.Right.Extent.Text -eq '$true'
+        }, $true))
+        @($Sets).Count | Should -Be 1
+        $Guard = Get-DATEnclosingGuardText -Node $Sets[0] -Stop $script:DrvLoop
+        $Guard | Should -Match 'UseVendorInstaller'
+        $Guard | Should -Match "DupVendor -eq 'AMD'"
+    }
+
+    It 'Takes the vendor route only for a device measured as needing it' {
+        # Above the pin, or on it with a mixed stack - both decided from the
+        # live device, never from a marker, and never for an unreadable one.
+        $Sets = @($script:DrvLoop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -eq '$VendorRoute' -and $n.Right.Extent.Text -ne '$false'
+        }, $true))
+        @($Sets).Count | Should -Be 2
+        foreach ($Set in $Sets) {
+            $Guard = Get-DATEnclosingGuardText -Node $Set -Stop $script:DrvLoop
+            $Guard | Should -Match 'LiveCmp -gt 0|LiveCmp -eq 0'
+            "$Guard $($Set.Right.Extent.Text)" | Should -Match 'WantVendor'
+        }
+    }
+
+    It 'Does not repeat the clean install for a stack it already could not fix' {
+        $script:DrvLoop.Extent.Text | Should -Match 'if \(\$WantVendor -and -not \$VendorAlreadyRan\)'
+        $script:DrvLoop.Extent.Text | Should -Match "'VendorInstallerVersion'"
+    }
+
+    It 'Runs the vendor installer only on the vendor route' {
+        $Calls = @($script:DrvLoop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.CommandElements[0].Extent.Text -eq '$InvokeVendorInstaller'
+        }, $true))
+        @($Calls).Count | Should -Be 1
+        (Get-DATEnclosingGuardText -Node $Calls[0] -Stop $script:DrvLoop) | Should -Match '\$VendorRoute'
+    }
+
+    It 'Never asks AMD to reboot the device itself, or to install twice' {
+        # ConfigMgr owns the restart (-BOOT would restart mid-deployment), and
+        # AMD's help lists -FACTORYRESETINSTALL as an exclusive mode that cannot
+        # be combined with -INSTALL.
+        $Block = Get-DATScriptBlockAssignment -Name '$InvokeVendorInstaller'
+        $Block | Should -Not -BeNullOrEmpty
+        $Strings = @($Block.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+            $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
+        }, $true) | ForEach-Object { $_.Value })
+        ($Strings -match '(?i)(^|\s)-BOOT\b') | Should -BeNullOrEmpty
+        ($Strings -match '(?i)(^|\s)-INSTALL\b') | Should -BeNullOrEmpty
+        (Get-DATScriptBlockAssignment -Name '$AmdCleanInstallSwitch').Right.Extent.Text | Should -Be "'-FACTORYRESETINSTALL'"
+    }
+
+    It 'Never kills the vendor installer' {
+        # Stopping a display-driver install half way can leave the device on
+        # no driver at all. Only the extract may be killed on timeout.
+        $Block = Get-DATScriptBlockAssignment -Name '$InvokeVendorInstaller'
+        $Kills = @($Block.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+            "$($n.Member.Extent.Text)" -eq 'Kill'
+        }, $true))
+        @($Kills).Count | Should -BeGreaterThan 0
+        foreach ($K in $Kills) { $K.Expression.Extent.Text | Should -Be '$Ex' }
+    }
+
+    It 'Decides the clean install''s outcome from AMD''s result file, not the exit code' {
+        $Block = (Get-DATScriptBlockAssignment -Name '$InvokeVendorInstaller').Extent.Text
+        $Block | Should -Match "elseif \(\`$Out\.ResultCode -eq 0\) \{\s*\`$Out\.Outcome = 'Passed'"
+        $Block | Should -Not -Match "ExitCode -eq 0\)\s*\{\s*\`$Out\.Outcome = 'Passed'"
+    }
+
+    It 'Keeps a deferred clean install out of the quarantine ledger' {
+        # AMD stops on 202/206 before changing anything; that is timing, not a
+        # broken installer, and must not quarantine the rollback.
+        $M = [regex]::Match($script:DrvLoop.Extent.Text, "elseif \(\`$VendorRoute -and \`$VendorRun\.Outcome -eq 'Deferred'\) \{(.*?)\} elseif \(\`$DupCode -in \`$NotApplicable\)", 'Singleline')
+        $M.Success | Should -BeTrue
+        $M.Groups[1].Value | Should -Match '\$Failed\+\+'
+        $M.Groups[1].Value | Should -Not -Match 'FailCount|FailedVersion'
     }
 }

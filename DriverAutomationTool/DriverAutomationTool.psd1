@@ -1,9 +1,9 @@
 @{
     RootModule        = 'DriverAutomationTool.psm1'
-    ModuleVersion     = '2.46.7'
+    ModuleVersion     = '2.47.0'
     GUID              = 'a3f7b2c1-4d5e-6f78-9a0b-1c2d3e4f5678'
     Author            = 'Driver Automation Tool Contributors'
-    Description       = '2.46.7 - Lenovo BIOS lookup now falls back to the other Windows catalog when the requested one lists no BIOS. Lenovo does not always publish the BIOS in both: the ThinkPad L390 (20NR/20NS) Win11 catalog has drivers but no BIOS, so a Windows 11 sync reported "No BIOS update found" even though BIOS 1.53 is in the Win10 catalog. The flash utility does not depend on the OS, so a Windows 11 sync now checks the Win10 catalog (and a Windows 10 sync the Win11 one) before giving up, and logs a warning naming the catalog it used.'
+    Description       = '2.47.0 - A pinned rollback now fixes the whole driver stack, not just the base driver. Windows keeps an extension driver when the base driver changes, so rolling back AMD''s display driver left the newer release''s extension (amduw23e) applied on top - Device Manager showed the pinned driver and the monitor fault stayed. After every verified rollback, and on a device already on the pin, the client now checks the extension and component drivers and logs MIXED STACK; with -RemoveOutrankingDriver it also retires the newer extension when the pinned release''s copy is staged. New per-pin option -UseVendorInstaller (GUI: Use AMD''s clean installer) runs AMD''s Setup.exe from the pinned DUP with -FACTORYRESETINSTALL, the silent form of the Factory Reset option that fixed the device by hand; -VendorInstallerArguments overrides it. Retired packages are now checked to have actually left the DriverStore (pnputil can report success and leave them), the client asks for a restart after swapping a running display driver, PIN NOT APPLIED is only logged as the final verdict, and the retire no longer silently skips when two packages are bound.'
     PowerShellVersion = '7.4'
     CompatiblePSEditions = @('Core')
     FunctionsToExport = @(

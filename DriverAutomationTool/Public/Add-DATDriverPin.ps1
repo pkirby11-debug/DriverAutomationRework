@@ -84,6 +84,37 @@
         something to fall back to.
 
         Off by default: this deletes a driver package from the machine.
+
+        Also covers the rest of the driver stack. When the device's base driver
+        is at the pin but a newer EXTENSION driver from the release you are
+        rolling back is still applied on top of it (Windows keeps an extension
+        across a base-driver change), the client retires that extension too -
+        only when the pinned release's own copy of the same extension is staged
+        to replace it.
+    .PARAMETER UseVendorInstaller
+        Enforce the pin by running the GPU vendor's own installer from inside the
+        pinned DUP, as a clean install, instead of relying on the DUP and PnP
+        ranking. This is what an engineer does by hand when a rollback "takes"
+        in Device Manager but the problem stays: extract the DUP and run AMD's
+        Setup.exe with the factory-reset option. That uninstalls every AMD
+        display component first - the newer extension driver, the software
+        components, the AMD Software app - and then installs the pinned release
+        as one consistent set.
+
+        Runs only on a device that needs it: one whose display driver is newer
+        than the pin, or whose driver is at the pin but still carries newer
+        pieces of the release being rolled back. The screen goes black for a
+        moment while the display driver reloads, and the client asks ConfigMgr
+        for a restart afterwards, so deploy the package in a maintenance window.
+
+        Only AMD Radeon graphics DUPs are supported. For anything else the client
+        logs that and enforces the pin with the DUP as usual.
+    .PARAMETER VendorInstallerArguments
+        Replace the arguments the client passes to the vendor installer. Leave
+        empty for the default AMD clean install (see the README). Only needed if
+        AMD changes its switches; the client always adds its own -LOG argument
+        so the result can be read back. Kept when the pin is re-added without
+        this parameter, so re-pinning from the GUI does not reset it.
     .PARAMETER VendorVersion
         The vendor's own dotted version for the pinned revision (Dell's
         vendorVersion, e.g. '32.0.23040.1006'). This is the number the client
@@ -158,6 +189,14 @@
         [switch]$RemoveOutrankingDriver,
 
         [Parameter(ValueFromPipelineByPropertyName)]
+        [switch]$UseVendorInstaller,
+
+        # Not pipeline-bound on purpose: it is kept on update unless passed, and
+        # a candidate row carrying an empty property would otherwise count as
+        # passed and wipe an override set by hand.
+        [string]$VendorInstallerArguments = '',
+
+        [Parameter(ValueFromPipelineByPropertyName)]
         [string]$VendorVersion = '',
 
         [Parameter(ValueFromPipelineByPropertyName)]
@@ -230,6 +269,15 @@
             # Explicit on every update rather than only when set: an operator
             # re-running the pin without the switch means they want it off.
             $Existing.RemoveOutrankingDriver = [bool]$RemoveOutrankingDriver
+            # Same rule for the vendor installer: re-adding without the switch
+            # turns it off. The arguments are only replaced when passed, so a
+            # GUI re-pin (which has no arguments box) keeps a hand-set override.
+            $Existing.UseVendorInstaller = [bool]$UseVendorInstaller
+            if ($PSBoundParameters.ContainsKey('VendorInstallerArguments')) {
+                $Existing.VendorInstallerArguments = $VendorInstallerArguments
+            } elseif ($null -eq $Existing.VendorInstallerArguments) {
+                $Existing.VendorInstallerArguments = ''
+            }
             if ($ComponentXml)   { $Existing.ComponentXml = $ComponentXml }
             if ($HashMD5)        { $Existing.HashMD5 = $HashMD5 }
             if ($Size)           { $Existing.Size = $Size }
@@ -251,6 +299,8 @@
                 PinnedName      = $PinnedName
                 VendorVersion   = $VendorVersion
                 RemoveOutrankingDriver = [bool]$RemoveOutrankingDriver
+                UseVendorInstaller = [bool]$UseVendorInstaller
+                VendorInstallerArguments = $VendorInstallerArguments
                 ComponentXml    = $ComponentXml
                 HashMD5         = $HashMD5
                 Size            = $Size
@@ -263,6 +313,15 @@
                 UpdatedAt       = $Now
             })
             Write-DATLog -Message "Driver pin added: '$NamePattern' pinned to v$PinnedVersion on SystemID $SystemId$(if ($Reason) { " - $Reason" }). Applies from the next sync; the package rebuilds once and the application updates in place." -Severity 1
+        }
+
+        if ($UseVendorInstaller) {
+            # The client only knows how to find and drive AMD's installer. Say so
+            # now rather than letting the operator find out from a client log.
+            $Described = "$NamePattern $PinnedName $PinnedFileName"
+            if ($Described -notmatch '(?i)radeon|\bamd\b|\bati\b' -or ($Category -and $Category -ne 'Video')) {
+                Write-DATLog -Message "Driver pin '$NamePattern' asks for the vendor installer, but the client only supports AMD Radeon graphics DUPs. For this driver it will log that and enforce the pin with the DUP as usual." -Severity 2
+            }
         }
 
         if (-not $SourceUrl) {

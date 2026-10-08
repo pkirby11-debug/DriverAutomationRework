@@ -63,7 +63,8 @@ Describe 'Driver Pins tab - XAML' {
         foreach ($Expected in @(
             'PinModelBox', 'PinOsCombo', 'PinForceRefreshCheckBox', 'PinLoadButton',
             'PinRollbackOnlyCheckBox', 'PinSearchBox', 'PinCandidateGrid',
-            'PinReasonBox', 'PinCreateButton', 'PinStatusLabel',
+            'PinReasonBox', 'PinRemoveOutrankingCheckBox', 'PinUseVendorInstallerCheckBox',
+            'PinCreateButton', 'PinStatusLabel',
             'PinRefreshButton', 'PinDisableButton', 'PinEnableButton',
             'PinRemoveButton', 'PinShowDisabledCheckBox', 'PinGrid')) {
             $Named | Should -Contain $Expected
@@ -153,5 +154,18 @@ Describe 'Driver Pins tab - event layer' {
             $M.Success | Should -BeTrue -Because "$Handler should have a click handler"
             $M.Groups[1].Value | Should -Match 'Complete-DATGridEdit'
         }
+    }
+}
+
+Describe 'Driver Pins tab - pin options reach Add-DATDriverPin' {
+    It 'Passes both pin options from their checkboxes' {
+        # A checkbox that is drawn but never read is the GUI version of the
+        # projection gap: the operator ticks it and nothing reaches the pin.
+        $M = [regex]::Match($script:CodeText, "\`$Controls\['PinCreateButton'\]\.Add_Click\(\{(.*?)\n    \}\)", 'Singleline')
+        $M.Success | Should -BeTrue
+        $Handler = $M.Groups[1].Value
+        $Handler | Should -Match "RemoveOutrankingDriver\s*=\s*\[bool\]\`$Controls\['PinRemoveOutrankingCheckBox'\]\.IsChecked"
+        $Handler | Should -Match "\`$Vendor\s*=\s*\[bool\]\`$Controls\['PinUseVendorInstallerCheckBox'\]\.IsChecked"
+        $Handler | Should -Match 'UseVendorInstaller\s*=\s*\$Vendor'
     }
 }

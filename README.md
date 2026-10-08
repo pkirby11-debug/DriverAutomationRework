@@ -172,8 +172,12 @@ Roll a driver back, and hold it there. See
   URL, MD5, size, filename and raw catalog XML along with it. That capture is the
   point of using the tab over the cmdlet: without it a pin stops resolving the day
   Dell drops the revision, which is exactly when you still need it.
+- **Retire the outranking driver** / **Use AMD's clean installer** — the two
+  per-pin options that change what runs on the device; see
+  [Driver version pinning](#pinning). Both are off by default.
 - **Active pins grid** — every pin, with **Recoverable** showing which ones carry
-  that metadata (`Version only` means the pin dies when Dell purges the revision).
+  that metadata (`Version only` means the pin dies when Dell purges the revision),
+  and which pins retire outranking drivers or use the vendor installer.
   **Disable** stops a pin applying but keeps the captured metadata; **Remove**
   throws it away and lets the driver resolve to the catalog's newest again.
 
@@ -427,6 +431,70 @@ On the client, a pinned package:
   has to leave the DriverStore first (`pnputil /enum-drivers`, then
   `pnputil /delete-driver oemNN.inf /uninstall`) — irreversible, so test it on
   one device before doing it at scale.
+- **checks the rest of the driver stack, not just the base driver.** A GPU driver is
+  a stack: the base INF bound to the device, *extension* INFs applied on top of it,
+  and software components (child devices such as AMD's OpenCL and Windows-support
+  components). Windows chooses an extension separately and **keeps it when the base
+  driver changes**, so rolling the base back can leave the newer release's extension
+  in place — Device Manager shows the pinned driver and the fault stays. That was
+  the field state on a Dell Pro Micro QCM1255: base `32.0.12046.3001`, AMD's
+  `amduw23e` extension still on `32.0.31033.3`. After every verified rollback, and
+  on a device that is *already* on the pinned version, the client reads the device's
+  extension and component drivers (`DEVPKEY_Device_ExtendedConfigurationIds` and the
+  device's children) and logs the stack. Anything from the pin's own release family
+  that is newer than the pin is logged as `MIXED STACK`; parts AMD versions on a
+  scheme of their own (uwppair, Crash Defender) are listed but never counted. With
+  `-RemoveOutrankingDriver` the newer extension is retired, but only when the
+  pinned release's own copy of the same INF is staged to replace it. Software
+  components are reported, never removed. The run summary counts stacks it cleared
+  and stacks still mixed.
+- **checks that a retired package actually left.** `pnputil /delete-driver
+  /uninstall` moves devices off the package first and deletes it second, and it
+  can manage the first, fail the second and still exit 0 (`Unable to uninstall
+  driver package: No more data is available.`). A package left behind can win the
+  device back at the next restart, so the client re-reads the DriverStore, retries
+  once with a plain `/delete-driver` (which Windows allows only once no device uses
+  the package — never `/force`), and warns if it is still there. After a base driver
+  is swapped on a running device the client asks ConfigMgr for a restart, so the
+  extension and components reload on the pinned driver.
+- **can run AMD's own clean installer instead** (`-UseVendorInstaller`, or the
+  *Use AMD's clean installer* tick box). This automates the manual fix: extract the
+  DUP and run AMD's `Setup.exe` with **Factory Reset**, which removes every AMD
+  display component — the newer extension, the software components, the AMD
+  Software app — before installing the pinned release as one consistent set. It
+  runs only on a device that needs it: one above the pin, or one on the pin whose
+  stack is mixed. The client extracts the DUP with Dell's documented `/s /e=`, finds
+  AMD's package root (the `Setup.exe` with `Bin64\ATISetup.exe` beside it) and runs:
+
+  ```
+  Setup.exe -FACTORYRESETINSTALL -LOG "C:\Windows\Temp\DATDupLogs\<run>\<DUP>.amd-result.log"
+  ```
+
+  `-FACTORYRESETINSTALL` is the silent form of the GUI's Factory Reset checkbox.
+  AMD's own command-line guides do not list it; Microsoft's *Install AMD GPU drivers
+  on N-series VMs* page documents `setup.exe -factoryresetinstall`, and AMD's
+  `ATISetup.exe -HELP` lists it. Because of that, the client first checks that the
+  package's own `ATISetup.exe` knows the switch and falls back to the DUP if it does
+  not. `-VendorInstallerArguments` replaces the switch if AMD ever changes it (the
+  client still adds `-LOG`). It never passes `-INSTALL` alongside it (AMD lists them
+  as exclusive modes) or `-BOOT` (ConfigMgr owns the restart), and it never kills
+  the installer on timeout. Success is read from AMD's documented result file
+  (`[ResponseResult] ResultCode`), not the undocumented exit code, and then from the
+  device itself. AMD errors 202 (Windows Update installing) and 206 (restart
+  pending) are reported as a **deferral**: nothing changed, the run reports failure
+  so ConfigMgr retries after the restart, and it does not count toward quarantine.
+  A clean install always requests a restart. AMD Radeon graphics DUPs only; any
+  other pinned driver logs that and keeps the DUP.
+
+  **Before using it on the fleet:**
+  - Prove it once, non-interactively, the way ConfigMgr runs it: on one affected
+    device, `psexec -s` the extracted `Setup.exe -FACTORYRESETINSTALL -LOG
+    "C:\Windows\Temp\amd.log"` and confirm it completes without a prompt. AMD
+    documents that the GUI Factory Reset restarts the PC mid-install and resumes
+    afterwards; nothing documents whether the silent switch does the same.
+  - The screen goes black while the display driver reloads, and AMD notes Factory
+    Reset pauses Windows Update while it works (the client logs it if a pause is
+    left behind). Deploy in a maintenance window.
 - **is not skipped by its own marker.** The per-DUP version marker holds the version
   being rolled back *from*, so the usual ">= manifest, skip" rule is narrowed to
   equality for a pinned row. `LiveVersionBefore` and `ForcedDowngrade` are recorded
