@@ -926,8 +926,10 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         # And it says where the kept extract is.
         $Loop | Should -Match 'kept in \$\(\$VendorRun\.WorkDir\) for a week'
         $Loop | Should -Match "(?s)\`$FailCmp -lt 0\)\) \{.*?-Name 'PendingCheck' -Value 1.*?after the failed clean install"
-        # A run on the pin that gave no verdict and left the stack mixed.
-        $Loop | Should -Match "if \(\`$Stack\.Mixed -and \`$VendorRetryOk -and \`$VendorRun\.Outcome -eq 'Unknown'\) \{(\s*#[^\n]*)*\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true"
+        # A clean install that leaves the stack reading mixed, whatever AMD's
+        # verdict: the extension only settles at a restart, so it is
+        # re-measured after one rather than written off as Installed.
+        $Loop | Should -Match "if \(\`$Stack\.Mixed -and \`$VendorRoute\) \{(\s*#[^\n]*)*\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true"
         # AMD is credited only for a change it made.
         $Loop | Should -Match '"\$AfterVersion" -ne "\$LiveVersion"'
     }

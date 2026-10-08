@@ -3849,18 +3849,33 @@ function Install-DriverUpdates {
         #    be read is said so in the log - in the field, a result file that
         #    was there but not read reported "absent", and a successful
         #    install "did not run".
-        $ResultCodePattern = '(?i)\bResultCode\b["'']?\s*(?:=|:|>)\s*["'']?\s*(\d+)'
+        #    AMD's documented form first - ResultCode inside [ResponseResult]
+        #    - and, as the field file's real layout is unconfirmed, then a
+        #    ResultCode opening a line in another notation (':', an XML
+        #    element, JSON). Never one mid-line: that could be a package's
+        #    own code rather than the overall verdict.
+        $ResultCodePatterns = @(
+            '(?ims)^\s*\[ResponseResult\][^\[]*?^\s*ResultCode\s*=\s*(\d+)'
+            '(?im)^[\s{,]*["<]?ResultCode\b["'']?\s*(?:=|:|>)\s*["'']?\s*(\d+)'
+        )
+        $GetResultCode = {
+            param([string]$Text)
+            foreach ($P in $ResultCodePatterns) {
+                if ($Text -match $P) { return [int]$Matches[1] }
+            }
+            return $null
+        }
         $ResultRead = $null
         for ($Wait = 0; $Wait -lt 6; $Wait++) {
             $ResultRead = & $ReadSharedText $ResultLog
-            if ($ResultRead.Ok -and $ResultRead.Text -match $ResultCodePattern) { break }
+            if ($ResultRead.Ok -and $null -ne (& $GetResultCode $ResultRead.Text)) { break }
             if ($Wait -lt 5) { Start-Sleep -Seconds 5 }
         }
         $ResultNote = 'not written'
         if ($ResultRead.Exists -and -not $ResultRead.Ok) {
             $ResultNote = "there but unreadable ($($ResultRead.Error))"
         } elseif ($ResultRead.Ok) {
-            if ($ResultRead.Text -match $ResultCodePattern) { $Out.ResultCode = [int]$Matches[1] }
+            $Out.ResultCode = & $GetResultCode $ResultRead.Text
             if ($ResultRead.Text -match '(?im)^\s*ErrorCode\s*=\s*3\s*$') { $Out.Detail = 'a package asked for a restart' }
             $ResultNote = if ($null -ne $Out.ResultCode) {
                 "ResultCode $($Out.ResultCode)"
@@ -4778,13 +4793,18 @@ function Install-DriverUpdates {
                     $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $null
                     if ($Stack.RebootRequired) { $Rebooted = $true }
                     if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
-                    if ($Stack.Mixed -and $VendorRetryOk -and $VendorRun.Outcome -eq 'Unknown') {
-                        # AMD worked without giving a verdict and the stack is
-                        # still mixed - it may be finishing after a restart.
+                    if ($Stack.Mixed -and $VendorRoute) {
+                        # Straight after AMD's clean install a mixed stack is
+                        # not the answer yet, whatever AMD's verdict: extension
+                        # and component changes settle at a restart, and AMD
+                        # may still be finishing. Re-measured once after it.
+                        # Never a loop - this only follows a run of the clean
+                        # installer, and those are bounded by
+                        # $VendorMaxAttempts.
                         $Rebooted = $true
                         $script:PinCheckAfterRestart = $true
                         $RowPendingCheck = $true
-                        Write-Log "$DriverLabel - AMD's clean installer gave no verdict and the stack is still mixed; requesting a restart, after which the application runs again and checks the device" -Severity 2
+                        Write-Log "$DriverLabel - the driver stack still reads mixed straight after AMD's clean install ($($VendorRun.Outcome)); extension changes settle at a restart, so requesting one - the application runs again afterwards and checks the device" -Severity 2
                     }
                 } elseif ($VendorRetryOk) {
                     $Rebooted = $true

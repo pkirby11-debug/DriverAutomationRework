@@ -1219,6 +1219,32 @@ Describe 'AMD clean installer from the pinned DUP' {
         $R.Detail | Should -Not -Match 'absent'
     }
 
+    It 'Reads the overall ResultCode from [ResponseResult], not a package''s own code ahead of it' {
+        $script:AmdResultCode = $null
+        $script:ResultText = "[Details]`r`nPackage Name = Display Driver`r`nResultCode = 0`r`n[ResponseResult]`r`nResultCode = 1"
+        $R = Invoke-Vendor
+        $R.ResultCode | Should -Be 1
+        $R.Outcome | Should -Be 'Failed'
+    }
+
+    It 'Reads a ResultCode that opens a line in another notation, never one mid-line' {
+        $script:AmdResultCode = $null
+        $script:ResultText = '{"ResultCode":0,"Packages":[{"Name":"Display Driver","ErrorCode":0}]}'
+        (Invoke-Vendor).ResultCode | Should -Be 0
+
+        $script:Launches.Clear()
+        $script:ResultText = "<Result>`r`n  <ResultCode>2</ResultCode>`r`n</Result>"
+        (Invoke-Vendor).ResultCode | Should -Be 2
+
+        # A package's own code inside a line is not the overall verdict.
+        $script:Launches.Clear()
+        $script:ResultText = 'Package Name = Display Driver (ResultCode = 0)'
+        $script:AmdLogLines = @()
+        $R = Invoke-Vendor
+        $R.ResultCode | Should -BeNullOrEmpty
+        $R.Outcome | Should -Be 'Unknown'
+    }
+
     It 'Says what it could not read instead of calling the result file absent' {
         $script:AmdResultCode = $null
         $script:ResultText = 'Result: something AMD has not documented'

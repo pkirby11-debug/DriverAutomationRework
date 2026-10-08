@@ -501,7 +501,8 @@ On the client, a pinned package:
     every parent folder is user-modifiable. Kept a week after a failed run, for
     diagnosis.
   - **The device decides**, not the undocumented exit code. AMD's result file
-    (`ResultCode`) and its `C:\Program Files\AMD\CIM\Log\Install.log` give AMD's
+    (`ResultCode` under `[ResponseResult]`) and its
+    `C:\Program Files\AMD\CIM\Log\Install.log` give AMD's
     verdict - both read while AMD may still hold them open, and Install.log
     only for this run's lines (found by the run's own folder name, which AMD
     logs). "Install of AMD Display Driver is successful" counts as a pass when
@@ -518,7 +519,9 @@ On the client, a pinned package:
   - **Restart, then check again.** AMD can finish a clean install after a
     restart, and leaves the GPU on Microsoft Basic Display Adapter until it does.
     A device not yet on the pin - or left without a readable display driver by a
-    failed clean install - is therefore never called verified. The run exits
+    failed clean install, or whose driver stack still reads mixed straight after
+    the clean install (extension changes settle at a restart) - is therefore
+    never called verified. The run exits
     3010 with the detection marker set to `PendingRestart` instead of
     `Installed` (or `Failed`, when other rows failed too), so ConfigMgr restarts
     the device and, finding the application not installed, runs it again at its
