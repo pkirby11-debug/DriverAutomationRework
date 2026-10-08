@@ -1247,17 +1247,16 @@ Describe 'Restart guard timestamps' {
 }
 
 Describe 'Protected folder check' {
-    BeforeAll {
-        # Elevated Windows only: the folder's owner then is SYSTEM or
-        # Administrators, as it is for the SYSTEM-run client. A non-elevated
-        # session owns what it creates, which the check rightly rejects.
-        $script:Elevated = $false
-        if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') {
-            $script:Elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        }
-    }
+    # Elevated Windows only: the folder's owner then is SYSTEM or
+    # Administrators, as it is for the SYSTEM-run client. A non-elevated
+    # session owns what it creates, which the check rightly rejects. Worked
+    # out here, in the Describe body: -Skip is evaluated at discovery, before
+    # any BeforeAll has run, so a value set there would always read as empty
+    # and skip the test everywhere.
+    $Elevated = ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') -and
+        ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-    It 'Accepts the folder the script creates, and rejects one users can write to' -Skip:(-not $script:Elevated) {
+    It 'Accepts the folder the script creates, and rejects one users can write to' -Skip:(-not $Elevated) {
         $ProtectedSids = $script:ProtectedSids
         $Good = Join-Path $TestDrive 'good'
         & $script:NewProtectedDirectory $Good
