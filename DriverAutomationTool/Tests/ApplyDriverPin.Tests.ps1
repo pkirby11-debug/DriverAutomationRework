@@ -1175,12 +1175,13 @@ Describe 'AMD clean installer from the pinned DUP' {
         ($script:LogLines -join "`n") | Should -Match 'removed -LOG/-BOOT'
     }
 
-    It 'Strips every spelling of -LOG and -BOOT, and nothing else' {
+    It 'Strips every spelling of -LOG and of the restart switches, and nothing else' {
         foreach ($Case in @(
             @{ In = '-INSTALL /LOG "C:\a b.log"';      Out = '-INSTALL' }
             @{ In = '-INSTALL -LOG:C:\a.log /BOOT';    Out = '-INSTALL' }
             @{ In = '-INSTALL -log="C:\a.log"';        Out = '-INSTALL' }
-            @{ In = '-INSTALL -LOGFILE x -BOOTSTRAP';   Out = '-INSTALL -LOGFILE x -BOOTSTRAP' }
+            @{ In = '-INSTALL -REBOOT /B';              Out = '-INSTALL' }
+            @{ In = '-INSTALL -LOGFILE x -BOOTSTRAP /BX'; Out = '-INSTALL -LOGFILE x -BOOTSTRAP /BX' }
         )) {
             $script:Launches.Clear()
             $script:Row.VendorInstallerArguments = $Case.In
@@ -1209,6 +1210,28 @@ Describe 'AMD clean installer from the pinned DUP' {
         )
         $null = Invoke-Vendor
         $script:Launches[1].FilePath | Should -Match '251014a-420077C-Dell'
+    }
+
+    It 'Reports a driver-search policy AMD left changed, and nothing when it restored them' {
+        # AMD sets these while it installs and restores them with a reg
+        # import; a run that ends early could leave them set.
+        $null = Invoke-Vendor
+        ($script:LogLines -join "`n") | Should -Not -Match 'driver-search policy'
+
+        $script:LogLines.Clear()
+        $script:Launches.Clear()
+        $script:PolicyReads = 0
+        function Get-ItemProperty {
+            [CmdletBinding()]
+            param($Path, $Name)
+            $script:PolicyReads++
+            # The three reads before the run find nothing; the ones after
+            # find AMD's values still there.
+            if ($script:PolicyReads -le 3) { throw 'not set' }
+            [PSCustomObject]@{ $Name = 1 }
+        }
+        $null = Invoke-Vendor
+        ($script:LogLines -join "`n") | Should -Match 'driver-search policy .*ExcludeWUDriversInQualityUpdate changed during AMD''s install \(\(not set\) -> 1\)'
     }
 
     It 'Never kills the installer' {

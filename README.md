@@ -482,9 +482,11 @@ On the client, a pinned package:
   installer cannot be used for another reason below - a device above the pin is
   rolled back with the DUP instead, and one already on it gets the stack check
   above. `-VendorInstallerArguments` replaces the switch if AMD ever changes it;
-  the client removes any `-LOG` or `-BOOT` from it and adds its own `-LOG`. It never
-  passes `-INSTALL` alongside it (AMD lists them as exclusive modes) or `-BOOT`
-  (ConfigMgr owns the restart), and it never kills the installer on timeout.
+  the client removes any `-LOG`, `-BOOT`, `-REBOOT` or `/B` from it and adds its own
+  `-LOG`. It never passes `-INSTALL` alongside it (AMD lists them as exclusive modes)
+  or any restart switch - in the package's `ATISetup.exe` those three are the only
+  ways it restarts the PC itself, so ConfigMgr keeps the restart - and it never kills
+  the installer on timeout.
 
   Safeguards:
   - **One AMD GPU only.** Factory Reset removes the driver of every AMD display
@@ -534,9 +536,11 @@ On the client, a pinned package:
     "C:\Windows\Temp\amd.log"` and confirm it completes without a prompt. AMD
     documents that the GUI Factory Reset restarts the PC mid-install and resumes
     afterwards; nothing documents whether the silent switch does the same.
-  - The screen goes black while the display driver reloads, and AMD notes Factory
-    Reset pauses Windows Update while it works (the client logs it if a pause is
-    left behind). Deploy in a maintenance window.
+  - The screen goes black while the display driver reloads. Deploy in a
+    maintenance window. While it works, AMD's installer stops the Windows Update
+    service (it starts again on demand) and temporarily sets the policies that
+    keep Windows Update from offering drivers, restoring them afterwards; the
+    client logs it if those policies come out different.
 - **is not skipped by its own marker.** The per-DUP version marker holds the version
   being rolled back *from*, so the usual ">= manifest, skip" rule is narrowed to
   equality for a pinned row. `LiveVersionBefore` and `ForcedDowngrade` are recorded

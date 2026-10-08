@@ -3644,17 +3644,18 @@ function Install-DriverUpdates {
             }
         }
 
-        # 3. Arguments. An operator override is used as given, except for two
+        # 3. Arguments. An operator override is used as given, except for
         #    switches that are never the operator's to set here: -LOG, because
         #    the client reads AMD's result from its own file (an override's
-        #    -LOG would leave it blind), and -BOOT, because ConfigMgr owns the
+        #    -LOG would leave it blind), and -BOOT, -REBOOT and /B - the only
+        #    ways ATISetup restarts the PC itself - because ConfigMgr owns the
         #    restart. Otherwise the clean-install switch, after confirming this
         #    build of ATISetup.exe actually knows it.
         $Custom = "$($Row.VendorInstallerArguments)".Trim()
         if ($Custom) {
             # Either switch prefix, and -LOG with its path given after a space,
             # ':' or '=', quoted or not; -LOGFILE and the like are left alone.
-            $Stripped = (($Custom -replace '(?i)(^|\s)[-/]LOG(?:(?:\s+|[:=]|(?="))("[^"]*"|(?![-/])\S+))?(?=\s|$)', ' ') -replace '(?i)(^|\s)[-/]BOOT(?=\s|$)', ' ') -replace '\s{2,}', ' '
+            $Stripped = (($Custom -replace '(?i)(^|\s)[-/]LOG(?:(?:\s+|[:=]|(?="))("[^"]*"|(?![-/])\S+))?(?=\s|$)', ' ') -replace '(?i)(^|\s)(?:[-/](?:RE)?BOOT|/B)(?=\s|$)', ' ') -replace '\s{2,}', ' '
             $Stripped = $Stripped.Trim()
             if ($Stripped -ne $Custom) {
                 Write-Log "$Label - removed -LOG/-BOOT from the pin's installer arguments ('$Custom'): the client reads AMD's result from its own file, and ConfigMgr owns the restart" -Severity 2
@@ -3694,21 +3695,29 @@ function Install-DriverUpdates {
         if (Test-Path $InstallLog) {
             try { $LogBefore = [System.IO.File]::ReadAllText($InstallLog) } catch { $LogBefore = '' }
         }
-        # Factory Reset "temporarily pauses Windows Updates" (AMD). Note the
-        # pause settings before, so a pause left behind can be reported.
-        $WuUx = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
-        $PauseNames = 'PauseUpdatesExpiryTime', 'PauseQualityUpdatesEndTime', 'PauseFeatureUpdatesEndTime'
-        $ReadPause = {
+        # What AMD's installer changes around Windows Update, from its own
+        # binaries: during a clean install it stops the wuauserv service
+        # (Manual start - Windows starts it again on demand, so nothing to
+        # watch) and, while it installs the display driver, sets two policies
+        # that keep Windows Update from supplying a driver in the meantime,
+        # restoring them afterwards with a reg import. A run that ends early
+        # could leave them set - harmless to the pin, but a fleet policy
+        # change nobody asked for - so they are compared before and after.
+        $PolicyValues = @(
+            @{ Key = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'; Name = 'ExcludeWUDriversInQualityUpdate' }
+            @{ Key = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching'; Name = 'SearchOrderConfig' }
+            @{ Key = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching'; Name = 'DontSearchWindowsUpdate' }
+        )
+        $ReadPolicies = {
             $P = @{}
-            try {
-                $Props = Get-ItemProperty -Path $WuUx -ErrorAction Stop
-                foreach ($N in $PauseNames) { if ($Props.PSObject.Properties[$N]) { $P[$N] = "$($Props.$N)" } }
-            } catch {
-                Write-Verbose "Windows Update pause settings unreadable: $($_.Exception.Message)"
+            foreach ($V in $PolicyValues) {
+                $Val = $null
+                try { $Val = (Get-ItemProperty -Path $V.Key -Name $V.Name -ErrorAction Stop).($V.Name) } catch { $Val = $null }
+                $P["$($V.Key)\$($V.Name)"] = if ($null -eq $Val) { '(not set)' } else { "$Val" }
             }
             $P
         }
-        $PauseBefore = & $ReadPause
+        $PoliciesBefore = & $ReadPolicies
 
         # Both executables must carry a valid AMD (or Dell) signature. The
         # folder is protected, so this is a second line, not the only one.
@@ -3807,10 +3816,10 @@ function Install-DriverUpdates {
             Select-Object -Last 4 | ForEach-Object { ($_ -replace '\s+', ' ').Trim() })
         $Quote = if ($Notable.Count -gt 0) { " | Install.log: $($Notable -join ' / ')" } else { '' }
 
-        $PauseAfter = & $ReadPause
-        foreach ($N in $PauseNames) {
-            if ($PauseAfter[$N] -and $PauseAfter[$N] -ne $PauseBefore[$N]) {
-                Write-Log "$Label - Windows Update is now paused ($N = $($PauseAfter[$N])); AMD's Factory Reset pauses it while it works. Check it resumes, or clear the pause in Settings > Windows Update." -Severity 2
+        $PoliciesAfter = & $ReadPolicies
+        foreach ($N in $PoliciesAfter.Keys) {
+            if ($PoliciesAfter[$N] -ne $PoliciesBefore[$N]) {
+                Write-Log "$Label - driver-search policy $N changed during AMD's install ($($PoliciesBefore[$N]) -> $($PoliciesAfter[$N])); AMD sets it while installing and normally restores it. Left set, Windows Update stops offering drivers on this device - restore it if that is not your policy." -Severity 2
             }
         }
 
