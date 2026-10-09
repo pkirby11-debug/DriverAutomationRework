@@ -530,8 +530,10 @@ On the client, a pinned package:
     3010 with the detection marker set to `PendingRestart` instead of
     `Installed` (or `Failed`, when other rows failed too), so ConfigMgr restarts
     the device and, finding the application not installed, runs it again at its
-    next evaluation. A display DUP that is putting a missing driver back is never
-    quarantined.
+    next evaluation. A restart owed by a clean install or a retire is kept the
+    same way when another row fails the run, and a clean install the client
+    stopped waiting for gets its restart before the device is judged again. A
+    display DUP that is putting a missing driver back is never quarantined.
   - **Pending restarts.** AMD refuses to run while a restart is pending (error
     206). Pinned rows that may use the clean installer run before the other
     DUPs, so those DUPs cannot leave one pending first. If one is pending anyway,

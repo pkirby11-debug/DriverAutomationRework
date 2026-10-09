@@ -2806,6 +2806,10 @@ function Install-DriverUpdates {
     $AlreadyInst  = 0
     $Quarantined  = 0
     $Rebooted     = $false
+    # A restart owed because a pinned driver stack actually changed - AMD's
+    # clean install ran, or a package was retired. Unlike a plain $Rebooted
+    # it must survive a run that fails on another row (see the end).
+    $PinRestart   = $false
     $FailureLines = [System.Collections.Generic.List[string]]::new()
 
     # Per-DUP version-skip support. After a successful run we record
@@ -4245,6 +4249,7 @@ function Install-DriverUpdates {
         # that measurably needs the rollback.
         $VendorRoute = $false
         $VendorRun = $null
+        $FailCmp = $null
         $StackDrift = $null
         # This row asked to be re-measured after a restart; its component
         # marker must not later be trusted as proof (see PendingCheck below).
@@ -4274,8 +4279,32 @@ function Install-DriverUpdates {
                 } catch {
                     Write-Verbose "No vendor-installer record for this DUP"
                 }
+                # A clean install this client stopped waiting for (TimedOut)
+                # asked for no restart, because AMD may still have been
+                # working. It is not running now (checked above), so whatever
+                # it did settles at a restart: ask for that one before the
+                # device is judged, as a finished run does. Bounded - once the
+                # device has restarted since the attempt (or that cannot be
+                # told: $RestartedSince fails closed), it is judged normally.
+                if ($VendorLastOutcome -eq 'TimedOut' -and $VendorLastAt -and -not (& $RestartedSince $VendorLastAt)) {
+                    $Rebooted = $true
+                    $script:PinCheckAfterRestart = $true
+                    $RowPendingCheck = $true
+                    $VendorDeferred++
+                    try {
+                        if (-not (Test-Path $CompKeyPath)) { New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null }
+                        New-ItemProperty -Path $CompKeyPath -Name 'PendingCheck' -Value 1 -PropertyType DWord -Force | Out-Null
+                    } catch {
+                        Write-Verbose "PendingCheck write failed: $($_.Exception.Message)"
+                    }
+                    Write-Log "$DriverLabel - AMD's clean install from $VendorLastAt went on after this client stopped waiting for it, and the device has not restarted since; requesting a restart before the device is judged - the application runs again afterwards and checks it" -Severity 2
+                    continue
+                }
                 if ($VendorAttempts -ge $VendorMaxAttempts) {
-                    Write-Log "$DriverLabel - AMD's clean installer has already run $VendorAttempts time(s) for this pinned revision on this device (last $VendorLastAt), so it is not run again - enforcing the pin with the DUP. Delete the VendorAttemptCount value under HKLM:\...\DriverUpdates\Components\$CompKey to allow it again." -Severity 2
+                    # The facts only: what runs instead is decided by the
+                    # device below (the DUP above the pin, the stack check on
+                    # it).
+                    Write-Log "$DriverLabel - AMD's clean installer has already run $VendorAttempts time(s) for this pinned revision on this device (last $VendorLastAt), so it is not run again. Delete the VendorAttemptCount value under HKLM:\...\DriverUpdates\Components\$CompKey to allow it again." -Severity 2
                 } else {
                     $WantVendor = $true
                 }
@@ -4332,11 +4361,11 @@ function Install-DriverUpdates {
                             " - running AMD's clean installer from the pinned DUP to replace the whole stack") -Severity 2
                         $VendorRoute = $true
                     } else {
-                        if ($WantVendor) {
+                        if ($WantVendor -or $VendorAttempts -gt 0) {
                             Write-Log "$DriverLabel - AMD's clean installer already ran for this pinned revision on this device ($VendorLastAt) and the stack is still mixed, so it is not repeated automatically. Delete the VendorAttemptCount value under HKLM:\...\DriverUpdates\Components\$CompKey to run it again." -Severity 2
                         }
                         $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $StackDrift
-                        if ($Stack.RebootRequired) { $Rebooted = $true }
+                        if ($Stack.RebootRequired) { $Rebooted = $true; if ($Stack.Retired -gt 0) { $PinRestart = $true } }
                         if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
                         $AlreadyInst++
                         continue
@@ -4460,7 +4489,7 @@ function Install-DriverUpdates {
                 # file. Same as any other reason it cannot run - reconcile the
                 # stack and move on rather than fail every run.
                 $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $StackDrift
-                if ($Stack.RebootRequired) { $Rebooted = $true }
+                if ($Stack.RebootRequired) { $Rebooted = $true; if ($Stack.Retired -gt 0) { $PinRestart = $true } }
                 if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
                 $AlreadyInst++
                 continue
@@ -4617,7 +4646,7 @@ function Install-DriverUpdates {
             } else {
                 Write-Log "$DriverLabel - AMD's clean installer could not be used: $($VendorRun.Reason)" -Severity 2
                 $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $StackDrift
-                if ($Stack.RebootRequired) { $Rebooted = $true }
+                if ($Stack.RebootRequired) { $Rebooted = $true; if ($Stack.Retired -gt 0) { $PinRestart = $true } }
                 if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
                 $AlreadyInst++
                 continue
@@ -4734,7 +4763,11 @@ function Install-DriverUpdates {
 
         if ($DupCode -in $SuccessCodes) {
             $Successful++
-            if ($DupCode -in $RebootCodes) { $Rebooted = $true }
+            if ($DupCode -in $RebootCodes) {
+                $Rebooted = $true
+                # AMD's clean install replaced the display stack.
+                if ($VendorRoute) { $PinRestart = $true }
+            }
             $RebootTag = if ($DupCode -in $RebootCodes) { ' (reboot required)' } else { '' }
             Write-Log "$DriverLabel - exit $DupCode (success$RebootTag) in ${Elapsed}s"
 
@@ -4817,7 +4850,7 @@ function Install-DriverUpdates {
                     # The base is right; check the rest of the stack before
                     # calling the rollback done.
                     $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $null
-                    if ($Stack.RebootRequired) { $Rebooted = $true }
+                    if ($Stack.RebootRequired) { $Rebooted = $true; if ($Stack.Retired -gt 0) { $PinRestart = $true } }
                     if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
                     if ($Stack.Mixed -and $VendorRoute) {
                         # Straight after AMD's clean install a mixed stack is
@@ -4946,7 +4979,17 @@ function Install-DriverUpdates {
                             }
                             $FinalVersion = & $GetLiveDriverVersion $Drv
                             $FinalCmp = if ($FinalVersion -and $PinTarget) { & $CompareVersion $FinalVersion $PinTarget } else { $null }
-                            if ($null -ne $FinalCmp -and $FinalCmp -le 0) {
+                            if ($VendorRoute -and $null -ne $FinalCmp -and $FinalCmp -lt 0) {
+                                # Below the pin straight after AMD's clean
+                                # install and a retire is not the pin - same
+                                # rule as the AfterCmp -lt 0 branch above: most
+                                # likely Microsoft Basic Display. Left not
+                                # applied, so the row fails and asks for the
+                                # restart, after which the pinned DUP installs
+                                # normally.
+                                $AfterVersion = $FinalVersion
+                                $RetireNote = "After retiring the outranking package the device reports v$FinalVersion, BELOW the pinned v$PinTarget - most likely the inbox display driver, not the pin; it is checked again after the restart, and the pinned DUP is installed normally. "
+                            } elseif ($null -ne $FinalCmp -and $FinalCmp -le 0) {
                                 $Applied = $true
                                 $AfterVersion = $FinalVersion
                                 # The base driver was swapped on a running
@@ -4954,6 +4997,7 @@ function Install-DriverUpdates {
                                 # only settle onto it at a restart. Ask for one
                                 # rather than report "no reboot required".
                                 $Rebooted = $true
+                                $PinRestart = $true
                                 Write-Log "$DriverLabel - PIN VERIFIED after retiring the outranking package: device is now on v$FinalVersion (was v$LiveVersion); requesting a restart so the rest of the driver stack reloads on it"
                                 $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $null
                                 if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
@@ -5074,7 +5118,7 @@ function Install-DriverUpdates {
                 # rather than fail the application over it.
                 Write-Log "$DriverLabel - AMD's clean installer did not run: $($VendorRun.Reason). Nothing was changed; reconciling the driver stack without it." -Severity 2
                 $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $StackDrift
-                if ($Stack.RebootRequired) { $Rebooted = $true }
+                if ($Stack.RebootRequired) { $Rebooted = $true; if ($Stack.Retired -gt 0) { $PinRestart = $true } }
                 if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
                 $AlreadyInst++
             } else {
@@ -5234,9 +5278,12 @@ function Install-DriverUpdates {
 
                     # A clean install that failed on a device already on the
                     # pin: the opted-in extension retire may still fix it, so
-                    # give the stack reconcile its turn now (fresh read). Not
-                    # after a timeout - AMD may still be working.
-                    if ($VendorRoute -and -not $ForceDowngrade -and $VendorRun.Outcome -eq 'Failed') {
+                    # give the stack reconcile its turn now (fresh read) - only
+                    # while the fresh read still shows the pin. Off it or
+                    # unreadable, the restart is already asked for and the
+                    # run after it decides. Not after a timeout - AMD may
+                    # still be working.
+                    if ($VendorRoute -and -not $ForceDowngrade -and $VendorRun.Outcome -eq 'Failed' -and $null -ne $FailCmp -and $FailCmp -eq 0) {
                         $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $null
                         if ($Stack.RebootRequired) {
                             # A retired extension goes at a restart. This run
@@ -5389,6 +5436,17 @@ function Install-DriverUpdates {
 
     if ($Rebooted) {
         $script:RebootRequired = $true
+    }
+
+    # A pinned driver stack changed this run and needs its restart, but other
+    # rows failed: this run exits 1, which drops a plain restart request, and
+    # the retry - finding the pinned row settled - would report Installed
+    # without it ever happening. Keep it the way that survives a failure
+    # (Failed marker, exit 3010). Bounded: only a run that changed the stack
+    # sets it, and the run after the restart finds nothing to change.
+    if ($Failed -gt 0 -and $PinRestart -and -not $VendorStillRunning -and -not $script:PinCheckAfterRestart) {
+        $script:PinCheckAfterRestart = $true
+        Write-Log "A pinned rollback changed the driver stack this run and needs a restart; keeping it although other rows failed (Failed marker, exit 3010) - ConfigMgr restarts the device and runs the application again" -Severity 2
     }
 
     # Any non-success/non-N-A failure -> non-zero return so the SCCM "Installed"

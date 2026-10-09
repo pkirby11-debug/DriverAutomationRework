@@ -953,10 +953,53 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
     }
 
     It 'Keeps the restart a retire needs when a failed clean install exits as a failure' {
-        $M = [regex]::Match($script:DrvLoop.Extent.Text, "(?s)if \(\`$VendorRoute -and -not \`$ForceDowngrade -and \`$VendorRun\.Outcome -eq 'Failed'\) \{\s*\`$Stack = & \`$ReconcilePinnedStack[^\n]*\s*if \(\`$Stack\.RebootRequired\) \{(.*?)\n\s*\}\s*if \(\`$Stack\.Mixed\)")
+        $M = [regex]::Match($script:DrvLoop.Extent.Text, "(?s)if \(\`$VendorRoute -and -not \`$ForceDowngrade -and \`$VendorRun\.Outcome -eq 'Failed'[^\n]*\) \{\s*\`$Stack = & \`$ReconcilePinnedStack[^\n]*\s*if \(\`$Stack\.RebootRequired\) \{(.*?)\n\s*\}\s*if \(\`$Stack\.Mixed\)")
         $M.Success | Should -BeTrue
         $M.Groups[1].Value | Should -Match '\$script:PinCheckAfterRestart = \$true'
         $M.Groups[1].Value | Should -Match "-Name 'PendingCheck' -Value 1"
+    }
+
+    It 'Keeps the restart a changed pinned stack needs, even when other rows fail the run' {
+        # A failed run exits 1 and drops a plain restart; the retry finds the
+        # pinned row settled and would report Installed without it.
+        $Fn = $script:InstallFn.Extent.Text
+        $Keep = [regex]::Match($Fn, '(?s)if \(\$Failed -gt 0 -and \$PinRestart -and -not \$VendorStillRunning -and -not \$script:PinCheckAfterRestart\) \{\s*\$script:PinCheckAfterRestart = \$true')
+        $Keep.Success | Should -BeTrue
+        $Return = [regex]::Match($Fn, '\n\s*if \(\$Failed -gt 0\) \{ return 1 \}')
+        $Keep.Index | Should -BeLessThan $Return.Index
+        $Loop = $script:DrvLoop.Extent.Text
+        # Owed only by a real change - AMD's install, or a retire that took -
+        # never by a reboot code alone, which could repeat every run.
+        $Loop | Should -Match '(?s)if \(\$DupCode -in \$RebootCodes\) \{\s*\$Rebooted = \$true(\s*#[^\n]*)*\s*if \(\$VendorRoute\) \{ \$PinRestart = \$true \}'
+        $Reconciles = [regex]::Matches($Loop, 'if \(\$Stack\.RebootRequired\) \{ \$Rebooted = \$true[^\n]*')
+        $Reconciles.Count | Should -BeGreaterThan 3
+        foreach ($R in $Reconciles) { $R.Value | Should -Match 'if \(\$Stack\.Retired -gt 0\) \{ \$PinRestart = \$true \}' }
+    }
+
+    It 'Asks for the restart a timed-out clean install still owes before judging the device' {
+        $Loop = $script:DrvLoop.Extent.Text
+        $Guard = [regex]::Match($Loop, "(?s)if \(\`$VendorLastOutcome -eq 'TimedOut' -and \`$VendorLastAt -and -not \(& \`$RestartedSince \`$VendorLastAt\)\) \{\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true\s*\`$RowPendingCheck = \`$true.*?continue")
+        $Guard.Success | Should -BeTrue
+        $Exhausted = [regex]::Match($Loop, 'if \(\$VendorAttempts -ge \$VendorMaxAttempts\)')
+        $Guard.Index | Should -BeLessThan $Exhausted.Index
+        $Loop | Should -Not -Match 'so it is not run again - enforcing the pin with the DUP'
+    }
+
+    It 'Never verifies a retire on the clean-install route that leaves the GPU below the pin' {
+        $Loop = $script:DrvLoop.Extent.Text
+        $Below = [regex]::Match($Loop, 'if \(\$VendorRoute -and \$null -ne \$FinalCmp -and \$FinalCmp -lt 0\) \{')
+        $Applied = [regex]::Match($Loop, '\} elseif \(\$null -ne \$FinalCmp -and \$FinalCmp -le 0\) \{\s*\$Applied = \$true')
+        $Below.Success | Should -BeTrue
+        $Applied.Success | Should -BeTrue
+        $Below.Index | Should -BeLessThan $Applied.Index
+        $Loop.Substring($Below.Index, $Applied.Index - $Below.Index) | Should -Not -Match '\$Applied = \$true'
+    }
+
+    It 'Reconciles after a failed clean install only while the GPU still reads on the pin' {
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match "if \(\`$VendorRoute -and -not \`$ForceDowngrade -and \`$VendorRun\.Outcome -eq 'Failed' -and \`$null -ne \`$FailCmp -and \`$FailCmp -eq 0\) \{"
+        # Never a $FailCmp left over from an earlier row.
+        $Loop | Should -Match '\$VendorRun = \$null\s*\$FailCmp = \$null'
     }
 
     It 'Keeps a deferred clean install out of the quarantine ledger' {
