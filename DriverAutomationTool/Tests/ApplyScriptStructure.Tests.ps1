@@ -346,9 +346,12 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
         }, $true))
         @($Fails).Count | Should -Be 1
         $Guarded = $false
+        $Child = $Fails[0]
         $Node = $Fails[0].Parent
         while ($Node -and $Node -ne $NotApplied) {
-            if ($Node -is [System.Management.Automation.Language.IfStatementAst] -and $Node.Clauses[0].Item1.Extent.Text -eq '$VendorRoute') { $Guarded = $true }
+            # In the THEN block of 'if ($VendorRoute)', not its else.
+            if ($Node -is [System.Management.Automation.Language.IfStatementAst] -and $Node.Clauses[0].Item1.Extent.Text -eq '$VendorRoute' -and $Child -eq $Node.Clauses[0].Item2) { $Guarded = $true }
+            $Child = $Node
             $Node = $Node.Parent
         }
         $Guarded | Should -BeTrue -Because 'only the clean-installer route may fail here'
@@ -935,10 +938,18 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
     It 'Fails, rather than marks Installed, a clean install that leaves the device above the pin' {
         # With AMD's runs used up the next run enforces the pin with the DUP;
         # an Installed marker would stop ConfigMgr from ever running it.
-        $M = [regex]::Match($script:DrvLoop.Extent.Text, '(?s)if \(-not \$Applied\) \{\s*\$PinNotApplied\+\+.*?if \(\$VendorRoute\) \{(.*?)\}')
+        # The statement 'if ($VendorRoute) {' opening a line, to its own
+        # closing brace at the same indent.
+        $M = [regex]::Match($script:DrvLoop.Extent.Text, '(?s)if \(-not \$Applied\) \{\s*\$PinNotApplied\+\+.*?\n([ \t]*)if \(\$VendorRoute\) \{(.*?)\n\1\}')
         $M.Success | Should -BeTrue
-        $M.Groups[1].Value | Should -Match '\$Failed\+\+'
-        $M.Groups[1].Value | Should -Match '\$FailureLines\.Add'
+        $Body = $M.Groups[2].Value
+        $Body | Should -Match '\$Failed\+\+'
+        $Body | Should -Match '\$Successful--'
+        $Body | Should -Match '\$FailureLines\.Add'
+        # ...and keeps the restart AMD's install needs, which a failed run
+        # would otherwise drop, with the component marker flagged.
+        $Body | Should -Match '\$script:PinCheckAfterRestart = \$true'
+        $Body | Should -Match '\$RowPendingCheck = \$true'
     }
 
     It 'Keeps the restart a retire needs when a failed clean install exits as a failure' {
@@ -961,10 +972,14 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         $Loop = $script:DrvLoop.Extent.Text
         # A failed run that may have removed the driver: AMD said a restart is
         # needed, or the GPU now reads below the pin or not at all.
-        $Loop | Should -Match "if \(\`$VendorRun\.Outcome -ne 'TimedOut' -and \(\`$VendorRun\.ResultCode -eq 2 -or \`$VendorRun\.RestartAsked -or \`$OnPinRanFailed -or \`$null -eq \`$FailCmp -or \`$FailCmp -lt 0\)\) \{\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true"
+        $Loop | Should -Match "\`$FailRestart = \`$VendorRun\.Outcome -ne 'TimedOut' -and \(\`$VendorRun\.ResultCode -eq 2 -or \`$VendorRun\.RestartAsked -or \`$OnPinRanFailed -or \`$null -eq \`$FailCmp -or \`$FailCmp -lt 0\)\s*if \(\`$FailRestart\) \{\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true"
         # ...including a clean install that ran and failed on a device on the
         # pin, whose stack read before the restart is not the answer yet.
-        $Loop | Should -Match "\`$OnPinRanFailed = -not \`$ForceDowngrade -and \`$VendorRun\.Outcome -eq 'Failed' -and -not \`$VendorRun\.NoOp -and \`$null -ne \`$FailCmp -and \`$FailCmp -eq 0"
+        # Whether the device was on the pin before, or AMD moved it there and
+        # the first re-read missed it.
+        $Loop | Should -Match "\`$OnPinRanFailed = \`$VendorRun\.Outcome -eq 'Failed' -and -not \`$VendorRun\.NoOp -and \`$null -ne \`$FailCmp -and \`$FailCmp -eq 0"
+        # The log promises the re-check only when it was asked for.
+        $Loop | Should -Match "elseif \(\`$FailRestart\) \{ '; the rest of the stack is checked again after the restart' \}"
         # ...judged on a FRESH read of the device, and the marker flagged.
         $Fail = [regex]::Match($Loop, '(?s)if \(\$AllowDowngrade -and \$VendorRoute\) \{(.*?)\$FailVersion = if')
         $Fail.Success | Should -BeTrue
@@ -973,7 +988,7 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         $Loop | Should -Match '\$FailVersion = if \(\$FailFresh\) \{ & \$GetLiveDriverVersion \$Drv \} else \{ \$null \}'
         # And it says where the kept extract is.
         $Loop | Should -Match 'kept in \$\(\$VendorRun\.WorkDir\) for a week'
-        $Loop | Should -Match "(?s)\`$FailCmp -lt 0\)\) \{.*?-Name 'PendingCheck' -Value 1.*?after the failed clean install"
+        $Loop | Should -Match "(?s)if \(\`$FailRestart\) \{.*?-Name 'PendingCheck' -Value 1.*?after the failed clean install"
         # A clean install that leaves the stack reading mixed, whatever AMD's
         # verdict: the extension only settles at a restart, so it is
         # re-measured after one rather than written off as Installed.

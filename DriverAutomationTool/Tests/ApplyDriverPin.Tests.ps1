@@ -1525,6 +1525,7 @@ Describe 'Judging a clean install by the device' {
         $GetLiveDriverVersion = $script:GetLiveDriverVersion
         $GetDriverStackDrift = { param($Row, $TargetVersion) $script:DriftCalls++; $script:Drift }
         $script:DriftCalls = 0
+        $script:LogLines.Clear()
         $script:CimThrows = $false
         $script:Drift = [PSCustomObject]@{ Readable = $true; Items = @(); Summary = 'base v32.0.12046.3001' }
         $LiveSignedDrivers = @()
@@ -1568,7 +1569,7 @@ Describe 'Judging a clean install by the device' {
         $V.OnPin | Should -BeFalse
         $V.StackClean | Should -BeFalse
         $script:DriftCalls | Should -Be 0
-        ($script:LogLines -join "`n") | Should -Match 'could not re-read the display adapter'
+        ($script:LogLines -join "`n") | Should -Match 'test - could not re-read the display adapter'
     }
 
     It 'On a device already on the pin, counts it only when nothing newer is left on top' {

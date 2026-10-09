@@ -518,8 +518,9 @@ On the client, a pinned package:
     once on a device already on the pin. Its failures never count toward the DUP
     quarantine, so they cannot block the DUP that reinstalls the display driver.
     If its runs are used up and the device is still above the pin, the run fails
-    rather than writing an Installed marker, so ConfigMgr runs it again and that
-    run enforces the pin with the DUP.
+    rather than writing an Installed marker - keeping the restart AMD's install
+    asked for (exit 3010) - so ConfigMgr restarts the device, runs the
+    application again, and that run enforces the pin with the DUP.
   - **Restart, then check again.** AMD can finish a clean install after a
     restart, and leaves the GPU on Microsoft Basic Display Adapter until it does.
     A device not yet on the pin - or left without a readable display driver by a

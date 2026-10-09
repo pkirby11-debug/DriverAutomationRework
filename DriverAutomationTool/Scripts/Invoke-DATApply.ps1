@@ -4967,9 +4967,13 @@ function Install-DriverUpdates {
 
                     if (-not $Applied) {
                         $PinNotApplied++
+                        $Closing = if ($VendorRoute) {
+                            "AMD's clean installer has used its $VendorMaxAttempts run(s) for this pinned revision, so this run is reported as FAILED: after the restart the application runs again and enforces the pin with Dell's DUP and /f."
+                        } else {
+                            "Neither Dell's /f nor a re-run can beat PnP ranking: two packages that match a device equally are separated by driver DATE, so the newer one keeps winning while it is in the DriverStore."
+                        }
                         Write-Log ("$DriverLabel - PIN NOT APPLIED: $InstallerSaid, but the device is STILL on v$AfterVersion instead of the pinned v$PinTarget. " +
-                            $Cause + $RetireNote +
-                            "Neither Dell's /f nor a re-run can beat PnP ranking: two packages that match a device equally are separated by driver DATE, so the newer one keeps winning while it is in the DriverStore.") -Severity 3
+                            $Cause + $RetireNote + $Closing) -Severity 3
                         if ($VendorRoute) {
                             # Unlike a DUP, a re-run here does change something:
                             # with AMD's runs used up, the next one enforces the
@@ -4978,6 +4982,16 @@ function Install-DriverUpdates {
                             $Successful--
                             $Failed++
                             $FailureLines.Add(("{0} (AMD clean install left the device on v{1})" -f $Drv.FileName, $AfterVersion))
+                            # AMD's install (and any retire above) still needs
+                            # its restart, and a failed run drops a plain one:
+                            # ask the way that survives it (Failed marker, exit
+                            # 3010), and flag the component marker so a blind
+                            # probe never trusts it. Bounded - AMD's runs are
+                            # used up, so the run after the restart takes the
+                            # DUP route, which never asks for this.
+                            $Rebooted = $true
+                            $script:PinCheckAfterRestart = $true
+                            $RowPendingCheck = $true
                         }
                     }
                 }
@@ -5171,13 +5185,15 @@ function Install-DriverUpdates {
                         $FailVersion = if ($FailFresh) { & $GetLiveDriverVersion $Drv } else { $null }
                         $FailCmp = if ($FailVersion -and $PinTarget) { & $CompareVersion $FailVersion $PinTarget } else { $null }
                         # Also after AMD asked for a restart, and after a clean
-                        # install that ran and failed on a device already on
-                        # the pin: its stack, read before the restart, is not
-                        # the answer yet. Bounded - on the pin a failed run is
-                        # never repeated, so the run after the restart only
-                        # re-measures and reconciles.
-                        $OnPinRanFailed = -not $ForceDowngrade -and $VendorRun.Outcome -eq 'Failed' -and -not $VendorRun.NoOp -and $null -ne $FailCmp -and $FailCmp -eq 0
-                        if ($VendorRun.Outcome -ne 'TimedOut' -and ($VendorRun.ResultCode -eq 2 -or $VendorRun.RestartAsked -or $OnPinRanFailed -or $null -eq $FailCmp -or $FailCmp -lt 0)) {
+                        # install that ran, failed and left the device reading
+                        # on the pin - whether it was there before or AMD moved
+                        # it and the first re-read missed that: its stack, read
+                        # before the restart, is not the answer yet. Bounded -
+                        # on the pin a failed run is never repeated, so the run
+                        # after the restart only re-measures and reconciles.
+                        $OnPinRanFailed = $VendorRun.Outcome -eq 'Failed' -and -not $VendorRun.NoOp -and $null -ne $FailCmp -and $FailCmp -eq 0
+                        $FailRestart = $VendorRun.Outcome -ne 'TimedOut' -and ($VendorRun.ResultCode -eq 2 -or $VendorRun.RestartAsked -or $OnPinRanFailed -or $null -eq $FailCmp -or $FailCmp -lt 0)
+                        if ($FailRestart) {
                             $Rebooted = $true
                             $script:PinCheckAfterRestart = $true
                             $RowPendingCheck = $true
@@ -5193,15 +5209,14 @@ function Install-DriverUpdates {
                             Write-Log "$DriverLabel - after the failed clean install the device reports $(if ($FailVersion) { "v$FailVersion" } else { 'no readable display driver version' }); requesting a restart, after which the application runs again and, if needed, installs the pinned DUP" -Severity 2
                         }
                         # Named for what the device shows. Still running: not
-                        # judged yet. On the pin (an AMD failure that had
-                        # moved it there went the success way, so this one
-                        # was on it before AMD ran): the base driver is right
-                        # and it is the rest of the stack that was not
-                        # replaced - not "PIN NOT APPLIED".
+                        # judged yet. On the pin: the base driver is right and
+                        # it is the rest of the stack that is unfinished - not
+                        # "PIN NOT APPLIED". Only a restart actually requested
+                        # is promised.
                         $FailHead = if ($VendorRun.Outcome -eq 'TimedOut') {
                             "PIN UNCONFIRMED: AMD's clean installer has not finished"
                         } elseif ($null -ne $FailCmp -and $FailCmp -eq 0) {
-                            "CLEAN INSTALL FAILED: the base driver is on the pinned v$FailVersion, but AMD's clean install did not complete$(if ($VendorRun.NoOp) { ' - it did not run, so the stack is reconciled without it' } else { '; the rest of the stack is checked again after the restart' })"
+                            "CLEAN INSTALL FAILED: the base driver is on the pinned v$FailVersion, but AMD's clean install did not complete$(if ($VendorRun.NoOp) { ' - it did not run, so the stack is reconciled without it' } elseif ($FailRestart) { '; the rest of the stack is checked again after the restart' })"
                         } else {
                             "PIN NOT APPLIED: AMD's clean installer failed"
                         }
