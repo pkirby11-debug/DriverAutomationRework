@@ -63,7 +63,8 @@ Describe 'Driver Pins tab - XAML' {
         foreach ($Expected in @(
             'PinModelBox', 'PinOsCombo', 'PinForceRefreshCheckBox', 'PinLoadButton',
             'PinRollbackOnlyCheckBox', 'PinSearchBox', 'PinCandidateGrid',
-            'PinReasonBox', 'PinCreateButton', 'PinStatusLabel',
+            'PinReasonBox', 'PinRemoveOutrankingCheckBox', 'PinUseVendorInstallerCheckBox',
+            'PinCreateButton', 'PinStatusLabel',
             'PinRefreshButton', 'PinDisableButton', 'PinEnableButton',
             'PinRemoveButton', 'PinShowDisabledCheckBox', 'PinGrid')) {
             $Named | Should -Contain $Expected
@@ -93,6 +94,14 @@ Describe 'Driver Pins tab - XAML' {
         $Columns.Count | Should -BeGreaterThan 1
         $Missing = @((Get-DATGridBindingList -GridName 'PinGrid') | Where-Object { $_ -notin $Columns })
         $Missing -join ', ' | Should -BeNullOrEmpty
+    }
+
+    It 'Wraps the pin options row, so Pin Selected Revision never leaves the window' {
+        # With both pin options the row is wider than the default window; a
+        # horizontal StackPanel pushed the button past the edge.
+        $Button = $script:PinTab.SelectSingleNode(".//d:Button[@*[local-name()='Name']='PinCreateButton']", $Ns)
+        $Button | Should -Not -BeNullOrEmpty
+        $Button.ParentNode.LocalName | Should -Be 'WrapPanel'
     }
 
     It 'Carries the metadata columns a pin needs, beyond what the grid shows' {
@@ -153,5 +162,18 @@ Describe 'Driver Pins tab - event layer' {
             $M.Success | Should -BeTrue -Because "$Handler should have a click handler"
             $M.Groups[1].Value | Should -Match 'Complete-DATGridEdit'
         }
+    }
+}
+
+Describe 'Driver Pins tab - pin options reach Add-DATDriverPin' {
+    It 'Passes both pin options from their checkboxes' {
+        # A checkbox that is drawn but never read is the GUI version of the
+        # projection gap: the operator ticks it and nothing reaches the pin.
+        $M = [regex]::Match($script:CodeText, "\`$Controls\['PinCreateButton'\]\.Add_Click\(\{(.*?)\n    \}\)", 'Singleline')
+        $M.Success | Should -BeTrue
+        $Handler = $M.Groups[1].Value
+        $Handler | Should -Match "RemoveOutrankingDriver\s*=\s*\[bool\]\`$Controls\['PinRemoveOutrankingCheckBox'\]\.IsChecked"
+        $Handler | Should -Match "\`$Vendor\s*=\s*\[bool\]\`$Controls\['PinUseVendorInstallerCheckBox'\]\.IsChecked"
+        $Handler | Should -Match 'UseVendorInstaller\s*=\s*\$Vendor'
     }
 }

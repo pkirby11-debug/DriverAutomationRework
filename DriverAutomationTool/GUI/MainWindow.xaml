@@ -566,17 +566,23 @@
                         </DataGrid.Columns>
                     </DataGrid>
 
-                    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
+                    <!-- WrapPanel, not a horizontal StackPanel: with both pin options the row is
+                         wider than the window's default width, and a StackPanel would push
+                         Pin Selected Revision off the edge instead of onto a second line. -->
+                    <WrapPanel Grid.Row="2" Margin="0,0,0,10">
                         <Label Content="Reason:" Width="55" />
                         <TextBox x:Name="PinReasonBox" Width="380" Margin="0,0,8,0"
                                  ToolTip="Why this driver is being held back. Carried into the package manifest and the client apply log." />
                         <CheckBox x:Name="PinRemoveOutrankingCheckBox" Content="Retire the outranking driver"
                                   VerticalAlignment="Center" Margin="0,0,10,0"
-                                  ToolTip="Installing the pinned revision is often not enough: Windows separates equally-matching driver packages by DATE, so the newer one keeps the device while it is still in the DriverStore. Tick this to let the client retire that newer package - but only after the pin has already failed to apply, only for a package newer than the pin that matches this component's hardware, and only when the pinned revision is already staged so PnP has somewhere to fall back to. This deletes a driver package from the machine." />
+                                  ToolTip="Installing the pinned revision is often not enough: Windows separates equally-matching driver packages by DATE, so the newer one keeps the device while it is still in the DriverStore. Tick this to let the client retire that newer package - but only after the pin has already failed to apply, only for a package newer than the pin that matches this component's hardware, and only when the pinned revision is already staged so PnP has somewhere to fall back to. It also retires a newer extension driver left applied on top of the pinned driver, when the pinned release's own copy is staged to replace it. This deletes driver packages from the machine." />
+                        <CheckBox x:Name="PinUseVendorInstallerCheckBox" Content="Use AMD's clean installer"
+                                  VerticalAlignment="Center" Margin="0,0,10,0"
+                                  ToolTip="AMD Radeon graphics only. On a device that needs the rollback, the client extracts the pinned DUP and runs AMD's own Setup.exe as a silent factory-reset install: every AMD display component is removed first (the newer extension driver, the software components, the AMD Software app) and the pinned release is installed as one consistent set. This is the manual fix of extracting the DUP and running Setup.exe with the force/factory-reset option. The screen goes black briefly and the client requests a restart, so deploy in a maintenance window." />
                         <Button x:Name="PinCreateButton" Content="Pin Selected Revision" Style="{StaticResource AccentButton}" Width="168" Margin="0,0,8,0" />
                         <TextBlock x:Name="PinStatusLabel" Text="" VerticalAlignment="Center"
                                    Foreground="{DynamicResource SubtleFg}" TextWrapping="Wrap" />
-                    </StackPanel>
+                    </WrapPanel>
 
                     <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,6">
                         <TextBlock Text="Active pins" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,16,0"
@@ -606,6 +612,7 @@
                             <DataGridTextColumn Header="OS" Width="120" IsReadOnly="True" Binding="{Binding OperatingSystem}" />
                             <DataGridTextColumn Header="Recoverable" Width="94" IsReadOnly="True" Binding="{Binding Recoverable}" />
                             <DataGridTextColumn Header="Retires outranking" Width="122" IsReadOnly="True" Binding="{Binding RetireOutranking}" />
+                            <DataGridTextColumn Header="Vendor installer" Width="110" IsReadOnly="True" Binding="{Binding VendorInstaller}" />
                             <DataGridTextColumn Header="Reason" Width="*" IsReadOnly="True" Binding="{Binding Reason}" />
                         </DataGrid.Columns>
                     </DataGrid>
