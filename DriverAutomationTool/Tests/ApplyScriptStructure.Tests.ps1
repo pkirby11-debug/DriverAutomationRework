@@ -978,8 +978,13 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
 
     It 'Asks for the restart a timed-out clean install still owes before judging the device' {
         $Loop = $script:DrvLoop.Extent.Text
-        $Guard = [regex]::Match($Loop, "(?s)if \(\`$VendorLastOutcome -eq 'TimedOut' -and \`$VendorLastAt -and -not \(& \`$RestartedSince \`$VendorLastAt\)\) \{\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true\s*\`$RowPendingCheck = \`$true.*?continue")
+        $Guard = [regex]::Match($Loop, "(?s)if \(\`$VendorLastOutcome -eq 'TimedOut' -and \`$VendorLastAt -and -not \(& \`$RestartedSince \`$VendorLastAt\) -and\s*-not \(\`$VendorTimeoutAskAt -and \(& \`$RestartedSince \`$VendorTimeoutAskAt\)\)\) \{\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true\s*\`$RowPendingCheck = \`$true.*?continue")
         $Guard.Success | Should -BeTrue
+        # Once per timeout: the request is stamped on the clock now in force,
+        # and a new attempt clears that stamp.
+        $Guard.Value | Should -Match "-Name 'VendorTimeoutRestartAt' -Value \(& \`$InvariantNow\)"
+        $Loop | Should -Match "foreach \(\`$DProp in 'VendorDeferredVersion', 'VendorDeferredAt', 'VendorTimeoutRestartAt'\)"
+        $Loop | Should -Match '\$VendorTimeoutAskAt = "\$\(\$VProps\.VendorTimeoutRestartAt\)"'
         $Exhausted = [regex]::Match($Loop, 'if \(\$VendorAttempts -ge \$VendorMaxAttempts\)')
         $Guard.Index | Should -BeLessThan $Exhausted.Index
         $Loop | Should -Not -Match 'so it is not run again - enforcing the pin with the DUP'
@@ -993,6 +998,12 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         $Applied.Success | Should -BeTrue
         $Below.Index | Should -BeLessThan $Applied.Index
         $Loop.Substring($Below.Index, $Applied.Index - $Below.Index) | Should -Not -Match '\$Applied = \$true'
+        # ...and says what happened: the device moved (to below the pin), and
+        # the next run installs the DUP normally, not with /f.
+        $Loop.Substring($Below.Index, $Applied.Index - $Below.Index) | Should -Match '\$RetireLeftBelowPin = \$true'
+        $Loop | Should -Match '\$Where = if \(\$RetireLeftBelowPin\) \{ "the device is now on'
+        $Loop | Should -Match '\$Closing = if \(\$RetireLeftBelowPin\) \{\s*"[^"]*without /f\."'
+        $Loop | Should -Match '\$FailCmp = \$null\s*\$RetireLeftBelowPin = \$false'
     }
 
     It 'Reconciles after a failed clean install only while the GPU still reads on the pin' {

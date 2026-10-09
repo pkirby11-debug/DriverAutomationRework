@@ -4250,6 +4250,7 @@ function Install-DriverUpdates {
         $VendorRoute = $false
         $VendorRun = $null
         $FailCmp = $null
+        $RetireLeftBelowPin = $false
         $StackDrift = $null
         # This row asked to be re-measured after a restart; its component
         # marker must not later be trusted as proof (see PendingCheck below).
@@ -4261,6 +4262,7 @@ function Install-DriverUpdates {
         $VendorLastAt = ''
         $VendorLastOutcome = ''
         $VendorDeferredAt = ''
+        $VendorTimeoutAskAt = ''
         if ($AllowDowngrade -and $Drv.UseVendorInstaller) {
             if ($DupVendor -eq 'AMD') {
                 # How often AMD's clean installer has already run for THIS
@@ -4274,6 +4276,7 @@ function Install-DriverUpdates {
                         $VendorAttempts = [int]$VProps.VendorAttemptCount
                         $VendorLastAt = "$($VProps.VendorAttemptAt)"
                         $VendorLastOutcome = "$($VProps.VendorAttemptOutcome)"
+                        $VendorTimeoutAskAt = "$($VProps.VendorTimeoutRestartAt)"
                     }
                     if ("$($VProps.VendorDeferredVersion)" -eq "$($Drv.Version)") { $VendorDeferredAt = "$($VProps.VendorDeferredAt)" }
                 } catch {
@@ -4285,8 +4288,14 @@ function Install-DriverUpdates {
                 # it did settles at a restart: ask for that one before the
                 # device is judged, as a finished run does. Bounded - once the
                 # device has restarted since the attempt (or that cannot be
-                # told: $RestartedSince fails closed), it is judged normally.
-                if ($VendorLastOutcome -eq 'TimedOut' -and $VendorLastAt -and -not (& $RestartedSince $VendorLastAt)) {
+                # told: $RestartedSince fails closed), it is judged normally -
+                # and asked once per timeout, as the 206 deferral does: the
+                # attempt's own stamp is local wall-clock time, so after a
+                # time-zone or clock change "not restarted since" could hold
+                # for hours of restarts. The request's own stamp, taken on the
+                # clock now in force, is passed by the first restart after it.
+                if ($VendorLastOutcome -eq 'TimedOut' -and $VendorLastAt -and -not (& $RestartedSince $VendorLastAt) -and
+                    -not ($VendorTimeoutAskAt -and (& $RestartedSince $VendorTimeoutAskAt))) {
                     $Rebooted = $true
                     $script:PinCheckAfterRestart = $true
                     $RowPendingCheck = $true
@@ -4294,6 +4303,7 @@ function Install-DriverUpdates {
                     try {
                         if (-not (Test-Path $CompKeyPath)) { New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null }
                         New-ItemProperty -Path $CompKeyPath -Name 'PendingCheck' -Value 1 -PropertyType DWord -Force | Out-Null
+                        New-ItemProperty -Path $CompKeyPath -Name 'VendorTimeoutRestartAt' -Value (& $InvariantNow) -PropertyType String -Force | Out-Null
                     } catch {
                         Write-Verbose "PendingCheck write failed: $($_.Exception.Message)"
                     }
@@ -4603,7 +4613,7 @@ function Install-DriverUpdates {
                     New-ItemProperty -Path $CompKeyPath -Name 'VendorAttemptCount' -Value $VendorAttempts -PropertyType DWord -Force | Out-Null
                     New-ItemProperty -Path $CompKeyPath -Name 'VendorAttemptAt' -Value (& $InvariantNow) -PropertyType String -Force | Out-Null
                     New-ItemProperty -Path $CompKeyPath -Name 'VendorAttemptOutcome' -Value ([string]$VendorRun.Outcome) -PropertyType String -Force | Out-Null
-                    foreach ($DProp in 'VendorDeferredVersion', 'VendorDeferredAt') {
+                    foreach ($DProp in 'VendorDeferredVersion', 'VendorDeferredAt', 'VendorTimeoutRestartAt') {
                         Remove-ItemProperty -Path $CompKeyPath -Name $DProp -ErrorAction SilentlyContinue
                     }
                 } catch {
@@ -4980,6 +4990,7 @@ function Install-DriverUpdates {
                             $FinalVersion = & $GetLiveDriverVersion $Drv
                             $FinalCmp = if ($FinalVersion -and $PinTarget) { & $CompareVersion $FinalVersion $PinTarget } else { $null }
                             if ($VendorRoute -and $null -ne $FinalCmp -and $FinalCmp -lt 0) {
+                                $RetireLeftBelowPin = $true
                                 # Below the pin straight after AMD's clean
                                 # install and a retire is not the pin - same
                                 # rule as the AfterCmp -lt 0 branch above: most
@@ -5011,12 +5022,15 @@ function Install-DriverUpdates {
 
                     if (-not $Applied) {
                         $PinNotApplied++
-                        $Closing = if ($VendorRoute) {
+                        $Closing = if ($RetireLeftBelowPin) {
+                            "AMD's clean installer has used its $VendorMaxAttempts run(s) for this pinned revision, so this run is reported as FAILED: after the restart the application runs again and checks the device - below the pin it installs the pinned DUP normally, without /f."
+                        } elseif ($VendorRoute) {
                             "AMD's clean installer has used its $VendorMaxAttempts run(s) for this pinned revision, so this run is reported as FAILED: after the restart the application runs again and enforces the pin with Dell's DUP and /f."
                         } else {
                             "Neither Dell's /f nor a re-run can beat PnP ranking: two packages that match a device equally are separated by driver DATE, so the newer one keeps winning while it is in the DriverStore."
                         }
-                        Write-Log ("$DriverLabel - PIN NOT APPLIED: $InstallerSaid, but the device is STILL on v$AfterVersion instead of the pinned v$PinTarget. " +
+                        $Where = if ($RetireLeftBelowPin) { "the device is now on v$AfterVersion (was v$LiveVersion)" } else { "the device is STILL on v$AfterVersion" }
+                        Write-Log ("$DriverLabel - PIN NOT APPLIED: $InstallerSaid, but $Where instead of the pinned v$PinTarget. " +
                             $Cause + $RetireNote + $Closing) -Severity 3
                         if ($VendorRoute) {
                             # Unlike a DUP, a re-run here does change something:
