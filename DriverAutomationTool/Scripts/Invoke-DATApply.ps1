@@ -3600,6 +3600,7 @@ function Install-DriverUpdates {
         $Out = [PSCustomObject]@{
             Ran = $false; Outcome = 'NotRun'; Reason = ''; ExitCode = $null
             ResultCode = $null; AmdError = $null; InstallerPath = ''; ResultLog = ''; InstallLog = ''; Detail = ''; WorkDir = ''
+            NoOp = $false; RestartAsked = $false
         }
         $SafeName = "$($Row.FileName)" -replace '[^\w\.\-]', '_'
 
@@ -3929,8 +3930,12 @@ function Install-DriverUpdates {
         $ErrHits = @([regex]::Matches($NewLog, 'Error code to display to user:\s*(\d+)'))
         if ($ErrHits.Count -gt 0) { $Out.AmdError = [int]$ErrHits[$ErrHits.Count - 1].Groups[1].Value }
         # AMD's own line for the display driver, as the field run logged it:
-        # "Install of AMD Display Driver is successful. - iResult - 0".
-        $DisplayOk = $NewLog -match '(?i)Install of AMD Display Driver is successful'
+        # "Install of AMD Display Driver is successful. - iResult - 0" - and
+        # not an "Uninstall of ..." line, should AMD ever log one that way.
+        $DisplayOk = $NewLog -match '(?i)\bInstall of AMD Display Driver is successful'
+        # AMD asking for a restart, in its result file (a package's ErrorCode
+        # 3) or in Install.log ("Install has completed. Reboot is required.").
+        $Out.RestartAsked = ($ResultRead.Ok -and $ResultRead.Text -match '(?im)^\s*ErrorCode\s*=\s*3\s*$') -or ($NewLog -match '(?i)reboot is required|requires a system reboot')
         $Notable = @(($NewLog -split "`r?`n") | Where-Object { $_ -match '(?i)error|reboot is required|requires a system reboot|starting install|factory|is successful|active display driver' } |
             Select-Object -Last 5 | ForEach-Object { ($_ -replace '\s+', ' ').Trim() })
         $Quote = if ($Notable.Count -gt 0) { " | Install.log: $($Notable -join ' / ')" } else { '' }
@@ -3956,13 +3961,22 @@ function Install-DriverUpdates {
         } elseif ($DisplayOk) {
             $Out.Outcome = 'Passed'
             $Out.Reason = "AMD's Install.log reports the display driver installed"
-        } elseif (-not $ResultRead.Exists -and $LogBefore.Ok -and $LogAfter.Ok -and $LogScoped -and -not $NewLog.Trim()) {
-            # Proof, not a guess: no result file, and an Install.log that was
-            # read before and after has not a line from this run. The
-            # installer did nothing (an argument it rejected, a prompt nobody
-            # can see in session 0).
+        } elseif (-not $ResultRead.Exists -and (
+                (-not $LogBefore.Exists -and -not $LogAfter.Exists) -or
+                ($LogBefore.Ok -and $LogAfter.Ok -and $LogScoped -and -not $NewLog.Trim()))) {
+            # Proof, not a guess: no result file, and either no Install.log
+            # at all - AMD's installer starts one as it starts, and a lock
+            # does not hide that a file exists - or one read before and after
+            # without a line from this run. The installer did nothing (an
+            # argument it rejected, a prompt nobody can see in session 0), so
+            # nothing needs a restart.
             $Out.Outcome = 'Failed'
-            $Out.Reason = "AMD's installer wrote no result file and nothing to Install.log (exit $($Out.ExitCode)) - it did not run"
+            $Out.NoOp = $true
+            $Out.Reason = if (-not $LogAfter.Exists) {
+                "AMD's installer wrote no result file and no Install.log (exit $($Out.ExitCode)) - it never started"
+            } else {
+                "AMD's installer wrote no result file and nothing to Install.log (exit $($Out.ExitCode)) - it did not run"
+            }
         } else {
             # No verdict that could be read. It may have finished, or ended in
             # a restart AMD scheduled itself: the device decides.
@@ -3988,15 +4002,19 @@ function Install-DriverUpdates {
     # AMD failed on (an audio driver, the AMD Software app) does not undo a
     # display driver that did install.
     $GetVendorDeviceVerdict = {
-        param($Row, [string]$TargetVersion, [string]$BeforeVersion)
+        param($Row, [string]$TargetVersion, [string]$BeforeVersion, [string]$Label)
         $V = [PSCustomObject]@{ Version = $null; OnPin = $false; Moved = $false; StackClean = $false }
         # A fresh read, in this block's own scope - where $GetLiveDriverVersion
         # looks for it - so the caller's enumeration is left as it was; the
-        # caller re-reads the device for itself.
+        # caller re-reads the device for itself. Without one, AMD's verdict
+        # stands: the enumeration from before the run already says "on the
+        # pin" on a device that was, and a failed clean install may have left
+        # it on Microsoft Basic Display since.
         try {
             Set-Variable -Name LiveVideoAdapters -Value @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
         } catch {
-            Write-Verbose "Post-install display re-read failed: $($_.Exception.Message)"
+            Write-Log "$Label - could not re-read the display adapter after AMD's clean install ($($_.Exception.Message)), so AMD's verdict stands" -Severity 2
+            return $V
         }
         $V.Version = & $GetLiveDriverVersion $Row
         $Cmp = if ($V.Version -and $TargetVersion) { & $CompareVersion $V.Version $TargetVersion } else { $null }
@@ -4519,6 +4537,7 @@ function Install-DriverUpdates {
                 $VendorRun = [PSCustomObject]@{
                     Ran = $false; Outcome = 'NotRun'; Reason = "a restart is still pending ($PendingWhy) although the device has restarted since this was last deferred ($VendorDeferredAt)"
                     ExitCode = $null; ResultCode = $null; AmdError = $null; InstallerPath = ''; ResultLog = ''; InstallLog = ''; Detail = ''
+                    NoOp = $false; RestartAsked = $false
                 }
             } elseif ($PendingWhy) {
                 # Same verdict AMD would reach (error 206), without extracting
@@ -4526,6 +4545,7 @@ function Install-DriverUpdates {
                 $VendorRun = [PSCustomObject]@{
                     Ran = $false; Outcome = 'Deferred'; Reason = $PendingWhy; ExitCode = $null
                     ResultCode = $null; AmdError = 206; InstallerPath = ''; ResultLog = ''; InstallLog = ''; Detail = 'not started'
+                    NoOp = $false; RestartAsked = $false
                 }
             } else {
                 $VendorRun = & $InvokeVendorInstaller $Drv $DriverExe (Join-Path $env:WINDIR 'Temp') $DupLogDir $DriverLabel $PinTarget
@@ -4579,7 +4599,7 @@ function Install-DriverUpdates {
                 # stack and asks for the restart. The ledger keeps AMD's own
                 # verdict, so a failed run is still never repeated on the pin.
                 if ($VendorRun.Outcome -eq 'Failed') {
-                    $Verdict = & $GetVendorDeviceVerdict $Drv $PinTarget $LiveVersion
+                    $Verdict = & $GetVendorDeviceVerdict $Drv $PinTarget $LiveVersion $DriverLabel
                     if ($Verdict.OnPin -and ($Verdict.Moved -or $Verdict.StackClean)) {
                         $DupCode = 2
                         Write-Log ("$DriverLabel - AMD's installer reported a failure ($($VendorRun.Reason)), but the device " +
@@ -4736,8 +4756,10 @@ function Install-DriverUpdates {
                 # The pre-loop enumeration is now stale for this device; re-read
                 # it. Assigning the same names refreshes them for later rows too,
                 # which is correct - they describe live state.
+                $AdaptersFresh = $false
                 try {
                     $LiveVideoAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+                    $AdaptersFresh = $true
                 } catch {
                     Write-Verbose "Post-install display re-read failed: $($_.Exception.Message)"
                 }
@@ -4753,7 +4775,11 @@ function Install-DriverUpdates {
                 # What the installer said, in its own terms: AMD's verdict, not
                 # the Dell exit code it is mapped onto for the bookkeeping.
                 $InstallerSaid = if ($VendorRoute) { "$Installer finished ($($VendorRun.Outcome))" } else { "$Installer exited $DupCode (success)" }
-                $AfterVersion = & $GetLiveDriverVersion $Drv
+                # After AMD's clean install, never judge from the enumeration
+                # taken before it: on a device already on the pin that reads
+                # as verified whatever AMD left behind. Unreadable is
+                # "unconfirmed", re-measured after a restart.
+                $AfterVersion = if ($VendorRoute -and -not $AdaptersFresh) { $null } else { & $GetLiveDriverVersion $Drv }
                 $AfterCmp = if ($AfterVersion -and $PinTarget) { & $CompareVersion $AfterVersion $PinTarget } else { $null }
                 # AMD can finish a clean install after a restart. While it still
                 # has a run left for this revision, a device that is not on the
@@ -4944,6 +4970,15 @@ function Install-DriverUpdates {
                         Write-Log ("$DriverLabel - PIN NOT APPLIED: $InstallerSaid, but the device is STILL on v$AfterVersion instead of the pinned v$PinTarget. " +
                             $Cause + $RetireNote +
                             "Neither Dell's /f nor a re-run can beat PnP ranking: two packages that match a device equally are separated by driver DATE, so the newer one keeps winning while it is in the DriverStore.") -Severity 3
+                        if ($VendorRoute) {
+                            # Unlike a DUP, a re-run here does change something:
+                            # with AMD's runs used up, the next one enforces the
+                            # pin with the DUP. An Installed marker would end it
+                            # here instead, so this is reported as a failure.
+                            $Successful--
+                            $Failed++
+                            $FailureLines.Add(("{0} (AMD clean install left the device on v{1})" -f $Drv.FileName, $AfterVersion))
+                        }
                     }
                 }
             }
@@ -5124,14 +5159,25 @@ function Install-DriverUpdates {
                         # unreadable, or AMD said a restart is needed, ask for
                         # the restart and re-measure after it rather than
                         # leave the display that way until a later retry.
+                        $FailFresh = $false
                         try {
                             $LiveVideoAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+                            $FailFresh = $true
                         } catch {
                             Write-Verbose "Post-failure display re-read failed: $($_.Exception.Message)"
                         }
-                        $FailVersion = & $GetLiveDriverVersion $Drv
+                        # Not from the enumeration taken before AMD ran -
+                        # unreadable instead, which asks for the restart.
+                        $FailVersion = if ($FailFresh) { & $GetLiveDriverVersion $Drv } else { $null }
                         $FailCmp = if ($FailVersion -and $PinTarget) { & $CompareVersion $FailVersion $PinTarget } else { $null }
-                        if ($VendorRun.Outcome -ne 'TimedOut' -and ($VendorRun.ResultCode -eq 2 -or $null -eq $FailCmp -or $FailCmp -lt 0)) {
+                        # Also after AMD asked for a restart, and after a clean
+                        # install that ran and failed on a device already on
+                        # the pin: its stack, read before the restart, is not
+                        # the answer yet. Bounded - on the pin a failed run is
+                        # never repeated, so the run after the restart only
+                        # re-measures and reconciles.
+                        $OnPinRanFailed = -not $ForceDowngrade -and $VendorRun.Outcome -eq 'Failed' -and -not $VendorRun.NoOp -and $null -ne $FailCmp -and $FailCmp -eq 0
+                        if ($VendorRun.Outcome -ne 'TimedOut' -and ($VendorRun.ResultCode -eq 2 -or $VendorRun.RestartAsked -or $OnPinRanFailed -or $null -eq $FailCmp -or $FailCmp -lt 0)) {
                             $Rebooted = $true
                             $script:PinCheckAfterRestart = $true
                             $RowPendingCheck = $true
@@ -5155,7 +5201,7 @@ function Install-DriverUpdates {
                         $FailHead = if ($VendorRun.Outcome -eq 'TimedOut') {
                             "PIN UNCONFIRMED: AMD's clean installer has not finished"
                         } elseif ($null -ne $FailCmp -and $FailCmp -eq 0) {
-                            "CLEAN INSTALL FAILED: the base driver is on the pinned v$FailVersion, but AMD's clean installer did not replace the rest of the stack"
+                            "CLEAN INSTALL FAILED: the base driver is on the pinned v$FailVersion, but AMD's clean install did not complete$(if ($VendorRun.NoOp) { ' - it did not run, so the stack is reconciled without it' } else { '; the rest of the stack is checked again after the restart' })"
                         } else {
                             "PIN NOT APPLIED: AMD's clean installer failed"
                         }
@@ -5177,7 +5223,21 @@ function Install-DriverUpdates {
                     # after a timeout - AMD may still be working.
                     if ($VendorRoute -and -not $ForceDowngrade -and $VendorRun.Outcome -eq 'Failed') {
                         $Stack = & $ReconcilePinnedStack $Drv $PinTarget $DriverLabel $null
-                        if ($Stack.RebootRequired) { $Rebooted = $true }
+                        if ($Stack.RebootRequired) {
+                            # A retired extension goes at a restart. This run
+                            # exits as a failure, which drops a plain restart
+                            # request, so ask the way that survives it - and
+                            # re-measure afterwards.
+                            $Rebooted = $true
+                            $script:PinCheckAfterRestart = $true
+                            $RowPendingCheck = $true
+                            try {
+                                if (-not (Test-Path $CompKeyPath)) { New-Item -Path $CompKeyPath -ItemType Directory -Force | Out-Null }
+                                New-ItemProperty -Path $CompKeyPath -Name 'PendingCheck' -Value 1 -PropertyType DWord -Force | Out-Null
+                            } catch {
+                                Write-Verbose "PendingCheck write failed: $($_.Exception.Message)"
+                            }
+                        }
                         if ($Stack.Mixed) { $StackMixed++ } elseif ($Stack.Retired -gt 0) { $StackRepaired++ }
                     }
 

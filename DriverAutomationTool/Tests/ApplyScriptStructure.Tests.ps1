@@ -320,20 +320,38 @@ Describe 'Version-pinned rollback (Dell DUP loop)' {
         $Loop | Should -Match 'PIN NOT APPLIED'
 
         # The re-read must be a fresh CIM query, not the pre-loop enumeration.
-        $Verify = [regex]::Match($Loop, '\$AfterVersion\s*=\s*&\s*\$GetLiveDriverVersion')
+        $Verify = [regex]::Match($Loop, '\$AfterVersion\s*=\s*(?:if \([^\n]*\) \{ \$null \} else \{ )?&\s*\$GetLiveDriverVersion')
         $Verify.Success | Should -BeTrue
         $Before = $Loop.Substring(0, $Verify.Index)
         $Before | Should -Match 'Get-CimInstance -ClassName Win32_VideoController'
     }
 
-    It 'Does not turn an unapplied pin into a deployment failure' {
-        # Retrying the install cannot fix PnP ranking, so failing the row would
-        # only loop ConfigMgr on a condition that never clears. It is counted
-        # and logged loudly instead.
+    It 'Does not turn an unapplied pin into a deployment failure - unless AMD''s clean installer was used' {
+        # Retrying a DUP cannot fix PnP ranking, so failing the row would only
+        # loop ConfigMgr on a condition that never clears. It is counted and
+        # logged loudly instead. After AMD's clean installer it is different:
+        # the next run enforces the pin with the DUP, and only a failure brings
+        # that run about.
         $Loop = $script:DrvLoop.Extent.Text
         $Loop | Should -Match '\$PinNotApplied\+\+'
-        $M = [regex]::Match($Loop, '\$PinNotApplied\+\+(.{0,400})', 'Singleline')
-        $M.Groups[1].Value | Should -Not -Match '\$Failed\+\+'
+        $NotApplied = $script:DrvLoop.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.IfStatementAst] -and
+            $n.Clauses[0].Item1.Extent.Text -eq '-not $Applied'
+        }, $true) | Select-Object -First 1
+        $NotApplied | Should -Not -BeNullOrEmpty
+        $Fails = @($NotApplied.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.UnaryExpressionAst] -and $n.Extent.Text -eq '$Failed++'
+        }, $true))
+        @($Fails).Count | Should -Be 1
+        $Guarded = $false
+        $Node = $Fails[0].Parent
+        while ($Node -and $Node -ne $NotApplied) {
+            if ($Node -is [System.Management.Automation.Language.IfStatementAst] -and $Node.Clauses[0].Item1.Extent.Text -eq '$VendorRoute') { $Guarded = $true }
+            $Node = $Node.Parent
+        }
+        $Guarded | Should -BeTrue -Because 'only the clean-installer route may fail here'
     }
 
     It 'Deletes driver packages in exactly one place, and never with /force' {
@@ -887,22 +905,47 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
 
     It 'Calls a clean install "did not run" only on proof, never because it could not read the logs' {
         $Block = (Get-DATScriptBlockAssignment -Name '$InvokeVendorInstaller').Extent.Text
-        $M = [regex]::Match($Block, "elseif \(([^\n]*)\) \{(\s*#[^\n]*)*\s*\`$Out\.Outcome = 'Failed'\s*\`$Out\.Reason = [^\n]*did not run")
+        $M = [regex]::Match($Block, "(?s)\} elseif \((-not \`$ResultRead\.Exists -and \(.*?\))\) \{(\s*#[^\n]*)*\s*\`$Out\.Outcome = 'Failed'\s*\`$Out\.NoOp = \`$true")
         $M.Success | Should -BeTrue
-        foreach ($Need in '-not \$ResultRead\.Exists', '\$LogBefore\.Ok', '\$LogAfter\.Ok', '\$LogScoped', '-not \$NewLog\.Trim\(\)') {
+        # No Install.log before or after (a lock does not hide a file), or one
+        # read before and after without a line from this run.
+        foreach ($Need in '-not \$LogBefore\.Exists -and -not \$LogAfter\.Exists', '\$LogBefore\.Ok', '\$LogAfter\.Ok', '\$LogScoped', '-not \$NewLog\.Trim\(\)') {
             $M.Groups[1].Value | Should -Match $Need
         }
+        $M.Groups[1].Value | Should -Not -Match 'LogBefore\.Exists -or|LogAfter\.Exists -or|-not \$LogAfter\.Ok|-not \$LogBefore\.Ok'
     }
 
     It 'Lets the device overrule a clean install AMD called a failure, after the ledger has recorded AMD''s verdict' {
         $Loop = $script:DrvLoop.Extent.Text
-        $M = [regex]::Match($Loop, "(?s)if \(\`$VendorRun\.Outcome -eq 'Failed'\) \{\s*\`$Verdict = & \`$GetVendorDeviceVerdict \`$Drv \`$PinTarget \`$LiveVersion\s*if \(\`$Verdict\.OnPin -and \(\`$Verdict\.Moved -or \`$Verdict\.StackClean\)\) \{\s*\`$DupCode = 2")
+        $M = [regex]::Match($Loop, "(?s)if \(\`$VendorRun\.Outcome -eq 'Failed'\) \{\s*\`$Verdict = & \`$GetVendorDeviceVerdict \`$Drv \`$PinTarget \`$LiveVersion \`$DriverLabel\s*if \(\`$Verdict\.OnPin -and \(\`$Verdict\.Moved -or \`$Verdict\.StackClean\)\) \{\s*\`$DupCode = 2")
         $M.Success | Should -BeTrue
         $Ledger = [regex]::Match($Loop, "-Name 'VendorAttemptOutcome' -Value \(\[string\]\`$VendorRun\.Outcome\)")
         $Map = [regex]::Match($Loop, "\`$DupCode = switch \(\`$VendorRun\.Outcome\)")
         $Ledger.Success | Should -BeTrue
         $Ledger.Index | Should -BeLessThan $Map.Index
         $Map.Index | Should -BeLessThan $M.Index
+    }
+
+    It 'Never verifies a pin after AMD''s clean install from the enumeration taken before it' {
+        $Loop = $script:DrvLoop.Extent.Text
+        $Loop | Should -Match '(?s)\$AdaptersFresh = \$false\s*try \{\s*\$LiveVideoAdapters = @\(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop\)\s*\$AdaptersFresh = \$true'
+        $Loop | Should -Match '\$AfterVersion = if \(\$VendorRoute -and -not \$AdaptersFresh\) \{ \$null \} else \{ & \$GetLiveDriverVersion \$Drv \}'
+    }
+
+    It 'Fails, rather than marks Installed, a clean install that leaves the device above the pin' {
+        # With AMD's runs used up the next run enforces the pin with the DUP;
+        # an Installed marker would stop ConfigMgr from ever running it.
+        $M = [regex]::Match($script:DrvLoop.Extent.Text, '(?s)if \(-not \$Applied\) \{\s*\$PinNotApplied\+\+.*?if \(\$VendorRoute\) \{(.*?)\}')
+        $M.Success | Should -BeTrue
+        $M.Groups[1].Value | Should -Match '\$Failed\+\+'
+        $M.Groups[1].Value | Should -Match '\$FailureLines\.Add'
+    }
+
+    It 'Keeps the restart a retire needs when a failed clean install exits as a failure' {
+        $M = [regex]::Match($script:DrvLoop.Extent.Text, "(?s)if \(\`$VendorRoute -and -not \`$ForceDowngrade -and \`$VendorRun\.Outcome -eq 'Failed'\) \{\s*\`$Stack = & \`$ReconcilePinnedStack[^\n]*\s*if \(\`$Stack\.RebootRequired\) \{(.*?)\n\s*\}\s*if \(\`$Stack\.Mixed\)")
+        $M.Success | Should -BeTrue
+        $M.Groups[1].Value | Should -Match '\$script:PinCheckAfterRestart = \$true'
+        $M.Groups[1].Value | Should -Match "-Name 'PendingCheck' -Value 1"
     }
 
     It 'Keeps a deferred clean install out of the quarantine ledger' {
@@ -918,11 +961,16 @@ Describe 'Pinned driver stack and vendor installer (Dell DUP loop)' {
         $Loop = $script:DrvLoop.Extent.Text
         # A failed run that may have removed the driver: AMD said a restart is
         # needed, or the GPU now reads below the pin or not at all.
-        $Loop | Should -Match "if \(\`$VendorRun\.Outcome -ne 'TimedOut' -and \(\`$VendorRun\.ResultCode -eq 2 -or \`$null -eq \`$FailCmp -or \`$FailCmp -lt 0\)\) \{\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true"
+        $Loop | Should -Match "if \(\`$VendorRun\.Outcome -ne 'TimedOut' -and \(\`$VendorRun\.ResultCode -eq 2 -or \`$VendorRun\.RestartAsked -or \`$OnPinRanFailed -or \`$null -eq \`$FailCmp -or \`$FailCmp -lt 0\)\) \{\s*\`$Rebooted = \`$true\s*\`$script:PinCheckAfterRestart = \`$true"
+        # ...including a clean install that ran and failed on a device on the
+        # pin, whose stack read before the restart is not the answer yet.
+        $Loop | Should -Match "\`$OnPinRanFailed = -not \`$ForceDowngrade -and \`$VendorRun\.Outcome -eq 'Failed' -and -not \`$VendorRun\.NoOp -and \`$null -ne \`$FailCmp -and \`$FailCmp -eq 0"
         # ...judged on a FRESH read of the device, and the marker flagged.
-        $Fail = [regex]::Match($Loop, '(?s)if \(\$AllowDowngrade -and \$VendorRoute\) \{(.*?)\$FailVersion = & \$GetLiveDriverVersion \$Drv')
+        $Fail = [regex]::Match($Loop, '(?s)if \(\$AllowDowngrade -and \$VendorRoute\) \{(.*?)\$FailVersion = if')
         $Fail.Success | Should -BeTrue
         $Fail.Groups[1].Value | Should -Match '\$LiveVideoAdapters = @\(Get-CimInstance -ClassName Win32_VideoController'
+        # ...and never from the enumeration taken before AMD ran.
+        $Loop | Should -Match '\$FailVersion = if \(\$FailFresh\) \{ & \$GetLiveDriverVersion \$Drv \} else \{ \$null \}'
         # And it says where the kept extract is.
         $Loop | Should -Match 'kept in \$\(\$VendorRun\.WorkDir\) for a week'
         $Loop | Should -Match "(?s)\`$FailCmp -lt 0\)\) \{.*?-Name 'PendingCheck' -Value 1.*?after the failed clean install"

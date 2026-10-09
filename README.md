@@ -508,14 +508,18 @@ On the client, a pinned package:
     logs). "Install of AMD Display Driver is successful" counts as a pass when
     the result file has no `ResultCode`. Then the GPU is re-read: a run AMD
     called a failure that left it on the pinned version is treated as
-    installed, and the rest of the stack is checked as after any rollback. A
-    run is called "did not run" only when there is no result file and an
-    Install.log read before and after has no line from it; when the client
-    could not read AMD's files, the log says what it could not read and the
-    device is checked instead.
+    installed, and the rest of the stack is checked as after any rollback. If
+    the GPU cannot be re-read, AMD's verdict stands and nothing is judged from
+    the enumeration taken before the run. A run is called "did not run" only on
+    proof: no result file, and either no Install.log at all or one read before
+    and after with no line from it. When the client could not read AMD's files,
+    the log says what it could not read and the device is checked instead.
   - **Bounded.** It runs at most twice per pinned revision on a device, and only
     once on a device already on the pin. Its failures never count toward the DUP
     quarantine, so they cannot block the DUP that reinstalls the display driver.
+    If its runs are used up and the device is still above the pin, the run fails
+    rather than writing an Installed marker, so ConfigMgr runs it again and that
+    run enforces the pin with the DUP.
   - **Restart, then check again.** AMD can finish a clean install after a
     restart, and leaves the GPU on Microsoft Basic Display Adapter until it does.
     A device not yet on the pin - or left without a readable display driver by a

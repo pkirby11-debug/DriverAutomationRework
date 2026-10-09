@@ -870,6 +870,10 @@ Describe 'AMD clean installer from the pinned DUP' {
                     }
                 }
             }
+            # Held with no sharing at all: there, but no one else can read it.
+            if ($script:LockInstallLog -and (Test-Path $script:InstallLog)) {
+                $script:Held.Add([System.IO.File]::Open((Get-Item -LiteralPath $script:InstallLog).FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None))
+            }
             return New-FakeProcess -ExitCode 0
         }
         function Write-FakeResult {
@@ -931,6 +935,7 @@ Describe 'AMD clean installer from the pinned DUP' {
         $script:LogLines.Clear()
         $script:Held = [System.Collections.Generic.List[object]]::new()
         $script:HoldOpen = $false
+        $script:LockInstallLog = $false
         $script:ResultText = $null
         $script:ResultEncoding = $null
         $script:AmdLogRewrite = $null
@@ -1157,19 +1162,61 @@ Describe 'AMD clean installer from the pinned DUP' {
         $R = Invoke-Vendor
         $R.Outcome | Should -Be 'Failed'
         $R.Reason | Should -Match 'did not run'
+        $R.NoOp | Should -BeTrue -Because 'nothing changed, so nothing needs a restart'
     }
 
-    It 'Leaves it to the device, rather than calling it "did not run", when it could not look' {
-        # No Install.log where it was looked for: that proves nothing about
-        # AMD - and in the field a "did not run" verdict was a run that had
-        # installed the pinned driver.
+    It 'Calls a run that left no result file and no Install.log at all one that never started' {
+        # AMD's installer starts its Install.log as it starts, and a lock does
+        # not hide that a file exists. Calling this Unknown cost two restarts
+        # and then an Installed marker on a device still above the pin.
+        $script:AmdResultCode = $null
+        $script:AmdLogLines = @()
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Failed'
+        $R.Reason | Should -Match 'never started'
+        $R.NoOp | Should -BeTrue
+        $R.Detail | Should -Match 'result file not written'
+        $R.Detail | Should -Match 'Install\.log not found at '
+    }
+
+    It 'Leaves it to the device, rather than calling it "did not run", when it could not read Install.log' {
+        # In the field a "did not run" verdict was a run that had installed
+        # the pinned driver: what cannot be read proves nothing about AMD.
+        Set-Content -Path $script:InstallLog -Value 'an earlier run'
+        $script:LockInstallLog = $true
         $script:AmdResultCode = $null
         $script:AmdLogLines = @()
         $R = Invoke-Vendor
         $R.Outcome | Should -Be 'Unknown'
-        $R.Reason | Should -Not -Match 'did not run'
-        $R.Detail | Should -Match 'result file not written'
-        $R.Detail | Should -Match 'Install\.log not found at '
+        $R.NoOp | Should -BeFalse
+        $R.Reason | Should -Not -Match 'did not run|never started'
+        $R.Detail | Should -Match 'Install\.log unreadable \('
+    }
+
+    It 'Notes when AMD asks for a restart, in Install.log or in its result file' {
+        $R = Invoke-Vendor
+        $R.RestartAsked | Should -BeTrue -Because 'Install.log says "Reboot is required."'
+
+        $script:Launches.Clear()
+        $script:AmdLogLines = @('InstallMan::performInstall Install of AMD Display Driver is successful. - iResult - 0')
+        $R = Invoke-Vendor
+        $R.RestartAsked | Should -BeFalse
+
+        $script:Launches.Clear()
+        $script:AmdResultCode = $null
+        $script:ResultText = "[ResponseResult]`r`nResultCode = 1`r`n[Details]`r`nPackage Name = AMD HDMI Audio Driver`r`nErrorCode = 3"
+        $R = Invoke-Vendor
+        $R.RestartAsked | Should -BeTrue -Because 'a package''s ErrorCode 3 asks for a restart'
+    }
+
+    It 'Does not take an "Uninstall of" line for the display driver installing' {
+        $script:AmdResultCode = $null
+        $script:AmdLogLines = @(
+            'InstallMan::InstallMan Starting install: "...\BIN64\AtiSetup.exe" -FACTORYRESETINSTALL -LOG "{RUN}"'
+            'InstallMan::performUninstall Uninstall of AMD Display Driver is successful. - iResult - 0'
+        )
+        $R = Invoke-Vendor
+        $R.Outcome | Should -Be 'Unknown'
     }
 
     It 'Reads AMD''s files while something of AMD''s still holds them open for writing' {
@@ -1509,6 +1556,19 @@ Describe 'Judging a clean install by the device' {
         $script:CimThrows = $false
         $script:Now = @()
         (& $script:GetVendorDeviceVerdict $script:Row '32.0.12046.3001' '32.0.31033.3').OnPin | Should -BeFalse
+    }
+
+    It 'Never judges a device already on the pin from the enumeration taken before AMD ran' {
+        # There the stale list already says "on the pin", and a failed clean
+        # install may have left the GPU on Microsoft Basic Display since -
+        # with no AMD extension left, its stack would even read clean.
+        $LiveVideoAdapters = @(New-FakeVideoController -PnpId 'PCI\VEN_1002&DEV_15C8&SUBSYS_0D581028&REV_D7\4&18e01285&0&0041' -DriverVersion '32.0.12046.3001')
+        $script:CimThrows = $true
+        $V = & $script:GetVendorDeviceVerdict $script:Row '32.0.12046.3001' '32.0.12046.3001' 'test'
+        $V.OnPin | Should -BeFalse
+        $V.StackClean | Should -BeFalse
+        $script:DriftCalls | Should -Be 0
+        ($script:LogLines -join "`n") | Should -Match 'could not re-read the display adapter'
     }
 
     It 'On a device already on the pin, counts it only when nothing newer is left on top' {
