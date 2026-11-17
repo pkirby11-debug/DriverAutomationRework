@@ -54,6 +54,8 @@ function Get-DATDriverPin {
             PinnedName      = [string]$Entry.PinnedName
             VendorVersion   = [string]$Entry.VendorVersion
             RemoveOutrankingDriver = [bool]$Entry.RemoveOutrankingDriver
+            UseVendorInstaller = [bool]$Entry.UseVendorInstaller
+            VendorInstallerArguments = [string]$Entry.VendorInstallerArguments
             HashMD5         = [string]$Entry.HashMD5
             Size            = $Entry.Size
             ReleaseDate     = [string]$Entry.ReleaseDate

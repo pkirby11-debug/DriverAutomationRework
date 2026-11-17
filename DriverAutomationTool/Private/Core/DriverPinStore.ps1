@@ -305,6 +305,11 @@ function Select-DATPinnedDriver {
         # package that is outranking this pin. Absent on pins created before the
         # switch existed, which reads as $false - the safe default.
         $Driver | Add-Member -NotePropertyName 'PinRemoveOutranking' -NotePropertyValue ([bool]$Pin.RemoveOutrankingDriver) -Force
+        # Whether the client enforces this pin with the GPU vendor's own clean
+        # installer, and any operator override of its arguments. Same default
+        # rule: absent on older pins reads as off.
+        $Driver | Add-Member -NotePropertyName 'PinUseVendorInstaller' -NotePropertyValue ([bool]$Pin.UseVendorInstaller) -Force
+        $Driver | Add-Member -NotePropertyName 'PinVendorInstallerArguments' -NotePropertyValue ([string]$Pin.VendorInstallerArguments) -Force
         $Driver
     }
 
@@ -481,8 +486,9 @@ function Get-DATDriverSetFingerprint {
 
         Driver names and versions alone do not answer that. A pin changes two
         other things - the per-row manifest flags that tell the client it may
-        force a downgrade and retire an outranking package, and the apply script
-        that acts on them - and neither shows up in a name/version list. Ticking
+        force a downgrade, retire an outranking package or run the vendor's
+        clean installer, and the apply script that acts on them - and neither
+        shows up in a name/version list. Ticking
         "retire the outranking driver" on an already-pinned revision therefore
         produced a byte-identical fingerprint, the smart check reported
         "already contains latest individual drivers", and manifest.json was never
@@ -524,6 +530,13 @@ function Get-DATDriverSetFingerprint {
             # reinterpreting what is already there.
             $Part += ';pin=1'
             if ($D.PinRemoveOutranking) { $Part += ';retire=1' }
+            if ($D.PinUseVendorInstaller) {
+                $Part += ';vendor=1'
+                # The override changes what the client runs, so it must move
+                # the fingerprint too; trimmed so stray whitespace does not.
+                $VArgs = "$($D.PinVendorInstallerArguments)".Trim()
+                if ($VArgs) { $Part += ";vargs=$VArgs" }
+            }
         }
         $Part
     }

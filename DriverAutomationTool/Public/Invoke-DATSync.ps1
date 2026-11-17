@@ -1111,7 +1111,7 @@ function Invoke-DATSyncSinglePackage {
                     # line and the fingerprint above are where to look first.
                     $PinnedRows = @($CachedIndividualDrivers | Where-Object { $_.IsPinned })
                     if ($PinnedRows.Count -gt 0) {
-                        Write-DATLog -Message ("  Pin(s) unchanged since the deployed build: {0}. The package keeps v{1}, so devices that already ran it will not run it again - which is what you want unless you just changed a pin. If you did, the fingerprint would have moved and this would be a rebuild." -f (@($PinnedRows | ForEach-Object { "'$($_.Name)'=v$($_.Version)$(if ($_.PinRemoveOutranking) { ' (retires outranking)' })" }) -join '; '), $ExistingToCheck.Version) -Severity 1
+                        Write-DATLog -Message ("  Pin(s) unchanged since the deployed build: {0}. The package keeps v{1}, so devices that already ran it will not run it again - which is what you want unless you just changed a pin. If you did, the fingerprint would have moved and this would be a rebuild." -f (@($PinnedRows | ForEach-Object { "'$($_.Name)'=v$($_.Version)$(if ($_.PinRemoveOutranking) { ' (retires outranking)' })$(if ($_.PinUseVendorInstaller) { ' (vendor installer)' })" }) -join '; '), $ExistingToCheck.Version) -Severity 1
                     }
 
                     # Backfill the DCU repository catalog into packages built before
@@ -2237,6 +2237,12 @@ function Invoke-DATSyncSinglePackage {
                                         # device until it leaves the DriverStore. Off unless the
                                         # pin was added with -RemoveOutrankingDriver.
                                         AllowDriverStoreRemoval = [bool]$IndvDriver.PinRemoveOutranking
+                                        # Enforce the pin with the GPU vendor's own clean
+                                        # installer (AMD Setup.exe, factory reset) from inside
+                                        # the DUP, instead of the DUP and PnP ranking. Empty
+                                        # arguments = the client's default.
+                                        UseVendorInstaller       = [bool]$IndvDriver.PinUseVendorInstaller
+                                        VendorInstallerArguments = if ($IndvDriver.PinUseVendorInstaller) { [string]$IndvDriver.PinVendorInstallerArguments } else { '' }
                                     })
                                     Write-DATLog -Message "  Staged DUP: $($IndvDriver.FileName) ($([math]::Round($StagedSize / 1MB, 2)) MB)" -Severity 1
                                     continue

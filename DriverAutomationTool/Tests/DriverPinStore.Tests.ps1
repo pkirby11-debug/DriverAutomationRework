@@ -343,6 +343,7 @@ Describe 'Get-DATDriverPin projection coverage' {
             -Reason 'blank screens on P2419H' -SourceUrl 'https://dl.dell.com/FOLDER11223344M/1/Video_A05.EXE' `
             -PinnedFileName 'Video_A05.EXE' -PinnedName 'AMD Radeon Graphics Driver' `
             -VendorVersion '32.0.23040.1006' -RemoveOutrankingDriver `
+            -UseVendorInstaller -VendorInstallerArguments '-INSTALL' `
             -ComponentXml '<SoftwareComponent />' -HashMD5 'abc' -Size 1024 `
             -ReleaseDate '2026-05-26' -Category 'Video' -HardwareIds @('VEN_1002&DEV_73FF')
 
@@ -522,5 +523,138 @@ Describe 'The sync computes the fingerprint in exactly one place' {
 
     It 'Hashes nothing inline' {
         $script:SyncSource | Should -Not -Match 'MD5\]::Create' -Because 'an inline copy can drift from the one the smart check compares against'
+    }
+}
+
+Describe 'UseVendorInstaller round trip' {
+    BeforeEach {
+        $script:SettingsPath = Join-Path $TestDrive ("Settings_{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+        New-Item -Path $script:SettingsPath -ItemType Directory -Force | Out-Null
+    }
+
+    It 'Survives the store and reaches the resolved driver' {
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A01' -SystemId '0D58' `
+            -Model 'Dell Pro Micro QCM12' -VendorVersion '32.0.12046.3001' `
+            -SourceUrl 'https://dl.dell.com/FOLDER11223344M/1/Video_A01.EXE' -UseVendorInstaller
+
+        $Pin = @(Get-DATDriverPin)[0]
+        $Pin.UseVendorInstaller       | Should -BeTrue
+        $Pin.VendorInstallerArguments | Should -Be ''
+
+        $Drv = New-TestDriver -Name 'AMD Radeon Graphics Driver' -Version 'A01'
+        $Out = @(Select-DATPinnedDriver -Selected @($Drv) -Candidates @($Drv) -Pins @($Pin))
+        $Out[0].PinUseVendorInstaller | Should -BeTrue
+        $Out[0].PinVendorInstallerArguments | Should -Be ''
+    }
+
+    It 'Turns off when re-added without the switch, but keeps a hand-set argument override' {
+        # The GUI re-pins without an arguments box; that must not silently drop
+        # an override set from the cmdlet.
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A01' -SystemId '0D58' -Model 'QCM12' `
+            -UseVendorInstaller -VendorInstallerArguments '-INSTALL'
+        @(Get-DATDriverPin)[0].VendorInstallerArguments | Should -Be '-INSTALL'
+
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A01' -SystemId '0D58' -Model 'QCM12' -UseVendorInstaller
+        $Pin = @(Get-DATDriverPin)[0]
+        $Pin.UseVendorInstaller       | Should -BeTrue
+        $Pin.VendorInstallerArguments | Should -Be '-INSTALL'
+
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A01' -SystemId '0D58' -Model 'QCM12'
+        @(Get-DATDriverPin)[0].UseVendorInstaller | Should -BeFalse
+
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A01' -SystemId '0D58' -Model 'QCM12' -UseVendorInstaller -VendorInstallerArguments ''
+        @(Get-DATDriverPin)[0].VendorInstallerArguments | Should -Be ''
+    }
+
+    It 'Warns when the pinned driver is not one the client can run a vendor installer for' {
+        Mock Write-DATLog {}
+        Add-DATDriverPin -NamePattern 'Intel Wi-Fi' -PinnedVersion '23.160.0.4' -SystemId '0D58' -Model 'QCM12' -Category 'Network' -UseVendorInstaller
+        Should -Invoke Write-DATLog -ParameterFilter { $Message -like '*only supports AMD Radeon graphics*' -and $Severity -eq 2 } -Times 1 -Exactly
+    }
+
+    It 'Does not warn for an AMD Radeon graphics pin' {
+        Mock Write-DATLog {}
+        Add-DATDriverPin -NamePattern 'AMD Radeon' -PinnedVersion 'A01' -SystemId '0D58' -Model 'QCM12' -Category 'Video' -UseVendorInstaller
+        Should -Invoke Write-DATLog -ParameterFilter { $Message -like '*only supports AMD Radeon graphics*' } -Times 0 -Exactly
+    }
+}
+
+Describe 'Get-DATDriverSetFingerprint - vendor installer' {
+    BeforeAll {
+        $script:ModuleRoot = Split-Path $PSScriptRoot -Parent
+        function New-VendorRow {
+            param([bool]$Vendor, [string]$VArgs = '')
+            [PSCustomObject]@{
+                Name = 'AMD Radeon Graphics Driver'; Version = 'A01'; IsPinned = $true
+                PinRemoveOutranking = $true; PinUseVendorInstaller = $Vendor; PinVendorInstallerArguments = $VArgs
+            }
+        }
+        $script:Other = [PSCustomObject]@{ Name = 'Intel Wi-Fi Driver'; Version = '23.160.0.4' }
+    }
+
+    It 'Moves when the vendor installer is turned on at the SAME pinned version' {
+        # Same shape as the retire flag: without this the package keeps its
+        # version, manifest.json is never rewritten, and the device never sees
+        # UseVendorInstaller.
+        (Get-DATDriverSetFingerprint -Drivers @((New-VendorRow -Vendor $false), $script:Other)) |
+            Should -Not -Be (Get-DATDriverSetFingerprint -Drivers @((New-VendorRow -Vendor $true), $script:Other))
+    }
+
+    It 'Moves when the argument override changes, and ignores stray whitespace' {
+        $Default = Get-DATDriverSetFingerprint -Drivers @((New-VendorRow -Vendor $true), $script:Other)
+        $Custom  = Get-DATDriverSetFingerprint -Drivers @((New-VendorRow -Vendor $true -VArgs '-INSTALL'), $script:Other)
+        $Blank   = Get-DATDriverSetFingerprint -Drivers @((New-VendorRow -Vendor $true -VArgs '   '), $script:Other)
+        $Custom | Should -Not -Be $Default
+        $Blank  | Should -Be $Default
+    }
+
+    It 'Ignores an override when the vendor installer is off' {
+        (Get-DATDriverSetFingerprint -Drivers @((New-VendorRow -Vendor $false -VArgs '-INSTALL'), $script:Other)) |
+            Should -Be (Get-DATDriverSetFingerprint -Drivers @((New-VendorRow -Vendor $false), $script:Other))
+    }
+}
+
+Describe 'Pin fields agree between the sync manifest and the client' {
+    # The manifest row is the only channel from the sync to the client. A pin
+    # field the client reads under a name the sync never writes does not fail -
+    # it reads as $null, which is "off" - the same silent shape as the
+    # projection gap that disabled RemoveOutrankingDriver.
+    BeforeAll {
+        $Root = Split-Path $PSScriptRoot -Parent
+        $SyncAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'Public/Invoke-DATSync.ps1'), [ref]$null, [ref]$null)
+        $Row = $SyncAst.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.HashtableAst] -and
+            @($n.KeyValuePairs | ForEach-Object { $_.Item1.Extent.Text }) -contains 'AllowDriverStoreRemoval'
+        }, $true) | Select-Object -First 1
+        $script:ManifestKeys = @($Row.KeyValuePairs | ForEach-Object { $_.Item1.Extent.Text })
+        $script:ManifestRowText = $Row.Extent.Text
+
+        $ApplyAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'Scripts/Invoke-DATApply.ps1'), [ref]$null, [ref]$null)
+        $Install = $ApplyAst.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Install-DriverUpdates'
+        }, $true) | Select-Object -First 1
+        $script:ClientReads = @($Install.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.MemberExpressionAst] -and
+            $n.Expression.Extent.Text -in '$Drv', '$Row'
+        }, $true) | ForEach-Object { $_.Member.Extent.Text } | Sort-Object -Unique)
+    }
+
+    It 'Finds the manifest row' {
+        $script:ManifestKeys.Count | Should -BeGreaterThan 10
+    }
+
+    It 'Writes every pin field the client reads' {
+        foreach ($Field in 'AllowDowngrade', 'AllowDriverStoreRemoval', 'UseVendorInstaller', 'VendorInstallerArguments', 'VendorVersion', 'PinReason') {
+            $script:ClientReads   | Should -Contain $Field -Because "the client is expected to act on $Field"
+            $script:ManifestKeys  | Should -Contain $Field -Because "the client reads $Field, so the sync must write it"
+        }
+    }
+
+    It 'Fills the vendor-installer fields from the tagged pin' {
+        $script:ManifestRowText | Should -Match 'UseVendorInstaller\s*=\s*\[bool\]\$IndvDriver\.PinUseVendorInstaller'
+        $script:ManifestRowText | Should -Match 'PinVendorInstallerArguments'
     }
 }

@@ -172,8 +172,12 @@ Roll a driver back, and hold it there. See
   URL, MD5, size, filename and raw catalog XML along with it. That capture is the
   point of using the tab over the cmdlet: without it a pin stops resolving the day
   Dell drops the revision, which is exactly when you still need it.
+- **Retire the outranking driver** / **Use AMD's clean installer** — the two
+  per-pin options that change what runs on the device; see
+  [Driver version pinning](#pinning). Both are off by default.
 - **Active pins grid** — every pin, with **Recoverable** showing which ones carry
-  that metadata (`Version only` means the pin dies when Dell purges the revision).
+  that metadata (`Version only` means the pin dies when Dell purges the revision),
+  and which pins retire outranking drivers or use the vendor installer.
   **Disable** stops a pin applying but keeps the captured metadata; **Remove**
   throws it away and lets the driver resolve to the catalog's newest again.
 
@@ -427,6 +431,136 @@ On the client, a pinned package:
   has to leave the DriverStore first (`pnputil /enum-drivers`, then
   `pnputil /delete-driver oemNN.inf /uninstall`) — irreversible, so test it on
   one device before doing it at scale.
+- **checks the rest of the driver stack, not just the base driver.** A GPU driver is
+  a stack: the base INF bound to the device, *extension* INFs applied on top of it,
+  and software components (child devices such as AMD's OpenCL and Windows-support
+  components). Windows chooses an extension separately and **keeps it when the base
+  driver changes**, so rolling the base back can leave the newer release's extension
+  in place — Device Manager shows the pinned driver and the fault stays. That was
+  the field state on a Dell Pro Micro QCM1255: base `32.0.12046.3001`, AMD's
+  `amduw23e` extension still on `32.0.31033.3`. After every verified rollback, and
+  on a device that is *already* on the pinned version, the client reads the device's
+  extension and component drivers (`DEVPKEY_Device_ExtendedConfigurationIds` and the
+  device's children) and logs the stack. Anything from the pin's own release family
+  that is newer than the pin is logged as `MIXED STACK`; parts AMD versions on a
+  scheme of their own (uwppair, Crash Defender) are listed but never counted. With
+  `-RemoveOutrankingDriver` the newer extension is retired, but only when the
+  pinned release's own copy of the same INF is staged to replace it. Software
+  components are reported, never removed. The run summary counts stacks it cleared
+  and stacks still mixed. The base-driver retire also refuses when the packages it
+  would remove drive two different GPUs of the same brand.
+- **checks that a retired package actually left.** `pnputil /delete-driver
+  /uninstall` moves devices off the package first and deletes it second, and it
+  can manage the first, fail the second and still exit 0 (`Unable to uninstall
+  driver package: No more data is available.`). A package left behind can win the
+  device back at the next restart, so the client re-reads the DriverStore, retries
+  once with a plain `/delete-driver` (which Windows allows only once no device uses
+  the package — never `/force`), and warns if it is still there. After a base driver
+  is swapped on a running device the client asks ConfigMgr for a restart, so the
+  extension and components reload on the pinned driver.
+- **can run AMD's own clean installer instead** (`-UseVendorInstaller`, or the
+  *Use AMD's clean installer* tick box). This automates the manual fix: extract the
+  DUP and run AMD's `Setup.exe` with **Factory Reset**, which removes every AMD
+  display component — the newer extension, the software components, the AMD
+  Software app — before installing the pinned release as one consistent set. It
+  runs only on a device that needs it: one above the pin, or one on the pin whose
+  stack is mixed. The client extracts the DUP with Dell's documented `/s /e=`, finds
+  AMD's package root (the `Setup.exe` with `Bin64\ATISetup.exe` beside it) and runs:
+
+  ```
+  Setup.exe -FACTORYRESETINSTALL -LOG "C:\Windows\Temp\DAT-Vendor-<random>\amd-result.log"
+  ```
+
+  AMD's result file is copied afterwards to
+  `C:\Windows\Temp\DATDupLogs\<run>\<DUP>.amd-result.log` beside the DUP logs.
+
+  `-FACTORYRESETINSTALL` is the silent form of the GUI's Factory Reset checkbox.
+  AMD's own command-line guides do not list it; Microsoft's *Install AMD GPU drivers
+  on N-series VMs* page documents `setup.exe -factoryresetinstall`, and AMD's
+  `ATISetup.exe -HELP` lists it. Because of that, the client first checks that the
+  package's own `ATISetup.exe` knows the switch. If it does not - or the clean
+  installer cannot be used for another reason below - a device above the pin is
+  rolled back with the DUP instead, and one already on it gets the stack check
+  above. `-VendorInstallerArguments` replaces the switch if AMD ever changes it;
+  the client removes any `-LOG`, `-BOOT`, `-REBOOT` or `/B` from it and adds its own
+  `-LOG`. It never passes `-INSTALL` alongside it (AMD lists them as exclusive modes)
+  or any restart switch - in the package's `ATISetup.exe` those three are the only
+  ways it restarts the PC itself, so ConfigMgr keeps the restart - and it never kills
+  the installer on timeout.
+
+  Safeguards:
+  - **One AMD GPU only.** Factory Reset removes the driver of every AMD display
+    adapter, so with two (an APU beside a Radeon card) the clean installer is not
+    used. It is also skipped when the package's display INFs do not list the
+    device's GPU.
+  - **A protected work folder.** SYSTEM runs everything in the AMD package, so it is
+    extracted into `C:\Windows\Temp\DAT-Vendor-<random>`, created with a DACL
+    only SYSTEM and Administrators can write to (users may read). Its owner and
+    permissions are read back before anything goes into it, and `Setup.exe` and
+    `ATISetup.exe` must carry a valid AMD or Dell signature. Under `C:\Temp`,
+    every parent folder is user-modifiable. Kept a week after a failed run, for
+    diagnosis.
+  - **The device decides**, not the undocumented exit code. AMD's result file
+    (`ResultCode` under `[ResponseResult]`) and its
+    `C:\Program Files\AMD\CIM\Log\Install.log` give AMD's
+    verdict - both read while AMD may still hold them open, and Install.log
+    only for this run's lines (found by the run's own folder name, which AMD
+    logs). "Install of AMD Display Driver is successful" counts as a pass when
+    the result file has no `ResultCode`. Then the GPU is re-read: a run AMD
+    called a failure that left it on the pinned version is treated as
+    installed, and the rest of the stack is checked as after any rollback. If
+    the GPU cannot be re-read, AMD's verdict stands and nothing is judged from
+    the enumeration taken before the run. A run is called "did not run" only on
+    proof: no result file, and either no Install.log at all or one read before
+    and after with no line from it. When the client could not read AMD's files,
+    the log says what it could not read and the device is checked instead.
+  - **Bounded.** It runs at most twice per pinned revision on a device, and only
+    once on a device already on the pin. Its failures never count toward the DUP
+    quarantine, so they cannot block the DUP that reinstalls the display driver.
+    If its runs are used up and the device is still above the pin, the run fails
+    rather than writing an Installed marker - keeping the restart AMD's install
+    asked for (exit 3010) - so ConfigMgr restarts the device, runs the
+    application again, and that run enforces the pin with the DUP.
+  - **Restart, then check again.** AMD can finish a clean install after a
+    restart, and leaves the GPU on Microsoft Basic Display Adapter until it does.
+    A device not yet on the pin - or left without a readable display driver by a
+    failed clean install, or whose driver stack still reads mixed straight after
+    the clean install (extension changes settle at a restart) - is therefore
+    never called verified. The run exits
+    3010 with the detection marker set to `PendingRestart` instead of
+    `Installed` (or `Failed`, when other rows failed too), so ConfigMgr restarts
+    the device and, finding the application not installed, runs it again at its
+    next evaluation. A restart owed by a clean install or a retire is kept the
+    same way when another row fails the run, and a clean install the client
+    stopped waiting for gets its restart before the device is judged again. A
+    display DUP that is putting a missing driver back is never quarantined.
+  - **Pending restarts.** AMD refuses to run while a restart is pending (error
+    206). Pinned rows that may use the clean installer run before the other
+    DUPs, so those DUPs cannot leave one pending first. If one is pending anyway,
+    nothing is changed and the run asks for the restart the same way - once. If
+    a restart is pending again after it, the clean installer is not used: a
+    device above the pin is rolled back with the DUP, one on the pin gets the
+    stack check. Windows Update installing (error 202) is a plain retry. None of
+    this counts toward quarantine.
+  - **Nothing runs beside it.** If AMD's installer is still running at its
+    30-minute limit it is left to finish, and the run's remaining DUPs wait for
+    the next run instead of installing alongside it. A run that finds one still
+    running from an earlier run installs nothing at all.
+
+  A clean install always requests a restart. AMD Radeon graphics DUPs only; any
+  other pinned driver logs that and keeps the DUP.
+
+  **Before using it on the fleet:**
+  - Prove it once, non-interactively, the way ConfigMgr runs it: on one affected
+    device, `psexec -s` the extracted `Setup.exe -FACTORYRESETINSTALL -LOG
+    "C:\Windows\Temp\amd.log"` and confirm it completes without a prompt. AMD
+    documents that the GUI Factory Reset restarts the PC mid-install and resumes
+    afterwards; nothing documents whether the silent switch does the same.
+  - The screen goes black while the display driver reloads. Deploy in a
+    maintenance window. While it works, AMD's installer stops the Windows Update
+    service (it starts again on demand) and temporarily sets the policies that
+    keep Windows Update from offering drivers, restoring them afterwards; the
+    client logs it if those policies come out different.
 - **is not skipped by its own marker.** The per-DUP version marker holds the version
   being rolled back *from*, so the usual ">= manifest, skip" rule is narrowed to
   equality for a pinned row. `LiveVersionBefore` and `ForcedDowngrade` are recorded

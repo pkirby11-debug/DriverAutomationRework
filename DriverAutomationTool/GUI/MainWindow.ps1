@@ -90,7 +90,7 @@ function New-DATMainWindow {
 
     $Controls['PinGridData'] = New-DATGridTable -Columns @(
         'Enabled', 'NamePattern', 'PinnedVersion', 'SystemId', 'Model',
-        'OperatingSystem', 'Recoverable', 'RetireOutranking', 'Reason')
+        'OperatingSystem', 'Recoverable', 'RetireOutranking', 'VendorInstaller', 'Reason')
     $Controls['PinGrid'].ItemsSource = $Controls['PinGridData'].DefaultView
 
     try {
@@ -2316,12 +2316,17 @@ function Initialize-DATMainWindow {
         # already-updated devices back down on the next deployment cycle.
         $Summary = (@($Rows | ForEach-Object { "  $($_['Name'])  ->  v$($_['Version'])" }) -join "`n")
         $Retire = [bool]$Controls['PinRemoveOutrankingCheckBox'].IsChecked
+        $Vendor = [bool]$Controls['PinUseVendorInstallerCheckBox'].IsChecked
         $Confirm = Show-DATWindowMessage -Type Question -Message (
             "Pin $($Rows.Count) driver(s)?`n`n$Summary`n`n" +
             "The next sync rebuilds this model's Driver Updates package with these revisions, and devices already running a newer driver are forced back down to them." +
             $(if ($Retire) {
                 "`n`nRETIRE THE OUTRANKING DRIVER is ticked. Where the pin does not take hold on its own, the client will DELETE the newer driver package from the device's DriverStore so the pinned one becomes the best match. " +
                 "It only does this after the pin has already failed, only for a package newer than the pin on matching hardware, and only when the pinned revision is already staged. This removes a driver package from the machine."
+            } else { '' }) +
+            $(if ($Vendor) {
+                "`n`nUSE AMD'S CLEAN INSTALLER is ticked. On a device that needs the rollback, the client runs AMD's own Setup.exe from the pinned DUP as a silent factory-reset install, which removes every AMD display component before installing the pinned release. " +
+                "The screen goes black briefly while the display driver reloads and the client asks for a restart, so deploy in a maintenance window. AMD Radeon graphics only - other drivers keep the DUP."
             } else { '' }))
         if ($Confirm -ne 'Yes') { return }
 
@@ -2342,6 +2347,7 @@ function Initialize-DATMainWindow {
                     PinnedName      = [string]$Row['Name']
                     VendorVersion   = [string]$Row['VendorVersion']
                     RemoveOutrankingDriver = [bool]$Controls['PinRemoveOutrankingCheckBox'].IsChecked
+                    UseVendorInstaller = $Vendor
                     ComponentXml    = [string]$Row['ComponentXml']
                     HashMD5         = [string]$Row['HashMD5']
                     Size            = [string]$Row['Size']
